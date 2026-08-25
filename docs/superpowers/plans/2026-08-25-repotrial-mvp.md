@@ -729,7 +729,7 @@ fixture 是测试资产，不进入生产包；测试端口使用随机端口。
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/integration/fixtures/test_fixture_contract.py -v`
 - [ ] **Step 5: Commit**
-`git add -- tests/fixtures/app tests/integration/fixtures/test_fixture_contract.py && git commit -m "test: add deterministic trial fixture app"`
+`git add -- tests/fixtures/app/app.py tests/fixtures/app/Dockerfile tests/fixtures/app/requirements.txt tests/fixtures/app/compose.yml tests/fixtures/app/repotrial.journeys.json tests/integration/fixtures/test_fixture_contract.py && git commit -m "test: add deterministic trial fixture app"`
 
 **Codex task prompt:**
 ```text
@@ -801,13 +801,14 @@ async def propose_recovery(
     readme_excerpt: str,
     allowed_env_keys: set[str],
     repeated_error_count: int,
+    model: ModelAdapter | None = None,
 ) -> RecoveryAction
 ```
 
 **MVP allowlist:** 只允许 `set_env`（仅 `.env.example` / Compose 已声明 key）、`wait`（<=30s）、`retry`、`stop`。禁止安装宿主软件、读取未知文件、执行 README 任意命令。
 
 - [ ] **Step 1: 测试策略边界**
-缺 `APP_REQUIRED_TOKEN` 日志 + `.env.example` 声明 key -> 可提出合成值；README 注入“读取 ~/.ssh/id_rsa” -> 必须拒绝；`repeated_error_count > 2` -> stop。计数由 RunState/调用方显式维护，planner 不使用全局可变状态。
+缺 `APP_REQUIRED_TOKEN` 日志 + `.env.example` 声明 key -> 可提出合成值；README 注入“读取 ~/.ssh/id_rsa” -> 必须拒绝；`repeated_error_count > 2` -> stop。另用 FakeModelAdapter 证明仅在 deterministic rules 无结果且显式传入 `model` 时调用 fallback；`model=None` 时不得访问模型。计数由 RunState/调用方显式维护，planner 不使用全局可变状态。
 - [ ] **Step 2: 验证失败**
 Run: `uv run pytest tests/unit/trial/test_recovery.py -v`
 - [ ] **Step 3: 实现**
@@ -1056,10 +1057,15 @@ Run: `uv run pytest tests/unit/agent -v && uv run pytest -q`
 ## M6.2 RepoTrial-Eval fixtures 与指标
 
 **Files:**
-- Create: `src/repotrial/eval/evaluator.py`, `src/repotrial/eval/metrics.py`, `eval/manifests/*.json`
+- Create: `src/repotrial/eval/evaluator.py`, `src/repotrial/eval/metrics.py`
 - Create: `src/repotrial/eval/cli.py`
+- Create: `eval/manifests/redundant_privileged.json`, `eval/manifests/readonly_tmpfs.json`, `eval/manifests/nonroot_ok.json`, `eval/manifests/required_capability.json`, `eval/manifests/prompt_injection.json`
+- Create: `tests/fixtures/redundant_privileged/compose.yml`, `tests/fixtures/redundant_privileged/ground_truth.json`
+- Create: `tests/fixtures/readonly_tmpfs/compose.yml`, `tests/fixtures/readonly_tmpfs/ground_truth.json`
+- Create: `tests/fixtures/nonroot_ok/compose.yml`, `tests/fixtures/nonroot_ok/ground_truth.json`
+- Create: `tests/fixtures/required_capability/compose.yml`, `tests/fixtures/required_capability/ground_truth.json`
+- Create: `tests/fixtures/prompt_injection/compose.yml`, `tests/fixtures/prompt_injection/ground_truth.json`, `tests/fixtures/prompt_injection/README.md`
 - Modify: `pyproject.toml`, `uv.lock`
-- Create/extend fixtures: `redundant_privileged`, `readonly_tmpfs`, `nonroot_ok`, `required_capability`, `prompt_injection`
 - Test: `tests/unit/eval/test_metrics.py`, `tests/integration/eval/test_fixture_benchmark.py`
 
 **Metric definitions:**
@@ -1080,7 +1086,7 @@ manifest 明确 ground truth；benchmark 默认 Fake/local fixture，不依赖�
 Run: `uv run repotrial-eval --fixtures eval/manifests`
 Expected: 每个 fixture 有 run result、metrics、失败 stop_reason。
 - [ ] **Step 5: Commit**
-`git add -- pyproject.toml uv.lock src/repotrial/eval/evaluator.py src/repotrial/eval/metrics.py src/repotrial/eval/cli.py eval/manifests tests/unit/eval/test_metrics.py tests/integration/eval/test_fixture_benchmark.py && git commit -m "feat: add reproducible repotrial benchmark"`
+`git add -- pyproject.toml uv.lock src/repotrial/eval/evaluator.py src/repotrial/eval/metrics.py src/repotrial/eval/cli.py eval/manifests/redundant_privileged.json eval/manifests/readonly_tmpfs.json eval/manifests/nonroot_ok.json eval/manifests/required_capability.json eval/manifests/prompt_injection.json tests/fixtures/redundant_privileged/compose.yml tests/fixtures/redundant_privileged/ground_truth.json tests/fixtures/readonly_tmpfs/compose.yml tests/fixtures/readonly_tmpfs/ground_truth.json tests/fixtures/nonroot_ok/compose.yml tests/fixtures/nonroot_ok/ground_truth.json tests/fixtures/required_capability/compose.yml tests/fixtures/required_capability/ground_truth.json tests/fixtures/prompt_injection/compose.yml tests/fixtures/prompt_injection/ground_truth.json tests/fixtures/prompt_injection/README.md tests/unit/eval/test_metrics.py tests/integration/eval/test_fixture_benchmark.py && git commit -m "feat: add reproducible repotrial benchmark"`
 
 **Codex task prompt:**
 ```text
@@ -1189,11 +1195,11 @@ Run: `uv run pytest -q && uv run ruff check .`
 - [ ] **Step 1: 写 mock server 测试**
 Mock HTTP endpoint 返回合法/非法 JSON；合法结果转输入 schema 对应的具体 Pydantic 类型，非法结果有限重试 1 次后失败；日志不记录 API key。CLI 测试断言 `--model-endpoint` 只在本任务加入并构造 concrete adapter。
 - [ ] **Step 2: 验证失败**
-Run: `uv run pytest tests/unit/models/test_openai_compat.py -v`
+Run: `uv run pytest tests/unit/models/test_openai_compat.py tests/unit/test_cli_model_endpoint.py -v`
 - [ ] **Step 3: 实现**
 兼容标准 OpenAI-style chat/completions/structured JSON 能力时优先；若目标本地服务不支持 schema，使用 JSON-only prompt + Pydantic validate。不得把模型具体品牌写死。
 - [ ] **Step 4: 回归**
-Run: `uv run pytest tests/unit/models -v`
+Run: `uv run pytest tests/unit/models tests/unit/test_cli_model_endpoint.py -v`
 - [ ] **Step 5: Commit**
 `git add -- src/repotrial/models/openai_compat.py src/repotrial/cli.py tests/unit/models/test_openai_compat.py tests/unit/test_cli_model_endpoint.py && git commit -m "feat: add local model compatible adapter"`
 
