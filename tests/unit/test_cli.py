@@ -51,12 +51,14 @@ def test_dry_run_inspect_creates_the_required_run_layout(tmp_path: Path) -> None
     assert all(path.is_dir() for path in run_directories)
 
 
-def test_dry_run_accepts_case_insensitive_github_hostname(tmp_path: Path) -> None:
+def test_dry_run_accepts_case_insensitive_github_hostname_and_git_suffix(
+    tmp_path: Path,
+) -> None:
     artifacts_root = tmp_path / "artifacts"
 
     result = CliRunner().invoke(
         make_app(artifacts_root),
-        ["inspect", "--dry-run", "https://GitHub.com/a/b"],
+        ["inspect", "--dry-run", "https://GitHub.com/a/b.git"],
     )
 
     assert result.exit_code == 0
