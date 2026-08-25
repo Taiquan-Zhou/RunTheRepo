@@ -38,6 +38,11 @@ def test_sdist_excludes_local_state_and_keeps_project_sources(tmp_path: Path) ->
         "docs/project/spec.docx",
         "htmlcov/index.html",
         "repotrial.egg-info/sentinel",
+        "src/repotrial.egg-info/PKG-INFO",
+        "src/repotrial/.env",
+        "src/repotrial/debug.log",
+        "tests/.coverage",
+        "tests/.idea/workspace.xml",
         "uv.lock",
     )
     for relative_path in excluded_paths:
