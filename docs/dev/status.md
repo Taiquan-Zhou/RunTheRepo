@@ -34,7 +34,11 @@
 
 ## M0 milestone review remediation
 
+- Base commit: `8710f334097ff6da8539f36d370a4d179647fd16`.
 - A fresh whole-M0 review identified remaining URL path-component, documentation, and repository-hygiene gaps.
-- Current bounded remediation adds CLI-level regression cases for literal/encoded dot segments and encoded separators, tightens only that URL boundary, updates M0 documentation, ignores root-level generated artifacts/build outputs, strengthens existing CLI side-effect assertions, and clarifies the M0/M2.1 Provider-plan boundary.
+- Bounded remediation: `2aaff31983572b57b41c8a5994641b44cf69b641` (`fix: close M0 milestone review gaps`) adds CLI-level regression cases for literal/encoded dot segments and encoded separators, tightens only that URL boundary, updates M0 documentation, ignores root-level generated artifacts/build outputs, strengthens existing CLI side-effect assertions, and clarifies the M0/M2.1 Provider-plan boundary.
+- RED evidence: the focused malformed-URL test collected 22 cases; the eight new dot-segment/encoded-separator cases failed because the CLI returned exit code 0 and created a run.
+- GREEN and quality-gate evidence: the focused CLI suite passed 28 tests; the full suite passed 35 tests; Ruff lint/format, strict mypy, branch coverage at 98.09%, pre-commit, diff check, and ignore-rule checks passed locally.
 - Independent scoped re-review and Controller final verification are required before this remediation or the M0 milestone can be accepted.
+- Remote CI: intentionally not run, and no push was performed.
 - M1 has not started.
