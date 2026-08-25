@@ -420,7 +420,7 @@ wheels = [
 [[package]]
 name = "repotrial"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 
 [package.dev-dependencies]
 dev = [

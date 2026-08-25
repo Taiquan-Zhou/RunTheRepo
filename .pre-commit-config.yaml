@@ -3,7 +3,7 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
-        exclude: ^docs/dev/AGENTIC_DEVELOPMENT_PROTOCOL\.md$
+        args: [--markdown-linebreak-ext=md]
       - id: end-of-file-fixer
       - id: check-yaml
   - repo: https://github.com/astral-sh/ruff-pre-commit
