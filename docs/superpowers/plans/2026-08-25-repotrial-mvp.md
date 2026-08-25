@@ -395,6 +395,8 @@ class SandboxProvider(ABC):
 | M6 | LangGraph 闭环 + RepoTrial-Eval | 一条命令跑完整 Agent + benchmark |
 | M7 | 报告、API、真实项目验证 | hardened overlay + HTML/JSON report + 真实 repo pilot |
 
+**M0 范围澄清：** 表中“模型/Provider 接口冻结”指本计划第 2 节的文本契约已确定；生产代码中的 `SandboxProvider` 接口文件及 `FakeSandboxProvider` 仍按 M2.1 落地，不前移任务顺序。
+
 ---
 
 # 4. 详细任务计划

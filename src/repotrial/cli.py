@@ -2,7 +2,7 @@ from collections.abc import Callable
 from pathlib import Path
 from string import ascii_letters, digits, hexdigits
 from typing import Annotated
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import typer
 
@@ -35,6 +35,7 @@ def _is_supported_github_url(url: str) -> bool:
     except ValueError:
         return False
     path_components = parsed.path.split("/")
+    decoded_components = tuple(unquote(component) for component in path_components[1:])
     return (
         parsed.scheme == "https"
         and hostname == "github.com"
@@ -47,6 +48,12 @@ def _is_supported_github_url(url: str) -> bool:
         and len(path_components) == 3
         and path_components[0] == ""
         and all(path_components[1:])
+        and all(
+            component not in {".", ".."}
+            and "/" not in component
+            and "\\" not in component
+            for component in decoded_components
+        )
     )
 
 

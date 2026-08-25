@@ -11,3 +11,30 @@
 - Controller fresh verification at `d1675c9` used CPython 3.12.13 and passed locked sync/install, ordinary import, Ruff lint/format, mypy, pytest, 100% branch coverage, pre-commit, diff check, and clean status.
 - Remote CI: GitHub Actions has not run from this worktree.
 - Deviations/rulings: none recorded.
+
+## M0.2 — core domain contracts
+
+- Base commit: `dece310f502ae1ea40028e48060bcbb7f3667020`.
+- Scope: Pydantic v2 enums and models for the frozen M0 domain/JSON contracts; no database, LangGraph, sandbox, or orchestration implementation.
+- Implementation: `4c32487b018b6bb3a9891c80f993a0c2a1d1e3e2` (`feat: define core domain contracts`).
+- RED/GREEN evidence: model tests first failed because the domain modules were absent, then the focused domain suite and applicable local quality gates passed.
+- Review: the independent task review and scoped second review closed all Critical/Important findings.
+- Remote CI: GitHub Actions has not run from this worktree.
+- Deviations/rulings: none recorded.
+
+## M0.3 — CLI skeleton and run layout
+
+- Base commit: `4c32487b018b6bb3a9891c80f993a0c2a1d1e3e2`.
+- Scope: `repotrial doctor` and `repotrial inspect --dry-run URL`; URL validation and empty run-directory creation only, with no clone, Compose, Docker, sandbox, agent, or hardening behavior.
+- Implementation and bounded fixes: `eb991381c8f84b2253a6438eea43240aede1b538` (`feat: add CLI skeleton and run artifacts`), `2d4e4602aeff3d29236632a4bb269d1905e9d196`, and `8710f334097ff6da8539f36d370a4d179647fd16`.
+- RED/GREEN evidence: CLI tests first failed because the command module was absent; focused CLI tests and all applicable local gates passed after implementation and each bounded fix.
+- Review: independent review identified URL-boundary defects; two scoped fix/re-review rounds closed the then-known Critical/Important findings.
+- Controller verification at `8710f33` used CPython 3.12.13 and passed locked dependency checks, CLI/unit tests, Ruff lint/format, strict mypy, branch coverage, pre-commit, diff check, and clean status. `doctor` left the injected artifacts root absent.
+- Remote CI: intentionally not run; the repository owner deferred GitHub Actions and push until local development is complete.
+
+## M0 milestone review remediation
+
+- A fresh whole-M0 review identified remaining URL path-component, documentation, and repository-hygiene gaps.
+- Current bounded remediation adds CLI-level regression cases for literal/encoded dot segments and encoded separators, tightens only that URL boundary, updates M0 documentation, ignores root-level generated artifacts/build outputs, strengthens existing CLI side-effect assertions, and clarifies the M0/M2.1 Provider-plan boundary.
+- Independent scoped re-review and Controller final verification are required before this remediation or the M0 milestone can be accepted.
+- M1 has not started.

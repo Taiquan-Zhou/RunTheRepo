@@ -1,6 +1,10 @@
 .worktrees/
 .superpowers/
 .venv/
+/artifacts/
+/dist/
+/build/
+*.egg-info/
 __pycache__/
 *.py[cod]
 .coverage

@@ -19,10 +19,13 @@ def make_app(artifacts_root: Path) -> Typer:
 
 
 def test_doctor_reports_a_healthy_result(tmp_path: Path) -> None:
-    result = CliRunner().invoke(make_app(tmp_path / "artifacts"), ["doctor"])
+    artifacts_root = tmp_path / "artifacts"
+
+    result = CliRunner().invoke(make_app(artifacts_root), ["doctor"])
 
     assert result.exit_code == 0
-    assert "ok" in result.stdout
+    assert result.stdout == "ok\n"
+    assert not artifacts_root.exists()
 
 
 def test_dry_run_inspect_creates_the_required_run_layout(tmp_path: Path) -> None:
@@ -39,11 +42,13 @@ def test_dry_run_inspect_creates_the_required_run_layout(tmp_path: Path) -> None
         f"run_id={FIXED_RUN_ID}",
         f"artifact_path={artifact_path}",
     ]
-    assert {path.name for path in artifact_path.iterdir()} == {
+    run_directories = list(artifact_path.iterdir())
+    assert {path.name for path in run_directories} == {
         "evidence",
         "experiments",
         "report",
     }
+    assert all(path.is_dir() for path in run_directories)
 
 
 def test_dry_run_accepts_case_insensitive_github_hostname(tmp_path: Path) -> None:
@@ -75,6 +80,14 @@ def test_dry_run_accepts_case_insensitive_github_hostname(tmp_path: Path) -> Non
         "https://github.com/a/b\n",
         "https://github.com/a/b|invalid",
         "https://github.com/a/b%zz",
+        "https://github.com/./repo",
+        "https://github.com/owner/..",
+        "https://github.com/%2e/repo",
+        "https://github.com/owner/%2e%2e",
+        "https://github.com/owner%2Frepo/project",
+        "https://github.com/owner/repo%2Fsub",
+        "https://github.com/owner%5Crepo/project",
+        "https://github.com/owner/repo%5Csub",
     ],
 )
 def test_malformed_inspect_url_creates_no_artifacts(tmp_path: Path, url: str) -> None:
@@ -83,6 +96,7 @@ def test_malformed_inspect_url_creates_no_artifacts(tmp_path: Path, url: str) ->
     result = CliRunner().invoke(make_app(artifacts_root), ["inspect", "--dry-run", url])
 
     assert result.exit_code != 0
+    assert "run_id=" not in result.stdout
     assert not artifacts_root.exists()
 
 
