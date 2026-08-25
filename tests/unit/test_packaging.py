@@ -18,16 +18,27 @@ def test_sdist_excludes_local_state_and_keeps_project_sources(tmp_path: Path) ->
 
     excluded_paths = (
         ".git",
+        ".env",
+        ".env.example",
         ".coverage",
+        ".coverage.worker",
+        ".github/workflows/ci.yml",
         ".superpowers/sdd/review.md",
         ".venv/sentinel",
+        ".idea/workspace.xml",
         ".mypy_cache/sentinel",
         ".pytest_cache/sentinel",
         ".ruff_cache/sentinel",
+        ".vscode/settings.json",
         "artifacts/sentinel",
+        "AGENTS.md",
         "build/sentinel",
+        "coverage.xml",
         "dist/sentinel",
+        "docs/project/spec.docx",
+        "htmlcov/index.html",
         "repotrial.egg-info/sentinel",
+        "uv.lock",
     )
     for relative_path in excluded_paths:
         sentinel = project_root / relative_path
@@ -50,8 +61,16 @@ def test_sdist_excludes_local_state_and_keeps_project_sources(tmp_path: Path) ->
             for member in archive.getmembers()
         }
 
-    for relative_path in excluded_paths:
-        assert PurePosixPath(relative_path) not in members
-    assert PurePosixPath("pyproject.toml") in members
-    assert PurePosixPath("src/repotrial/__init__.py") in members
-    assert PurePosixPath("tests/unit/test_smoke.py") in members
+    excluded_members = {PurePosixPath(path) for path in excluded_paths}
+    assert excluded_members.isdisjoint(members), excluded_members & members
+    expected_members = {
+        PurePosixPath("README.md"),
+        PurePosixPath("pyproject.toml"),
+        PurePosixPath("PKG-INFO"),
+        *(
+            PurePosixPath(path.relative_to(project_root).as_posix())
+            for source_root in (project_root / "src", project_root / "tests")
+            for path in source_root.rglob("*.py")
+        ),
+    }
+    assert expected_members <= members

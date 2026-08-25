@@ -40,7 +40,8 @@
 - RED evidence: the focused malformed-URL test collected 22 cases; the eight new dot-segment/encoded-separator cases failed because the CLI returned exit code 0 and created a run.
 - GREEN and quality-gate evidence: the focused CLI suite passed 28 tests; the full suite passed 35 tests; Ruff lint/format, strict mypy, branch coverage at 98.09%, pre-commit, diff check, and ignore-rule checks passed locally.
 - A later Controller package-build gate found that the Hatch source distribution still included worktree-local `.git`, `.coverage`, and `.superpowers/sdd` content even though the wheel and installed `repotrial doctor` entry point were clean.
-- The bounded packaging remediation adds target-specific sdist exclusions plus a real-archive regression test that injects local-state sentinels into a temporary project copy and also checks that package sources, tests, and metadata remain present.
-- Independent scoped re-review and Controller final verification are required before this remediation or the M0 milestone can be accepted.
+- The first bounded packaging remediation, `f785181d7a6d82a112a3111881ae22df033ff3bb` (`fix: exclude local state from source distribution`), added a target-specific exclusion blacklist and a real-archive regression test. Independent scoped re-review reproduced six unlisted paths in the sdist (`.env`, `.coverage.worker`, IDE state, and coverage reports), so its Important packaging finding remained open.
+- The current bounded remediation replaces that blacklist with an intentional sdist allowlist for `src` and `tests`. Its expanded temporary-project regression first failed with all six reproduced paths present, then passed while requiring every Python source/test plus `pyproject.toml`, `README.md`, and generated `PKG-INFO` in the archive. `uv.lock` and `.env.example` remain repository inputs rather than distribution inputs because neither is required to build or run the current package.
+- Independent scoped re-review and Controller final verification are still pending before this remediation or the M0 milestone can be accepted.
 - Remote CI: intentionally not run, and no push was performed.
 - M1 has not started.
