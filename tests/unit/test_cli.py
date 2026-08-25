@@ -46,6 +46,18 @@ def test_dry_run_inspect_creates_the_required_run_layout(tmp_path: Path) -> None
     }
 
 
+def test_dry_run_accepts_case_insensitive_github_hostname(tmp_path: Path) -> None:
+    artifacts_root = tmp_path / "artifacts"
+
+    result = CliRunner().invoke(
+        make_app(artifacts_root),
+        ["inspect", "--dry-run", "https://GitHub.com/a/b"],
+    )
+
+    assert result.exit_code == 0
+    assert (artifacts_root / FIXED_RUN_ID).is_dir()
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -58,6 +70,10 @@ def test_dry_run_inspect_creates_the_required_run_layout(tmp_path: Path) -> None
         "https://github.com/a/b/c",
         "https://github.com/a/b?branch=main",
         "https://github.com/a/b#readme",
+        "https://github.com/a/b ",
+        "https://github.com/a/b\n",
+        "https://github.com/a/b|invalid",
+        "https://github.com/a/b%zz",
     ],
 )
 def test_malformed_inspect_url_creates_no_artifacts(tmp_path: Path, url: str) -> None:

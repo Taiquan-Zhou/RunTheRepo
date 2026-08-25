@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from pathlib import Path
+from string import ascii_letters, digits, hexdigits
 from typing import Annotated
 from urllib.parse import urlsplit
 
@@ -7,13 +8,39 @@ import typer
 
 from repotrial.config import create_run_layout, generate_run_id
 
+_RAW_URI_CHARACTERS = frozenset(ascii_letters + digits + "-._~:/?#[]@!$&'()*+,;=%")
+
+
+def _has_valid_raw_uri_form(url: str) -> bool:
+    if not url or any(character not in _RAW_URI_CHARACTERS for character in url):
+        return False
+    return all(
+        character != "%"
+        or (
+            index + 2 < len(url)
+            and url[index + 1] in hexdigits
+            and url[index + 2] in hexdigits
+        )
+        for index, character in enumerate(url)
+    )
+
 
 def _is_supported_github_url(url: str) -> bool:
-    parsed = urlsplit(url)
+    if not _has_valid_raw_uri_form(url):
+        return False
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
     path_components = parsed.path.split("/")
     return (
         parsed.scheme == "https"
-        and parsed.netloc == "github.com"
+        and hostname == "github.com"
+        and parsed.username is None
+        and parsed.password is None
+        and port is None
         and "?" not in url
         and "#" not in url
         and len(path_components) == 3
