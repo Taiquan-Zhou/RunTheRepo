@@ -47,4 +47,36 @@
 - Controller fresh final verification at `7879de4` used CPython 3.12.13 and passed `uv lock --check`, locked sync, Ruff lint/format, strict mypy, focused and full pytest runs with 36 tests passed, 98.09% branch coverage, pre-commit, git diff/fsck/ancestry checks, and secret/suppression/dependency/ignored-tracked hygiene checks. Default `uv build` explicitly built the wheel from the sdist; complete inspection found 13 sdist members and nine wheel members. An isolated wheel install ran `repotrial doctor` with output `ok` and created no `artifacts`; the tracked and untracked tree was clean afterward.
 - Controller decision: the local M0 milestone gate is GO and accepted. Remote GitHub Actions remain intentionally unrun under the repository owner's decision, and no push was performed.
 - `LICENSE` remains an owner decision required before public release, not an M0 implementation defect.
-- M1 has not started.
+- Historical closure: after the M0 GO decision, M1.1 was authorized as the
+  next bounded task.
+
+## M1.1 — GitHub repository intake and immutable pinning
+
+- Base commit: `9c360790812509edbe4998e45c82ab2634c5912c`.
+- Implementation and bounded fixes: `24921720c29a3d798039f86d2eaf03944cc75639`,
+  `a3380ac749046083df248bfbe6e6a78a76ff8581`, and
+  `051a7a1c883a1672ada4f1cced71f1ad205aa848`.
+- Scope: GitHub URL policy with CLI reuse; offline local Git clone and ref
+  resolution into `PinnedRepo` with an immutable commit SHA. M1.2+ behavior
+  was not implemented.
+- TDD evidence: initial coverage recorded 32 RED cases followed by 32 GREEN
+  cases. The implementation-review fixes added 13 RED cases and reached 74
+  GREEN cases. The final communication `FileNotFoundError` regression also
+  went RED then GREEN.
+- Review: the independent revised design review was APPROVED. The implementation
+  review required two bounded fix rounds and was then finally APPROVED with no
+  Critical, Important, or Minor findings.
+- Controller fresh evidence: `uv lock --check`, `uv sync --locked --all-groups`,
+  focused tests (`75 passed`), Ruff lint/format, strict mypy, full tests
+  (`83 passed`), branch coverage (`91.58%`, threshold `>=85%`), pre-commit,
+  diff/range inspection, and clean status all passed.
+- Git was available, so the local-Git integration tests ran without an
+  `unsupported` skip. No real-GitHub E2E was run; the suite is deliberately
+  offline. No push or remote GitHub Actions run was performed.
+- Limitation/ruling: M1.1 guarantees direct Git-child kill/reap only, not
+  descendant process-tree termination. On Windows, the standard library cannot
+  make directory identity recheck and recursive path deletion atomic, so M1.1
+  does not claim resistance to an adversarial same-host actor that swaps a
+  destination directory between arbitrary Python instructions. Stronger host
+  containment remains Sandbox-stage work.
+- M1.2 has not started.
