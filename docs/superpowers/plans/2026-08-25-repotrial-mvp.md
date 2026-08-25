@@ -869,6 +869,15 @@ Run: `uv run pytest tests/integration/journey/test_playwright_fixture.py -v`
 - Modify: `src/repotrial/trial/planner.py`
 - Test: `tests/unit/trial/test_journey_planner.py`
 
+**Interfaces:**
+```python
+from typing import Protocol
+from pydantic import BaseModel
+
+class ModelAdapter(Protocol):
+    async def structured(self, *, system: str, user: str, schema: type[BaseModel]) -> BaseModel: ...
+```
+
 **Priority:** 若 repo 存在 `repotrial.journeys.json`，100% 使用声明式 Journey；否则从 README 提取候选入口，LLM 只能生成受限 DSL，最多 5 条 Journey，每条最多 8 步。
 
 - [ ] **Step 1: 测试声明式优先**
@@ -1164,11 +1173,7 @@ Run: `uv run pytest -q && uv run ruff check .`
 - Create: `src/repotrial/models/openai_compat.py`
 - Test: `tests/unit/models/test_openai_compat.py`
 
-**Interfaces:**
-```python
-class ModelAdapter(Protocol):
-    async def structured(self, *, system: str, user: str, schema: type[BaseModel]) -> BaseModel: ...
-```
+**Interfaces:** Consumes the `ModelAdapter` protocol created in M4.3 and produces one concrete OpenAI-compatible implementation with the same `structured(...)` signature.
 
 - [ ] **Step 1: 写 mock server 测试**
 Mock HTTP endpoint 返回合法/非法 JSON；合法结果转 Pydantic，非法结果有限重试 1 次后失败；日志不记录 API key。
