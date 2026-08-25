@@ -334,6 +334,7 @@ class RunState(BaseModel):
     current_config_hash: str | None = None
     risk_findings: list[RiskFinding] = Field(default_factory=list)
     journeys: list[Journey] = Field(default_factory=list)
+    baseline_journey_results: list[JourneyResult] = Field(default_factory=list)
     baseline_observation: ObservationSnapshot | None = None
     experiments: list[ExperimentRecord] = Field(default_factory=list)
     artifacts: list[str] = Field(default_factory=list)
@@ -402,7 +403,7 @@ class SandboxProvider(ABC):
 
 **Files:**
 - Pre-existing governance: `AGENTS.md`, `docs/dev/AGENTIC_DEVELOPMENT_PROTOCOL.md`, `docs/superpowers/plans/2026-08-25-repotrial-mvp.md`
-- Create: `pyproject.toml`, `.gitignore`, `.env.example`, `.pre-commit-config.yaml`, `.github/workflows/ci.yml`, `README.md`, `src/repotrial/__init__.py`, `tests/unit/test_smoke.py`, `docs/dev/status.md`
+- Create: `pyproject.toml`, `uv.lock`, `.gitignore`, `.env.example`, `.pre-commit-config.yaml`, `.github/workflows/ci.yml`, `README.md`, `src/repotrial/__init__.py`, `tests/unit/test_smoke.py`, `docs/dev/status.md`
 
 **Interfaces:**
 - Produces: `repotrial.__version__`, pytest 可运行环境、全局开发约束。
@@ -438,7 +439,7 @@ Expected: 全部 PASS；CI 使用同等或更严格命令。
 
 - [ ] **Step 5: Commit**
 
-`git add pyproject.toml uv.lock .gitignore .env.example .pre-commit-config.yaml .github/workflows/ci.yml README.md src/repotrial/__init__.py tests/unit/test_smoke.py docs/dev/status.md && git commit -m "chore: bootstrap repotrial project"`
+`git add -- pyproject.toml uv.lock .gitignore .env.example .pre-commit-config.yaml .github/workflows/ci.yml README.md src/repotrial/__init__.py tests/unit/test_smoke.py docs/dev/status.md && git commit -m "chore: bootstrap repotrial project"`
 
 **Codex task prompt:**
 ```text
@@ -451,6 +452,7 @@ Expected: 全部 PASS；CI 使用同等或更严格命令。
 
 **Files:**
 - Create: `src/repotrial/domain/enums.py`, `src/repotrial/domain/models.py`
+- Modify: `pyproject.toml`, `uv.lock`
 - Test: `tests/unit/domain/test_models.py`
 
 **Interfaces:** 使用“核心接口冻结”章节中的类型名和字段名。
@@ -481,7 +483,7 @@ Run: `uv run pytest tests/unit/domain -v`
 Expected: PASS。
 
 - [ ] **Step 5: Commit**
-`git commit -m "feat: define core domain contracts"`
+`git add -- pyproject.toml uv.lock src/repotrial/domain/enums.py src/repotrial/domain/models.py tests/unit/domain/test_models.py && git commit -m "feat: define core domain contracts"`
 
 **Codex task prompt:**
 ```text
@@ -494,6 +496,7 @@ Expected: PASS。
 
 **Files:**
 - Create: `src/repotrial/cli.py`, `src/repotrial/config.py`
+- Modify: `pyproject.toml`, `uv.lock`
 - Test: `tests/unit/test_cli.py`
 
 **Interfaces:**
@@ -508,7 +511,7 @@ Run: `uv run pytest tests/unit/test_cli.py -v`
 - [ ] **Step 4: 回归**
 Run: `uv run pytest -q`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: add CLI skeleton and run artifacts"`
+`git add -- pyproject.toml uv.lock src/repotrial/cli.py src/repotrial/config.py tests/unit/test_cli.py && git commit -m "feat: add CLI skeleton and run artifacts"`
 
 **Codex task prompt:**
 ```text
@@ -539,7 +542,7 @@ Run: `uv run pytest tests/unit/intake tests/integration/intake -v`
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/intake tests/integration/intake -v`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: pin repositories to immutable commits"`
+`git add -- src/repotrial/intake/github.py tests/unit/intake/test_github.py tests/integration/intake/test_local_git_pin.py && git commit -m "feat: pin repositories to immutable commits"`
 
 **Codex task prompt:**
 ```text
@@ -552,6 +555,7 @@ Run: `uv run pytest tests/unit/intake tests/integration/intake -v`
 
 **Files:**
 - Create: `src/repotrial/intake/compose_discovery.py`, `src/repotrial/compose/parser.py`
+- Modify: `pyproject.toml`, `uv.lock`
 - Test: `tests/unit/compose/test_discovery.py`, `tests/unit/compose/test_parser.py`
 
 **Interfaces:**
@@ -572,7 +576,7 @@ Run: `uv run pytest tests/unit/compose/test_discovery.py tests/unit/compose/test
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/compose -v`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: discover and parse compose projects"`
+`git add -- pyproject.toml uv.lock src/repotrial/intake/compose_discovery.py src/repotrial/compose/parser.py tests/unit/compose/test_discovery.py tests/unit/compose/test_parser.py && git commit -m "feat: discover and parse compose projects"`
 
 **Codex task prompt:**
 ```text
@@ -604,7 +608,7 @@ Run: `uv run pytest tests/unit/compose/test_risk.py -v`
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/compose -v`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: add deterministic compose risk findings"`
+`git add -- src/repotrial/compose/risk.py tests/unit/compose/test_risk.py && git commit -m "feat: add deterministic compose risk findings"`
 
 **Codex task prompt:**
 ```text
@@ -630,7 +634,7 @@ Fake provider 不运行真实容器，通过预设 script map 返回 `ExecResult
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/sandbox -v`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: define sandbox provider contract"`
+`git add -- src/repotrial/sandbox/base.py src/repotrial/sandbox/fake.py tests/unit/sandbox/test_fake.py && git commit -m "feat: define sandbox provider contract"`
 
 **Codex task prompt:**
 ```text
@@ -661,7 +665,7 @@ Run: `uv run pytest tests/unit/sandbox/test_docker_sbx_commands.py -v`
 Run: `REPOTRIAL_RUN_SBX_TESTS=1 uv run pytest tests/integration/sandbox/test_docker_sbx_smoke.py -v`
 Expected: 环境有 SBX 时 create -> exec `echo ok` -> destroy 全通过；无 SBX 时测试可显式 skip，但任务完成报告必须把真实 Provider 集成门禁记为 `UNSUPPORTED`，不得写成已通过。
 - [ ] **Step 5: Commit**
-`git commit -m "feat: add docker sandboxes provider"`
+`git add -- src/repotrial/sandbox/docker_sbx.py tests/unit/sandbox/test_docker_sbx_commands.py tests/integration/sandbox/test_docker_sbx_smoke.py && git commit -m "feat: add docker sandboxes provider"`
 
 **Codex task prompt:**
 ```text
@@ -692,7 +696,7 @@ Run: `uv run pytest tests/unit/sandbox/test_lifecycle.py -v`
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/sandbox -v`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: guarantee sandbox cleanup"`
+`git add -- src/repotrial/sandbox/lifecycle.py tests/unit/sandbox/test_lifecycle.py && git commit -m "feat: guarantee sandbox cleanup"`
 
 **Codex task prompt:**
 ```text
@@ -725,7 +729,7 @@ fixture 是测试资产，不进入生产包；测试端口使用随机端口。
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/integration/fixtures/test_fixture_contract.py -v`
 - [ ] **Step 5: Commit**
-`git commit -m "test: add deterministic trial fixture app"`
+`git add -- tests/fixtures/app tests/integration/fixtures/test_fixture_contract.py && git commit -m "test: add deterministic trial fixture app"`
 
 **Codex task prompt:**
 ```text
@@ -760,7 +764,7 @@ Boot runner 不调用 LLM；命令、日志上限、超时固定配置化；输�
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/trial -v`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: add deterministic compose boot runner"`
+`git add -- src/repotrial/trial/boot.py tests/unit/trial/test_boot.py && git commit -m "feat: add deterministic compose boot runner"`
 
 **Codex task prompt:**
 ```text
@@ -772,11 +776,21 @@ Run: `uv run pytest tests/unit/trial -v`
 ## M3.3 有限启动恢复策略
 
 **Files:**
-- Create: `src/repotrial/trial/planner.py`
+- Create: `src/repotrial/trial/planner.py`, `src/repotrial/models/base.py`
 - Test: `tests/unit/trial/test_recovery.py`
 
 **Interfaces:**
 ```python
+from typing import Protocol, TypeVar
+from pydantic import BaseModel
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
+
+class ModelAdapter(Protocol):
+    async def structured(
+        self, *, system: str, user: str, schema: type[ModelT]
+    ) -> ModelT: ...
+
 class RecoveryAction(BaseModel):
     action: str  # set_env | wait | retry | stop
     params: dict[str, str | int]
@@ -797,11 +811,11 @@ async def propose_recovery(
 - [ ] **Step 2: 验证失败**
 Run: `uv run pytest tests/unit/trial/test_recovery.py -v`
 - [ ] **Step 3: 实现**
-先做 deterministic regex/rules 识别常见 missing env/wait；LLM adapter 作为可选 fallback，输出严格 Pydantic schema，再经 policy validator 二次过滤。没有模型时 fixture 仍能跑通。
+先做 deterministic regex/rules 识别常见 missing env/wait；`src/repotrial/models/base.py` 唯一定义上述泛型 `ModelAdapter` 协议。LLM adapter 作为可选 fallback，输出严格 Pydantic schema，再经 policy validator 二次过滤。没有模型时 fixture 仍能跑通。
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/trial -v`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: add bounded boot recovery policy"`
+`git add -- src/repotrial/trial/planner.py src/repotrial/models/base.py tests/unit/trial/test_recovery.py && git commit -m "feat: add bounded boot recovery policy"`
 
 **Codex task prompt:**
 ```text
@@ -814,6 +828,7 @@ Run: `uv run pytest tests/unit/trial -v`
 
 **Files:**
 - Create: `src/repotrial/journey/verifier.py`, `src/repotrial/journey/http_runner.py`
+- Modify: `pyproject.toml`, `uv.lock`
 - Test: `tests/unit/journey/test_http_runner.py`
 
 **Interfaces:** 使用 `Journey/Step/Assertion/Result`；MVP HTTP actions: `request`；assertions: `status_code`, `json_path_equals`, `text_contains`。
@@ -827,7 +842,7 @@ Run: `uv run pytest tests/unit/journey/test_http_runner.py -v`
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/journey -v`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: add deterministic HTTP journey runner"`
+`git add -- pyproject.toml uv.lock src/repotrial/journey/verifier.py src/repotrial/journey/http_runner.py tests/unit/journey/test_http_runner.py && git commit -m "feat: add deterministic HTTP journey runner"`
 
 **Codex task prompt:**
 ```text
@@ -840,6 +855,7 @@ Run: `uv run pytest tests/unit/journey -v`
 
 **Files:**
 - Create: `src/repotrial/journey/playwright_runner.py`
+- Modify: `pyproject.toml`, `uv.lock`
 - Test: `tests/integration/journey/test_playwright_fixture.py`
 
 **MVP browser actions:** `goto`, `fill_by_label`, `click_by_role`, `assert_text_visible`。优先 Playwright user-facing locator（role/label/text），不允许 LLM 直接生成任意 JS。
@@ -849,11 +865,11 @@ Run: `uv run pytest tests/unit/journey -v`
 - [ ] **Step 2: 验证失败**
 Run: `uv run pytest tests/integration/journey/test_playwright_fixture.py -v`
 - [ ] **Step 3: 实现**
-使用 Playwright async API；locator 使用 `get_by_role/get_by_label/get_by_text`；trace 开启 screenshots/snapshots；artifact path 写入 JourneyResult。
+先加入 `playwright` 运行依赖并在测试环境安装固定 Chromium；使用 Playwright async API；locator 使用 `get_by_role/get_by_label/get_by_text`；trace 开启 screenshots/snapshots；artifact path 写入 JourneyResult。
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/integration/journey/test_playwright_fixture.py -v`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: add replayable browser journeys"`
+`git add -- pyproject.toml uv.lock src/repotrial/journey/playwright_runner.py tests/integration/journey/test_playwright_fixture.py && git commit -m "feat: add replayable browser journeys"`
 
 **Codex task prompt:**
 ```text
@@ -865,18 +881,10 @@ Run: `uv run pytest tests/integration/journey/test_playwright_fixture.py -v`
 ## M4.3 Journey Planner：先声明式，后 LLM 建议
 
 **Files:**
-- Create: `src/repotrial/models/base.py`
 - Modify: `src/repotrial/trial/planner.py`
 - Test: `tests/unit/trial/test_journey_planner.py`
 
-**Interfaces:**
-```python
-from typing import Protocol
-from pydantic import BaseModel
-
-class ModelAdapter(Protocol):
-    async def structured(self, *, system: str, user: str, schema: type[BaseModel]) -> BaseModel: ...
-```
+**Interfaces:** Consumes the generic `ModelAdapter` protocol created in M3.3; this task must not redefine it.
 
 **Priority:** 若 repo 存在 `repotrial.journeys.json`，100% 使用声明式 Journey；否则从 README 提取候选入口，LLM 只能生成受限 DSL，最多 5 条 Journey，每条最多 8 步。
 
@@ -885,11 +893,11 @@ class ModelAdapter(Protocol):
 - [ ] **Step 2: 验证失败**
 Run: `uv run pytest tests/unit/trial/test_journey_planner.py -v`
 - [ ] **Step 3: 实现**
-在 `src/repotrial/models/base.py` 唯一定义 `ModelAdapter` 协议；planner 只依赖该协议。OpenAI-compatible 具体实现延后到 M7；当前测试用 FakeModelAdapter，禁止在 planner 内复制第二份协议。
+Planner 只依赖 M3.3 的 `ModelAdapter` 协议。OpenAI-compatible 具体实现延后到 M7；当前测试用 FakeModelAdapter，禁止在 planner 内复制第二份协议。
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/trial -v`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: add constrained journey planning"`
+`git add -- src/repotrial/trial/planner.py tests/unit/trial/test_journey_planner.py && git commit -m "feat: add constrained journey planning"`
 
 **Codex task prompt:**
 ```text
@@ -922,7 +930,7 @@ Run: `uv run pytest tests/unit/compose/test_mutations.py -v`
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/compose -v`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: add auditable compose mutations"`
+`git add -- src/repotrial/compose/overlay.py src/repotrial/compose/mutations.py tests/unit/compose/test_mutations.py && git commit -m "feat: add auditable compose mutations"`
 
 **Codex task prompt:**
 ```text
@@ -948,7 +956,7 @@ Run: `uv run pytest tests/unit/trial/test_observer.py -v`
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/trial -v`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: collect runtime evidence snapshots"`
+`git add -- src/repotrial/trial/observer.py tests/unit/trial/test_observer.py && git commit -m "feat: collect runtime evidence snapshots"`
 
 **Codex task prompt:**
 ```text
@@ -983,7 +991,7 @@ Run: `uv run pytest tests/unit/hardening/test_engine.py -v`
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/hardening -v`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: add keep rollback hardening experiments"`
+`git add -- src/repotrial/hardening/engine.py src/repotrial/hardening/policy.py tests/unit/hardening/test_engine.py && git commit -m "feat: add keep rollback hardening experiments"`
 
 **Codex task prompt:**
 ```text
@@ -1009,7 +1017,7 @@ Run: `uv run pytest tests/unit/hardening/test_policy.py -v`
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/hardening -v`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: prioritize bounded hardening trials"`
+`git add -- src/repotrial/hardening/policy.py tests/unit/hardening/test_policy.py && git commit -m "feat: prioritize bounded hardening trials"`
 
 **Codex task prompt:**
 ```text
@@ -1022,6 +1030,7 @@ Run: `uv run pytest tests/unit/hardening -v`
 
 **Files:**
 - Create: `src/repotrial/agent/state.py`, `src/repotrial/agent/graph.py`
+- Modify: `pyproject.toml`, `uv.lock`
 - Test: `tests/unit/agent/test_graph.py`
 
 **Graph stages:** `intake -> baseline -> boot -> journeys -> observe -> propose_mutation -> experiment -> decide -> report_or_next`。只维护一个图，不创建“安全专家 Agent/网络 Agent”等人格。
@@ -1035,7 +1044,7 @@ Run: `uv run pytest tests/unit/agent/test_graph.py -v`
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/agent -v && uv run pytest -q`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: orchestrate repotrial state machine"`
+`git add -- pyproject.toml uv.lock src/repotrial/agent/state.py src/repotrial/agent/graph.py tests/unit/agent/test_graph.py && git commit -m "feat: orchestrate repotrial state machine"`
 
 **Codex task prompt:**
 ```text
@@ -1049,7 +1058,7 @@ Run: `uv run pytest tests/unit/agent -v && uv run pytest -q`
 **Files:**
 - Create: `src/repotrial/eval/evaluator.py`, `src/repotrial/eval/metrics.py`, `eval/manifests/*.json`
 - Create: `src/repotrial/eval/cli.py`
-- Modify: `pyproject.toml`
+- Modify: `pyproject.toml`, `uv.lock`
 - Create/extend fixtures: `redundant_privileged`, `readonly_tmpfs`, `nonroot_ok`, `required_capability`, `prompt_injection`
 - Test: `tests/unit/eval/test_metrics.py`, `tests/integration/eval/test_fixture_benchmark.py`
 
@@ -1071,7 +1080,7 @@ manifest 明确 ground truth；benchmark 默认 Fake/local fixture，不依赖�
 Run: `uv run repotrial-eval --fixtures eval/manifests`
 Expected: 每个 fixture 有 run result、metrics、失败 stop_reason。
 - [ ] **Step 5: Commit**
-`git commit -m "feat: add reproducible repotrial benchmark"`
+`git add -- pyproject.toml uv.lock src/repotrial/eval/evaluator.py src/repotrial/eval/metrics.py src/repotrial/eval/cli.py eval/manifests tests/unit/eval/test_metrics.py tests/integration/eval/test_fixture_benchmark.py && git commit -m "feat: add reproducible repotrial benchmark"`
 
 **Codex task prompt:**
 ```text
@@ -1084,6 +1093,7 @@ Expected: 每个 fixture 有 run result、metrics、失败 stop_reason。
 
 **Files:**
 - Create: `src/repotrial/agent/checkpoint.py`
+- Modify: `pyproject.toml`, `uv.lock`
 - Test: `tests/unit/agent/test_checkpoint_factory.py`
 
 **Interfaces:**
@@ -1100,7 +1110,7 @@ Run: `uv run pytest tests/unit/agent/test_checkpoint_factory.py -v`
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/agent -v`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: persist agent checkpoints in postgres"`
+`git add -- pyproject.toml uv.lock src/repotrial/agent/checkpoint.py tests/unit/agent/test_checkpoint_factory.py && git commit -m "feat: persist agent checkpoints in postgres"`
 
 **Codex task prompt:**
 ```text
@@ -1113,6 +1123,7 @@ Run: `uv run pytest tests/unit/agent -v`
 
 **Files:**
 - Create: `src/repotrial/report/render.py`, `src/repotrial/report/templates/report.html.j2`
+- Modify: `pyproject.toml`, `uv.lock`
 - Test: `tests/unit/report/test_render.py`
 
 **Report required sections:** identity(commit/hash)、coverage boundary、baseline findings、observed behavior、experiments timeline、KEEP/ROLLBACK evidence、generated overlay、unsupported collectors、免责声明。
@@ -1122,11 +1133,11 @@ Run: `uv run pytest tests/unit/agent -v`
 - [ ] **Step 2: 验证失败**
 Run: `uv run pytest tests/unit/report/test_render.py -v`
 - [ ] **Step 3: 实现**
-Jinja2 默认 autoescape；不要在 HTML 中直接渲染目标页面原始 HTML；外部文本全部 escape；overlay 单独保存 YAML。
+先加入 `jinja2` 运行依赖。Jinja2 默认 autoescape；不要在 HTML 中直接渲染目标页面原始 HTML；外部文本全部 escape；overlay 单独保存 YAML。
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/report -v`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: render auditable trial reports"`
+`git add -- pyproject.toml uv.lock src/repotrial/report/render.py src/repotrial/report/templates/report.html.j2 tests/unit/report/test_render.py && git commit -m "feat: render auditable trial reports"`
 
 **Codex task prompt:**
 ```text
@@ -1135,7 +1146,7 @@ Run: `uv run pytest tests/unit/report -v`
 
 ---
 
-## M7.2 完整 CLI `inspect`
+## M7.2 Fixture/FakeModel 端到端 CLI `inspect`
 
 **Files:**
 - Modify: `src/repotrial/cli.py`
@@ -1145,7 +1156,6 @@ Run: `uv run pytest tests/unit/report -v`
 ```bash
 repotrial inspect <repo-url-or-fixture> \
   --provider fake|docker-sbx \
-  --model-endpoint http://localhost:8000/v1 \
   --max-experiments 8
 ```
 
@@ -1154,11 +1164,11 @@ repotrial inspect <repo-url-or-fixture> \
 - [ ] **Step 2: 验证失败**
 Run: `uv run pytest tests/integration/test_cli_e2e_fixture.py -v`
 - [ ] **Step 3: 实现**
-CLI 负责组装依赖和调用 graph，不在命令函数中写业务逻辑。失败 exit code 区分 unsupported(2)、trial failed(3)、internal error(4)。
+CLI 负责组装依赖和调用 graph，不在命令函数中写业务逻辑。本任务 fixture E2E 注入 FakeModelAdapter，不接受真实 model endpoint。失败 exit code 区分 unsupported(2)、trial failed(3)、internal error(4)。
 - [ ] **Step 4: 全量回归**
 Run: `uv run pytest -q && uv run ruff check .`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: ship end-to-end inspect command"`
+`git add -- src/repotrial/cli.py tests/integration/test_cli_e2e_fixture.py && git commit -m "feat: ship end-to-end inspect command"`
 
 **Codex task prompt:**
 ```text
@@ -1171,12 +1181,13 @@ Run: `uv run pytest -q && uv run ruff check .`
 
 **Files:**
 - Create: `src/repotrial/models/openai_compat.py`
-- Test: `tests/unit/models/test_openai_compat.py`
+- Modify: `src/repotrial/cli.py`
+- Test: `tests/unit/models/test_openai_compat.py`, `tests/unit/test_cli_model_endpoint.py`
 
-**Interfaces:** Consumes the `ModelAdapter` protocol created in M4.3 and produces one concrete OpenAI-compatible implementation with the same `structured(...)` signature.
+**Interfaces:** Consumes the generic `ModelAdapter` protocol created in M3.3 and produces one concrete OpenAI-compatible implementation with the same `structured(...)` signature. This task adds `--model-endpoint URL` to `repotrial inspect` and wires the concrete adapter at the CLI composition root.
 
 - [ ] **Step 1: 写 mock server 测试**
-Mock HTTP endpoint 返回合法/非法 JSON；合法结果转 Pydantic，非法结果有限重试 1 次后失败；日志不记录 API key。
+Mock HTTP endpoint 返回合法/非法 JSON；合法结果转输入 schema 对应的具体 Pydantic 类型，非法结果有限重试 1 次后失败；日志不记录 API key。CLI 测试断言 `--model-endpoint` 只在本任务加入并构造 concrete adapter。
 - [ ] **Step 2: 验证失败**
 Run: `uv run pytest tests/unit/models/test_openai_compat.py -v`
 - [ ] **Step 3: 实现**
@@ -1184,7 +1195,7 @@ Run: `uv run pytest tests/unit/models/test_openai_compat.py -v`
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/models -v`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: add local model compatible adapter"`
+`git add -- src/repotrial/models/openai_compat.py src/repotrial/cli.py tests/unit/models/test_openai_compat.py tests/unit/test_cli_model_endpoint.py && git commit -m "feat: add local model compatible adapter"`
 
 **Codex task prompt:**
 ```text
@@ -1197,6 +1208,7 @@ Run: `uv run pytest tests/unit/models -v`
 
 **Files:**
 - Create: `src/repotrial/api/app.py`, `deploy/docker-compose.yml`
+- Modify: `pyproject.toml`, `uv.lock`
 - Test: `tests/unit/api/test_app.py`
 
 **Endpoints:** `GET /healthz`, `POST /runs`（创建 run，MVP 可同步/后台任务二选一但接口返回 run_id）, `GET /runs/{id}`, `GET /runs/{id}/report`。
@@ -1206,11 +1218,11 @@ Run: `uv run pytest tests/unit/models -v`
 - [ ] **Step 2: 验证失败**
 Run: `uv run pytest tests/unit/api/test_app.py -v`
 - [ ] **Step 3: 实现**
-API 不接收任意 shell；repo URL/model config 均 schema 校验；control plane Docker Compose 只启动 API/Postgres，可选本地模型由用户自己配置 endpoint，不把 Docker Sandboxes 嵌进 control plane container。
+先加入 `fastapi` 运行依赖。API 不接收任意 shell；repo URL/model config 均 schema 校验；control plane Docker Compose 只启动 API/Postgres，可选本地模型由用户自己配置 endpoint，不把 Docker Sandboxes 嵌进 control plane container。
 - [ ] **Step 4: 回归**
 Run: `uv run pytest tests/unit/api -v && docker compose -f deploy/docker-compose.yml config`
 - [ ] **Step 5: Commit**
-`git commit -m "feat: add minimal control plane api"`
+`git add -- pyproject.toml uv.lock src/repotrial/api/app.py deploy/docker-compose.yml tests/unit/api/test_app.py && git commit -m "feat: add minimal control plane api"`
 
 **Codex task prompt:**
 ```text
@@ -1236,7 +1248,7 @@ Run: `repotrial inspect <url> --provider docker-sbx ...`；保存完整 stop_rea
 - [ ] **Step 4: 对照 Kill Criteria**
 发布门槛严格采用立项文档：10 个中自主跑通 `>=7` 且有意义收敛 `>=5`，才可制作发布型 Before/After Demo；否则如实记录未达门槛。若自主跑通 `<5`，触发 Kill Criteria 分析；`5-6` 个跑通或仅 `3-4` 个有意义收敛属于“未达发布门槛但未自动触发 Kill”的继续验证区间。
 - [ ] **Step 5: Commit**
-`git commit -m "test: document real repository pilot"`
+`git add -- eval/real_repos.yaml docs/dev/pilot-report.md README.md && git commit -m "test: document real repository pilot"`
 
 **Codex task prompt:**
 ```text
