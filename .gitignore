@@ -1,2 +1,12 @@
 .worktrees/
 .superpowers/
+.venv/
+__pycache__/
+*.py[cod]
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.env
