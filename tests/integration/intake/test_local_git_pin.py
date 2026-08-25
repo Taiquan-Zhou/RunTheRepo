@@ -433,6 +433,21 @@ class _CommunicateOSErrorProcess:
         self.returncode = -9
 
 
+class _CommunicateFileNotFoundErrorProcess:
+    def __init__(self) -> None:
+        self.communicate_calls = 0
+        self.killed = False
+        self.returncode: int | None = None
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        self.communicate_calls += 1
+        raise FileNotFoundError("SECRET communicate file-not-found failure")
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+
 def test_clone_sanitizes_communicate_oserror_and_cleans_destination(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -455,6 +470,36 @@ def test_clone_sanitizes_communicate_oserror_and_cleans_destination(
 
     assert "SECRET" not in str(raised.value)
     assert process.killed is True
+    assert not destination.exists()
+
+
+def test_clone_sanitizes_communicate_file_not_found_and_cleans_destination(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "destination"
+    process = _CommunicateFileNotFoundErrorProcess()
+
+    async def fake_create_subprocess_exec(
+        *_args: object, **_kwargs: object
+    ) -> _CommunicateFileNotFoundErrorProcess:
+        return process
+
+    monkeypatch.setattr(
+        github.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+
+    with pytest.raises(github.RepoIntakeError) as raised:
+        asyncio.run(github.clone_and_resolve(str(source), destination))
+
+    assert str(raised.value) == "repository intake failed: clone_io"
+    assert "SECRET" not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert raised.value.__suppress_context__ is True
+    assert process.killed is True
+    assert process.communicate_calls == 2
     assert not destination.exists()
 
 

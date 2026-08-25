@@ -243,6 +243,7 @@ def _git_environment() -> dict[str, str]:
 
 async def _run_git(operation: str, *arguments: str) -> bytes:
     process: asyncio.subprocess.Process | None = None
+    communicate_failed = False
     try:
         async with asyncio.timeout(COMMAND_TIMEOUT_SECONDS):
             process = await asyncio.create_subprocess_exec(
@@ -253,7 +254,10 @@ async def _run_git(operation: str, *arguments: str) -> bytes:
                 stderr=asyncio.subprocess.PIPE,
                 env=_git_environment(),
             )
-            stdout, _stderr = await process.communicate()
+            try:
+                stdout, _stderr = await process.communicate()
+            except OSError:
+                communicate_failed = True
     except TimeoutError as error:
         if process is not None:
             await _kill_and_reap(process)
@@ -270,6 +274,9 @@ async def _run_git(operation: str, *arguments: str) -> bytes:
         raise RepoIntakeError(f"{operation}_io") from None
 
     assert process is not None
+    if communicate_failed:
+        await _kill_and_reap(process)
+        raise RepoIntakeError(f"{operation}_io") from None
     if process.returncode != 0:
         raise RepoIntakeError(operation, process.returncode) from None
     return stdout
