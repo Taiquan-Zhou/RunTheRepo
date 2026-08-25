@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Reproducible deployment trials for untrusted Docker Compose web applications."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "pydantic>=2",
+]
 
 [dependency-groups]
 dev = [
