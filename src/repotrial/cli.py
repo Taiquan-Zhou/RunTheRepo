@@ -38,6 +38,7 @@ def _is_supported_github_url(url: str) -> bool:
     return (
         parsed.scheme == "https"
         and hostname == "github.com"
+        and parsed.netloc.lower() == "github.com"
         and parsed.username is None
         and parsed.password is None
         and port is None

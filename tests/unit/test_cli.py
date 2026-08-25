@@ -65,6 +65,7 @@ def test_dry_run_accepts_case_insensitive_github_hostname(tmp_path: Path) -> Non
         "https://github.com/a",
         "http://github.com/a/b",
         "https://github.com:443/a/b",
+        "https://github.com:/a/b",
         "https://user@github.com/a/b",
         "https://github.com/a/b/",
         "https://github.com/a/b/c",
