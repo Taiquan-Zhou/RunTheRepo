@@ -78,6 +78,8 @@ def test_dry_run_accepts_case_insensitive_github_hostname_and_git_suffix(
         "https://github.com/a/b/c",
         "https://github.com/a/b?branch=main",
         "https://github.com/a/b#readme",
+        "https://github.com/a/b?",
+        "https://github.com/a/b#",
         "https://github.com/a/b ",
         "https://github.com/a/b\n",
         "https://github.com/a/b|invalid",

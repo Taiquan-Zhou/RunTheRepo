@@ -38,6 +38,8 @@ def test_parse_github_url_preserves_requested_branch_or_tag_exactly() -> None:
         ("https://github.com/owner//repo", None),
         ("https://github.com/owner/repo?ref=main", None),
         ("https://github.com/owner/repo#readme", None),
+        ("https://github.com/owner/repo?", None),
+        ("https://github.com/owner/repo#", None),
         ("https://github.com/owner/repo%2Egit", None),
         ("https://github.com/owner/repo with space", None),
         ("https://github.com/owner/repo\n", None),

@@ -4,6 +4,8 @@ import asyncio
 import os
 import re
 import shutil
+import stat
+from dataclasses import dataclass
 from pathlib import Path
 from string import ascii_letters, digits
 from urllib.parse import SplitResult, urlsplit
@@ -24,6 +26,14 @@ class RepoIntakeError(RuntimeError):
         if returncode is not None:
             message = f"{message} (returncode={returncode})"
         super().__init__(message)
+
+
+@dataclass(frozen=True)
+class _DestinationClaim:
+    path: Path
+    device: int
+    inode: int
+    file_type: int
 
 
 def parse_github_url(url: str, requested_ref: str | None = None) -> RepoRef:
@@ -80,7 +90,7 @@ async def clone_and_resolve(
     _validate_requested_ref(requested_ref)
     clone_source = _normalize_clone_source(source)
     destination = _normalize_destination(dest)
-    _claim_destination(destination)
+    claim = _claim_destination(destination)
 
     try:
         clone_arguments = [
@@ -103,10 +113,10 @@ async def clone_and_resolve(
             raise RepoIntakeError("invalid_commit_sha")
         return commit_sha, destination
     except asyncio.CancelledError:
-        _remove_owned_destination(destination)
+        _remove_owned_destination(claim)
         raise
     except RepoIntakeError:
-        _remove_owned_destination(destination)
+        _remove_owned_destination(claim)
         raise
 
 
@@ -118,15 +128,9 @@ def _validate_requested_ref(requested_ref: str | None) -> None:
 
 
 def _normalize_clone_source(source: str) -> str:
-    if "://" in source:
-        parsed = _parse_credential_free_https_url(source)
-        if parsed is None:
-            raise RepoIntakeError("invalid_clone_source")
-        return source
-
-    source_path = Path(source)
-    if source_path.exists():
-        return str(source_path.resolve())
+    local_source = _resolve_existing_local_source(source)
+    if local_source is not None:
+        return local_source
 
     parsed = _parse_credential_free_https_url(source)
     if parsed is None:
@@ -134,11 +138,31 @@ def _normalize_clone_source(source: str) -> str:
     return source
 
 
+def _resolve_existing_local_source(source: str) -> str | None:
+    if "://" in source and not _is_windows_drive_path(source):
+        return None
+    source_path = Path(source)
+    if source_path.exists():
+        return str(source_path.resolve())
+    return None
+
+
+def _is_windows_drive_path(value: str) -> bool:
+    return (
+        len(value) >= 3
+        and value[0] in ascii_letters
+        and value[1] == ":"
+        and value[2] in {"/", "\\"}
+    )
+
+
 def _parse_credential_free_https_url(url: str) -> SplitResult | None:
     if (
         not url
         or _contains_control(url)
         or "%" in url
+        or "?" in url
+        or "#" in url
         or any(character not in _RAW_URI_CHARACTERS for character in url)
     ):
         return None
@@ -170,20 +194,34 @@ def _contains_control(value: str) -> bool:
 
 def _normalize_destination(dest: Path) -> Path:
     destination = Path(dest)
-    if not destination.parent.is_dir():
+    try:
+        parent = destination.parent.resolve(strict=True)
+    except OSError:
+        raise RepoIntakeError("destination_parent") from None
+    if not parent.is_dir() or not destination.name:
         raise RepoIntakeError("destination_parent")
-    if destination.exists() or destination.is_symlink():
-        raise RepoIntakeError("destination_exists")
-    return destination.resolve(strict=False)
+    return parent / destination.name
 
 
-def _claim_destination(destination: Path) -> None:
+def _claim_destination(destination: Path) -> _DestinationClaim:
     try:
         destination.mkdir(exist_ok=False)
     except FileExistsError:
         raise RepoIntakeError("destination_exists") from None
     except OSError:
         raise RepoIntakeError("destination_create") from None
+    try:
+        identity = destination.lstat()
+    except OSError:
+        raise RepoIntakeError("destination_claim") from None
+    if not stat.S_ISDIR(identity.st_mode):
+        raise RepoIntakeError("destination_claim")
+    return _DestinationClaim(
+        path=destination,
+        device=identity.st_dev,
+        inode=identity.st_ino,
+        file_type=stat.S_IFMT(identity.st_mode),
+    )
 
 
 def _git_environment() -> dict[str, str]:
@@ -204,31 +242,34 @@ def _git_environment() -> dict[str, str]:
 
 
 async def _run_git(operation: str, *arguments: str) -> bytes:
+    process: asyncio.subprocess.Process | None = None
     try:
-        process = await asyncio.create_subprocess_exec(
-            "git",
-            *arguments,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_git_environment(),
-        )
+        async with asyncio.timeout(COMMAND_TIMEOUT_SECONDS):
+            process = await asyncio.create_subprocess_exec(
+                "git",
+                *arguments,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_git_environment(),
+            )
+            stdout, _stderr = await process.communicate()
+    except TimeoutError as error:
+        if process is not None:
+            await _kill_and_reap(process)
+        raise RepoIntakeError(f"{operation}_timeout") from error
+    except asyncio.CancelledError:
+        if process is not None:
+            await _kill_and_reap(process)
+        raise
     except FileNotFoundError as error:
         raise RepoIntakeError("git_unavailable") from error
     except OSError:
-        raise RepoIntakeError(f"{operation}_spawn") from None
+        if process is not None:
+            await _kill_and_reap(process)
+        raise RepoIntakeError(f"{operation}_io") from None
 
-    try:
-        stdout, _stderr = await asyncio.wait_for(
-            process.communicate(), timeout=COMMAND_TIMEOUT_SECONDS
-        )
-    except TimeoutError as error:
-        await _kill_and_reap(process)
-        raise RepoIntakeError(f"{operation}_timeout") from error
-    except asyncio.CancelledError:
-        await _kill_and_reap(process)
-        raise
-
+    assert process is not None
     if process.returncode != 0:
         raise RepoIntakeError(operation, process.returncode) from None
     return stdout
@@ -238,14 +279,24 @@ async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
     if process.returncode is None:
         try:
             process.kill()
-        except ProcessLookupError:
+        except (OSError, ProcessLookupError):
             pass
     try:
         await asyncio.wait_for(process.communicate(), timeout=REAP_TIMEOUT_SECONDS)
-    except TimeoutError:
+    except (OSError, TimeoutError):
         pass
 
 
-def _remove_owned_destination(destination: Path) -> None:
-    if not destination.is_symlink():
-        shutil.rmtree(destination, ignore_errors=True)
+def _remove_owned_destination(claim: _DestinationClaim) -> None:
+    try:
+        current_identity = claim.path.lstat()
+    except OSError:
+        return
+    if (
+        not stat.S_ISDIR(current_identity.st_mode)
+        or current_identity.st_dev != claim.device
+        or current_identity.st_ino != claim.inode
+        or stat.S_IFMT(current_identity.st_mode) != claim.file_type
+    ):
+        return
+    shutil.rmtree(claim.path, ignore_errors=True)
