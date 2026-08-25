@@ -284,7 +284,7 @@ class JourneyStep(BaseModel):
     tool: str
     action: str
     params: dict[str, Any]
-    assertions: list[JourneyAssertion] = []
+    assertions: list[JourneyAssertion] = Field(default_factory=list)
 
 class Journey(BaseModel):
     journey_id: str
@@ -296,21 +296,21 @@ class JourneyResult(BaseModel):
     verdict: Verdict
     passed_steps: int
     total_steps: int
-    evidence_paths: list[str] = []
+    evidence_paths: list[str] = Field(default_factory=list)
     failure_reason: str | None = None
 
 class Mutation(BaseModel):
     mutation_id: str
     type: MutationType
     service: str
-    params: dict[str, Any] = {}
+    params: dict[str, Any] = Field(default_factory=dict)
 
 class ObservationSnapshot(BaseModel):
-    inspect: dict[str, Any] = {}
-    file_changes: list[dict[str, Any]] = []
-    process_events: list[dict[str, Any]] = []
-    network_events: list[dict[str, Any]] = []
-    unsupported_collectors: list[str] = []
+    inspect: dict[str, Any] = Field(default_factory=dict)
+    file_changes: list[dict[str, Any]] = Field(default_factory=list)
+    process_events: list[dict[str, Any]] = Field(default_factory=list)
+    network_events: list[dict[str, Any]] = Field(default_factory=list)
+    unsupported_collectors: list[str] = Field(default_factory=list)
 
 class ExperimentRecord(BaseModel):
     experiment_id: str
@@ -332,11 +332,11 @@ class RunState(BaseModel):
     sandbox_id: str | None = None
     baseline_config_hash: str | None = None
     current_config_hash: str | None = None
-    risk_findings: list[RiskFinding] = []
-    journeys: list[Journey] = []
+    risk_findings: list[RiskFinding] = Field(default_factory=list)
+    journeys: list[Journey] = Field(default_factory=list)
     baseline_observation: ObservationSnapshot | None = None
-    experiments: list[ExperimentRecord] = []
-    artifacts: list[str] = []
+    experiments: list[ExperimentRecord] = Field(default_factory=list)
+    artifacts: list[str] = Field(default_factory=list)
     stop_reason: str | None = None
 ```
 
@@ -344,6 +344,7 @@ class RunState(BaseModel):
 # src/repotrial/sandbox/base.py
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Any
 from pydantic import BaseModel, Field
 
 class ExecResult(BaseModel):
@@ -352,7 +353,7 @@ class ExecResult(BaseModel):
     stderr: str
 
 class NetworkLogResult(BaseModel):
-    events: list[dict] = Field(default_factory=list)
+    events: list[dict[str, Any]] = Field(default_factory=list)
     supported: bool
     unsupported_reason: str | None = None
 
@@ -658,7 +659,7 @@ Run: `uv run pytest tests/unit/sandbox/test_docker_sbx_commands.py -v`
 所有 subprocess 带超时与 stderr 截断；`publish_port` 解析 `sbx ports` 返回的 host port；`network_log()` 若当前 CLI 无机器可读日志接口，必须返回 `NetworkLogResult(events=[], supported=False, unsupported_reason=...)`，不能伪装已观测。隔离策略与资源限制只通过经 probe 验证的 Provider 能力落实；不能落实则停止为 `UNSUPPORTED`。
 - [ ] **Step 4: 可选集成验证**
 Run: `REPOTRIAL_RUN_SBX_TESTS=1 uv run pytest tests/integration/sandbox/test_docker_sbx_smoke.py -v`
-Expected: 环境有 SBX 时 create -> exec `echo ok` -> destroy 全通过；无 SBX 时明确 skip。
+Expected: 环境有 SBX 时 create -> exec `echo ok` -> destroy 全通过；无 SBX 时测试可显式 skip，但任务完成报告必须把真实 Provider 集成门禁记为 `UNSUPPORTED`，不得写成已通过。
 - [ ] **Step 5: Commit**
 `git commit -m "feat: add docker sandboxes provider"`
 
@@ -1161,7 +1162,6 @@ Run: `uv run pytest -q && uv run ruff check .`
 
 **Files:**
 - Create: `src/repotrial/models/openai_compat.py`
-- Modify: `src/repotrial/models/base.py` only if the concrete adapter needs a protocol-compatible typing refinement
 - Test: `tests/unit/models/test_openai_compat.py`
 
 **Interfaces:**
