@@ -1,13 +1,27 @@
+import json
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
+from repotrial.compose.parser import load_compose
 from repotrial.compose.risk import analyze_risk, risk_score
 from repotrial.domain.models import RiskFinding
 
 
 def _finding_data(findings: list[RiskFinding]) -> list[dict[str, object]]:
     return [finding.model_dump() for finding in findings]
+
+
+def _load_compose(tmp_path: Path, content: str) -> dict[str, object]:
+    compose_path = tmp_path / "compose.yml"
+    compose_path.write_text(content, encoding="utf-8")
+    return load_compose(compose_path)
+
+
+def _assert_findings_are_json_safe(findings: list[RiskFinding]) -> None:
+    for finding in findings:
+        assert json.loads(finding.model_dump_json())["evidence"] == finding.evidence
 
 
 def test_analyze_risk_emits_every_kind_with_exact_evidence() -> None:
@@ -210,6 +224,277 @@ def test_analyze_risk_suppresses_read_only_binds_and_does_not_duplicate_sockets(
             "evidence": {"volumes": ["./cache:/cache:delegated"]},
         },
     ]
+
+
+def test_analyze_risk_parses_short_volumes_from_right_and_honors_ro_mode_token() -> (
+    None
+):
+    volumes = [
+        "/var/run/docker.sock:backup:/container",
+        "/var/run/docker.sock:backup:/container:rw,z",
+        "/var/run/docker.sock:/container:ro,z",
+        "/var/run/docker.sock:/container:z,ro",
+        "/var/run/docker.sock:/container:ro,custom",
+        "/var/run/docker.sock:/container:custom,ro",
+        "/var/run/docker.sock:/container:rw,z",
+        "/var/run/docker.sock:/container:rw,custom",
+        r"C:\work:archive:/container:rw,z",
+        r"\\server\share:archive:/container:rw,z",
+    ]
+
+    findings = analyze_risk({"services": {"app": {"volumes": volumes}}})
+
+    assert _finding_data(
+        [
+            finding
+            for finding in findings
+            if finding.kind in {"docker_socket_rw", "rw_host_bind"}
+        ]
+    ) == [
+        {
+            "finding_id": "docker_socket_rw:app",
+            "kind": "docker_socket_rw",
+            "service": "app",
+            "severity": 90,
+            "evidence": {
+                "volumes": [
+                    "/var/run/docker.sock:/container:rw,z",
+                    "/var/run/docker.sock:/container:rw,custom",
+                ]
+            },
+        },
+        {
+            "finding_id": "rw_host_bind:app",
+            "kind": "rw_host_bind",
+            "service": "app",
+            "severity": 25,
+            "evidence": {
+                "volumes": [
+                    "/var/run/docker.sock:backup:/container",
+                    "/var/run/docker.sock:backup:/container:rw,z",
+                    r"C:\work:archive:/container:rw,z",
+                    r"\\server\share:archive:/container:rw,z",
+                ]
+            },
+        },
+    ]
+
+
+def test_analyze_risk_applies_override_tags_and_preserves_json_safe_evidence(
+    tmp_path: Path,
+) -> None:
+    compose = _load_compose(
+        tmp_path,
+        "services:\n"
+        "  app:\n"
+        "    privileged: !override true\n"
+        "    network_mode: !override host\n"
+        "    pid: !override host\n"
+        "    cap_add: !override [NET_ADMIN]\n"
+        "    user: !override root\n"
+        "    read_only: !override true\n"
+        "    volumes: !override\n"
+        "      - type: bind\n"
+        "        source: !override /var/run/docker.sock\n"
+        "        target: /socket\n",
+    )
+
+    findings = analyze_risk(compose)
+
+    assert _finding_data(findings) == [
+        {
+            "finding_id": "privileged:app",
+            "kind": "privileged",
+            "service": "app",
+            "severity": 100,
+            "evidence": {"privileged": {"$yaml_tag": "!override", "value": True}},
+        },
+        {
+            "finding_id": "docker_socket_rw:app",
+            "kind": "docker_socket_rw",
+            "service": "app",
+            "severity": 90,
+            "evidence": {
+                "volumes": [
+                    {
+                        "type": "bind",
+                        "source": {
+                            "$yaml_tag": "!override",
+                            "value": "/var/run/docker.sock",
+                        },
+                        "target": "/socket",
+                    }
+                ]
+            },
+        },
+        {
+            "finding_id": "host_network:app",
+            "kind": "host_network",
+            "service": "app",
+            "severity": 70,
+            "evidence": {"network_mode": {"$yaml_tag": "!override", "value": "host"}},
+        },
+        {
+            "finding_id": "host_pid:app",
+            "kind": "host_pid",
+            "service": "app",
+            "severity": 70,
+            "evidence": {"pid": {"$yaml_tag": "!override", "value": "host"}},
+        },
+        {
+            "finding_id": "cap_add:app",
+            "kind": "cap_add",
+            "service": "app",
+            "severity": 50,
+            "evidence": {
+                "cap_add": {
+                    "$yaml_tag": "!override",
+                    "value": ["NET_ADMIN"],
+                }
+            },
+        },
+        {
+            "finding_id": "root_user:app",
+            "kind": "root_user",
+            "service": "app",
+            "severity": 30,
+            "evidence": {"user": {"$yaml_tag": "!override", "value": "root"}},
+        },
+    ]
+    _assert_findings_are_json_safe(findings)
+
+
+def test_analyze_risk_treats_reset_tags_as_unset_and_preserves_evidence(
+    tmp_path: Path,
+) -> None:
+    compose = _load_compose(
+        tmp_path,
+        "services:\n"
+        "  app:\n"
+        "    privileged: !reset true\n"
+        "    network_mode: !reset host\n"
+        "    pid: !reset host\n"
+        "    cap_add: !reset [NET_ADMIN]\n"
+        "    user: !reset root\n"
+        "    read_only: !reset true\n"
+        "    volumes: !reset\n"
+        "      - /var/run/docker.sock:/socket\n",
+    )
+
+    findings = analyze_risk(compose)
+
+    assert _finding_data(findings) == [
+        {
+            "finding_id": "root_user_possible:app",
+            "kind": "root_user_possible",
+            "service": "app",
+            "severity": 30,
+            "evidence": {
+                "user": {"$yaml_tag": "!reset", "value": "root"},
+                "declared": True,
+            },
+        },
+        {
+            "finding_id": "writable_rootfs:app",
+            "kind": "writable_rootfs",
+            "service": "app",
+            "severity": 25,
+            "evidence": {
+                "read_only": {"$yaml_tag": "!reset", "value": True},
+                "declared": True,
+            },
+        },
+    ]
+    _assert_findings_are_json_safe(findings)
+
+
+def test_analyze_risk_keeps_quoted_override_scalars_as_strings(tmp_path: Path) -> None:
+    compose = _load_compose(
+        tmp_path,
+        "services:\n"
+        "  app:\n"
+        '    privileged: !override "true"\n'
+        '    network_mode: !override "host"\n'
+        '    user: !override "root"\n'
+        '    read_only: !override "true"\n',
+    )
+
+    findings = analyze_risk(compose)
+
+    assert _finding_data(findings) == [
+        {
+            "finding_id": "host_network:app",
+            "kind": "host_network",
+            "service": "app",
+            "severity": 70,
+            "evidence": {"network_mode": {"$yaml_tag": "!override", "value": "host"}},
+        },
+        {
+            "finding_id": "root_user:app",
+            "kind": "root_user",
+            "service": "app",
+            "severity": 30,
+            "evidence": {"user": {"$yaml_tag": "!override", "value": "root"}},
+        },
+        {
+            "finding_id": "writable_rootfs:app",
+            "kind": "writable_rootfs",
+            "service": "app",
+            "severity": 25,
+            "evidence": {
+                "read_only": {"$yaml_tag": "!override", "value": "true"},
+                "declared": True,
+            },
+        },
+    ]
+    _assert_findings_are_json_safe(findings)
+
+
+def test_analyze_risk_excludes_unsupported_manual_evidence_values() -> None:
+    unsupported = object()
+    compose = {
+        "services": {
+            "app": {
+                "cap_add": [unsupported],
+                "read_only": unsupported,
+                "volumes": [{"type": "bind", "source": "/host", 1: unsupported}],
+            }
+        }
+    }
+
+    findings = analyze_risk(compose)
+
+    assert _finding_data(findings) == [
+        {
+            "finding_id": "cap_add:app",
+            "kind": "cap_add",
+            "service": "app",
+            "severity": 50,
+            "evidence": {"cap_add": [None]},
+        },
+        {
+            "finding_id": "root_user_possible:app",
+            "kind": "root_user_possible",
+            "service": "app",
+            "severity": 30,
+            "evidence": {"user": None, "declared": False},
+        },
+        {
+            "finding_id": "rw_host_bind:app",
+            "kind": "rw_host_bind",
+            "service": "app",
+            "severity": 25,
+            "evidence": {"volumes": [{"source": "/host", "type": "bind"}]},
+        },
+        {
+            "finding_id": "writable_rootfs:app",
+            "kind": "writable_rootfs",
+            "service": "app",
+            "severity": 25,
+            "evidence": {"read_only": None, "declared": True},
+        },
+    ]
+    _assert_findings_are_json_safe(findings)
 
 
 @pytest.mark.parametrize(
