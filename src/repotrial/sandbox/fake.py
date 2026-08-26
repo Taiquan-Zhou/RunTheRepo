@@ -32,11 +32,13 @@ class FakeSandboxProvider(SandboxProvider):
     async def exec(
         self, sandbox_id: str, argv: list[str], timeout_s: int = 60
     ) -> ExecResult:
+        if not isinstance(argv, list) or not all(
+            isinstance(argument, str) for argument in argv
+        ):
+            raise TypeError("argv must be a list of strings")
         argv_snapshot = tuple(argv)
         self.calls.append(("exec", sandbox_id, argv_snapshot, timeout_s))
         self._require_active(sandbox_id)
-        if not isinstance(argv, list):
-            raise TypeError("argv must be a list of strings")
         try:
             return self._scripts[argv_snapshot]
         except KeyError:

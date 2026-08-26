@@ -130,7 +130,9 @@ def test_exec_snapshots_argv_and_never_executes_it_on_the_host(tmp_path: Path) -
     assert not marker.exists()
 
 
-def test_exec_rejects_non_list_argv_at_the_provider_boundary(tmp_path: Path) -> None:
+def test_exec_rejects_non_list_argv_before_recording_the_attempt(
+    tmp_path: Path,
+) -> None:
     provider = FakeSandboxProvider(
         scripts={("whoami",): ExecResult(exit_code=0, stdout="fake", stderr="")}
     )
@@ -141,10 +143,40 @@ def test_exec_rejects_non_list_argv_at_the_provider_boundary(tmp_path: Path) -> 
             await provider.exec(sandbox_id, cast(list[str], ("whoami",)))
 
     asyncio.run(exercise())
-    assert provider.calls == [
-        ("create", tmp_path, "trial"),
-        ("exec", "sandbox-1", ("whoami",), 60),
-    ]
+    assert provider.calls == [("create", tmp_path, "trial")]
+
+
+def test_exec_rejects_non_string_argv_elements_before_mapping_lookup(
+    tmp_path: Path,
+) -> None:
+    malformed_key = cast(tuple[str, ...], (1,))
+    provider = FakeSandboxProvider(
+        scripts={
+            malformed_key: ExecResult(exit_code=0, stdout="must-not-return", stderr="")
+        }
+    )
+
+    async def exercise() -> None:
+        sandbox_id = await provider.create(tmp_path, "trial")
+        with pytest.raises(TypeError, match="argv must be a list of strings"):
+            await provider.exec(sandbox_id, cast(list[str], [1]))
+
+    asyncio.run(exercise())
+    assert provider.calls == [("create", tmp_path, "trial")]
+
+
+def test_exec_rejects_nested_argv_before_audit_or_active_sandbox_lookup() -> None:
+    provider = FakeSandboxProvider()
+
+    with pytest.raises(TypeError, match="argv must be a list of strings"):
+        asyncio.run(
+            provider.exec(
+                "sandbox-unknown",
+                cast(list[str], [["nested"]]),
+            )
+        )
+
+    assert provider.calls == []
 
 
 def test_missing_script_and_port_entries_fail_loudly(tmp_path: Path) -> None:
@@ -181,21 +213,32 @@ def test_constructor_defensively_copies_script_and_port_mappings(
     )
 
 
-def test_destroyed_and_unknown_sandboxes_fail_without_affecting_other_state(
+def test_all_operations_reject_destroyed_and_unknown_sandboxes_in_audited_order(
     tmp_path: Path,
 ) -> None:
+    local_path = tmp_path / "must-not-exist.txt"
     provider = FakeSandboxProvider(
-        scripts={("status",): ExecResult(exit_code=0, stdout="active", stderr="")}
+        scripts={("status",): ExecResult(exit_code=0, stdout="active", stderr="")},
+        ports={80: 41000},
     )
 
     async def exercise() -> ExecResult:
         destroyed_id = await provider.create(tmp_path, "destroyed")
         active_id = await provider.create(tmp_path, "active")
         await provider.destroy(destroyed_id)
-        with pytest.raises(RuntimeError, match="sandbox is not active"):
-            await provider.exec(destroyed_id, ["status"])
-        with pytest.raises(RuntimeError, match="sandbox is not active"):
-            await provider.network_log("sandbox-unknown")
+
+        for inactive_id in (destroyed_id, "sandbox-unknown"):
+            with pytest.raises(RuntimeError, match="sandbox is not active"):
+                await provider.exec(inactive_id, ["status"])
+            with pytest.raises(RuntimeError, match="sandbox is not active"):
+                await provider.publish_port(inactive_id, 80)
+            with pytest.raises(RuntimeError, match="sandbox is not active"):
+                await provider.copy(inactive_id, "/result.txt", local_path)
+            with pytest.raises(RuntimeError, match="sandbox is not active"):
+                await provider.network_log(inactive_id)
+            with pytest.raises(RuntimeError, match="sandbox is not active"):
+                await provider.destroy(inactive_id)
+
         return await provider.exec(active_id, ["status"])
 
     assert asyncio.run(exercise()) == ExecResult(
@@ -208,18 +251,18 @@ def test_destroyed_and_unknown_sandboxes_fail_without_affecting_other_state(
         ("create", tmp_path, "active"),
         ("destroy", "sandbox-1"),
         ("exec", "sandbox-1", ("status",), 60),
+        ("publish_port", "sandbox-1", 80),
+        ("copy", "sandbox-1", "/result.txt", local_path),
+        ("network_log", "sandbox-1"),
+        ("destroy", "sandbox-1"),
+        ("exec", "sandbox-unknown", ("status",), 60),
+        ("publish_port", "sandbox-unknown", 80),
+        ("copy", "sandbox-unknown", "/result.txt", local_path),
         ("network_log", "sandbox-unknown"),
+        ("destroy", "sandbox-unknown"),
         ("exec", "sandbox-2", ("status",), 60),
     ]
-
-
-def test_destroy_rejects_an_unknown_sandbox_and_records_the_attempt() -> None:
-    provider = FakeSandboxProvider()
-
-    with pytest.raises(RuntimeError, match="sandbox is not active"):
-        asyncio.run(provider.destroy("sandbox-unknown"))
-
-    assert provider.calls == [("destroy", "sandbox-unknown")]
+    assert not local_path.exists()
 
 
 def test_network_log_distinguishes_observed_empty_from_unsupported(
