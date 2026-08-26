@@ -1,4 +1,5 @@
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,25 @@ from repotrial.intake.compose_discovery import (
     ComposeNotFoundError,
     discover_compose,
 )
+
+
+@dataclass(frozen=True)
+class _StatWithUnavailableInode:
+    st_mode: int
+    st_ino: int
+    st_dev: int
+    st_size: int
+    st_file_attributes: int
+
+
+def _with_unavailable_inode(stat_result: os.stat_result) -> _StatWithUnavailableInode:
+    return _StatWithUnavailableInode(
+        st_mode=stat_result.st_mode,
+        st_ino=0,
+        st_dev=stat_result.st_dev,
+        st_size=stat_result.st_size,
+        st_file_attributes=getattr(stat_result, "st_file_attributes", 0) or 0,
+    )
 
 
 def test_discover_compose_uses_standard_name_priority(tmp_path: Path) -> None:
@@ -225,6 +245,111 @@ def test_discover_compose_rejects_fallback_replaced_by_different_regular_file(
         return result
 
     monkeypatch.setattr(Path, "lstat", lstat_then_replace)
+
+    with pytest.raises(ComposeDiscoveryError):
+        discover_compose(tmp_path)
+
+
+def test_discover_compose_rejects_static_root_without_usable_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "compose.yml").write_text("services: {}\n", encoding="utf-8")
+    original_lstat = Path.lstat
+
+    def lstat_with_unavailable_inode(path: Path) -> os.stat_result:
+        result = original_lstat(path)
+        if path == root:
+            return _with_unavailable_inode(result)
+        return result
+
+    monkeypatch.setattr(Path, "lstat", lstat_with_unavailable_inode)
+
+    with pytest.raises(ComposeDiscoveryError):
+        discover_compose(root)
+
+
+def test_discover_compose_rejects_zero_inode_root_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "compose.yml").write_text("services: {origin: {}}\n", encoding="utf-8")
+    attacker_root = tmp_path / "attacker-root"
+    attacker_root.mkdir()
+    (attacker_root / "compose.yml").write_text(
+        "services: {attacker: {}}\n", encoding="utf-8"
+    )
+    original_lstat = Path.lstat
+    swapped = False
+
+    def lstat_with_unavailable_inode(path: Path) -> os.stat_result:
+        nonlocal swapped
+        result = original_lstat(path)
+        if path == root:
+            if not swapped:
+                swapped = True
+                root.replace(tmp_path / "original-root")
+                attacker_root.replace(root)
+            return _with_unavailable_inode(result)
+        return result
+
+    monkeypatch.setattr(Path, "lstat", lstat_with_unavailable_inode)
+
+    with pytest.raises(ComposeDiscoveryError):
+        discover_compose(root)
+
+
+def test_discover_compose_rejects_zero_inode_standard_candidate_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = tmp_path / "compose.yml"
+    candidate.write_text("services: {origin: {}}\n", encoding="utf-8")
+    replacement = tmp_path / "replacement.yml"
+    replacement.write_text("services: {attacker: {}}\n", encoding="utf-8")
+    original_lstat = Path.lstat
+    swapped = False
+
+    def lstat_with_unavailable_inode(path: Path) -> os.stat_result:
+        nonlocal swapped
+        result = original_lstat(path)
+        if path == candidate:
+            if not swapped:
+                swapped = True
+                candidate.unlink()
+                replacement.replace(candidate)
+            return _with_unavailable_inode(result)
+        return result
+
+    monkeypatch.setattr(Path, "lstat", lstat_with_unavailable_inode)
+
+    with pytest.raises(ComposeDiscoveryError):
+        discover_compose(tmp_path)
+
+
+def test_discover_compose_rejects_zero_inode_fallback_candidate_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = tmp_path / "project-compose.yml"
+    candidate.write_text("services: {origin: {}}\n", encoding="utf-8")
+    replacement = tmp_path / "replacement.yml"
+    replacement.write_text("services: {attacker: {}}\n", encoding="utf-8")
+    original_lstat = Path.lstat
+    swapped = False
+
+    def lstat_with_unavailable_inode(path: Path) -> os.stat_result:
+        nonlocal swapped
+        result = original_lstat(path)
+        if path == candidate:
+            if not swapped:
+                swapped = True
+                candidate.unlink()
+                replacement.replace(candidate)
+            return _with_unavailable_inode(result)
+        return result
+
+    monkeypatch.setattr(Path, "lstat", lstat_with_unavailable_inode)
 
     with pytest.raises(ComposeDiscoveryError):
         discover_compose(tmp_path)

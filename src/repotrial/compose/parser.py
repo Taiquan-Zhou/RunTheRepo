@@ -130,6 +130,8 @@ def _require_path_identity(path: Path, expected: tuple[int, int, int]) -> None:
 
 
 def _file_identity(stat_result: os.stat_result) -> tuple[int, int, int]:
+    if stat_result.st_ino == 0:
+        raise ComposeParseError("invalid_path")
     return (
         stat_result.st_dev,
         stat_result.st_ino,

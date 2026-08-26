@@ -1,5 +1,6 @@
 import json
 import os
+from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
 from typing import Self
@@ -23,6 +24,25 @@ def _write_compose(tmp_path: Path, content: str) -> Path:
     compose_path = tmp_path / "compose.yml"
     compose_path.write_text(content, encoding="utf-8")
     return compose_path
+
+
+@dataclass(frozen=True)
+class _StatWithUnavailableInode:
+    st_mode: int
+    st_ino: int
+    st_dev: int
+    st_size: int
+    st_file_attributes: int
+
+
+def _with_unavailable_inode(stat_result: os.stat_result) -> _StatWithUnavailableInode:
+    return _StatWithUnavailableInode(
+        st_mode=stat_result.st_mode,
+        st_ino=0,
+        st_dev=stat_result.st_dev,
+        st_size=stat_result.st_size,
+        st_file_attributes=getattr(stat_result, "st_file_attributes", 0) or 0,
+    )
 
 
 def test_load_compose_preserves_anchor_alias_and_round_trip_information(
@@ -108,6 +128,82 @@ def test_load_compose_rejects_path_replaced_after_initial_identity_check(
 
     with pytest.raises(ComposeParseError):
         load_compose(compose_path)
+
+
+def test_load_compose_rejects_zero_inode_path_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    compose_path = _write_compose(tmp_path, "services: {origin: {}}\n")
+    replacement = tmp_path / "replacement.yml"
+    replacement.write_text("services: {attacker: {}}\n", encoding="utf-8")
+    original_lstat = Path.lstat
+    original_fstat = parser.os.fstat
+
+    def lstat_with_unavailable_inode(path: Path) -> os.stat_result:
+        if path == compose_path:
+            return _with_unavailable_inode(original_lstat(replacement))
+        return original_lstat(path)
+
+    def fstat_with_unavailable_inode(file_descriptor: int) -> os.stat_result:
+        return _with_unavailable_inode(original_fstat(file_descriptor))
+
+    monkeypatch.setattr(Path, "lstat", lstat_with_unavailable_inode)
+    monkeypatch.setattr(parser.os, "fstat", fstat_with_unavailable_inode)
+
+    with pytest.raises(ComposeParseError):
+        load_compose(compose_path)
+
+
+def test_load_compose_rejects_static_zero_inode_before_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    compose_path = _write_compose(tmp_path, "services: {}\n")
+    original_open = Path.open
+    original_lstat = Path.lstat
+    original_fstat = parser.os.fstat
+    read_calls = 0
+
+    class NoReadHandle:
+        def __init__(self, handle: object) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> Self:
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *arguments: object) -> None:
+            self._handle.__exit__(*arguments)
+
+        def fileno(self) -> int:
+            return self._handle.fileno()
+
+        def read(self, size: int = -1) -> bytes:
+            nonlocal read_calls
+            read_calls += 1
+            raise AssertionError(f"unexpected read size: {size}")
+
+    def guarded_open(
+        path: Path, *arguments: object, **keywords: object
+    ) -> NoReadHandle:
+        return NoReadHandle(original_open(path, *arguments, **keywords))
+
+    def lstat_with_unavailable_inode(path: Path) -> os.stat_result:
+        result = original_lstat(path)
+        if path == compose_path:
+            return _with_unavailable_inode(result)
+        return result
+
+    def fstat_with_unavailable_inode(file_descriptor: int) -> os.stat_result:
+        return _with_unavailable_inode(original_fstat(file_descriptor))
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    monkeypatch.setattr(Path, "lstat", lstat_with_unavailable_inode)
+    monkeypatch.setattr(parser.os, "fstat", fstat_with_unavailable_inode)
+
+    with pytest.raises(ComposeParseError):
+        load_compose(compose_path)
+
+    assert read_calls == 0
 
 
 @pytest.mark.parametrize(

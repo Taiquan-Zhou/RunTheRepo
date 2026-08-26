@@ -164,6 +164,8 @@ def _require_file_identity(path: Path, expected: _PathIdentity) -> None:
 
 
 def _identity(stat_result: os.stat_result) -> _PathIdentity:
+    if stat_result.st_ino == 0:
+        raise ComposeDiscoveryError("identity_unavailable")
     return _PathIdentity(
         device=stat_result.st_dev,
         inode=stat_result.st_ino,
