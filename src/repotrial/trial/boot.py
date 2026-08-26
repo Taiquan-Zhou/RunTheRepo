@@ -15,13 +15,13 @@ _CONTROL_ENV_KEYS = {
     "XDG_CONFIG_HOME",
 }
 _CONTROL_ENV_PREFIXES = ("COMPOSE_", "DOCKER_", "DYLD_", "LD_")
-_ASSIGNMENT_PATTERN = re.compile(
-    r"(?im)(?P<prefix>(?<![A-Za-z0-9_-])(?P<quote>[\"']?)"
+_ASSIGNMENT_START_PATTERN = re.compile(
+    r"(?i)(?P<prefix>(?<![A-Za-z0-9_-])(?P<quote>[\"']?)"
     r"(?P<name>[A-Za-z_][A-Za-z0-9_-]*)(?P=quote)[ \t]*[:=][ \t]*)"
-    r"[^\r\n]*"
 )
 _BEARER_PATTERN = re.compile(r"(?i)\bbearer[ \t]+[^\s,;]+")
 _REDACTION = "[REDACTED]"
+_MARKER_OVERFLOW_REDACTION = "[REDACTED: excessive truncation markers]"
 _LOG_LIMIT = 65_536
 _TRUNCATION_MARKER = "\n...[truncated]"
 
@@ -200,22 +200,48 @@ def _is_sensitive_env_key(key: str) -> bool:
 
 
 def _sanitize_result(result: ExecResult, sensitive_values: tuple[str, ...]) -> str:
-    combined = _combine_output(result.stdout, result.stderr)
-    combined = _redact_truncated_sensitive_prefixes(combined, sensitive_values)
+    combined = _combine_output(
+        _bound_raw_evidence(result.stdout),
+        _bound_raw_evidence(result.stderr),
+    )
     for value in sensitive_values:
         combined = combined.replace(value, _REDACTION)
+    if combined.count(_TRUNCATION_MARKER) > 2:
+        return _MARKER_OVERFLOW_REDACTION
+    combined = _redact_truncated_sensitive_prefixes(combined, sensitive_values)
     combined = _BEARER_PATTERN.sub(lambda match: f"Bearer {_REDACTION}", combined)
-    combined = _ASSIGNMENT_PATTERN.sub(_redact_sensitive_assignment, combined)
+    combined = _redact_sensitive_assignments(combined)
     if len(combined) <= _LOG_LIMIT:
         return combined
     retained = _LOG_LIMIT - len(_TRUNCATION_MARKER)
     return f"{combined[:retained]}{_TRUNCATION_MARKER}"
 
 
-def _redact_sensitive_assignment(match: re.Match[str]) -> str:
-    if not _is_sensitive_env_key(match.group("name")):
-        return match.group(0)
-    return f"{match.group('prefix')}{_REDACTION}"
+def _bound_raw_evidence(text: str) -> str:
+    if len(text) <= _LOG_LIMIT:
+        return text
+    retained = _LOG_LIMIT - len(_TRUNCATION_MARKER)
+    return f"{text[:retained]}{_TRUNCATION_MARKER}"
+
+
+def _redact_sensitive_assignments(text: str) -> str:
+    redacted_lines: list[str] = []
+    for line in text.splitlines(keepends=True):
+        body, ending = _split_line_ending(line)
+        for match in _ASSIGNMENT_START_PATTERN.finditer(body):
+            if _is_sensitive_env_key(match.group("name")):
+                body = f"{body[: match.end()]}{_REDACTION}"
+                break
+        redacted_lines.append(f"{body}{ending}")
+    return "".join(redacted_lines)
+
+
+def _split_line_ending(line: str) -> tuple[str, str]:
+    if line.endswith("\r\n"):
+        return line[:-2], "\r\n"
+    if line.endswith(("\r", "\n")):
+        return line[:-1], line[-1]
+    return line, ""
 
 
 def _redact_truncated_sensitive_prefixes(
@@ -224,8 +250,10 @@ def _redact_truncated_sensitive_prefixes(
     marker_indexes = [
         match.start() for match in re.finditer(re.escape(_TRUNCATION_MARKER), text)
     ]
+    max_sensitive_length = max(map(len, sensitive_values), default=0)
     for marker_index in reversed(marker_indexes):
-        preceding = text[:marker_index]
+        window_start = max(0, marker_index - max_sensitive_length)
+        preceding = text[window_start:marker_index]
         prefix_length = max(
             (_longest_prefix_at_end(value, preceding) for value in sensitive_values),
             default=0,
@@ -237,11 +265,13 @@ def _redact_truncated_sensitive_prefixes(
 
 
 def _longest_prefix_at_end(value: str, text: str) -> int:
-    suffix = text[-len(value) :]
+    maximum_length = min(len(value), len(text))
+    value_prefix = value[:maximum_length]
+    suffix = text[-maximum_length:]
     separator = "\0"
     while separator in suffix:
         separator += "\0"
-    sequence = f"{value}{separator}{suffix}"
+    sequence = f"{value_prefix}{separator}{suffix}"
     prefix_lengths = [0] * len(sequence)
     for index in range(1, len(sequence)):
         candidate = prefix_lengths[index - 1]
@@ -250,7 +280,7 @@ def _longest_prefix_at_end(value: str, text: str) -> int:
         if sequence[index] == sequence[candidate]:
             candidate += 1
         prefix_lengths[index] = candidate
-    return min(prefix_lengths[-1], len(value))
+    return min(prefix_lengths[-1], maximum_length)
 
 
 def _combine_output(stdout: str, stderr: str) -> str:

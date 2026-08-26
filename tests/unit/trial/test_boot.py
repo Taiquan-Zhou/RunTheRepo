@@ -296,6 +296,8 @@ def test_sensitive_evidence_is_redacted_before_every_source_is_truncated() -> No
         "DATABASE_PASSWORD=database-password-value-678\r\n"
         "DB_TOKEN = db-token-value-901\r\n"
         "X-aPi-KeY: mixed-case-api-value-234\r\n"
+        "level=INFO ToKeN=same-line-token-value-567\r\n"
+        '{"user":"alice","PaSsWoRd":"same-line-json-value-890"}\r\n'
         f"leaked={supplied_secret}\n"
         "APP_REQUIRED_TOKEN is required\n"
     )
@@ -335,10 +337,14 @@ def test_sensitive_evidence_is_redacted_before_every_source_is_truncated() -> No
         assert "database-password-value-678" not in value
         assert "db-token-value-901" not in value
         assert "mixed-case-api-value-234" not in value
+        assert "same-line-token-value-567" not in value
+        assert "same-line-json-value-890" not in value
+        assert "level=INFO ToKeN=[REDACTED]" in value
+        assert '{"user":"alice","PaSsWoRd":[REDACTED]' in value
         assert supplied_secret not in value
         assert "[REDACTED]" in value
         assert "APP_REQUIRED_TOKEN is required" in value
-        assert len(value) == 65_536
+        assert len(value) <= 65_536
         assert value.endswith("\n...[truncated]")
 
 
@@ -368,6 +374,48 @@ def test_provider_truncated_sensitive_env_prefixes_are_redacted_at_markers() -> 
     assert stderr_prefix not in result.logs["logs"]
     assert result.logs["up"] == "stdout leaked=[REDACTED]\n...[truncated]"
     assert result.logs["logs"] == "stderr leaked=[REDACTED]\n...[truncated]"
+
+
+def test_complete_sensitive_value_containing_marker_is_redacted_atomically() -> None:
+    supplied_secret = "atomic-secret-prefix\n...[truncated]atomic-secret-suffix"
+    prefix = ("env", f"APP_TOKEN={supplied_secret}")
+    provider = FakeSandboxProvider(
+        scripts={
+            (*prefix, *UP_ARGV): _result(stdout=f"leaked={supplied_secret}\ntrailing"),
+            (*prefix, *PS_ARGV): _result(stdout=_healthy_ps()),
+            (*prefix, *LOGS_ARGV): _result(),
+        }
+    )
+
+    result = _run_with_active_sandbox(
+        provider,
+        env={"APP_TOKEN": supplied_secret},
+    )
+
+    assert result.logs["up"] == "leaked=[REDACTED]\ntrailing"
+    assert "atomic-secret-prefix" not in result.logs["up"]
+    assert "atomic-secret-suffix" not in result.logs["up"]
+
+
+def test_many_markers_collapse_to_deterministic_redacted_overflow() -> None:
+    supplied_secret = "sensitive-" + ("x" * 128)
+    marker = "\n...[truncated]"
+    attacker_output = marker * 2_000
+    prefix = ("env", f"APP_TOKEN={supplied_secret}")
+    provider = FakeSandboxProvider(
+        scripts={
+            (*prefix, *UP_ARGV): _result(stdout=attacker_output),
+            (*prefix, *PS_ARGV): _result(stdout=_healthy_ps()),
+            (*prefix, *LOGS_ARGV): _result(),
+        }
+    )
+
+    result = _run_with_active_sandbox(
+        provider,
+        env={"APP_TOKEN": supplied_secret},
+    )
+
+    assert result.logs["up"] == "[REDACTED: excessive truncation markers]"
 
 
 @pytest.mark.parametrize(
