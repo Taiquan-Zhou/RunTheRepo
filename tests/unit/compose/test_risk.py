@@ -65,12 +65,32 @@ def _unsupported_marker_count(value: object) -> int:
 class _CountingList(list[object]):
     def __init__(self, values: list[object]) -> None:
         super().__init__(values)
-        self.visited_items = 0
+        self.fetched_items = 0
 
     def __iter__(self) -> Iterator[object]:
         for value in super().__iter__():
-            self.visited_items += 1
+            self.fetched_items += 1
             yield value
+
+    def __getitem__(self, index: int) -> object:
+        self.fetched_items += 1
+        return super().__getitem__(index)
+
+
+class _CountingDict(dict[str, object]):
+    def __init__(self, values: dict[str, object]) -> None:
+        super().__init__(values)
+        self.key_enumerations = 0
+        self.value_accesses = 0
+
+    def __iter__(self) -> Iterator[str]:
+        for key in super().__iter__():
+            self.key_enumerations += 1
+            yield key
+
+    def __getitem__(self, key: str) -> object:
+        self.value_accesses += 1
+        return super().__getitem__(key)
 
 
 def test_analyze_risk_emits_every_kind_with_exact_evidence() -> None:
@@ -403,6 +423,43 @@ def test_analyze_risk_ignores_ambiguous_short_bind() -> None:
     assert [finding for finding in findings if finding.kind == "rw_host_bind"] == []
 
 
+def test_analyze_risk_stops_colon_rich_ambiguous_volume_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    volume = "/a" + ":/b" * 4_000
+    compose = _load_compose(
+        tmp_path,
+        f"services:\n  app:\n    volumes: ['{volume}']\n",
+    )
+    source_materializations: list[str] = []
+    target_materializations: list[str] = []
+
+    from repotrial.compose import risk as risk_module
+
+    is_host_path = risk_module._is_host_path
+    is_container_path = risk_module._is_container_path
+
+    def record_host_path(source: str) -> bool:
+        source_materializations.append(source)
+        return is_host_path(source)
+
+    def record_container_path(target: str) -> bool:
+        target_materializations.append(target)
+        return is_container_path(target)
+
+    monkeypatch.setattr(risk_module, "_is_host_path", record_host_path)
+    monkeypatch.setattr(risk_module, "_is_container_path", record_container_path)
+
+    findings = analyze_risk(compose)
+
+    assert [finding for finding in findings if finding.kind == "rw_host_bind"] == []
+    assert len(source_materializations) <= 2
+    assert len(target_materializations) <= 2
+    assert sum(map(len, source_materializations + target_materializations)) <= len(
+        volume
+    )
+
+
 def test_analyze_risk_applies_override_tags_and_preserves_json_safe_evidence(
     tmp_path: Path,
 ) -> None:
@@ -697,7 +754,7 @@ def test_analyze_risk_truncates_overwide_evidence_before_iteration() -> None:
 
     finding = next(finding for finding in findings if finding.kind == "cap_add")
 
-    assert cap_add.visited_items == 0
+    assert cap_add.fetched_items == 0
     assert finding.evidence["cap_add"] == {"$evidence_unsupported": "node_limit"}
     assert len(finding.model_dump_json()) < 500
 
@@ -709,6 +766,45 @@ def test_analyze_risk_marks_overwide_evidence_once() -> None:
     _assert_findings_are_json_safe(findings)
     finding = next(finding for finding in findings if finding.kind == "cap_add")
     assert finding.evidence["cap_add"] == {"$evidence_unsupported": "node_limit"}
+
+
+def test_analyze_risk_reserves_nested_mapping_keys_before_enumeration() -> None:
+    child: object = None
+    mappings: list[_CountingDict] = []
+    for _ in range(5):
+        mapping = _CountingDict({f"key-{index}": child for index in range(9_000)})
+        mappings.append(mapping)
+        child = mapping
+    cap_add = [child]
+
+    findings = analyze_risk({"services": {"app": {"cap_add": cap_add}}})
+
+    observed_work = sum(
+        mapping.key_enumerations + mapping.value_accesses for mapping in mappings
+    )
+    finding = next(finding for finding in findings if finding.kind == "cap_add")
+    assert observed_work <= 10_000
+    assert finding.evidence["cap_add"] == {"$evidence_unsupported": "node_limit"}
+    assert len(finding.model_dump_json()) < 500
+    _assert_findings_are_json_safe(findings)
+    for index, mapping in enumerate(mappings):
+        assert len(mapping) == 9_000
+        assert mapping["key-0"] is (None if index == 0 else mappings[index - 1])
+
+
+def test_analyze_risk_stops_before_fetching_sibling_after_node_exhaustion() -> None:
+    children = [_CountingList([None]) for _ in range(6_000)]
+    cap_add = _CountingList(children)
+
+    findings = analyze_risk({"services": {"app": {"cap_add": cap_add}}})
+
+    finding = next(finding for finding in findings if finding.kind == "cap_add")
+    assert cap_add.fetched_items == 4_999
+    assert sum(child.fetched_items for child in children) == 4_998
+    assert finding.evidence["cap_add"] == {"$evidence_unsupported": "node_limit"}
+    assert len(finding.model_dump_json()) < 500
+    _assert_findings_are_json_safe(findings)
+    assert cap_add[0] is children[0]
 
 
 @pytest.mark.parametrize(

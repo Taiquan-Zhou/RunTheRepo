@@ -13,14 +13,11 @@ from ruamel.yaml.nodes import ScalarNode
 from repotrial.domain.models import RiskFinding
 
 _WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
-_SCALAR_MODE_TOKEN = re.compile(r"^[A-Za-z0-9._-]+$")
 _ALLOWED_YAML_TAGS = frozenset({"!override", "!reset"})
 _MAX_EVIDENCE_DEPTH = 48
 _MAX_EVIDENCE_NODES = 10_000
 _RESET = object()
 _UNSUPPORTED = object()
-_EVIDENCE_DEPTH_LIMIT = object()
-_EVIDENCE_NODE_LIMIT = object()
 
 
 @dataclass
@@ -32,6 +29,26 @@ class _EvidenceBudget:
             return False
         self.remaining -= 1
         return True
+
+    def reserve(self, count: int) -> bool:
+        if count > self.remaining:
+            return False
+        self.remaining -= count
+        return True
+
+
+@dataclass(frozen=True)
+class _ShortVolumeCandidate:
+    separator_index: int
+    target_end: int
+    mode_start: int | None
+
+
+@dataclass(frozen=True)
+class _EvidenceValue:
+    value: object
+    reason: str | None = None
+    stop: bool = False
 
 
 def analyze_risk(compose: dict[str, object]) -> list[RiskFinding]:
@@ -188,38 +205,112 @@ def _recognized_host_bind(volume: object) -> tuple[str, bool] | None:
 
 
 def _short_host_bind(volume: str) -> tuple[str, bool] | None:
-    source_and_target, separator, candidate_mode = volume.rpartition(":")
-    if separator and _is_scalar_mode(candidate_mode):
-        candidates = _short_source_target_candidates(source_and_target, candidate_mode)
+    final_separator = volume.rfind(":")
+    if final_separator >= 0 and _is_scalar_mode_range(
+        volume, final_separator + 1, len(volume)
+    ):
+        candidate = _scan_short_volume_candidate(
+            volume, final_separator, final_separator + 1
+        )
     else:
-        candidates = _short_source_target_candidates(volume, None)
+        candidate = _scan_short_volume_candidate(volume, len(volume), None)
 
-    if len(candidates) != 1:
+    if candidate is None:
         return None
-    source, _, mode = candidates[0]
+    source, _, mode = _materialize_short_volume_candidate(volume, candidate)
     return source, mode is None or "ro" not in mode.split(",")
 
 
-def _short_source_target_candidates(
-    source_and_target: str, mode: str | None
-) -> list[tuple[str, str, str | None]]:
-    candidates: dict[tuple[str, str, str | None], None] = {}
-    for separator_index in range(len(source_and_target) - 1, -1, -1):
-        if source_and_target[separator_index] != ":":
+def _scan_short_volume_candidate(
+    volume: str, target_end: int, mode_start: int | None
+) -> _ShortVolumeCandidate | None:
+    candidate: _ShortVolumeCandidate | None = None
+    for separator_index in range(target_end - 1, -1, -1):
+        if volume[separator_index] != ":":
             continue
-        source = source_and_target[:separator_index]
-        target = source_and_target[separator_index + 1 :]
-        if _is_host_path(source) and _is_container_path(target):
-            candidates[(source, target, mode)] = None
-    return list(candidates)
+        if not _is_host_path_prefix(volume, separator_index):
+            continue
+        if not _is_container_path_range(volume, separator_index + 1, target_end):
+            continue
+        if candidate is not None:
+            return None
+        candidate = _ShortVolumeCandidate(separator_index, target_end, mode_start)
+    return candidate
 
 
-def _is_scalar_mode(mode: str) -> bool:
-    tokens = mode.split(",")
-    return bool(tokens) and all(
-        bool(token) and _SCALAR_MODE_TOKEN.fullmatch(token) is not None
-        for token in tokens
+def _materialize_short_volume_candidate(
+    volume: str, candidate: _ShortVolumeCandidate
+) -> tuple[str, str, str | None]:
+    source = volume[: candidate.separator_index]
+    target = volume[candidate.separator_index + 1 : candidate.target_end]
+    mode = None if candidate.mode_start is None else volume[candidate.mode_start :]
+    return source, target, mode
+
+
+def _is_scalar_mode_range(volume: str, start: int, end: int) -> bool:
+    if start >= end:
+        return False
+    token_start = start
+    for index in range(start, end):
+        character = volume[index]
+        if character == ",":
+            if index == token_start:
+                return False
+            token_start = index + 1
+            continue
+        if not (
+            "A" <= character <= "Z"
+            or "a" <= character <= "z"
+            or "0" <= character <= "9"
+            or character in "._-"
+        ):
+            return False
+    return token_start < end
+
+
+def _is_host_path_prefix(volume: str, end: int) -> bool:
+    if end >= 1 and volume[0] == "/":
+        return True
+    if end >= 2 and volume[0] in {".", "~"} and volume[1] in {"/", "\\"}:
+        return True
+    if (
+        end >= 3
+        and volume[0] == "."
+        and volume[1] == "."
+        and volume[2]
+        in {
+            "/",
+            "\\",
+        }
+    ):
+        return True
+    if end >= 2 and volume[0] == "\\" and volume[1] == "\\":
+        return True
+    return (
+        end >= 3
+        and _is_ascii_letter(volume[0])
+        and volume[1] == ":"
+        and volume[2] in {"/", "\\"}
     )
+
+
+def _is_container_path_range(volume: str, start: int, end: int) -> bool:
+    if start >= end:
+        return False
+    if volume[start] == "/":
+        return True
+    if end - start >= 2 and volume[start] == "\\" and volume[start + 1] == "\\":
+        return True
+    return (
+        end - start >= 3
+        and _is_ascii_letter(volume[start])
+        and volume[start + 1] == ":"
+        and volume[start + 2] in {"/", "\\"}
+    )
+
+
+def _is_ascii_letter(character: str) -> bool:
+    return "A" <= character <= "Z" or "a" <= character <= "z"
 
 
 def _is_host_path(source: str) -> bool:
@@ -287,48 +378,51 @@ def _tagged_underlying_value(value: object) -> object:
 
 def _json_safe_evidence(evidence: dict[str, object]) -> dict[str, object]:
     budget = _EvidenceBudget()
-    if len(evidence) >= budget.remaining:
+    if not budget.consume() or not budget.reserve(len(evidence)):
         return _evidence_unsupported("node_limit")
-    budget.consume()
 
     safe_evidence: dict[str, object] = {}
     for key in sorted(evidence):
-        if not budget.consume():
+        if budget.remaining == 0:
             return _evidence_unsupported("node_limit")
         safe_value = _json_safe_value(evidence[key], set(), 1, budget)
-        if safe_value is _EVIDENCE_DEPTH_LIMIT:
-            return _evidence_unsupported("depth_limit")
-        if safe_value is _EVIDENCE_NODE_LIMIT:
-            return _evidence_unsupported("node_limit")
-        safe_evidence[key] = safe_value
+        if safe_value.reason == "depth":
+            safe_evidence[key] = _evidence_unsupported("depth_limit")
+            break
+        if safe_value.reason == "node":
+            if not safe_value.stop:
+                return _evidence_unsupported("node_limit")
+            safe_evidence[key] = safe_value.value
+            break
+        safe_evidence[key] = safe_value.value
     return safe_evidence
 
 
 def _json_safe_value(
     value: object, active: set[int], depth: int, budget: _EvidenceBudget
-) -> object:
+) -> _EvidenceValue:
     tag = _yaml_tag(value)
     if tag is not None:
         if tag not in _ALLOWED_YAML_TAGS:
             return _json_safe_scalar(None, budget)
         if depth >= _MAX_EVIDENCE_DEPTH:
-            return _EVIDENCE_DEPTH_LIMIT
+            return _evidence_limit("depth")
         if not budget.consume():
-            return _EVIDENCE_NODE_LIMIT
+            return _evidence_limit("node")
         safe_value = _json_safe_untagged_value(
             _tagged_underlying_value(value), active, depth + 1, budget
         )
-        if safe_value is _EVIDENCE_DEPTH_LIMIT:
-            return _evidence_unsupported("depth_limit")
-        if safe_value is _EVIDENCE_NODE_LIMIT:
-            return _evidence_unsupported("node_limit")
-        return {"$yaml_tag": tag, "value": safe_value}
+        if safe_value.reason == "depth":
+            return _evidence_marker_result("depth")
+        if safe_value.reason == "node":
+            return _evidence_marker_result("node", stop=True)
+        return _EvidenceValue({"$yaml_tag": tag, "value": safe_value.value})
     return _json_safe_untagged_value(value, active, depth, budget)
 
 
 def _json_safe_untagged_value(
     value: object, active: set[int], depth: int, budget: _EvidenceBudget
-) -> object:
+) -> _EvidenceValue:
     if value is None or isinstance(value, (bool, int, str)):
         return _json_safe_scalar(value, budget)
     if isinstance(value, float):
@@ -340,8 +434,10 @@ def _json_safe_untagged_value(
     return _json_safe_scalar(None, budget)
 
 
-def _json_safe_scalar(value: object, budget: _EvidenceBudget) -> object:
-    return value if budget.consume() else _EVIDENCE_NODE_LIMIT
+def _json_safe_scalar(value: object, budget: _EvidenceBudget) -> _EvidenceValue:
+    if not budget.consume():
+        return _evidence_limit("node")
+    return _EvidenceValue(value)
 
 
 def _json_safe_mapping(
@@ -349,68 +445,68 @@ def _json_safe_mapping(
     active: set[int],
     depth: int,
     budget: _EvidenceBudget,
-) -> object:
+) -> _EvidenceValue:
     if id(value) in active:
         return _json_safe_scalar(None, budget)
     if depth >= _MAX_EVIDENCE_DEPTH:
-        return _EVIDENCE_DEPTH_LIMIT
-    if len(value) >= budget.remaining:
-        return _evidence_marker("node_limit", depth, budget)
+        return _evidence_limit("depth")
     if not budget.consume():
-        return _EVIDENCE_NODE_LIMIT
+        return _evidence_limit("node")
+    if not budget.reserve(len(value)):
+        return _evidence_marker_result("node", stop=True)
 
     active.add(id(value))
     try:
         safe_mapping: dict[str, object] = {}
         for key in sorted(key for key in value if isinstance(key, str)):
-            if not budget.consume():
-                return _evidence_unsupported("node_limit")
+            if budget.remaining == 0:
+                return _evidence_marker_result("node", stop=True)
             safe_value = _json_safe_value(value[key], active, depth + 1, budget)
-            if safe_value is _EVIDENCE_DEPTH_LIMIT:
-                return _evidence_unsupported("depth_limit")
-            if safe_value is _EVIDENCE_NODE_LIMIT:
-                return _evidence_unsupported("node_limit")
-            safe_mapping[key] = safe_value
-        return safe_mapping
+            if safe_value.reason == "depth":
+                return _evidence_marker_result("depth")
+            if safe_value.reason == "node":
+                return _evidence_marker_result("node", stop=True)
+            safe_mapping[key] = safe_value.value
+        return _EvidenceValue(safe_mapping)
     finally:
         active.remove(id(value))
 
 
 def _json_safe_sequence(
     value: list[object], active: set[int], depth: int, budget: _EvidenceBudget
-) -> object:
+) -> _EvidenceValue:
     if id(value) in active:
         return _json_safe_scalar(None, budget)
     if depth >= _MAX_EVIDENCE_DEPTH:
-        return _EVIDENCE_DEPTH_LIMIT
-    if len(value) >= budget.remaining:
-        return _evidence_marker("node_limit", depth, budget)
+        return _evidence_limit("depth")
     if not budget.consume():
-        return _EVIDENCE_NODE_LIMIT
+        return _evidence_limit("node")
+    if len(value) > budget.remaining:
+        return _evidence_marker_result("node", stop=True)
 
     active.add(id(value))
     try:
         safe_sequence: list[object] = []
-        for item in value:
-            safe_value = _json_safe_value(item, active, depth + 1, budget)
-            if safe_value is _EVIDENCE_DEPTH_LIMIT:
-                return _evidence_unsupported("depth_limit")
-            if safe_value is _EVIDENCE_NODE_LIMIT:
-                return _evidence_unsupported("node_limit")
-            safe_sequence.append(safe_value)
-        return safe_sequence
+        for index in range(len(value)):
+            if budget.remaining == 0:
+                return _evidence_marker_result("node", stop=True)
+            safe_value = _json_safe_value(value[index], active, depth + 1, budget)
+            if safe_value.reason == "depth":
+                return _evidence_marker_result("depth")
+            if safe_value.reason == "node":
+                return _evidence_marker_result("node", stop=True)
+            safe_sequence.append(safe_value.value)
+        return _EvidenceValue(safe_sequence)
     finally:
         active.remove(id(value))
 
 
-def _evidence_marker(
-    reason: str, depth: int, budget: _EvidenceBudget
-) -> dict[str, object] | object:
-    if depth >= _MAX_EVIDENCE_DEPTH:
-        return _EVIDENCE_DEPTH_LIMIT
-    if not budget.consume():
-        return _EVIDENCE_NODE_LIMIT
-    return _evidence_unsupported(reason)
+def _evidence_limit(reason: str) -> _EvidenceValue:
+    return _EvidenceValue(None, reason)
+
+
+def _evidence_marker_result(reason: str, stop: bool = False) -> _EvidenceValue:
+    return _EvidenceValue(_evidence_unsupported(f"{reason}_limit"), reason, stop)
 
 
 def _evidence_unsupported(reason: str) -> dict[str, object]:
