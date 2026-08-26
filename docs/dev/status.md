@@ -86,7 +86,8 @@
 - Base commit: `a11b348ee1a3c1a1b0610c3865678641b979567b`.
 - Implementation and bounded fixes: `a22b93f56da1f9b06fae69b0a10d270b4f140c4e`,
   `7395870d81d313de970e38e0402cbf55674198ff`, and
-  `7c908f7d040fb838966532a9b280fc0759d7ab1d`.
+  `7c908f7d040fb838966532a9b280fc0759d7ab1d`, and
+  `c0223b0ea758834febc13b49fd0af9e14d10bb10`.
 - Scope: deterministic root-only Compose discovery, safe ruamel round-trip
   parsing, inert official tags only, typed canonical hash material, and
   resource/path-identity limits. No Compose execution, LLM, source mutation,
@@ -96,20 +97,33 @@
   every original behavior. This historical gap is not repaired rhetorically.
   Fix round 1 added real RED/GREEN evidence for independently reproduced
   path, resource, quote, tag, and exception defects; fix round 2 added real
-  RED/GREEN evidence for zero/unavailable-inode fail-closed behavior.
+  RED/GREEN evidence for zero/unavailable-inode fail-closed behavior. Fix
+  round 3 recorded a real RED where 129 collections reached the patched
+  constructor before the fix, and NUL plus patched `lstat`/`resolve`/`iterdir`
+  paths leaked `ValueError`; after the fix, 128 is accepted, 129 fails before
+  `YAML.load`, active anchors use O(1) counts, and the typed discovery
+  boundary is preserved.
 - Review: the initial independent review reported two Critical and four
   Important findings. The first fix re-review closed C2/I1/I2/I3 and accepted
   the I4 ledger, but retained one C1 zero-ID Critical. The second fix
   re-review was APPROVED with Critical, Important, and Minor findings all
-  None.
-- Controller fresh evidence at `7c908f7`: locked check/sync, 52 focused
-  tests, 135 full tests, Ruff lint/format, strict mypy, 91.30% branch coverage
-  (threshold `>=85%`), pre-commit, full diff/range/suppression checks, and a
-  clean worktree all passed locally.
+  None. An owner-requested fresh full audit after that earlier approval found
+  one Critical (missing pre-construction collection-depth budget), one
+  Important (raw discovery `ValueError` for invalid `pathlib` input), and no
+  Minor findings. The original final auditor's two scoped follow-up attempts
+  were blocked by the platform content filter and produced no verdict; a
+  different fresh independent reviewer then completed scoped review and
+  returned APPROVED with Critical, Important, and Minor findings all None.
+- Controller fresh evidence at `c0223b0`: locked check/sync, 59 focused
+  tests, 142 full tests, Ruff lint/format, strict mypy, 92.23% branch coverage
+  (threshold `>=85%`), pre-commit, full diff/range/status checks, and a clean
+  worktree all passed locally.
 - Limitations/rulings: filesystems without a non-zero stable inode/file ID are
   unsupported and fail closed; no claim is made against mutation of the same
-  inode's contents between checks. Canonical JSON is typed hash material, not
-  source reserialization, and only tested root-level discovery behavior is
-  claimed.
+  inode's contents between checks. A maximum of 128 simultaneously open YAML
+  mapping/sequence collections, including the root mapping, is enforced before
+  `YAML.load`; this does not claim general parser resource immunity. Canonical
+  JSON is typed hash material, not source reserialization, and only tested
+  root-level discovery behavior is claimed.
 - No push or remote GitHub Actions run was performed. M1.3 remains unstarted
   and unauthorized in this run.
