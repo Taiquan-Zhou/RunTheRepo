@@ -79,4 +79,37 @@
   does not claim resistance to an adversarial same-host actor that swaps a
   destination directory between arbitrary Python instructions. Stronger host
   containment remains Sandbox-stage work.
-- M1.2 has not started.
+- Historical transition: M1.2 was subsequently authorized as the next bounded task.
+
+## M1.2 — Compose discovery and safe parsing
+
+- Base commit: `a11b348ee1a3c1a1b0610c3865678641b979567b`.
+- Implementation and bounded fixes: `a22b93f56da1f9b06fae69b0a10d270b4f140c4e`,
+  `7395870d81d313de970e38e0402cbf55674198ff`, and
+  `7c908f7d040fb838966532a9b280fc0759d7ab1d`.
+- Scope: deterministic root-only Compose discovery, safe ruamel round-trip
+  parsing, inert official tags only, typed canonical hash material, and
+  resource/path-identity limits. No Compose execution, LLM, source mutation,
+  or M1.3 behavior was implemented.
+- TDD record: the original implementation report proved only two initial
+  missing-module REDs and one mixed-key RED, not a behavior-focused RED for
+  every original behavior. This historical gap is not repaired rhetorically.
+  Fix round 1 added real RED/GREEN evidence for independently reproduced
+  path, resource, quote, tag, and exception defects; fix round 2 added real
+  RED/GREEN evidence for zero/unavailable-inode fail-closed behavior.
+- Review: the initial independent review reported two Critical and four
+  Important findings. The first fix re-review closed C2/I1/I2/I3 and accepted
+  the I4 ledger, but retained one C1 zero-ID Critical. The second fix
+  re-review was APPROVED with Critical, Important, and Minor findings all
+  None.
+- Controller fresh evidence at `7c908f7`: locked check/sync, 52 focused
+  tests, 135 full tests, Ruff lint/format, strict mypy, 91.30% branch coverage
+  (threshold `>=85%`), pre-commit, full diff/range/suppression checks, and a
+  clean worktree all passed locally.
+- Limitations/rulings: filesystems without a non-zero stable inode/file ID are
+  unsupported and fail closed; no claim is made against mutation of the same
+  inode's contents between checks. Canonical JSON is typed hash material, not
+  source reserialization, and only tested root-level discovery behavior is
+  claimed.
+- No push or remote GitHub Actions run was performed. M1.3 remains unstarted
+  and unauthorized in this run.
