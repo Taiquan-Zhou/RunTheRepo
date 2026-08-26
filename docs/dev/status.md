@@ -127,3 +127,43 @@
   root-level discovery behavior is claimed.
 - No push or remote GitHub Actions run was performed. M1.3 remains unstarted
   and unauthorized in this run.
+
+## M1.3 — deterministic baseline risk findings
+
+- Base commit: `3ea153dc77b7b870faf59e1f4083ab6be3962935`.
+- Implementation and bounded corrections: `79ceb66d0cbc38e8eddbb3a6bb192bd62cfcbdd5`,
+  `ab02e3edb4e75503849f7f913cd7c60d14023190`,
+  `3bc309cdd8d7c16ba350f898a1be76027a886ff2`,
+  `815ab9fbdb7fb82a06be037163ffe8f9c426218d`,
+  `ab1e7ccc8162bad71a4c8746535cf5b44c5656bc`, and the final bounded
+  architecture closure `c88d86c6b8e76d06bcd4df6d712820277dd57183`.
+- Scope: deterministic configuration-fact findings and unbounded aggregate
+  ordering score only. M1.3 does not execute Compose, scan for vulnerabilities,
+  invoke an LLM, mutate source input, or produce a safe/unsafe verdict.
+- TDD record: the original implementation RED stopped at import collection and
+  is retained as a disclosed process deviation. Later corrections recorded
+  behavior-level RED/GREEN evidence. The final closure first reproduced the
+  I2 ancestor-collapse cases and I1 `~\\` short/long mismatch; the I3 scanner
+  regression used a disclosed controlled mutation because the production
+  scanner behavior was already correct while the old test observed dead paths.
+- Final architecture: pending evidence limits and materialized evidence values
+  are disjoint result states; a materialized marker is retained as an ordinary
+  child, while independent halt control stops only unvisited siblings after
+  true node exhaustion. Preflight-wide subtrees remain local markers. The
+  output evidence boundary is 48 actual containers including the evidence
+  root, and nested traversal remains within the 10,000-work accounting bound.
+- Independent final review at `c88d86c` returned `APPROVED`: I1, I2, and I3
+  were each `CLOSED`, with no new load-bearing architecture finding.
+  Independent reproductions covered short/long host-path parity, manual and
+  parser-loaded depth preservation, nested/exhaustion accounting, and the live
+  colon-rich scanner path.
+- Controller fresh evidence at `c88d86c`: focused I1 (`40 passed`), I2
+  (`10 passed`), and I3 (`1 passed`) selections; `test_risk.py` (`79 passed`),
+  Compose unit tests (`138 passed`), and full tests (`221 passed`); Ruff
+  lint/format, strict mypy, 91.44% branch coverage (M1.3 risk module 90%),
+  pre-commit, lock, diff, HEAD/scope, and clean-status checks passed locally.
+- Evidence wording remains bounded: findings describe recognized configuration
+  facts and truncated evidence explicitly; they do not establish that a target
+  is safe, globally least-privileged, or free of unobserved risk.
+- No push or remote GitHub Actions run was performed. M2.1 and later tasks were
+  not started.
