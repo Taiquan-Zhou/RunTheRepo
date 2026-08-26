@@ -215,9 +215,37 @@ def test_any_nonzero_command_fails_but_all_evidence_calls_still_run(
         "not-json",
         "[]",
         '{"Service":"","State":"running","Health":"healthy"}',
+        '{"Service":" \\t","State":"running","Health":"healthy"}',
         '{"Service":"web","State":7,"Health":"healthy"}',
         '{"Service":"web","State":"running","Health":7}',
         '{"Service":"web","State":"running"}',
+        pytest.param(
+            '{"Service":"web","State":"running","Health":"healthy",'
+            f'"Huge":{"9" * 5_000}}}',
+            id="resource-limit-integer",
+        ),
+        pytest.param(
+            '{"Service":"attacker","Service":"web",'
+            '"State":"running","Health":"healthy"}',
+            id="duplicate-service",
+        ),
+        pytest.param(
+            '{"Service":"web","State":"exited","State":"running","Health":"healthy"}',
+            id="duplicate-state",
+        ),
+        pytest.param(
+            '{"Service":"web","State":"running","Health":"unhealthy",'
+            '"Health":"healthy"}',
+            id="duplicate-health",
+        ),
+        pytest.param(
+            '{"Service":"web","State":"running","Health":"healthy","Metric":NaN}',
+            id="nan-constant",
+        ),
+        pytest.param(
+            '{"Service":"web","State":"running","Health":"healthy","Metric":Infinity}',
+            id="infinity-constant",
+        ),
     ],
 )
 def test_empty_malformed_or_invalid_schema_ps_never_infers_success_from_logs(
@@ -238,6 +266,24 @@ def test_empty_malformed_or_invalid_schema_ps_never_infers_success_from_logs(
     assert result.logs["logs"] == "healthy running ready success"
 
 
+def test_oversized_ps_fails_before_returning_parsed_service_state() -> None:
+    healthy_row = _healthy_ps()
+    ps_output = healthy_row + (" " * (65_537 - len(healthy_row)))
+    provider = FakeSandboxProvider(
+        scripts={
+            UP_ARGV: _result(),
+            PS_ARGV: _result(stdout=ps_output),
+            LOGS_ARGV: _result(stdout="ready"),
+        }
+    )
+
+    result = _run_with_active_sandbox(provider)
+
+    assert len(ps_output) == 65_537
+    assert result.verdict is Verdict.FAIL
+    assert result.service_states == {}
+
+
 def test_sensitive_evidence_is_redacted_before_every_source_is_truncated() -> None:
     supplied_secret = "env-secret-value-93a427"
     sensitive_prefix = (
@@ -246,6 +292,10 @@ def test_sensitive_evidence_is_redacted_before_every_source_is_truncated() -> No
         "Password: password-value-789\n"
         "Secret: secret phrase with spaces\n"
         "api-key: api-key-value-012\n"
+        '{"password":"json-password-value-345"}\r\n'
+        "DATABASE_PASSWORD=database-password-value-678\r\n"
+        "DB_TOKEN = db-token-value-901\r\n"
+        "X-aPi-KeY: mixed-case-api-value-234\r\n"
         f"leaked={supplied_secret}\n"
         "APP_REQUIRED_TOKEN is required\n"
     )
@@ -281,11 +331,43 @@ def test_sensitive_evidence_is_redacted_before_every_source_is_truncated() -> No
         assert "password-value-789" not in value
         assert "phrase with spaces" not in value
         assert "api-key-value-012" not in value
+        assert "json-password-value-345" not in value
+        assert "database-password-value-678" not in value
+        assert "db-token-value-901" not in value
+        assert "mixed-case-api-value-234" not in value
         assert supplied_secret not in value
         assert "[REDACTED]" in value
         assert "APP_REQUIRED_TOKEN is required" in value
         assert len(value) == 65_536
         assert value.endswith("\n...[truncated]")
+
+
+def test_provider_truncated_sensitive_env_prefixes_are_redacted_at_markers() -> None:
+    supplied_secret = "marker-sensitive-value-93a427-tail"
+    stdout_prefix = "marker-sensitive-value-93a"
+    stderr_prefix = "marker-sensitive-value-93a427"
+    prefix = ("env", f"APP_TOKEN={supplied_secret}")
+    provider = FakeSandboxProvider(
+        scripts={
+            (*prefix, *UP_ARGV): _result(
+                stdout=f"stdout leaked={stdout_prefix}\n...[truncated]"
+            ),
+            (*prefix, *PS_ARGV): _result(stdout=_healthy_ps()),
+            (*prefix, *LOGS_ARGV): _result(
+                stderr=f"stderr leaked={stderr_prefix}\n...[truncated]"
+            ),
+        }
+    )
+
+    result = _run_with_active_sandbox(
+        provider,
+        env={"APP_TOKEN": supplied_secret},
+    )
+
+    assert stdout_prefix not in result.logs["up"]
+    assert stderr_prefix not in result.logs["logs"]
+    assert result.logs["up"] == "stdout leaked=[REDACTED]\n...[truncated]"
+    assert result.logs["logs"] == "stderr leaked=[REDACTED]\n...[truncated]"
 
 
 @pytest.mark.parametrize(
@@ -297,6 +379,15 @@ def test_sensitive_evidence_is_redacted_before_every_source_is_truncated() -> No
         (COMPOSE_PATH, {"BAD\x00KEY": "value"}),
         (COMPOSE_PATH, {"GOOD_KEY": "bad\x00value"}),
         (COMPOSE_PATH, cast(dict[str, str], {"GOOD_KEY": 7})),
+        (COMPOSE_PATH, {"PATH": "/attacker/bin"}),
+        (COMPOSE_PATH, {"home": "/attacker/home"}),
+        (COMPOSE_PATH, {"XdG_Config_Home": "/attacker/config"}),
+        (COMPOSE_PATH, {"pythonhome": "/attacker/python"}),
+        (COMPOSE_PATH, {"PYTHONPATH": "/attacker/modules"}),
+        (COMPOSE_PATH, {"ld_preload": "/attacker/loader.so"}),
+        (COMPOSE_PATH, {"DyLd_Insert_Libraries": "/attacker/loader.dylib"}),
+        (COMPOSE_PATH, {"docker_host": "tcp://attacker:2375"}),
+        (COMPOSE_PATH, {"compose_project_name": "attacker"}),
     ],
 )
 def test_invalid_path_or_env_fails_before_any_provider_call(

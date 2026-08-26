@@ -7,9 +7,17 @@ from repotrial.domain.enums import Verdict
 from repotrial.sandbox.base import ExecResult, SandboxProvider
 
 _ENV_KEY_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-_SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
-    r"(?im)(?P<prefix>(?<![A-Za-z0-9_-])"
-    r"(?:token|password|secret|api[_-]key)[ \t]*[:=][ \t]*)"
+_CONTROL_ENV_KEYS = {
+    "HOME",
+    "PATH",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "XDG_CONFIG_HOME",
+}
+_CONTROL_ENV_PREFIXES = ("COMPOSE_", "DOCKER_", "DYLD_", "LD_")
+_ASSIGNMENT_PATTERN = re.compile(
+    r"(?im)(?P<prefix>(?<![A-Za-z0-9_-])(?P<quote>[\"']?)"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_-]*)(?P=quote)[ \t]*[:=][ \t]*)"
     r"[^\r\n]*"
 )
 _BEARER_PATTERN = re.compile(r"(?i)\bbearer[ \t]+[^\s,;]+")
@@ -84,6 +92,11 @@ def _validated_env_prefix(compose_path: str, env: dict[str, str]) -> list[str]:
             raise ValueError("environment keys must not contain NUL")
         if _ENV_KEY_PATTERN.fullmatch(key) is None:
             raise ValueError("environment key is not portable")
+        normalized_key = key.upper()
+        if normalized_key in _CONTROL_ENV_KEYS or normalized_key.startswith(
+            _CONTROL_ENV_PREFIXES
+        ):
+            raise ValueError("environment key controls the Compose toolchain")
         if not isinstance(value, str):
             raise TypeError("environment values must be strings")
         if "\0" in value:
@@ -96,6 +109,9 @@ def _validated_env_prefix(compose_path: str, env: dict[str, str]) -> list[str]:
 
 
 def _parse_service_states(output: str) -> tuple[dict[str, str], bool]:
+    if len(output) > _LOG_LIMIT:
+        return {}, False
+
     labels_by_service: dict[str, set[str]] = {}
     valid = True
     row_count = 0
@@ -106,8 +122,12 @@ def _parse_service_states(output: str) -> tuple[dict[str, str], bool]:
             continue
         row_count += 1
         try:
-            decoded: object = json.loads(line)
-        except (json.JSONDecodeError, RecursionError):
+            decoded: object = json.loads(
+                line,
+                object_pairs_hook=_object_without_duplicate_keys,
+                parse_constant=_reject_nonstandard_constant,
+            )
+        except (ValueError, RecursionError):
             valid = False
             continue
         if not isinstance(decoded, dict):
@@ -122,13 +142,14 @@ def _parse_service_states(output: str) -> tuple[dict[str, str], bool]:
         health = decoded["Health"]
         if (
             not isinstance(service, str)
-            or not service
+            or not service.strip()
             or not isinstance(state, str)
             or not (isinstance(health, str) or health is None)
         ):
             valid = False
             continue
 
+        service = service.strip()
         normalized_state = state.lower()
         normalized_health = health.lower() if health is not None else ""
         label = normalized_state or "<empty>"
@@ -149,6 +170,21 @@ def _parse_service_states(output: str) -> tuple[dict[str, str], bool]:
     return service_states, all_services_ready
 
 
+def _object_without_duplicate_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    decoded: dict[str, object] = {}
+    for key, value in pairs:
+        if key in decoded:
+            raise ValueError("duplicate JSON key")
+        decoded[key] = value
+    return decoded
+
+
+def _reject_nonstandard_constant(_: str) -> object:
+    raise ValueError("non-standard JSON constant")
+
+
 def _sensitive_env_values(env: dict[str, str]) -> tuple[str, ...]:
     values = {
         value for key, value in env.items() if value and _is_sensitive_env_key(key)
@@ -157,7 +193,7 @@ def _sensitive_env_values(env: dict[str, str]) -> tuple[str, ...]:
 
 
 def _is_sensitive_env_key(key: str) -> bool:
-    parts = key.lower().split("_")
+    parts = re.split(r"[_-]+", key.lower())
     return any(part in {"token", "password", "secret"} for part in parts) or any(
         parts[index : index + 2] == ["api", "key"] for index in range(len(parts) - 1)
     )
@@ -165,17 +201,56 @@ def _is_sensitive_env_key(key: str) -> bool:
 
 def _sanitize_result(result: ExecResult, sensitive_values: tuple[str, ...]) -> str:
     combined = _combine_output(result.stdout, result.stderr)
+    combined = _redact_truncated_sensitive_prefixes(combined, sensitive_values)
     for value in sensitive_values:
         combined = combined.replace(value, _REDACTION)
     combined = _BEARER_PATTERN.sub(lambda match: f"Bearer {_REDACTION}", combined)
-    combined = _SENSITIVE_ASSIGNMENT_PATTERN.sub(
-        lambda match: f"{match.group('prefix')}{_REDACTION}",
-        combined,
-    )
+    combined = _ASSIGNMENT_PATTERN.sub(_redact_sensitive_assignment, combined)
     if len(combined) <= _LOG_LIMIT:
         return combined
     retained = _LOG_LIMIT - len(_TRUNCATION_MARKER)
     return f"{combined[:retained]}{_TRUNCATION_MARKER}"
+
+
+def _redact_sensitive_assignment(match: re.Match[str]) -> str:
+    if not _is_sensitive_env_key(match.group("name")):
+        return match.group(0)
+    return f"{match.group('prefix')}{_REDACTION}"
+
+
+def _redact_truncated_sensitive_prefixes(
+    text: str, sensitive_values: tuple[str, ...]
+) -> str:
+    marker_indexes = [
+        match.start() for match in re.finditer(re.escape(_TRUNCATION_MARKER), text)
+    ]
+    for marker_index in reversed(marker_indexes):
+        preceding = text[:marker_index]
+        prefix_length = max(
+            (_longest_prefix_at_end(value, preceding) for value in sensitive_values),
+            default=0,
+        )
+        if prefix_length:
+            start = marker_index - prefix_length
+            text = f"{text[:start]}{_REDACTION}{text[marker_index:]}"
+    return text
+
+
+def _longest_prefix_at_end(value: str, text: str) -> int:
+    suffix = text[-len(value) :]
+    separator = "\0"
+    while separator in suffix:
+        separator += "\0"
+    sequence = f"{value}{separator}{suffix}"
+    prefix_lengths = [0] * len(sequence)
+    for index in range(1, len(sequence)):
+        candidate = prefix_lengths[index - 1]
+        while candidate and sequence[index] != sequence[candidate]:
+            candidate = prefix_lengths[candidate - 1]
+        if sequence[index] == sequence[candidate]:
+            candidate += 1
+        prefix_lengths[index] = candidate
+    return min(prefix_lengths[-1], len(value))
 
 
 def _combine_output(stdout: str, stderr: str) -> str:
