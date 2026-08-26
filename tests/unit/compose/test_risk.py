@@ -1,4 +1,5 @@
 import json
+from collections.abc import Iterator
 from copy import deepcopy
 from pathlib import Path
 
@@ -39,6 +40,37 @@ def _depth_limited_value(value: object) -> object:
         assert isinstance(nested, list)
         nested = nested[0]
     return nested
+
+
+def _maximum_container_depth(value: object) -> int:
+    if isinstance(value, dict):
+        return 1 + max(
+            (_maximum_container_depth(item) for item in value.values()), default=0
+        )
+    if isinstance(value, list):
+        return 1 + max((_maximum_container_depth(item) for item in value), default=0)
+    return 0
+
+
+def _unsupported_marker_count(value: object) -> int:
+    if isinstance(value, dict):
+        return int(value == {"$evidence_unsupported": "depth_limit"}) + sum(
+            _unsupported_marker_count(item) for item in value.values()
+        )
+    if isinstance(value, list):
+        return sum(_unsupported_marker_count(item) for item in value)
+    return 0
+
+
+class _CountingList(list[object]):
+    def __init__(self, values: list[object]) -> None:
+        super().__init__(values)
+        self.visited_items = 0
+
+    def __iter__(self) -> Iterator[object]:
+        for value in super().__iter__():
+            self.visited_items += 1
+            yield value
 
 
 def test_analyze_risk_emits_every_kind_with_exact_evidence() -> None:
@@ -323,6 +355,54 @@ def test_analyze_risk_validates_short_volume_mode_candidates() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        ("/host", "/container"),
+        ("/host", r"D:\container"),
+        ("/host", r"\\server\share"),
+        (r"C:\host", "/container"),
+        (r"C:\host", r"D:\container"),
+        (r"C:\host", r"\\server\share"),
+        (r"\\server\share", "/container"),
+        (r"\\server\share", r"D:\container"),
+        (r"\\server\share", r"\\server\share"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("suffix", "read_write"),
+    [("", True), (":ro", False), (":rw", True), (":unknown", True)],
+)
+def test_analyze_risk_accepts_short_bind_source_target_matrix(
+    source: str, target: str, suffix: str, read_write: bool
+) -> None:
+    volume = f"{source}:{target}{suffix}"
+
+    findings = analyze_risk({"services": {"app": {"volumes": [volume]}}})
+
+    host_binds = [finding for finding in findings if finding.kind == "rw_host_bind"]
+    if not read_write:
+        assert host_binds == []
+        return
+    assert _finding_data(host_binds) == [
+        {
+            "finding_id": "rw_host_bind:app",
+            "kind": "rw_host_bind",
+            "service": "app",
+            "severity": 25,
+            "evidence": {"volumes": [volume]},
+        }
+    ]
+
+
+def test_analyze_risk_ignores_ambiguous_short_bind() -> None:
+    volume = "/host:/container:/nested"
+
+    findings = analyze_risk({"services": {"app": {"volumes": [volume]}}})
+
+    assert [finding for finding in findings if finding.kind == "rw_host_bind"] == []
+
+
 def test_analyze_risk_applies_override_tags_and_preserves_json_safe_evidence(
     tmp_path: Path,
 ) -> None:
@@ -573,9 +653,29 @@ def test_analyze_risk_limits_real_parser_evidence_depth(tmp_path: Path) -> None:
 
     _assert_findings_are_json_safe(findings)
     cap_add = next(finding for finding in findings if finding.kind == "cap_add")
-    assert _depth_limited_value(cap_add.evidence["cap_add"]) == {
-        "$evidence_unsupported": "depth_limit"
-    }
+    assert _maximum_container_depth(cap_add.evidence) <= 48
+    assert _unsupported_marker_count(cap_add.evidence) == 1
+
+
+def test_analyze_risk_limits_tagged_output_evidence_depth(tmp_path: Path) -> None:
+    nested_flow = "!override [" * 60 + "NET_ADMIN" + "]" * 60
+    compose = _load_compose(
+        tmp_path,
+        f"services:\n  app:\n    cap_add: {nested_flow}\n",
+    )
+    services = compose["services"]
+    assert isinstance(services, dict)
+    app = services["app"]
+    assert isinstance(app, dict)
+    raw_cap_add = app["cap_add"]
+
+    findings = analyze_risk(compose)
+
+    _assert_findings_are_json_safe(findings)
+    finding = next(finding for finding in findings if finding.kind == "cap_add")
+    assert _maximum_container_depth(finding.evidence) <= 48
+    assert _unsupported_marker_count(finding.evidence) == 1
+    assert app["cap_add"] is raw_cap_add
 
 
 def test_analyze_risk_limits_manual_acyclic_evidence_depth() -> None:
@@ -586,25 +686,29 @@ def test_analyze_risk_limits_manual_acyclic_evidence_depth() -> None:
 
     _assert_findings_are_json_safe(findings)
     finding = next(finding for finding in findings if finding.kind == "cap_add")
-    assert _depth_limited_value(finding.evidence["cap_add"]) == {
-        "$evidence_unsupported": "depth_limit"
-    }
+    assert _maximum_container_depth(finding.evidence) <= 48
+    assert _unsupported_marker_count(finding.evidence) == 1
     assert _depth_limited_value(cap_add) != {"$evidence_unsupported": "depth_limit"}
 
 
-def test_analyze_risk_marks_evidence_after_node_budget() -> None:
+def test_analyze_risk_truncates_overwide_evidence_before_iteration() -> None:
+    cap_add = _CountingList([None] * 20_000)
+    findings = analyze_risk({"services": {"app": {"cap_add": cap_add}}})
+
+    finding = next(finding for finding in findings if finding.kind == "cap_add")
+
+    assert cap_add.visited_items == 0
+    assert finding.evidence["cap_add"] == {"$evidence_unsupported": "node_limit"}
+    assert len(finding.model_dump_json()) < 500
+
+
+def test_analyze_risk_marks_overwide_evidence_once() -> None:
     cap_add = [None] * 10_001
     findings = analyze_risk({"services": {"app": {"cap_add": cap_add}}})
 
     _assert_findings_are_json_safe(findings)
     finding = next(finding for finding in findings if finding.kind == "cap_add")
-    evidence = finding.evidence["cap_add"]
-    assert isinstance(evidence, list)
-    assert evidence[:9_999] == [None] * 9_999
-    assert evidence[9_999:] == [
-        {"$evidence_unsupported": "node_limit"},
-        {"$evidence_unsupported": "node_limit"},
-    ]
+    assert finding.evidence["cap_add"] == {"$evidence_unsupported": "node_limit"}
 
 
 @pytest.mark.parametrize(
