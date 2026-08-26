@@ -244,6 +244,32 @@ def test_analyze_risk_recognizes_short_and_long_host_bind_forms() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("suffix", "read_only"),
+    [("", None), (":rw", False), (":ro", True)],
+)
+def test_short_and_long_tilde_backslash_sources_are_not_host_paths(
+    suffix: str, read_only: bool | None
+) -> None:
+    from repotrial.compose import risk as risk_module
+
+    short_volume = rf"~\cache:/container{suffix}"
+    long_volume: dict[str, object] = {
+        "type": "bind",
+        "source": r"~\cache",
+        "target": "/container",
+    }
+    if read_only is not None:
+        long_volume["read_only"] = read_only
+
+    assert risk_module._recognized_host_bind(short_volume) is None
+    assert risk_module._recognized_host_bind(long_volume) is None
+    findings = analyze_risk(
+        {"services": {"app": {"volumes": [short_volume, long_volume]}}}
+    )
+    assert [finding for finding in findings if finding.kind == "rw_host_bind"] == []
+
+
 def test_analyze_risk_suppresses_read_only_binds_and_does_not_duplicate_sockets() -> (
     None
 ):
@@ -423,41 +449,103 @@ def test_analyze_risk_ignores_ambiguous_short_bind() -> None:
     assert [finding for finding in findings if finding.kind == "rw_host_bind"] == []
 
 
-def test_analyze_risk_stops_colon_rich_ambiguous_volume_scan(
+def test_analyze_risk_bounds_colon_rich_short_volume_scan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    volume = "/a" + ":/b" * 4_000
-    compose = _load_compose(
-        tmp_path,
-        f"services:\n  app:\n    volumes: ['{volume}']\n",
-    )
-    source_materializations: list[str] = []
-    target_materializations: list[str] = []
-
     from repotrial.compose import risk as risk_module
 
-    is_host_path = risk_module._is_host_path
-    is_container_path = risk_module._is_container_path
+    host_checks: list[tuple[int, int]] = []
+    target_checks: list[tuple[int, int, int]] = []
+    candidate_constructions: list[object] = []
+    materializations: list[object] = []
+    scan_steps = 0
+    is_host_path_prefix = risk_module._is_host_path_prefix
+    is_container_path_range = risk_module._is_container_path_range
+    short_volume_candidate = risk_module._ShortVolumeCandidate
+    materialize_candidate = risk_module._materialize_short_volume_candidate
 
-    def record_host_path(source: str) -> bool:
-        source_materializations.append(source)
-        return is_host_path(source)
+    def record_host_path_prefix(volume: str, end: int) -> bool:
+        host_checks.append((len(volume), end))
+        return is_host_path_prefix(volume, end)
 
-    def record_container_path(target: str) -> bool:
-        target_materializations.append(target)
-        return is_container_path(target)
+    def record_container_path_range(volume: str, start: int, end: int) -> bool:
+        target_checks.append((len(volume), start, end))
+        return is_container_path_range(volume, start, end)
 
-    monkeypatch.setattr(risk_module, "_is_host_path", record_host_path)
-    monkeypatch.setattr(risk_module, "_is_container_path", record_container_path)
+    def record_candidate(
+        separator_index: int, target_end: int, mode_start: int | None
+    ) -> object:
+        candidate = short_volume_candidate(separator_index, target_end, mode_start)
+        candidate_constructions.append(candidate)
+        return candidate
 
-    findings = analyze_risk(compose)
+    def record_materialization(volume: str, candidate: object) -> object:
+        materializations.append(candidate)
+        return materialize_candidate(volume, candidate)
 
-    assert [finding for finding in findings if finding.kind == "rw_host_bind"] == []
-    assert len(source_materializations) <= 2
-    assert len(target_materializations) <= 2
-    assert sum(map(len, source_materializations + target_materializations)) <= len(
-        volume
+    def record_range(*args: int) -> range | Iterator[int]:
+        scanned_range = range(*args)
+        if len(args) != 3 or args[1:] != (-1, -1):
+            return scanned_range
+
+        def count_scan_steps() -> Iterator[int]:
+            nonlocal scan_steps
+            for index in scanned_range:
+                scan_steps += 1
+                yield index
+
+        return count_scan_steps()
+
+    monkeypatch.setattr(risk_module, "_is_host_path_prefix", record_host_path_prefix)
+    monkeypatch.setattr(
+        risk_module, "_is_container_path_range", record_container_path_range
     )
+    monkeypatch.setattr(risk_module, "_ShortVolumeCandidate", record_candidate)
+    monkeypatch.setattr(
+        risk_module, "_materialize_short_volume_candidate", record_materialization
+    )
+    monkeypatch.setattr(risk_module, "range", record_range, raising=False)
+
+    ambiguous = "/a" + ":/b" * 4_000
+    ambiguous_compose = _load_compose(
+        tmp_path,
+        f"services:\n  app:\n    volumes: ['{ambiguous}']\n",
+    )
+
+    ambiguous_findings = analyze_risk(ambiguous_compose)
+
+    assert [
+        finding for finding in ambiguous_findings if finding.kind == "rw_host_bind"
+    ] == []
+    assert len(host_checks) == 2
+    assert len(target_checks) == 2
+    assert scan_steps == 6
+    assert len(candidate_constructions) == 1
+    assert materializations == []
+
+    host_checks.clear()
+    target_checks.clear()
+    candidate_constructions.clear()
+    materializations.clear()
+    scan_steps = 0
+    unique = "/host" + ":archive" * 4_000 + ":/container"
+    unique_compose = _load_compose(
+        tmp_path,
+        f"services:\n  app:\n    volumes: ['{unique}']\n",
+    )
+
+    unique_findings = analyze_risk(unique_compose)
+
+    unique_host_binds = [
+        finding for finding in unique_findings if finding.kind == "rw_host_bind"
+    ]
+    assert len(unique_host_binds) == 1
+    assert unique_host_binds[0].evidence == {"volumes": [unique]}
+    assert len(host_checks) == 4_001
+    assert len(target_checks) == 4_001
+    assert scan_steps == len(unique)
+    assert len(candidate_constructions) == 1
+    assert len(materializations) == 1
 
 
 def test_analyze_risk_applies_override_tags_and_preserves_json_safe_evidence(
@@ -714,6 +802,87 @@ def test_analyze_risk_limits_real_parser_evidence_depth(tmp_path: Path) -> None:
     assert _unsupported_marker_count(cap_add.evidence) == 1
 
 
+def test_analyze_risk_preserves_outer_sequence_around_depth_marker() -> None:
+    deep_subtree = _nested_list(120, "TOO_DEEP")
+    cap_add = ["KEEP_BEFORE", deep_subtree, "KEEP_AFTER"]
+    compose = {"services": {"app": {"cap_add": cap_add}}}
+    original = deepcopy(compose)
+
+    findings = analyze_risk(compose)
+
+    finding = next(finding for finding in findings if finding.kind == "cap_add")
+    safe_cap_add = finding.evidence["cap_add"]
+    assert isinstance(safe_cap_add, list)
+    assert safe_cap_add[0] == "KEEP_BEFORE"
+    assert safe_cap_add[2] == "KEEP_AFTER"
+    nested = safe_cap_add[1]
+    for level in range(45):
+        assert isinstance(nested, list), level
+        assert len(nested) == 1
+        nested = nested[0]
+    assert nested == {"$evidence_unsupported": "depth_limit"}
+    assert _maximum_container_depth(finding.evidence) == 48
+    assert _unsupported_marker_count(finding.evidence) == 1
+    _assert_findings_are_json_safe(findings)
+    assert compose == original
+    assert compose["services"]["app"]["cap_add"] is cap_add
+
+
+def test_analyze_risk_preserves_outer_sequence_around_overwide_mapping() -> None:
+    overwide = {f"key-{index}": None for index in range(10_000)}
+    cap_add = ["KEEP_BEFORE", overwide, "KEEP_AFTER"]
+
+    findings = analyze_risk({"services": {"app": {"cap_add": cap_add}}})
+
+    finding = next(finding for finding in findings if finding.kind == "cap_add")
+    assert finding.evidence["cap_add"] == [
+        "KEEP_BEFORE",
+        {"$evidence_unsupported": "node_limit"},
+        "KEEP_AFTER",
+    ]
+    _assert_findings_are_json_safe(findings)
+    assert cap_add[1] is overwide
+    assert len(overwide) == 10_000
+
+
+def test_analyze_risk_preserves_tagged_outer_sequence_around_depth_marker(
+    tmp_path: Path,
+) -> None:
+    nested_flow = "[" * 120 + "TOO_DEEP" + "]" * 120
+    compose = _load_compose(
+        tmp_path,
+        "services:\n"
+        "  app:\n"
+        f"    cap_add: !override [KEEP_BEFORE, {nested_flow}, KEEP_AFTER]\n",
+    )
+    services = compose["services"]
+    assert isinstance(services, dict)
+    app = services["app"]
+    assert isinstance(app, dict)
+    raw_cap_add = app["cap_add"]
+
+    findings = analyze_risk(compose)
+
+    finding = next(finding for finding in findings if finding.kind == "cap_add")
+    tagged = finding.evidence["cap_add"]
+    assert isinstance(tagged, dict)
+    assert tagged["$yaml_tag"] == "!override"
+    safe_cap_add = tagged["value"]
+    assert isinstance(safe_cap_add, list)
+    assert safe_cap_add[0] == "KEEP_BEFORE"
+    assert safe_cap_add[2] == "KEEP_AFTER"
+    nested = safe_cap_add[1]
+    for level in range(44):
+        assert isinstance(nested, list), level
+        assert len(nested) == 1
+        nested = nested[0]
+    assert nested == {"$evidence_unsupported": "depth_limit"}
+    assert _maximum_container_depth(finding.evidence) == 48
+    assert _unsupported_marker_count(finding.evidence) == 1
+    _assert_findings_are_json_safe(findings)
+    assert app["cap_add"] is raw_cap_add
+
+
 def test_analyze_risk_limits_tagged_output_evidence_depth(tmp_path: Path) -> None:
     nested_flow = "!override [" * 60 + "NET_ADMIN" + "]" * 60
     compose = _load_compose(
@@ -784,7 +953,7 @@ def test_analyze_risk_reserves_nested_mapping_keys_before_enumeration() -> None:
     )
     finding = next(finding for finding in findings if finding.kind == "cap_add")
     assert observed_work <= 10_000
-    assert finding.evidence["cap_add"] == {"$evidence_unsupported": "node_limit"}
+    assert finding.evidence["cap_add"] == [{"$evidence_unsupported": "node_limit"}]
     assert len(finding.model_dump_json()) < 500
     _assert_findings_are_json_safe(findings)
     for index, mapping in enumerate(mappings):

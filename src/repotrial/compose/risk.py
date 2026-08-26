@@ -1,9 +1,9 @@
 """Deterministic, static baseline risk findings for Compose mappings."""
 
 import math
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Literal
 
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import TaggedScalar
@@ -12,7 +12,6 @@ from ruamel.yaml.nodes import ScalarNode
 
 from repotrial.domain.models import RiskFinding
 
-_WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
 _ALLOWED_YAML_TAGS = frozenset({"!override", "!reset"})
 _MAX_EVIDENCE_DEPTH = 48
 _MAX_EVIDENCE_NODES = 10_000
@@ -47,8 +46,19 @@ class _ShortVolumeCandidate:
 @dataclass(frozen=True)
 class _EvidenceValue:
     value: object
-    reason: str | None = None
-    stop: bool = False
+    halt: bool = False
+
+
+type _EvidenceLimitReason = Literal["depth", "node"]
+
+
+@dataclass(frozen=True)
+class _EvidencePending:
+    reason: _EvidenceLimitReason
+    halt: bool
+
+
+type _EvidenceResult = _EvidenceValue | _EvidencePending
 
 
 def analyze_risk(compose: dict[str, object]) -> list[RiskFinding]:
@@ -271,7 +281,9 @@ def _is_scalar_mode_range(volume: str, start: int, end: int) -> bool:
 def _is_host_path_prefix(volume: str, end: int) -> bool:
     if end >= 1 and volume[0] == "/":
         return True
-    if end >= 2 and volume[0] in {".", "~"} and volume[1] in {"/", "\\"}:
+    if end >= 2 and volume[0] == "." and volume[1] in {"/", "\\"}:
+        return True
+    if end >= 2 and volume[0] == "~" and volume[1] == "/":
         return True
     if (
         end >= 3
@@ -314,13 +326,7 @@ def _is_ascii_letter(character: str) -> bool:
 
 
 def _is_host_path(source: str) -> bool:
-    return source.startswith(("/", "./", "../", "~/", ".\\", "..\\", "\\\\")) or bool(
-        _WINDOWS_DRIVE_PATH.match(source)
-    )
-
-
-def _is_container_path(target: str) -> bool:
-    return target.startswith(("/", "\\\\")) or bool(_WINDOWS_DRIVE_PATH.match(target))
+    return _is_host_path_prefix(source, len(source))
 
 
 def _is_docker_socket(source: str) -> bool:
@@ -386,21 +392,17 @@ def _json_safe_evidence(evidence: dict[str, object]) -> dict[str, object]:
         if budget.remaining == 0:
             return _evidence_unsupported("node_limit")
         safe_value = _json_safe_value(evidence[key], set(), 1, budget)
-        if safe_value.reason == "depth":
-            safe_evidence[key] = _evidence_unsupported("depth_limit")
-            break
-        if safe_value.reason == "node":
-            if not safe_value.stop:
-                return _evidence_unsupported("node_limit")
-            safe_evidence[key] = safe_value.value
-            break
+        if isinstance(safe_value, _EvidencePending):
+            return _evidence_unsupported(f"{safe_value.reason}_limit")
         safe_evidence[key] = safe_value.value
+        if safe_value.halt:
+            break
     return safe_evidence
 
 
 def _json_safe_value(
     value: object, active: set[int], depth: int, budget: _EvidenceBudget
-) -> _EvidenceValue:
+) -> _EvidenceResult:
     tag = _yaml_tag(value)
     if tag is not None:
         if tag not in _ALLOWED_YAML_TAGS:
@@ -412,17 +414,17 @@ def _json_safe_value(
         safe_value = _json_safe_untagged_value(
             _tagged_underlying_value(value), active, depth + 1, budget
         )
-        if safe_value.reason == "depth":
-            return _evidence_marker_result("depth")
-        if safe_value.reason == "node":
-            return _evidence_marker_result("node", stop=True)
-        return _EvidenceValue({"$yaml_tag": tag, "value": safe_value.value})
+        if isinstance(safe_value, _EvidencePending):
+            return _materialize_evidence_limit(safe_value)
+        return _EvidenceValue(
+            {"$yaml_tag": tag, "value": safe_value.value}, halt=safe_value.halt
+        )
     return _json_safe_untagged_value(value, active, depth, budget)
 
 
 def _json_safe_untagged_value(
     value: object, active: set[int], depth: int, budget: _EvidenceBudget
-) -> _EvidenceValue:
+) -> _EvidenceResult:
     if value is None or isinstance(value, (bool, int, str)):
         return _json_safe_scalar(value, budget)
     if isinstance(value, float):
@@ -434,7 +436,7 @@ def _json_safe_untagged_value(
     return _json_safe_scalar(None, budget)
 
 
-def _json_safe_scalar(value: object, budget: _EvidenceBudget) -> _EvidenceValue:
+def _json_safe_scalar(value: object, budget: _EvidenceBudget) -> _EvidenceResult:
     if not budget.consume():
         return _evidence_limit("node")
     return _EvidenceValue(value)
@@ -445,7 +447,7 @@ def _json_safe_mapping(
     active: set[int],
     depth: int,
     budget: _EvidenceBudget,
-) -> _EvidenceValue:
+) -> _EvidenceResult:
     if id(value) in active:
         return _json_safe_scalar(None, budget)
     if depth >= _MAX_EVIDENCE_DEPTH:
@@ -453,20 +455,20 @@ def _json_safe_mapping(
     if not budget.consume():
         return _evidence_limit("node")
     if not budget.reserve(len(value)):
-        return _evidence_marker_result("node", stop=True)
+        return _evidence_node_preflight_result(budget)
 
     active.add(id(value))
     try:
         safe_mapping: dict[str, object] = {}
         for key in sorted(key for key in value if isinstance(key, str)):
             if budget.remaining == 0:
-                return _evidence_marker_result("node", stop=True)
+                return _evidence_limit("node")
             safe_value = _json_safe_value(value[key], active, depth + 1, budget)
-            if safe_value.reason == "depth":
-                return _evidence_marker_result("depth")
-            if safe_value.reason == "node":
-                return _evidence_marker_result("node", stop=True)
+            if isinstance(safe_value, _EvidencePending):
+                return _materialize_evidence_limit(safe_value)
             safe_mapping[key] = safe_value.value
+            if safe_value.halt:
+                return _EvidenceValue(safe_mapping, halt=True)
         return _EvidenceValue(safe_mapping)
     finally:
         active.remove(id(value))
@@ -474,7 +476,7 @@ def _json_safe_mapping(
 
 def _json_safe_sequence(
     value: list[object], active: set[int], depth: int, budget: _EvidenceBudget
-) -> _EvidenceValue:
+) -> _EvidenceResult:
     if id(value) in active:
         return _json_safe_scalar(None, budget)
     if depth >= _MAX_EVIDENCE_DEPTH:
@@ -482,31 +484,43 @@ def _json_safe_sequence(
     if not budget.consume():
         return _evidence_limit("node")
     if len(value) > budget.remaining:
-        return _evidence_marker_result("node", stop=True)
+        return _evidence_node_preflight_result(budget)
 
     active.add(id(value))
     try:
         safe_sequence: list[object] = []
         for index in range(len(value)):
             if budget.remaining == 0:
-                return _evidence_marker_result("node", stop=True)
+                return _evidence_limit("node")
             safe_value = _json_safe_value(value[index], active, depth + 1, budget)
-            if safe_value.reason == "depth":
-                return _evidence_marker_result("depth")
-            if safe_value.reason == "node":
-                return _evidence_marker_result("node", stop=True)
+            if isinstance(safe_value, _EvidencePending):
+                return _materialize_evidence_limit(safe_value)
             safe_sequence.append(safe_value.value)
+            if safe_value.halt:
+                return _EvidenceValue(safe_sequence, halt=True)
         return _EvidenceValue(safe_sequence)
     finally:
         active.remove(id(value))
 
 
-def _evidence_limit(reason: str) -> _EvidenceValue:
-    return _EvidenceValue(None, reason)
+def _evidence_limit(reason: _EvidenceLimitReason) -> _EvidencePending:
+    return _EvidencePending(reason, halt=reason == "node")
 
 
-def _evidence_marker_result(reason: str, stop: bool = False) -> _EvidenceValue:
-    return _EvidenceValue(_evidence_unsupported(f"{reason}_limit"), reason, stop)
+def _materialize_evidence_limit(pending: _EvidencePending) -> _EvidenceValue:
+    return _evidence_marker_result(pending.reason, halt=pending.halt)
+
+
+def _evidence_node_preflight_result(budget: _EvidenceBudget) -> _EvidenceResult:
+    if budget.remaining == 0:
+        return _evidence_limit("node")
+    return _evidence_marker_result("node")
+
+
+def _evidence_marker_result(
+    reason: _EvidenceLimitReason, *, halt: bool = False
+) -> _EvidenceValue:
+    return _EvidenceValue(_evidence_unsupported(f"{reason}_limit"), halt=halt)
 
 
 def _evidence_unsupported(reason: str) -> dict[str, object]:
