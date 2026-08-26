@@ -290,6 +290,41 @@ def test_nonzero_required_probe_fails_closed_before_create(
     assert _non_help_create_calls(spawner) == []
 
 
+def test_required_probe_propagates_unconfirmed_process_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("repotrial.sandbox.docker_sbx.REAP_TIMEOUT_SECONDS", 0.01)
+    spawner = _SbxSpawner()
+    spawner.overrides[("sbx", "create", "--help")] = _Outcome(
+        hang=True, kill_error=OSError("kill denied")
+    )
+    provider = _provider(monkeypatch, spawner, command_timeout_s=0.05)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert raised.value.operation == "probe_create"
+    assert raised.value.reason == "process_cleanup_unconfirmed"
+    assert "kill denied" in raised.value.cleanup_error
+    assert "reap_timeout" in raised.value.cleanup_error
+    assert _non_help_create_calls(spawner) == []
+
+
+def test_required_probe_confirmed_timeout_remains_unsupported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    spawner.overrides[("sbx", "create", "--help")] = _Outcome(hang=True)
+    provider = _provider(monkeypatch, spawner, command_timeout_s=0.05)
+
+    with pytest.raises(DockerSbxUnsupportedError) as raised:
+        _create(provider, tmp_path)
+
+    assert raised.value.reason == "create_probe_failed"
+    assert any(process.killed and process.waited for process in spawner.processes)
+    assert _non_help_create_calls(spawner) == []
+
+
 @pytest.mark.parametrize("missing_flag", CREATE_FLAGS)
 def test_each_missing_create_boundary_fails_closed_without_target_execution(
     missing_flag: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -387,6 +422,41 @@ def test_optional_network_log_probe_does_not_weaken_create_gate(
         unsupported_reason="network_log_capability_unavailable",
     )
     assert len(spawner.calls) == calls_before_log
+
+
+def test_optional_network_log_probe_cleanup_failure_aborts_before_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("repotrial.sandbox.docker_sbx.REAP_TIMEOUT_SECONDS", 0.01)
+    spawner = _SbxSpawner()
+    spawner.overrides[("sbx", "policy", "log", "--help")] = _Outcome(
+        hang=True, kill_error=OSError("kill denied")
+    )
+    provider = _provider(monkeypatch, spawner, command_timeout_s=0.05)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert raised.value.operation == "probe_network_log"
+    assert raised.value.reason == "process_cleanup_unconfirmed"
+    assert "kill denied" in raised.value.cleanup_error
+    assert "reap_timeout" in raised.value.cleanup_error
+    assert _non_help_create_calls(spawner) == []
+
+
+def test_optional_network_log_probe_confirmed_timeout_remains_optional(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    spawner.overrides[("sbx", "policy", "log", "--help")] = _Outcome(hang=True)
+    provider = _provider(monkeypatch, spawner, command_timeout_s=0.05)
+
+    sandbox_id = _create(provider, tmp_path)
+    result = asyncio.run(provider.network_log(sandbox_id))
+
+    assert result.unsupported_reason == "network_log_capability_unavailable"
+    assert any(process.killed and process.waited for process in spawner.processes)
+    assert len(_non_help_create_calls(spawner)) == 1
 
 
 def test_failed_create_force_removes_pending_id_and_cleaned_destroy_is_noop(
@@ -1115,6 +1185,56 @@ def test_network_log_command_failure_is_unsupported_not_observed_empty(
     assert result == NetworkLogResult(
         events=[], supported=False, unsupported_reason="network_log_command_failed"
     )
+
+
+def test_network_log_propagates_unconfirmed_process_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("repotrial.sandbox.docker_sbx.REAP_TIMEOUT_SECONDS", 0.01)
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner, command_timeout_s=0.05)
+    sandbox_id = _create(provider, tmp_path)
+    command = (
+        "sbx",
+        "policy",
+        "log",
+        sandbox_id,
+        "--type",
+        "network",
+        "--json",
+    )
+    spawner.overrides[command] = _Outcome(hang=True, kill_error=OSError("kill denied"))
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(provider.network_log(sandbox_id))
+
+    assert raised.value.operation == "network_log"
+    assert raised.value.reason == "process_cleanup_unconfirmed"
+    assert "kill denied" in raised.value.cleanup_error
+    assert "reap_timeout" in raised.value.cleanup_error
+
+
+def test_network_log_confirmed_timeout_remains_unsupported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner, command_timeout_s=0.05)
+    sandbox_id = _create(provider, tmp_path)
+    command = (
+        "sbx",
+        "policy",
+        "log",
+        sandbox_id,
+        "--type",
+        "network",
+        "--json",
+    )
+    spawner.overrides[command] = _Outcome(hang=True)
+
+    result = asyncio.run(provider.network_log(sandbox_id))
+
+    assert result.unsupported_reason == "network_log_command_failed"
+    assert any(process.killed and process.waited for process in spawner.processes)
 
 
 def _non_help_create_calls(spawner: _SbxSpawner) -> list[tuple[str, ...]]:

@@ -295,7 +295,9 @@ class DockerSbxProvider(SandboxProvider):
                 ],
                 self._command_timeout_s,
             )
-        except DockerSbxError:
+        except DockerSbxError as error:
+            if error.reason == "process_cleanup_unconfirmed":
+                raise
             return _unsupported_network_log("network_log_command_failed")
         if result.returncode != 0:
             return _unsupported_network_log("network_log_command_failed")
@@ -398,7 +400,9 @@ class DockerSbxProvider(SandboxProvider):
                 ["policy", "log", "--help"],
                 self._command_timeout_s,
             )
-        except DockerSbxError:
+        except DockerSbxError as error:
+            if error.reason == "process_cleanup_unconfirmed":
+                raise
             return False
         return log_help.returncode == 0 and all(
             _has_token(log_help.stdout, token) for token in ("--type", "--json")
@@ -412,6 +416,8 @@ class DockerSbxProvider(SandboxProvider):
                 f"probe_{capability}", arguments, self._command_timeout_s
             )
         except DockerSbxError as error:
+            if error.reason == "process_cleanup_unconfirmed":
+                raise
             if capability == "version" and error.reason == "executable_unavailable":
                 raise DockerSbxUnsupportedError(
                     "sbx_unavailable", stderr=error.stderr
