@@ -15,10 +15,12 @@ repotrial = "repotrial.cli:app"
 
 [dependency-groups]
 dev = [
+    "fastapi>=0.115.0",
     "mypy>=1.13.0",
     "pytest>=8.3.0",
     "pytest-cov>=6.0.0",
     "ruff>=0.8.0",
+    "uvicorn>=0.32.0",
 ]
 
 [build-system]

@@ -1,0 +1,269 @@
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+import pytest
+
+from repotrial.domain.models import Journey
+
+FIXTURE_DIR = Path(__file__).parents[2] / "fixtures" / "app"
+PROJECT_ROOT = Path(__file__).parents[3]
+READINESS_TIMEOUT_S = 5.0
+
+
+@dataclass(frozen=True)
+class FixtureServer:
+    port: int
+    process: subprocess.Popen[str]
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+
+def _random_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _http_request(
+    url: str, *, method: str = "GET", payload: dict[str, str] | None = None
+) -> tuple[int, bytes]:
+    data = None if payload is None else json.dumps(payload).encode()
+    request = Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"} if data is not None else {},
+        method=method,
+    )
+    try:
+        with urlopen(request, timeout=1) as response:
+            return response.status, response.read()
+    except HTTPError as error:
+        return error.code, error.read()
+
+
+def _wait_for_ready(server: FixtureServer) -> None:
+    deadline = time.monotonic() + READINESS_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if server.process.poll() is not None:
+            output = (
+                server.process.stdout.read()
+                if server.process.stdout is not None
+                else ""
+            )
+            pytest.fail(f"fixture exited before readiness: {output}")
+        try:
+            status, body = _http_request(f"{server.base_url}/health")
+        except OSError:
+            time.sleep(0.02)
+            continue
+        if status == 200 and body == b'{"status":"ok"}':
+            return
+        time.sleep(0.02)
+    pytest.fail("fixture did not become ready before the bounded deadline")
+
+
+def _reap(process: subprocess.Popen[str]) -> None:
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+
+
+@contextmanager
+def _running_fixture(
+    tmp_path: Path,
+    *,
+    startup_delay_s: str | None = None,
+    proc_status: str | None = None,
+) -> Iterator[FixtureServer]:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "APP_REQUIRED_TOKEN": "contract-token",
+            "REPOTRIAL_FIXTURE_DATA_PATH": str(tmp_path / "items.json"),
+            "REPOTRIAL_FIXTURE_TMP_PATH": str(tmp_path / "repotrial.tmp"),
+            "REPOTRIAL_FIXTURE_PROC_STATUS": str(tmp_path / "status"),
+        }
+    )
+    if startup_delay_s is not None:
+        environment["STARTUP_DELAY_S"] = startup_delay_s
+    else:
+        environment.pop("STARTUP_DELAY_S", None)
+    if proc_status is not None:
+        (tmp_path / "status").write_text(proc_status, encoding="utf-8")
+    port = _random_local_port()
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "app:app",
+            "--app-dir",
+            str(FIXTURE_DIR),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    server = FixtureServer(port=port, process=process)
+    try:
+        _wait_for_ready(server)
+        yield server
+    finally:
+        _reap(process)
+
+
+def _start_process(
+    tmp_path: Path, *, token: str | None, delay: str | None = None
+) -> subprocess.Popen[str]:
+    environment = os.environ.copy()
+    if token is None:
+        environment.pop("APP_REQUIRED_TOKEN", None)
+    else:
+        environment["APP_REQUIRED_TOKEN"] = token
+    environment.update(
+        {
+            "REPOTRIAL_FIXTURE_DATA_PATH": str(tmp_path / "items.json"),
+            "REPOTRIAL_FIXTURE_TMP_PATH": str(tmp_path / "repotrial.tmp"),
+            "REPOTRIAL_FIXTURE_PROC_STATUS": str(tmp_path / "status"),
+        }
+    )
+    if delay is not None:
+        environment["STARTUP_DELAY_S"] = delay
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "app:app",
+            "--app-dir",
+            str(FIXTURE_DIR),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(_random_local_port()),
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+def test_fixture_requires_token_and_rejects_invalid_startup_delays(
+    tmp_path: Path,
+) -> None:
+    process = _start_process(tmp_path, token=None)
+    try:
+        assert process.wait(timeout=3) != 0
+    finally:
+        _reap(process)
+
+    for invalid_delay in ("-0.01", "not-a-number", "nan", "inf"):
+        process = _start_process(tmp_path, token="contract-token", delay=invalid_delay)
+        try:
+            assert process.wait(timeout=3) != 0
+        finally:
+            _reap(process)
+
+
+def test_fixture_health_crud_files_and_accessible_ui(tmp_path: Path) -> None:
+    with _running_fixture(tmp_path) as server:
+        status, body = _http_request(f"{server.base_url}/health")
+        assert (status, body) == (200, b'{"status":"ok"}')
+
+        status, body = _http_request(
+            f"{server.base_url}/items", method="POST", payload={"name": ""}
+        )
+        assert status == 422
+        assert _http_request(f"{server.base_url}/items")[1] == b"[]"
+
+        status, body = _http_request(
+            f"{server.base_url}/items", method="POST", payload={"name": "first item"}
+        )
+        assert (status, json.loads(body)) == (200, {"id": 1, "name": "first item"})
+        status, body = _http_request(
+            f"{server.base_url}/items", method="POST", payload={"name": "second item"}
+        )
+        assert (status, json.loads(body)) == (200, {"id": 2, "name": "second item"})
+        assert json.loads((tmp_path / "items.json").read_text(encoding="utf-8")) == [
+            {"id": 1, "name": "first item"},
+            {"id": 2, "name": "second item"},
+        ]
+        assert (tmp_path / "repotrial.tmp").read_text(encoding="utf-8") == "created"
+
+        status, body = _http_request(f"{server.base_url}/items")
+        assert (status, json.loads(body)) == (
+            200,
+            [{"id": 1, "name": "first item"}, {"id": 2, "name": "second item"}],
+        )
+        status, body = _http_request(f"{server.base_url}/")
+        page = body.decode()
+        assert status == 200
+        assert '<label for="item-name">Item name</label>' in page
+        assert 'aria-label="Create item"' in page
+        assert "first item" in page and "second item" in page
+        assert 'aria-label="Delete first item"' in page
+        assert 'aria-label="Delete second item"' in page
+
+        status, body = _http_request(f"{server.base_url}/items/1", method="DELETE")
+        assert (status, body) == (204, b"")
+        assert json.loads(_http_request(f"{server.base_url}/items")[1]) == [
+            {"id": 2, "name": "second item"}
+        ]
+        _assert_cap_net_raw(server, tmp_path / "status")
+
+
+def test_fixture_applies_non_negative_startup_delay(tmp_path: Path) -> None:
+    started = time.monotonic()
+    with _running_fixture(tmp_path, startup_delay_s="0.15") as server:
+        assert _http_request(f"{server.base_url}/health")[0] == 200
+    assert time.monotonic() - started >= 0.15
+
+
+def _assert_cap_net_raw(server: FixtureServer, status_path: Path) -> None:
+    cases = [
+        (None, False),
+        ("Name:\tfixture\nCapEff:\t0000000000002000\n", True),
+        ("Name:\tfixture\nCapEff:\t0000000000000000\n", False),
+        ("Name:\tfixture\nCapEff:\tnot-hex\n", False),
+    ]
+    for status_data, expected in cases:
+        if status_data is None:
+            status_path.unlink(missing_ok=True)
+        else:
+            status_path.write_text(status_data, encoding="utf-8")
+        status, body = _http_request(f"{server.base_url}/debug/cap-net-raw")
+        assert (status, json.loads(body)) == (200, {"cap_net_raw": expected})
+
+
+def test_fixture_journey_asset_is_valid_current_domain_data() -> None:
+    payload = json.loads(
+        (FIXTURE_DIR / "repotrial.journeys.json").read_text(encoding="utf-8")
+    )
+
+    journeys = [Journey.model_validate(item) for item in payload]
+
+    assert [journey.journey_id for journey in journeys] == ["health", "items"]

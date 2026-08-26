@@ -1,0 +1,32 @@
+[
+  {
+    "journey_id": "health",
+    "name": "Health check",
+    "steps": [
+      {
+        "step_id": "get-health",
+        "tool": "http",
+        "action": "request",
+        "params": {"method": "GET", "path": "/health"},
+        "assertions": [
+          {"kind": "status_code", "target": "response.status", "expected": 200}
+        ]
+      }
+    ]
+  },
+  {
+    "journey_id": "items",
+    "name": "Create and list an item",
+    "steps": [
+      {
+        "step_id": "create-item",
+        "tool": "http",
+        "action": "request",
+        "params": {"method": "POST", "path": "/items", "json": {"name": "fixture item"}},
+        "assertions": [
+          {"kind": "status_code", "target": "response.status", "expected": 200}
+        ]
+      }
+    ]
+  }
+]
