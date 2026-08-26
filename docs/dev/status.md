@@ -114,7 +114,7 @@
   were blocked by the platform content filter and produced no verdict; a
   different fresh independent reviewer then completed scoped review and
   returned APPROVED with Critical, Important, and Minor findings all None.
-- Controller fresh evidence at `c0223b0`: locked check/sync, 59 focused
+- Controller fresh evidence at `c0223b0`: `uv lock --check`, 59 focused
   tests, 142 full tests, Ruff lint/format, strict mypy, 92.23% branch coverage
   (threshold `>=85%`), pre-commit, full diff/range/status checks, and a clean
   worktree all passed locally.
