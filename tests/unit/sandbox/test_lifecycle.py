@@ -337,6 +337,139 @@ def test_cancellation_waits_for_destroy_without_leaving_background_tasks(
     ]
 
 
+def test_asyncio_run_shutdown_drains_an_already_started_destroy_child(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    destroy_started: asyncio.Event
+    parent_tasks: list[asyncio.Task[None]] = []
+    cleanup_tasks: list[asyncio.Task[object]] = []
+    shutdown_diagnostics: list[dict[str, object]] = []
+    destroy_calls: list[str] = []
+    direct_cancellations: list[asyncio.CancelledError] = []
+    destroy_completed = False
+
+    class FiniteDestroyProvider(_Provider):
+        async def destroy(self, sandbox_id: str) -> None:
+            nonlocal destroy_completed
+            destroy_calls.append(sandbox_id)
+            cleanup_task = asyncio.current_task()
+            assert cleanup_task is not None
+            cleanup_tasks.append(cleanup_task)
+            destroy_started.set()
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError as cancellation:
+                direct_cancellations.append(cancellation)
+                raise
+            destroy_completed = True
+
+    provider = FiniteDestroyProvider()
+
+    async def run_trial() -> None:
+        async with managed_sandbox(
+            provider,
+            tmp_path / "workspace",
+            "trial",
+            lifecycle_artifact=tmp_path / "lifecycle.jsonl",
+        ):
+            pass
+
+    async def abandon_parent_after_cleanup_starts() -> None:
+        nonlocal destroy_started
+        destroy_started = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(
+            lambda _loop, context: shutdown_diagnostics.append(context)
+        )
+        parent_tasks.append(asyncio.create_task(run_trial()))
+        await destroy_started.wait()
+
+    asyncio.run(abandon_parent_after_cleanup_starts())
+
+    assert destroy_completed is True
+    assert destroy_calls == ["sandbox-17", "sandbox-17"]
+    assert len(direct_cancellations) == 1
+    assert len(cleanup_tasks) == 2
+    assert cleanup_tasks[0] is cleanup_tasks[1]
+    assert cleanup_tasks[0].done() is True
+    assert cleanup_tasks[0].cancelled() is False
+    assert cleanup_tasks[0].result() is None
+    assert len(parent_tasks) == 1
+    assert parent_tasks[0].cancelled() is True
+    with pytest.raises(asyncio.CancelledError) as shutdown_result:
+        parent_tasks[0].exception()
+    assert shutdown_result.value.args == ()
+    assert shutdown_diagnostics == []
+    diagnostics = capsys.readouterr().err.lower()
+    assert "never retrieved" not in diagnostics
+    assert "unhandled exception during asyncio.run() shutdown" not in diagnostics
+    assert all(
+        "unhandled exception" not in record.message.lower() for record in caplog.records
+    )
+
+
+def test_repeated_direct_cleanup_task_cancellation_retries_until_confirmed(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> tuple[list[str], list[asyncio.CancelledError]]:
+        allow_destroy = asyncio.Event()
+        cleanup_tasks: list[asyncio.Task[object]] = []
+        destroy_calls: list[str] = []
+        direct_cancellations: list[asyncio.CancelledError] = []
+
+        class BlockingDestroyProvider(_Provider):
+            async def destroy(self, sandbox_id: str) -> None:
+                destroy_calls.append(sandbox_id)
+                cleanup_task = asyncio.current_task()
+                assert cleanup_task is not None
+                cleanup_tasks.append(cleanup_task)
+                try:
+                    await allow_destroy.wait()
+                except asyncio.CancelledError as cancellation:
+                    direct_cancellations.append(cancellation)
+                    raise
+
+        provider = BlockingDestroyProvider()
+
+        async def run_trial() -> None:
+            async with managed_sandbox(
+                provider,
+                tmp_path / "workspace",
+                "trial",
+                lifecycle_artifact=tmp_path / "lifecycle.jsonl",
+            ):
+                pass
+
+        parent_task = asyncio.create_task(run_trial())
+        while len(cleanup_tasks) < 1:
+            await asyncio.sleep(0)
+        cleanup_tasks[0].cancel("first direct cleanup cancellation")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert len(cleanup_tasks) == 2
+        cleanup_tasks[0].cancel("second direct cleanup cancellation")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert len(cleanup_tasks) == 3
+        allow_destroy.set()
+        await parent_task
+
+        assert all(task is cleanup_tasks[0] for task in cleanup_tasks)
+        assert cleanup_tasks[0].cancelled() is False
+        assert cleanup_tasks[0].result() is None
+        return destroy_calls, direct_cancellations
+
+    destroy_calls, direct_cancellations = asyncio.run(exercise())
+
+    assert destroy_calls == ["sandbox-17", "sandbox-17", "sandbox-17"]
+    assert [cancellation.args for cancellation in direct_cancellations] == [
+        ("first direct cleanup cancellation",),
+        ("second direct cleanup cancellation",),
+    ]
+
+
 def test_unopenable_artifact_prevents_provider_calls(tmp_path: Path) -> None:
     provider = _Provider()
     artifact_directory = tmp_path / "artifact-directory"
@@ -750,10 +883,14 @@ def test_annotated_destroy_cancellation_is_preserved_verbatim(tmp_path: Path) ->
     destroy_failure = asyncio.CancelledError("provider destroy cancelled")
     destroy_failure.add_note("process cleanup unconfirmed: reap_timeout")
     destroy_failure.__cause__ = destroy_cause
+    cancellation_counts: list[int] = []
 
     class DestroyFailingProvider(_Provider):
         async def destroy(self, sandbox_id: str) -> None:
             self.calls.append(("destroy", sandbox_id))
+            task = asyncio.current_task()
+            assert task is not None
+            cancellation_counts.append(task.cancelling())
             raise destroy_failure
 
     provider = DestroyFailingProvider()
@@ -777,6 +914,11 @@ def test_annotated_destroy_cancellation_is_preserved_verbatim(tmp_path: Path) ->
     ]
     assert raised.value.destroy_failure.__cause__ is destroy_cause
     assert raised.value.__cause__ is destroy_failure
+    assert cancellation_counts == [0]
+    assert provider.calls == [
+        ("create", tmp_path / "workspace", "trial"),
+        ("destroy", "sandbox-17"),
+    ]
 
 
 def test_repeated_cancellation_preserves_original_body_cancellation(

@@ -77,11 +77,19 @@ async def _destroy_boundary(
     provider: SandboxProvider,
     sandbox_id: str,
 ) -> BaseException | None:
-    try:
-        await provider.destroy(sandbox_id)
-    except _BOUNDARY_FAILURES as failure:
-        return failure
-    return None
+    while True:
+        try:
+            await provider.destroy(sandbox_id)
+        except asyncio.CancelledError as failure:
+            cleanup_task = asyncio.current_task()
+            if cleanup_task is None or cleanup_task.cancelling() == 0:
+                return failure
+            while cleanup_task.cancelling():
+                cleanup_task.uncancel()
+        except _BOUNDARY_FAILURES as failure:
+            return failure
+        else:
+            return None
 
 
 def _secondary_cause(failures: list[BaseException]) -> BaseException:
