@@ -86,6 +86,104 @@ def test_discover_compose_rejects_invalid_root_and_never_recurses(
         discover_compose(tmp_path)
 
 
+def _assert_sanitized_discovery_error(
+    error: ComposeDiscoveryError, marker: str, reason: str
+) -> None:
+    assert str(error) == f"compose discovery failed: {reason}"
+    assert marker not in str(error)
+    assert error.__cause__ is None
+    assert error.__suppress_context__
+
+
+def test_discover_compose_sanitizes_nul_root_before_traversal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    untrusted_marker = "untrusted-nul-root-marker"
+    traversals: list[str] = []
+
+    def unexpected_resolve(path: Path, *arguments: object, **keywords: object) -> Path:
+        traversals.append("resolve")
+        raise AssertionError(f"unexpected resolution: {path}")
+
+    def unexpected_iterdir(path: Path) -> object:
+        traversals.append("iterdir")
+        raise AssertionError(f"unexpected enumeration: {path}")
+
+    monkeypatch.setattr(Path, "resolve", unexpected_resolve)
+    monkeypatch.setattr(Path, "iterdir", unexpected_iterdir)
+
+    with pytest.raises(ComposeDiscoveryError) as error:
+        discover_compose(Path(f"{untrusted_marker}\0.yml"))
+
+    _assert_sanitized_discovery_error(error.value, untrusted_marker, "path_unreadable")
+    assert traversals == []
+
+
+def test_discover_compose_sanitizes_root_resolution_value_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    untrusted_marker = "root-resolution-marker"
+    original_resolve = Path.resolve
+
+    def invalid_root_resolve(
+        path: Path, *arguments: object, **keywords: object
+    ) -> Path:
+        if path == tmp_path:
+            raise ValueError(untrusted_marker)
+        return original_resolve(path, *arguments, **keywords)
+
+    monkeypatch.setattr(Path, "resolve", invalid_root_resolve)
+
+    with pytest.raises(ComposeDiscoveryError) as error:
+        discover_compose(tmp_path)
+
+    _assert_sanitized_discovery_error(error.value, untrusted_marker, "invalid_root")
+
+
+def test_discover_compose_sanitizes_fallback_enumeration_value_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    untrusted_marker = "fallback-enumeration-marker"
+    original_iterdir = Path.iterdir
+
+    def invalid_root_iterdir(path: Path) -> object:
+        if path == tmp_path:
+            raise ValueError(untrusted_marker)
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", invalid_root_iterdir)
+
+    with pytest.raises(ComposeDiscoveryError) as error:
+        discover_compose(tmp_path)
+
+    _assert_sanitized_discovery_error(error.value, untrusted_marker, "root_unreadable")
+
+
+def test_discover_compose_sanitizes_candidate_resolution_value_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = tmp_path / "compose.yml"
+    candidate.write_text("services: {}\n", encoding="utf-8")
+    untrusted_marker = "candidate-resolution-marker"
+    original_resolve = Path.resolve
+
+    def invalid_candidate_resolve(
+        path: Path, *arguments: object, **keywords: object
+    ) -> Path:
+        if path == candidate:
+            raise ValueError(untrusted_marker)
+        return original_resolve(path, *arguments, **keywords)
+
+    monkeypatch.setattr(Path, "resolve", invalid_candidate_resolve)
+
+    with pytest.raises(ComposeDiscoveryError) as error:
+        discover_compose(tmp_path)
+
+    _assert_sanitized_discovery_error(
+        error.value, untrusted_marker, "candidate_unreadable"
+    )
+
+
 def test_discover_compose_rejects_symlink_root(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()

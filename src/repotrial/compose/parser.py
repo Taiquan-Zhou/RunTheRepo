@@ -25,6 +25,8 @@ from ruamel.yaml.nodes import ScalarNode
 _MAX_COMPOSE_BYTES = 4 * 1024 * 1024
 _MAX_SEMANTIC_NODES = 100_000
 _MAX_INTEGER_DIGITS = 4_300
+# The root mapping counts toward this simultaneous collection limit.
+_MAX_OPEN_COLLECTIONS = 128
 _ALLOWED_COMPOSE_TAGS = frozenset({"!reset", "!override"})
 
 
@@ -151,6 +153,7 @@ def _validate_yaml_events(yaml: YAML, source: bytes) -> None:
     document_count = 0
     semantic_node_count = 0
     collection_anchors: list[str | None] = []
+    active_collection_anchors: dict[str, int] = {}
     for event in yaml.parse(source):
         if isinstance(event, DocumentStartEvent):
             document_count += 1
@@ -165,10 +168,26 @@ def _validate_yaml_events(yaml: YAML, source: bytes) -> None:
         if isinstance(event, ScalarEvent):
             _validate_scalar_event(event, yaml)
         if isinstance(event, (MappingStartEvent, SequenceStartEvent)):
+            if len(collection_anchors) >= _MAX_OPEN_COLLECTIONS:
+                raise _ComposeValidationError("resource_limit")
             collection_anchors.append(event.anchor)
+            if event.anchor is not None:
+                active_collection_anchors[event.anchor] = (
+                    active_collection_anchors.get(event.anchor, 0) + 1
+                )
         elif isinstance(event, (MappingEndEvent, SequenceEndEvent)):
-            collection_anchors.pop()
-        elif isinstance(event, AliasEvent) and event.anchor in collection_anchors:
+            completed_anchor = collection_anchors.pop()
+            if completed_anchor is not None:
+                active_count = active_collection_anchors[completed_anchor]
+                if active_count == 1:
+                    del active_collection_anchors[completed_anchor]
+                else:
+                    active_collection_anchors[completed_anchor] = active_count - 1
+        elif (
+            isinstance(event, AliasEvent)
+            and event.anchor is not None
+            and event.anchor in active_collection_anchors
+        ):
             raise _ComposeValidationError("cyclic_alias")
     if document_count != 1:
         raise _ComposeValidationError("document_count")

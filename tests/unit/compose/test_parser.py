@@ -26,6 +26,10 @@ def _write_compose(tmp_path: Path, content: str) -> Path:
     return compose_path
 
 
+def _nested_flow_sequence(collection_count: int, leaf: str = "value") -> str:
+    return f"items: {'[' * collection_count}{leaf}{']' * collection_count}\n"
+
+
 @dataclass(frozen=True)
 class _StatWithUnavailableInode:
     st_mode: int
@@ -490,6 +494,49 @@ def test_load_compose_rejects_event_budget_before_constructor(
 
     with pytest.raises(ComposeParseError):
         load_compose(compose_path)
+
+
+def test_load_compose_accepts_128_open_collections(tmp_path: Path) -> None:
+    compose = load_compose(_write_compose(tmp_path, _nested_flow_sequence(127)))
+
+    assert isinstance(compose["items"], list)
+
+
+def test_load_compose_rejects_129_open_collections_before_constructor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    untrusted_marker = "depth-limit-marker-must-not-leak"
+    compose_path = _write_compose(
+        tmp_path, _nested_flow_sequence(128, untrusted_marker)
+    )
+
+    def unexpected_load(instance: object, source: object) -> object:
+        raise AssertionError("unexpected constructor invocation")
+
+    monkeypatch.setattr(parser.YAML, "load", unexpected_load)
+
+    with pytest.raises(ComposeParseError) as error:
+        load_compose(compose_path)
+
+    assert str(error.value) == "compose parse failed: resource_limit"
+    assert untrusted_marker not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__suppress_context__
+
+
+def test_load_compose_preserves_shallow_alias_and_rejects_shallow_cycle(
+    tmp_path: Path,
+) -> None:
+    shared = load_compose(
+        _write_compose(
+            tmp_path,
+            "services:\n  base: &base {image: nginx}\n  app: *base\n",
+        )
+    )
+
+    assert shared["services"]["app"] is shared["services"]["base"]
+    with pytest.raises(ComposeParseError):
+        load_compose(_write_compose(tmp_path, "loop: &loop [*loop]\n"))
 
 
 def test_load_compose_rejects_pathological_integer_before_constructor(

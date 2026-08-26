@@ -61,7 +61,7 @@ def discover_compose(root: Path) -> Path:
     _require_root_identity(root, normalized_root, root_identity)
     try:
         direct_children = list(normalized_root.iterdir())
-    except OSError:
+    except (OSError, ValueError):
         raise ComposeDiscoveryError("root_unreadable") from None
     _require_root_identity(root, normalized_root, root_identity)
     for candidate in direct_children:
@@ -95,7 +95,7 @@ def _normalize_root(root: Path) -> tuple[Path, _PathIdentity]:
     root_identity = _identity(root_stat)
     try:
         normalized_root = root.resolve(strict=True)
-    except OSError:
+    except (OSError, ValueError):
         raise ComposeDiscoveryError("invalid_root") from None
     _require_root_identity(root, normalized_root, root_identity)
     return normalized_root, root_identity
@@ -113,7 +113,7 @@ def _lstat(path: Path) -> os.stat_result | None:
         return path.lstat()
     except FileNotFoundError:
         return None
-    except OSError:
+    except (OSError, ValueError):
         raise ComposeDiscoveryError("path_unreadable") from None
 
 
@@ -127,7 +127,7 @@ def _normalize_candidate(
     _require_root_identity(root, normalized_root, root_identity)
     try:
         normalized_candidate = candidate.resolve(strict=True)
-    except OSError:
+    except (OSError, ValueError):
         raise ComposeDiscoveryError("candidate_unreadable") from None
     _require_root_identity(root, normalized_root, root_identity)
     _require_file_identity(candidate, candidate_identity)
