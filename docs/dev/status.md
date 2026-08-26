@@ -125,8 +125,8 @@
   `YAML.load`; this does not claim general parser resource immunity. Canonical
   JSON is typed hash material, not source reserialization, and only tested
   root-level discovery behavior is claimed.
-- No push or remote GitHub Actions run was performed. M1.3 remains unstarted
-  and unauthorized in this run.
+- No push or remote GitHub Actions run was performed. In that M1.2 run, M1.3
+  remained unstarted and unauthorized; the later M1.3 result is recorded below.
 
 ## M1.3 — deterministic baseline risk findings
 
@@ -157,8 +157,10 @@
   Independent reproductions covered short/long host-path parity, manual and
   parser-loaded depth preservation, nested/exhaustion accounting, and the live
   colon-rich scanner path.
-- Controller fresh evidence at `c88d86c`: focused I1 (`40 passed`), I2
-  (`10 passed`), and I3 (`1 passed`) selections; `test_risk.py` (`79 passed`),
+- Controller fresh evidence at `c88d86c`: the I1 selector covering tilde
+  backslash parity plus the short/long and source-target matrices (`40 passed`),
+  focused I2 (`10 passed`), and focused I3 (`1 passed`) selections;
+  `test_risk.py` (`79 passed`),
   Compose unit tests (`138 passed`), and full tests (`221 passed`); Ruff
   lint/format, strict mypy, 91.44% branch coverage (M1.3 risk module 90%),
   pre-commit, lock, diff, HEAD/scope, and clean-status checks passed locally.
