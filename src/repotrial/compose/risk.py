@@ -3,34 +3,33 @@
 import math
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import TaggedScalar
+from ruamel.yaml.error import YAMLError
 from ruamel.yaml.nodes import ScalarNode
 
 from repotrial.domain.models import RiskFinding
 
 _WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
+_SCALAR_MODE_TOKEN = re.compile(r"^[A-Za-z0-9._-]+$")
 _ALLOWED_YAML_TAGS = frozenset({"!override", "!reset"})
-_SHORT_VOLUME_MODE_TOKENS = frozenset(
-    {
-        "cached",
-        "consistent",
-        "delegated",
-        "private",
-        "ro",
-        "rprivate",
-        "rshared",
-        "rslave",
-        "rw",
-        "shared",
-        "slave",
-        "z",
-        "Z",
-    }
-)
+_MAX_EVIDENCE_DEPTH = 48
+_MAX_EVIDENCE_NODES = 10_000
 _RESET = object()
 _UNSUPPORTED = object()
+
+
+@dataclass
+class _EvidenceBudget:
+    nodes: int = 0
+
+    def consume(self) -> bool:
+        if self.nodes >= _MAX_EVIDENCE_NODES:
+            return False
+        self.nodes += 1
+        return True
 
 
 def analyze_risk(compose: dict[str, object]) -> list[RiskFinding]:
@@ -187,27 +186,46 @@ def _recognized_host_bind(volume: object) -> tuple[str, bool] | None:
 
 
 def _short_host_bind(volume: str) -> tuple[str, bool] | None:
-    source_and_target, mode = _split_short_volume_mode(volume)
-    source, separator, target = source_and_target.rpartition(":")
-    if not separator or not target or not _is_host_path(source):
+    candidates: list[tuple[str, str | None]] = []
+    no_mode = _short_source_target(volume)
+    if no_mode is not None:
+        candidates.append((no_mode[0], None))
+
+    source_and_target, separator, candidate_mode = volume.rpartition(":")
+    if separator and _is_scalar_mode(candidate_mode):
+        with_mode = _short_source_target(source_and_target)
+        if with_mode is not None:
+            candidates.append((with_mode[0], candidate_mode))
+
+    if len(candidates) != 1:
         return None
+    source, mode = candidates[0]
     return source, mode is None or "ro" not in mode.split(",")
 
 
-def _split_short_volume_mode(volume: str) -> tuple[str, str | None]:
-    source_and_target, separator, candidate = volume.rpartition(":")
-    if not separator:
-        return volume, None
-    tokens = candidate.split(",")
-    if "," in candidate or all(token in _SHORT_VOLUME_MODE_TOKENS for token in tokens):
-        return source_and_target, candidate
-    return volume, None
+def _short_source_target(volume: str) -> tuple[str, str] | None:
+    source, separator, target = volume.rpartition(":")
+    if not separator or not _is_host_path(source) or not _is_container_path(target):
+        return None
+    return source, target
+
+
+def _is_scalar_mode(mode: str) -> bool:
+    tokens = mode.split(",")
+    return bool(tokens) and all(
+        bool(token) and _SCALAR_MODE_TOKEN.fullmatch(token) is not None
+        for token in tokens
+    )
 
 
 def _is_host_path(source: str) -> bool:
     return source.startswith(("/", "./", "../", "~/", ".\\", "..\\", "\\\\")) or bool(
         _WINDOWS_DRIVE_PATH.match(source)
     )
+
+
+def _is_container_path(target: str) -> bool:
+    return target.startswith(("/", "\\\\")) or bool(_WINDOWS_DRIVE_PATH.match(target))
 
 
 def _is_docker_socket(source: str) -> bool:
@@ -253,56 +271,77 @@ def _tagged_underlying_value(value: object) -> object:
         return _UNSUPPORTED
     if value.style is not None:
         return scalar_value
-    yaml = YAML(typ="rt", pure=True)
-    resolved_tag = yaml.resolver.resolve(ScalarNode, scalar_value, (True, False))
-    return yaml.constructor.construct_object(
-        ScalarNode(tag=resolved_tag, value=scalar_value)
-    )
+    try:
+        yaml = YAML(typ="rt", pure=True)
+        resolved_tag = yaml.resolver.resolve(ScalarNode, scalar_value, (True, False))
+        return yaml.constructor.construct_object(
+            ScalarNode(tag=resolved_tag, value=scalar_value)
+        )
+    except (OverflowError, RecursionError, UnicodeError, ValueError, YAMLError):
+        return _UNSUPPORTED
 
 
 def _json_safe_evidence(evidence: dict[str, object]) -> dict[str, object]:
+    budget = _EvidenceBudget()
     return {
-        key: _json_safe_value(value, set()) for key, value in sorted(evidence.items())
+        key: _json_safe_value(value, set(), 0, budget)
+        for key, value in sorted(evidence.items())
     }
 
 
-def _json_safe_value(value: object, active: set[int]) -> object:
+def _json_safe_value(
+    value: object, active: set[int], depth: int, budget: _EvidenceBudget
+) -> object:
+    if not budget.consume():
+        return _evidence_unsupported("node_limit")
     tag = _yaml_tag(value)
     if tag is not None:
         if tag not in _ALLOWED_YAML_TAGS:
             return None
         return {
             "$yaml_tag": tag,
-            "value": _json_safe_untagged_value(_tagged_underlying_value(value), active),
+            "value": _json_safe_untagged_value(
+                _tagged_underlying_value(value), active, depth, budget
+            ),
         }
-    return _json_safe_untagged_value(value, active)
+    return _json_safe_untagged_value(value, active, depth, budget)
 
 
-def _json_safe_untagged_value(value: object, active: set[int]) -> object:
+def _json_safe_untagged_value(
+    value: object, active: set[int], depth: int, budget: _EvidenceBudget
+) -> object:
     if value is None or isinstance(value, (bool, int, str)):
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, Mapping):
+        if depth >= _MAX_EVIDENCE_DEPTH:
+            return _evidence_unsupported("depth_limit")
         if id(value) in active:
             return None
         active.add(id(value))
         try:
             return {
-                key: _json_safe_value(value[key], active)
+                key: _json_safe_value(value[key], active, depth + 1, budget)
                 for key in sorted(key for key in value if isinstance(key, str))
             }
         finally:
             active.remove(id(value))
     if isinstance(value, list):
+        if depth >= _MAX_EVIDENCE_DEPTH:
+            return _evidence_unsupported("depth_limit")
         if id(value) in active:
             return None
         active.add(id(value))
         try:
-            return [_json_safe_value(item, active) for item in value]
+            return [_json_safe_value(item, active, depth + 1, budget) for item in value]
         finally:
             active.remove(id(value))
     return None
+
+
+def _evidence_unsupported(reason: str) -> dict[str, str]:
+    return {"$evidence_unsupported": reason}
 
 
 def _add_finding(

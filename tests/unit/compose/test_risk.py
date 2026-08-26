@@ -3,6 +3,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
+from ruamel.yaml.comments import TaggedScalar
 
 from repotrial.compose.parser import load_compose
 from repotrial.compose.risk import analyze_risk, risk_score
@@ -22,6 +23,22 @@ def _load_compose(tmp_path: Path, content: str) -> dict[str, object]:
 def _assert_findings_are_json_safe(findings: list[RiskFinding]) -> None:
     for finding in findings:
         assert json.loads(finding.model_dump_json())["evidence"] == finding.evidence
+
+
+def _nested_list(depth: int, leaf: object) -> list[object]:
+    nested: object = leaf
+    for _ in range(depth):
+        nested = [nested]
+    assert isinstance(nested, list)
+    return nested
+
+
+def _depth_limited_value(value: object) -> object:
+    nested = value
+    for _ in range(48):
+        assert isinstance(nested, list)
+        nested = nested[0]
+    return nested
 
 
 def test_analyze_risk_emits_every_kind_with_exact_evidence() -> None:
@@ -280,6 +297,32 @@ def test_analyze_risk_parses_short_volumes_from_right_and_honors_ro_mode_token()
     ]
 
 
+def test_analyze_risk_validates_short_volume_mode_candidates() -> None:
+    volumes = [
+        "/var/run/docker.sock:/container:custom",
+        "/var/run/docker.sock:/container:rocustom",
+        "/var/run/docker.sock:/container,archive",
+    ]
+
+    findings = analyze_risk({"services": {"app": {"volumes": volumes}}})
+
+    assert _finding_data(
+        [
+            finding
+            for finding in findings
+            if finding.kind in {"docker_socket_rw", "rw_host_bind"}
+        ]
+    ) == [
+        {
+            "finding_id": "docker_socket_rw:app",
+            "kind": "docker_socket_rw",
+            "service": "app",
+            "severity": 90,
+            "evidence": {"volumes": volumes},
+        }
+    ]
+
+
 def test_analyze_risk_applies_override_tags_and_preserves_json_safe_evidence(
     tmp_path: Path,
 ) -> None:
@@ -495,6 +538,73 @@ def test_analyze_risk_excludes_unsupported_manual_evidence_values() -> None:
         },
     ]
     _assert_findings_are_json_safe(findings)
+
+
+@pytest.mark.parametrize("value", ["9" * 5_000, "2026-02-30"])
+def test_analyze_risk_sanitizes_invalid_allowed_tagged_scalars(value: str) -> None:
+    tagged_value = TaggedScalar(value=value, tag="!override")
+    findings = analyze_risk(
+        {"services": {"app": {"user": tagged_value, "read_only": tagged_value}}}
+    )
+
+    assert _finding_data(findings) == [
+        {
+            "finding_id": "writable_rootfs:app",
+            "kind": "writable_rootfs",
+            "service": "app",
+            "severity": 25,
+            "evidence": {
+                "read_only": {"$yaml_tag": "!override", "value": None},
+                "declared": True,
+            },
+        }
+    ]
+    _assert_findings_are_json_safe(findings)
+
+
+def test_analyze_risk_limits_real_parser_evidence_depth(tmp_path: Path) -> None:
+    nested_flow = "[" * 120 + "NET_ADMIN" + "]" * 120
+    compose = _load_compose(
+        tmp_path,
+        f"services:\n  app:\n    cap_add: {nested_flow}\n",
+    )
+
+    findings = analyze_risk(compose)
+
+    _assert_findings_are_json_safe(findings)
+    cap_add = next(finding for finding in findings if finding.kind == "cap_add")
+    assert _depth_limited_value(cap_add.evidence["cap_add"]) == {
+        "$evidence_unsupported": "depth_limit"
+    }
+
+
+def test_analyze_risk_limits_manual_acyclic_evidence_depth() -> None:
+    cap_add = _nested_list(500, "NET_ADMIN")
+    compose = {"services": {"app": {"cap_add": cap_add}}}
+
+    findings = analyze_risk(compose)
+
+    _assert_findings_are_json_safe(findings)
+    finding = next(finding for finding in findings if finding.kind == "cap_add")
+    assert _depth_limited_value(finding.evidence["cap_add"]) == {
+        "$evidence_unsupported": "depth_limit"
+    }
+    assert _depth_limited_value(cap_add) != {"$evidence_unsupported": "depth_limit"}
+
+
+def test_analyze_risk_marks_evidence_after_node_budget() -> None:
+    cap_add = [None] * 10_001
+    findings = analyze_risk({"services": {"app": {"cap_add": cap_add}}})
+
+    _assert_findings_are_json_safe(findings)
+    finding = next(finding for finding in findings if finding.kind == "cap_add")
+    evidence = finding.evidence["cap_add"]
+    assert isinstance(evidence, list)
+    assert evidence[:9_999] == [None] * 9_999
+    assert evidence[9_999:] == [
+        {"$evidence_unsupported": "node_limit"},
+        {"$evidence_unsupported": "node_limit"},
+    ]
 
 
 @pytest.mark.parametrize(
