@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, cast
 
 from pydantic import BaseModel, Field
 
@@ -15,6 +16,46 @@ class NetworkLogResult(BaseModel):
     events: list[dict[str, Any]] = Field(default_factory=list)
     supported: bool
     unsupported_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PartialCreateCleanupContext:
+    """Owned sandbox identity and failures from an unconfirmed create cleanup."""
+
+    sandbox_id: str
+    create_failure: BaseException
+    cleanup_failure: BaseException
+
+
+class _PartialCreateCleanupCarrier(Protocol):
+    partial_create_cleanup: PartialCreateCleanupContext
+
+
+def attach_partial_create_cleanup_context(
+    create_failure: BaseException,
+    sandbox_id: str,
+    cleanup_failure: BaseException,
+) -> PartialCreateCleanupContext:
+    context = PartialCreateCleanupContext(
+        sandbox_id=sandbox_id,
+        create_failure=create_failure,
+        cleanup_failure=cleanup_failure,
+    )
+    carrier = cast(_PartialCreateCleanupCarrier, create_failure)
+    carrier.partial_create_cleanup = context
+    return context
+
+
+def get_partial_create_cleanup_context(
+    create_failure: BaseException,
+) -> PartialCreateCleanupContext | None:
+    context = getattr(create_failure, "partial_create_cleanup", None)
+    if (
+        isinstance(context, PartialCreateCleanupContext)
+        and context.create_failure is create_failure
+    ):
+        return context
+    return None
 
 
 class SandboxProvider(ABC):
@@ -38,4 +79,6 @@ class SandboxProvider(ABC):
     async def network_log(self, sandbox_id: str) -> NetworkLogResult: ...
 
     @abstractmethod
-    async def destroy(self, sandbox_id: str) -> None: ...
+    async def destroy(self, sandbox_id: str) -> None:
+        """Retry-safe cleanup for owned IDs; unknown or unowned IDs fail closed."""
+        ...

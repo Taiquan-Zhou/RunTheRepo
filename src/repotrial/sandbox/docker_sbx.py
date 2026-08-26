@@ -10,7 +10,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, NoReturn
 
-from .base import ExecResult, NetworkLogResult, SandboxProvider
+from .base import (
+    ExecResult,
+    NetworkLogResult,
+    SandboxProvider,
+    attach_partial_create_cleanup_context,
+)
 
 MAX_OUTPUT_BYTES = 65_536
 MAX_NETWORK_EVENTS = 100
@@ -186,6 +191,7 @@ class DockerSbxProvider(SandboxProvider):
 
     async def create(self, workspace: Path, name: str) -> str:
         network_log_supported = await self._probe()
+        self._require_runtime_policy_enforcement()
         sandbox_id = _new_sandbox_id(name)
         self._sandbox_states[sandbox_id] = _SandboxState.PENDING
         arguments = [
@@ -211,11 +217,20 @@ class DockerSbxProvider(SandboxProvider):
             result = await self._run("create", arguments, self._command_timeout_s)
             _require_success("create", result)
         except (DockerSbxError, asyncio.CancelledError) as error:
-            await self._cleanup_after_uncertain_failure(sandbox_id, error)
+            await self._cleanup_after_uncertain_failure(
+                sandbox_id,
+                error,
+                partial_create=True,
+            )
         self._sandbox_states[sandbox_id] = _SandboxState.ACTIVE
         if network_log_supported:
             self._network_log_sandboxes.add(sandbox_id)
         return sandbox_id
+
+    def _require_runtime_policy_enforcement(self) -> None:
+        raise DockerSbxUnsupportedError(
+            "runtime_policy_enforcement_unproven:pids,disk,total_duration"
+        )
 
     async def exec(
         self, sandbox_id: str, argv: list[str], timeout_s: int = 60
@@ -329,7 +344,11 @@ class DockerSbxProvider(SandboxProvider):
         self._network_log_sandboxes.discard(sandbox_id)
 
     async def _cleanup_after_uncertain_failure(
-        self, sandbox_id: str, primary_error: DockerSbxError | asyncio.CancelledError
+        self,
+        sandbox_id: str,
+        primary_error: DockerSbxError | asyncio.CancelledError,
+        *,
+        partial_create: bool = False,
     ) -> NoReturn:
         cleanup_task = asyncio.create_task(
             self._force_destroy(sandbox_id, operation="cleanup")
@@ -350,11 +369,19 @@ class DockerSbxProvider(SandboxProvider):
         if cleanup_error is not None:
             self._sandbox_states[sandbox_id] = _SandboxState.CLEANUP_UNSAFE
             detail = str(cleanup_error)
+            if partial_create:
+                attach_partial_create_cleanup_context(
+                    primary_error,
+                    sandbox_id,
+                    cleanup_error,
+                )
             if cancellation is not None:
                 cancellation.add_note(
                     f"sandbox cleanup unconfirmed: {sandbox_id}: {detail}"
                 )
                 raise cancellation
+            if partial_create:
+                raise primary_error
             assert isinstance(primary_error, DockerSbxError)
             raise DockerSbxError(
                 primary_error.operation,

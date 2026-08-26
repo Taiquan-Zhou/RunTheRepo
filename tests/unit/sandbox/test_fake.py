@@ -213,7 +213,7 @@ def test_constructor_defensively_copies_script_and_port_mappings(
     )
 
 
-def test_all_operations_reject_destroyed_and_unknown_sandboxes_in_audited_order(
+def test_operations_reject_inactive_while_destroy_is_retry_safe_and_audited(
     tmp_path: Path,
 ) -> None:
     local_path = tmp_path / "must-not-exist.txt"
@@ -236,8 +236,11 @@ def test_all_operations_reject_destroyed_and_unknown_sandboxes_in_audited_order(
                 await provider.copy(inactive_id, "/result.txt", local_path)
             with pytest.raises(RuntimeError, match="sandbox is not active"):
                 await provider.network_log(inactive_id)
-            with pytest.raises(RuntimeError, match="sandbox is not active"):
+            if inactive_id == destroyed_id:
                 await provider.destroy(inactive_id)
+            else:
+                with pytest.raises(RuntimeError, match="sandbox is not active"):
+                    await provider.destroy(inactive_id)
 
         return await provider.exec(active_id, ["status"])
 

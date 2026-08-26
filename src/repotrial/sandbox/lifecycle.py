@@ -6,7 +6,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NoReturn, TextIO
 
-from repotrial.sandbox.base import SandboxProvider
+from repotrial.sandbox.base import (
+    PartialCreateCleanupContext,
+    SandboxProvider,
+    get_partial_create_cleanup_context,
+)
 
 # Audit and provider boundaries must retain process-control failures until cleanup.
 _BOUNDARY_FAILURES = (BaseException,)
@@ -19,6 +23,8 @@ class CleanupError(RuntimeError):
         destroy_failure: BaseException,
         body_failure: BaseException | None,
         *,
+        create_failure: BaseException | None = None,
+        initial_cleanup_failure: BaseException | None = None,
         audit_failures: tuple[BaseException, ...] = (),
         secondary_failures: tuple[BaseException, ...] = (),
     ) -> None:
@@ -26,6 +32,8 @@ class CleanupError(RuntimeError):
         self.sandbox_id = sandbox_id
         self.destroy_failure = destroy_failure
         self.body_failure = body_failure
+        self.create_failure = create_failure
+        self.initial_cleanup_failure = initial_cleanup_failure
         self.audit_failures = audit_failures
         self.secondary_failures = secondary_failures
 
@@ -43,12 +51,19 @@ def _write_event(
     event: str,
     sandbox_id: str | None = None,
     exception: BaseException | None = None,
+    *,
+    state: str | None = None,
+    cleanup_exception: BaseException | None = None,
 ) -> None:
     record = {"event": event}
     if sandbox_id is not None:
         record["sandbox_id"] = sandbox_id
     if exception is not None:
         record["exception_type"] = type(exception).__name__
+    if state is not None:
+        record["state"] = state
+    if cleanup_exception is not None:
+        record["cleanup_exception_type"] = type(cleanup_exception).__name__
     artifact.write(json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n")
     artifact.flush()
 
@@ -59,9 +74,19 @@ def _record_event(
     event: str,
     sandbox_id: str | None = None,
     exception: BaseException | None = None,
+    *,
+    state: str | None = None,
+    cleanup_exception: BaseException | None = None,
 ) -> None:
     try:
-        _write_event(artifact, event, sandbox_id, exception)
+        _write_event(
+            artifact,
+            event,
+            sandbox_id,
+            exception,
+            state=state,
+            cleanup_exception=cleanup_exception,
+        )
     except _BOUNDARY_FAILURES as failure:
         outcome.audit_failures.append(failure)
 
@@ -133,6 +158,59 @@ def _raise_outcome(outcome: _Outcome, sandbox_id: str) -> None:
         _raise_primary(outcome.audit_failures[0], outcome.audit_failures[1:])
 
 
+async def _retry_partial_create_cleanup(
+    provider: SandboxProvider,
+    context: PartialCreateCleanupContext,
+    create_failure: BaseException,
+    artifact: TextIO,
+    outcome: _Outcome,
+) -> NoReturn:
+    sandbox_id = context.sandbox_id
+    _record_event(
+        outcome,
+        artifact,
+        "create_cleanup_unsafe",
+        sandbox_id,
+        create_failure,
+        state="cleanup_unsafe",
+        cleanup_exception=context.cleanup_failure,
+    )
+    _record_event(outcome, artifact, "cleanup_retry_attempt", sandbox_id)
+    cleanup_task = asyncio.create_task(_destroy_boundary(provider, sandbox_id))
+    while not cleanup_task.done():
+        try:
+            await asyncio.wait({cleanup_task})
+        except asyncio.CancelledError as cancellation:
+            outcome.cancellations.append(cancellation)
+    retry_failure = cleanup_task.result()
+    if retry_failure is None:
+        _record_event(outcome, artifact, "cleanup_retry_success", sandbox_id)
+        _close_artifact(outcome, artifact)
+        _raise_primary(
+            create_failure,
+            [*outcome.audit_failures, *outcome.cancellations],
+        )
+
+    _record_event(
+        outcome,
+        artifact,
+        "cleanup_retry_failure",
+        sandbox_id,
+        retry_failure,
+    )
+    _close_artifact(outcome, artifact)
+    cleanup_error = CleanupError(
+        sandbox_id,
+        retry_failure,
+        None,
+        create_failure=create_failure,
+        initial_cleanup_failure=context.cleanup_failure,
+        audit_failures=tuple(outcome.audit_failures),
+        secondary_failures=tuple(outcome.cancellations),
+    )
+    raise cleanup_error from retry_failure
+
+
 def _validate_artifact_destination(workspace: Path, artifact: Path) -> None:
     resolved_workspace = workspace.resolve(strict=False)
     resolved_artifact = artifact.resolve(strict=False)
@@ -159,6 +237,15 @@ async def managed_sandbox(
     try:
         sandbox_id = await provider.create(workspace, name)
     except _BOUNDARY_FAILURES as create_failure:
+        partial_cleanup = get_partial_create_cleanup_context(create_failure)
+        if partial_cleanup is not None:
+            await _retry_partial_create_cleanup(
+                provider,
+                partial_cleanup,
+                create_failure,
+                artifact,
+                pre_create,
+            )
         _record_event(
             pre_create,
             artifact,

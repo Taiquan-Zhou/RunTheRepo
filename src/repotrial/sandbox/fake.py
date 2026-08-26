@@ -18,6 +18,7 @@ class FakeSandboxProvider(SandboxProvider):
             supported=False,
             unsupported_reason="network logging is not supported by FakeSandboxProvider",
         )
+        self._owned_sandboxes: set[str] = set()
         self._active_sandboxes: set[str] = set()
         self._next_sandbox_number = 1
         self.calls: list[tuple[object, ...]] = []
@@ -26,6 +27,7 @@ class FakeSandboxProvider(SandboxProvider):
         self.calls.append(("create", workspace, name))
         sandbox_id = f"sandbox-{self._next_sandbox_number}"
         self._next_sandbox_number += 1
+        self._owned_sandboxes.add(sandbox_id)
         self._active_sandboxes.add(sandbox_id)
         return sandbox_id
 
@@ -65,8 +67,9 @@ class FakeSandboxProvider(SandboxProvider):
 
     async def destroy(self, sandbox_id: str) -> None:
         self.calls.append(("destroy", sandbox_id))
-        self._require_active(sandbox_id)
-        self._active_sandboxes.remove(sandbox_id)
+        if sandbox_id not in self._owned_sandboxes:
+            raise RuntimeError(f"sandbox is not active: {sandbox_id}")
+        self._active_sandboxes.discard(sandbox_id)
 
     def _require_active(self, sandbox_id: str) -> None:
         if sandbox_id not in self._active_sandboxes:

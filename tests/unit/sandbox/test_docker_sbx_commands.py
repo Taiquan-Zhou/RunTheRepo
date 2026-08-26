@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,8 @@ from repotrial.sandbox.docker_sbx import (
     DockerSbxProvider,
     DockerSbxUnsupportedError,
 )
+from repotrial.sandbox.fake import FakeSandboxProvider
+from repotrial.sandbox.lifecycle import CleanupError, managed_sandbox
 
 CREATE_FLAGS = (
     "--name",
@@ -159,10 +162,12 @@ def _provider(
     command_timeout_s: float = 5,
 ) -> DockerSbxProvider:
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawner)
-    return DockerSbxProvider(
+    provider = DockerSbxProvider(
         _policy(deny_network=frozenset({"example.internal"})),
         command_timeout_s=command_timeout_s,
     )
+    monkeypatch.setattr(provider, "_require_runtime_policy_enforcement", lambda: None)
+    return provider
 
 
 def _create(provider: DockerSbxProvider, workspace: Path) -> str:
@@ -371,6 +376,26 @@ def test_missing_required_operation_flag_prevents_create(
     assert _non_help_create_calls(spawner) == []
 
 
+def test_complete_help_tokens_cannot_attest_runtime_policy_enforcement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawner)
+    provider = DockerSbxProvider(_policy())
+
+    with pytest.raises(DockerSbxUnsupportedError) as raised:
+        _create(provider, tmp_path)
+
+    assert (
+        raised.value.reason
+        == "runtime_policy_enforcement_unproven:pids,disk,total_duration"
+    )
+    assert _non_help_create_calls(spawner) == []
+    assert not any(
+        call[:2] == ("sbx", "exec") and call[-1] != "--help" for call in spawner.calls
+    )
+
+
 def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -503,9 +528,11 @@ def test_failed_create_cleanup_failure_is_visible_and_retained_for_retry(
 
     create_call = _actual_create_call(spawner)
     sandbox_id = create_call[create_call.index("--name") + 1]
-    assert raised.value.reason == "cleanup_unconfirmed"
-    assert raised.value.sandbox_id == sandbox_id
-    assert "cleanup failed" in raised.value.cleanup_error
+    assert raised.value.reason == "nonzero_exit"
+    context = raised.value.partial_create_cleanup
+    assert context.create_failure is raised.value
+    assert context.sandbox_id == sandbox_id
+    assert "cleanup failed" in str(context.cleanup_failure)
 
     spawner.handler = lambda command: _Outcome()
     asyncio.run(provider.destroy(sandbox_id))
@@ -594,6 +621,161 @@ def test_cancelled_create_cleanup_failure_reports_id_and_remains_retryable(
         await provider.destroy(sandbox_id)
 
     asyncio.run(exercise())
+
+
+def test_managed_sandbox_retries_partial_create_cleanup_and_preserves_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    remove_attempts = 0
+
+    def outcome(command: tuple[str, ...]) -> _Outcome:
+        nonlocal remove_attempts
+        if command[:2] == ("sbx", "create") and command[-1] != "--help":
+            return _Outcome(returncode=7, stderr=b"create failed")
+        if command[:3] == ("sbx", "rm", "--force"):
+            remove_attempts += 1
+            if remove_attempts == 1:
+                return _Outcome(returncode=8, stderr=b"initial cleanup failed")
+        return _Outcome()
+
+    spawner.handler = outcome
+    provider = _provider(monkeypatch, spawner)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifact = tmp_path / "lifecycle.jsonl"
+
+    async def exercise() -> None:
+        async with managed_sandbox(
+            provider, workspace, "trial", lifecycle_artifact=artifact
+        ):
+            raise AssertionError("partial create must not yield")
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(exercise())
+
+    create_failure = raised.value
+    context = create_failure.partial_create_cleanup
+    sandbox_id = context.sandbox_id
+    assert create_failure.reason == "nonzero_exit"
+    assert context.create_failure is create_failure
+    assert context.cleanup_failure.operation == "cleanup"
+    assert remove_attempts == 2
+    events = [json.loads(line) for line in artifact.read_text().splitlines()]
+    assert events[1:] == [
+        {
+            "cleanup_exception_type": "DockerSbxError",
+            "event": "create_cleanup_unsafe",
+            "exception_type": "DockerSbxError",
+            "sandbox_id": sandbox_id,
+            "state": "cleanup_unsafe",
+        },
+        {"event": "cleanup_retry_attempt", "sandbox_id": sandbox_id},
+        {"event": "cleanup_retry_success", "sandbox_id": sandbox_id},
+    ]
+    calls_before_repeat = len(spawner.calls)
+    asyncio.run(provider.destroy(sandbox_id))
+    assert len(spawner.calls) == calls_before_repeat
+
+
+def test_managed_sandbox_retries_cancelled_partial_create_and_preserves_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    remove_attempts = 0
+
+    def outcome(command: tuple[str, ...]) -> _Outcome:
+        nonlocal remove_attempts
+        if command[:2] == ("sbx", "create") and command[-1] != "--help":
+            return _Outcome(hang=True)
+        if command[:3] == ("sbx", "rm", "--force"):
+            remove_attempts += 1
+            if remove_attempts == 1:
+                return _Outcome(returncode=9, stderr=b"cleanup blocked")
+        return _Outcome()
+
+    spawner.handler = outcome
+    provider = _provider(monkeypatch, spawner)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifact = tmp_path / "lifecycle.jsonl"
+
+    async def exercise() -> asyncio.CancelledError:
+        async def manage() -> None:
+            async with managed_sandbox(
+                provider, workspace, "trial", lifecycle_artifact=artifact
+            ):
+                raise AssertionError("partial create must not yield")
+
+        task = asyncio.create_task(manage())
+        while not _non_help_create_calls(spawner):
+            await asyncio.sleep(0)
+        task.cancel("original create cancellation")
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        return raised.value
+
+    cancellation = asyncio.run(exercise())
+    context = cancellation.partial_create_cleanup
+    assert context.create_failure is cancellation
+    assert cancellation.args == ("original create cancellation",)
+    assert remove_attempts == 2
+    events = [json.loads(line) for line in artifact.read_text().splitlines()]
+    assert events[1]["event"] == "create_cleanup_unsafe"
+    assert events[1]["state"] == "cleanup_unsafe"
+    assert events[1]["sandbox_id"] == context.sandbox_id
+    assert events[-1] == {
+        "event": "cleanup_retry_success",
+        "sandbox_id": context.sandbox_id,
+    }
+
+
+def test_managed_sandbox_partial_create_retry_failure_retains_all_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+
+    def outcome(command: tuple[str, ...]) -> _Outcome:
+        if command[:2] == ("sbx", "create") and command[-1] != "--help":
+            return _Outcome(returncode=7, stderr=b"create failed")
+        if command[:3] == ("sbx", "rm", "--force"):
+            return _Outcome(returncode=8, stderr=b"cleanup failed")
+        return _Outcome()
+
+    spawner.handler = outcome
+    provider = _provider(monkeypatch, spawner)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifact = tmp_path / "lifecycle.jsonl"
+
+    async def exercise() -> None:
+        async with managed_sandbox(
+            provider, workspace, "trial", lifecycle_artifact=artifact
+        ):
+            raise AssertionError("partial create must not yield")
+
+    with pytest.raises(CleanupError) as raised:
+        asyncio.run(exercise())
+
+    cleanup_error = raised.value
+    assert cleanup_error.create_failure.reason == "nonzero_exit"
+    assert cleanup_error.initial_cleanup_failure.operation == "cleanup"
+    assert cleanup_error.destroy_failure.operation == "destroy"
+    assert cleanup_error.create_failure.partial_create_cleanup.create_failure is (
+        cleanup_error.create_failure
+    )
+    assert cleanup_error.audit_failures == ()
+    assert cleanup_error.secondary_failures == ()
+    sandbox_id = cleanup_error.sandbox_id
+    events = [json.loads(line) for line in artifact.read_text().splitlines()]
+    assert events[-1] == {
+        "event": "cleanup_retry_failure",
+        "exception_type": "DockerSbxError",
+        "sandbox_id": sandbox_id,
+    }
+    spawner.handler = lambda command: _Outcome()
+    asyncio.run(provider.destroy(sandbox_id))
+    assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
 
 
 def test_exec_preserves_argv_boundaries_and_never_runs_target_on_host(
@@ -888,6 +1070,41 @@ def test_copy_and_destroy_use_exact_argv_and_cleaned_destroy_is_idempotent(
         ("sbx", "rm", "--force", sandbox_id),
     ]
     assert not local_path.exists()
+
+
+@pytest.mark.parametrize("provider_kind", ["fake", "docker"])
+def test_providers_share_retry_safe_destroy_contract(
+    provider_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider = (
+        FakeSandboxProvider()
+        if provider_kind == "fake"
+        else _provider(monkeypatch, spawner)
+    )
+
+    async def exercise() -> str:
+        sandbox_id = await provider.create(tmp_path, "trial")
+        await provider.destroy(sandbox_id)
+        await provider.destroy(sandbox_id)
+        with pytest.raises(RuntimeError, match="sandbox is not active"):
+            await provider.destroy("never-owned")
+        with pytest.raises(RuntimeError, match="sandbox is not active"):
+            await provider.exec(sandbox_id, ["echo", "must-not-run"])
+        return sandbox_id
+
+    sandbox_id = asyncio.run(exercise())
+    if provider_kind == "fake":
+        assert provider.calls[-4:] == [
+            ("destroy", sandbox_id),
+            ("destroy", sandbox_id),
+            ("destroy", "never-owned"),
+            ("exec", sandbox_id, ("echo", "must-not-run"), 60),
+        ]
+    else:
+        assert spawner.calls.count(("sbx", "rm", "--force", sandbox_id)) == 1
 
 
 def test_failed_destroy_keeps_provider_state_for_retry(
