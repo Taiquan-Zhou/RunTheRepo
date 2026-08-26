@@ -94,3 +94,137 @@ def test_discover_compose_fails_closed_for_invalid_standard_or_fallback_path(
 
     with pytest.raises(ComposeDiscoveryError):
         discover_compose(tmp_path)
+
+
+def test_discover_compose_rejects_root_replaced_after_initial_identity_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "compose.yml").write_text("services: {}\n", encoding="utf-8")
+    attacker_root = tmp_path / "attacker-root"
+    attacker_root.mkdir()
+    (attacker_root / "compose.yml").write_text("services: {}\n", encoding="utf-8")
+    original_lstat = Path.lstat
+    swapped = False
+
+    def lstat_then_swap(path: Path) -> os.stat_result:
+        nonlocal swapped
+        result = original_lstat(path)
+        if path == root and not swapped:
+            swapped = True
+            (root / "compose.yml").unlink()
+            root.rmdir()
+            os.symlink(attacker_root, root, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(Path, "lstat", lstat_then_swap)
+
+    with pytest.raises(ComposeDiscoveryError):
+        discover_compose(root)
+
+
+def test_discover_compose_rejects_candidate_replaced_after_identity_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = tmp_path / "compose.yml"
+    candidate.write_text("services: {}\n", encoding="utf-8")
+    attacker_candidate = tmp_path / "attacker.yml"
+    attacker_candidate.write_text("services: {}\n", encoding="utf-8")
+    original_lstat = Path.lstat
+    swapped = False
+
+    def lstat_then_swap(path: Path) -> os.stat_result:
+        nonlocal swapped
+        result = original_lstat(path)
+        if path == candidate and not swapped:
+            swapped = True
+            candidate.unlink()
+            os.symlink(attacker_candidate, candidate)
+        return result
+
+    monkeypatch.setattr(Path, "lstat", lstat_then_swap)
+
+    with pytest.raises(ComposeDiscoveryError):
+        discover_compose(tmp_path)
+
+
+def test_discover_compose_rejects_root_replaced_before_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    candidate = root / "compose.yml"
+    candidate.write_text("services: {}\n", encoding="utf-8")
+    attacker_root = tmp_path / "attacker-root"
+    attacker_root.mkdir()
+    os.link(candidate, attacker_root / "compose.yml")
+    original_lstat = Path.lstat
+    candidate_lstat_calls = 0
+
+    def lstat_then_swap_root(path: Path) -> os.stat_result:
+        nonlocal candidate_lstat_calls
+        result = original_lstat(path)
+        if path == candidate:
+            candidate_lstat_calls += 1
+            if candidate_lstat_calls == 3:
+                candidate.unlink()
+                root.rmdir()
+                os.symlink(attacker_root, root, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(Path, "lstat", lstat_then_swap_root)
+
+    with pytest.raises(ComposeDiscoveryError):
+        discover_compose(root)
+
+
+def test_discover_compose_rejects_candidate_replaced_before_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = tmp_path / "compose.yml"
+    candidate.write_text("services: {}\n", encoding="utf-8")
+    replacement = tmp_path / "replacement.yml"
+    replacement.write_text("services: {app: {image: attacker}}\n", encoding="utf-8")
+    original_lstat = Path.lstat
+    candidate_lstat_calls = 0
+
+    def lstat_then_replace(path: Path) -> os.stat_result:
+        nonlocal candidate_lstat_calls
+        result = original_lstat(path)
+        if path == candidate:
+            candidate_lstat_calls += 1
+            if candidate_lstat_calls == 3:
+                candidate.unlink()
+                replacement.replace(candidate)
+        return result
+
+    monkeypatch.setattr(Path, "lstat", lstat_then_replace)
+
+    with pytest.raises(ComposeDiscoveryError):
+        discover_compose(tmp_path)
+
+
+def test_discover_compose_rejects_fallback_replaced_by_different_regular_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = tmp_path / "project-compose.yml"
+    candidate.write_text("services: {}\n", encoding="utf-8")
+    replacement = tmp_path / "replacement.yml"
+    replacement.write_text("services: {app: {image: attacker}}\n", encoding="utf-8")
+    original_lstat = Path.lstat
+    swapped = False
+
+    def lstat_then_replace(path: Path) -> os.stat_result:
+        nonlocal swapped
+        result = original_lstat(path)
+        if path == candidate and not swapped:
+            swapped = True
+            candidate.unlink()
+            replacement.replace(candidate)
+        return result
+
+    monkeypatch.setattr(Path, "lstat", lstat_then_replace)
+
+    with pytest.raises(ComposeDiscoveryError):
+        discover_compose(tmp_path)
