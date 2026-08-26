@@ -24,6 +24,7 @@ READINESS_TIMEOUT_S = 5.0
 class FixtureServer:
     port: int
     process: subprocess.Popen[str]
+    readiness_elapsed_s: float | None = None
 
     @property
     def base_url(self) -> str:
@@ -53,8 +54,9 @@ def _http_request(
         return error.code, error.read()
 
 
-def _wait_for_ready(server: FixtureServer) -> None:
-    deadline = time.monotonic() + READINESS_TIMEOUT_S
+def _wait_for_ready(server: FixtureServer) -> float:
+    started = time.monotonic()
+    deadline = started + READINESS_TIMEOUT_S
     while time.monotonic() < deadline:
         if server.process.poll() is not None:
             output = (
@@ -69,7 +71,7 @@ def _wait_for_ready(server: FixtureServer) -> None:
             time.sleep(0.02)
             continue
         if status == 200 and body == b'{"status":"ok"}':
-            return
+            return time.monotonic() - started
         time.sleep(0.02)
     pytest.fail("fixture did not become ready before the bounded deadline")
 
@@ -82,6 +84,12 @@ def _reap(process: subprocess.Popen[str]) -> None:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=3)
+
+
+def _wait_for_failure(process: subprocess.Popen[str]) -> tuple[int, str]:
+    return_code = process.wait(timeout=3)
+    output = process.stdout.read() if process.stdout is not None else ""
+    return return_code, output
 
 
 @contextmanager
@@ -128,8 +136,12 @@ def _running_fixture(
     )
     server = FixtureServer(port=port, process=process)
     try:
-        _wait_for_ready(server)
-        yield server
+        readiness_elapsed_s = _wait_for_ready(server)
+        yield FixtureServer(
+            port=port,
+            process=process,
+            readiness_elapsed_s=readiness_elapsed_s,
+        )
     finally:
         _reap(process)
 
@@ -177,14 +189,18 @@ def test_fixture_requires_token_and_rejects_invalid_startup_delays(
 ) -> None:
     process = _start_process(tmp_path, token=None)
     try:
-        assert process.wait(timeout=3) != 0
+        return_code, output = _wait_for_failure(process)
+        assert return_code != 0
+        assert "APP_REQUIRED_TOKEN is required" in output
     finally:
         _reap(process)
 
     for invalid_delay in ("-0.01", "not-a-number", "nan", "inf"):
         process = _start_process(tmp_path, token="contract-token", delay=invalid_delay)
         try:
-            assert process.wait(timeout=3) != 0
+            return_code, output = _wait_for_failure(process)
+            assert return_code != 0
+            assert "STARTUP_DELAY_S must be a finite non-negative number" in output
         finally:
             _reap(process)
 
@@ -237,10 +253,18 @@ def test_fixture_health_crud_files_and_accessible_ui(tmp_path: Path) -> None:
 
 
 def test_fixture_applies_non_negative_startup_delay(tmp_path: Path) -> None:
-    started = time.monotonic()
-    with _running_fixture(tmp_path, startup_delay_s="0.15") as server:
-        assert _http_request(f"{server.base_url}/health")[0] == 200
-    assert time.monotonic() - started >= 0.15
+    with _running_fixture(tmp_path / "zero-delay") as zero_delay_server:
+        assert _http_request(f"{zero_delay_server.base_url}/health")[0] == 200
+        zero_delay_readiness_s = zero_delay_server.readiness_elapsed_s
+    with _running_fixture(
+        tmp_path / "delayed", startup_delay_s="0.5"
+    ) as delayed_server:
+        assert _http_request(f"{delayed_server.base_url}/health")[0] == 200
+        delayed_readiness_s = delayed_server.readiness_elapsed_s
+
+    assert zero_delay_readiness_s is not None
+    assert delayed_readiness_s is not None
+    assert delayed_readiness_s >= zero_delay_readiness_s + 0.25
 
 
 def _assert_cap_net_raw(server: FixtureServer, status_path: Path) -> None:
@@ -248,6 +272,7 @@ def _assert_cap_net_raw(server: FixtureServer, status_path: Path) -> None:
         (None, False),
         ("Name:\tfixture\nCapEff:\t0000000000002000\n", True),
         ("Name:\tfixture\nCapEff:\t0000000000000000\n", False),
+        ("Name:\tfixture\nCapEff:\t-1\n", False),
         ("Name:\tfixture\nCapEff:\tnot-hex\n", False),
     ]
     for status_data, expected in cases:

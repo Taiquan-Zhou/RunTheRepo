@@ -3,6 +3,7 @@ import html
 import json
 import math
 import os
+import string
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -112,7 +113,12 @@ def cap_net_raw() -> dict[str, bool]:
     try:
         for line in PROC_STATUS_PATH.read_text(encoding="utf-8").splitlines():
             if line.startswith("CapEff:"):
-                cap_eff = int(line.split(":", maxsplit=1)[1].strip(), 16)
+                cap_eff_token = line.split(":", maxsplit=1)[1].strip()
+                if not cap_eff_token or not all(
+                    character in string.hexdigits for character in cap_eff_token
+                ):
+                    return {"cap_net_raw": False}
+                cap_eff = int(cap_eff_token, 16)
                 return {"cap_net_raw": bool(cap_eff & (1 << 13))}
     except (OSError, ValueError):
         pass
