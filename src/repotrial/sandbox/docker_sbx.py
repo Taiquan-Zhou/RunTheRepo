@@ -6,8 +6,9 @@ import math
 import re
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from .base import ExecResult, NetworkLogResult, SandboxProvider
 
@@ -17,6 +18,7 @@ REAP_TIMEOUT_SECONDS = 5
 _TRUNCATION_MARKER = b"\n...[truncated]"
 _CREATE_FLAGS = (
     "--name",
+    "--clone",
     "--cpus",
     "--memory",
     "--deny-network",
@@ -86,16 +88,24 @@ class DockerSbxError(RuntimeError):
         *,
         returncode: int | None = None,
         stderr: str = "",
+        sandbox_id: str | None = None,
+        cleanup_error: str = "",
     ) -> None:
         self.operation = operation
         self.reason = reason
         self.returncode = returncode
         self.stderr = stderr
+        self.sandbox_id = sandbox_id
+        self.cleanup_error = cleanup_error
         message = f"docker sandboxes {operation} failed: {reason}"
         if returncode is not None:
             message = f"{message} (returncode={returncode})"
         if stderr:
             message = f"{message}: {stderr}"
+        if sandbox_id is not None:
+            message = f"{message} (sandbox_id={sandbox_id})"
+        if cleanup_error:
+            message = f"{message}; cleanup: {cleanup_error}"
         super().__init__(message)
 
 
@@ -141,8 +151,19 @@ class DockerSbxPolicy:
 @dataclass(frozen=True, slots=True)
 class _CommandResult:
     returncode: int
-    stdout: str
-    stderr: str
+    stdout: bytes
+    stderr: bytes
+
+
+class _SandboxState(Enum):
+    PENDING = "pending"
+    ACTIVE = "active"
+    CLEANUP_UNSAFE = "cleanup-unsafe"
+    CLEANED = "cleaned"
+
+
+class _ProcessCleanupError(RuntimeError):
+    pass
 
 
 class DockerSbxProvider(SandboxProvider):
@@ -160,16 +181,18 @@ class DockerSbxProvider(SandboxProvider):
             raise ValueError("command_timeout_s must be positive and finite")
         self._policy = policy
         self._command_timeout_s = float(command_timeout_s)
-        self._active_sandboxes: set[str] = set()
+        self._sandbox_states: dict[str, _SandboxState] = {}
         self._network_log_sandboxes: set[str] = set()
 
     async def create(self, workspace: Path, name: str) -> str:
         network_log_supported = await self._probe()
         sandbox_id = _new_sandbox_id(name)
+        self._sandbox_states[sandbox_id] = _SandboxState.PENDING
         arguments = [
             "create",
             "--name",
             sandbox_id,
+            "--clone",
             "--cpus",
             _format_cpus(self._policy.cpus),
             "--memory",
@@ -184,9 +207,12 @@ class DockerSbxProvider(SandboxProvider):
         for resource in sorted(self._policy.deny_network):
             arguments.extend(("--deny-network", resource))
         arguments.extend(("shell", str(workspace)))
-        result = await self._run("create", arguments, self._command_timeout_s)
-        _require_success("create", result)
-        self._active_sandboxes.add(sandbox_id)
+        try:
+            result = await self._run("create", arguments, self._command_timeout_s)
+            _require_success("create", result)
+        except (DockerSbxError, asyncio.CancelledError) as error:
+            await self._cleanup_after_uncertain_failure(sandbox_id, error)
+        self._sandbox_states[sandbox_id] = _SandboxState.ACTIVE
         if network_log_supported:
             self._network_log_sandboxes.add(sandbox_id)
         return sandbox_id
@@ -212,8 +238,8 @@ class DockerSbxProvider(SandboxProvider):
         )
         return ExecResult(
             exit_code=result.returncode,
-            stdout=result.stdout,
-            stderr=result.stderr,
+            stdout=_decode_human_output(result.stdout),
+            stderr=_decode_human_output(result.stderr),
         )
 
     async def publish_port(self, sandbox_id: str, container_port: int) -> int:
@@ -224,19 +250,22 @@ class DockerSbxProvider(SandboxProvider):
             or not 1 <= container_port <= 65_535
         ):
             raise ValueError("container_port must be between 1 and 65535")
-        published = await self._run(
-            "publish_port",
-            ["ports", sandbox_id, "--publish", f"{container_port}/tcp4"],
-            self._command_timeout_s,
-        )
-        _require_success("publish_port", published)
-        listed = await self._run(
-            "publish_port",
-            ["ports", sandbox_id, "--json"],
-            self._command_timeout_s,
-        )
-        _require_success("publish_port", listed)
-        return _parse_published_port(listed.stdout, container_port)
+        try:
+            published = await self._run(
+                "publish_port",
+                ["ports", sandbox_id, "--publish", f"{container_port}/tcp4"],
+                self._command_timeout_s,
+            )
+            _require_success("publish_port", published)
+            listed = await self._run(
+                "publish_port",
+                ["ports", sandbox_id, "--json"],
+                self._command_timeout_s,
+            )
+            _require_success("publish_port", listed)
+            return _parse_published_port(listed.stdout, container_port)
+        except (DockerSbxError, asyncio.CancelledError) as error:
+            await self._cleanup_after_uncertain_failure(sandbox_id, error)
 
     async def copy(self, sandbox_id: str, remote_path: str, local_path: Path) -> None:
         self._require_active(sandbox_id)
@@ -276,25 +305,75 @@ class DockerSbxProvider(SandboxProvider):
         return NetworkLogResult(events=events, supported=True)
 
     async def destroy(self, sandbox_id: str) -> None:
-        self._require_active(sandbox_id)
+        state = self._sandbox_states.get(sandbox_id)
+        if state is _SandboxState.CLEANED:
+            return
+        if state not in {_SandboxState.ACTIVE, _SandboxState.CLEANUP_UNSAFE}:
+            raise RuntimeError(f"sandbox is not active: {sandbox_id}")
+        try:
+            await self._force_destroy(sandbox_id, operation="destroy")
+        except (DockerSbxError, asyncio.CancelledError):
+            self._sandbox_states[sandbox_id] = _SandboxState.CLEANUP_UNSAFE
+            raise
+
+    async def _force_destroy(self, sandbox_id: str, *, operation: str) -> None:
         result = await self._run(
-            "destroy",
+            operation,
             ["rm", "--force", sandbox_id],
             self._command_timeout_s,
         )
-        _require_success("destroy", result)
-        self._active_sandboxes.remove(sandbox_id)
+        _require_success(operation, result)
+        self._sandbox_states[sandbox_id] = _SandboxState.CLEANED
         self._network_log_sandboxes.discard(sandbox_id)
+
+    async def _cleanup_after_uncertain_failure(
+        self, sandbox_id: str, primary_error: DockerSbxError | asyncio.CancelledError
+    ) -> NoReturn:
+        cleanup_task = asyncio.create_task(
+            self._force_destroy(sandbox_id, operation="cleanup")
+        )
+        cancellation = (
+            primary_error if isinstance(primary_error, asyncio.CancelledError) else None
+        )
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+            except DockerSbxError:
+                pass
+
+        cleanup_error = cleanup_task.exception()
+        if cleanup_error is not None:
+            self._sandbox_states[sandbox_id] = _SandboxState.CLEANUP_UNSAFE
+            detail = str(cleanup_error)
+            if cancellation is not None:
+                cancellation.add_note(
+                    f"sandbox cleanup unconfirmed: {sandbox_id}: {detail}"
+                )
+                raise cancellation
+            assert isinstance(primary_error, DockerSbxError)
+            raise DockerSbxError(
+                primary_error.operation,
+                "cleanup_unconfirmed",
+                sandbox_id=sandbox_id,
+                cleanup_error=detail,
+            ) from primary_error
+        if cancellation is not None:
+            raise cancellation
+        raise primary_error
 
     async def _probe(self) -> bool:
         version = await self._probe_call("version", ["version"])
         if version.returncode != 0:
             raise DockerSbxUnsupportedError(
-                "version_probe_failed", stderr=version.stderr
+                "version_probe_failed", stderr=_decode_human_output(version.stderr)
             )
 
         required_help = (
             ("create", ["create", "--help"], _CREATE_FLAGS),
+            ("create_shell", ["create", "shell", "--help"], ("PATH",)),
             ("exec", ["exec", "--help"], ("--",)),
             ("ports", ["ports", "--help"], ("--publish", "--json")),
             ("cp", ["cp", "--help"], ()),
@@ -304,7 +383,8 @@ class DockerSbxProvider(SandboxProvider):
             result = await self._probe_call(capability, arguments)
             if result.returncode != 0:
                 raise DockerSbxUnsupportedError(
-                    f"{capability}_probe_failed", stderr=result.stderr
+                    f"{capability}_probe_failed",
+                    stderr=_decode_human_output(result.stderr),
                 )
             for token in tokens:
                 if not _has_token(result.stdout, token):
@@ -362,27 +442,29 @@ class DockerSbxProvider(SandboxProvider):
                 )
         except TimeoutError as error:
             if process is not None:
-                await _kill_and_reap(process)
+                await _raise_after_process_cleanup(operation, "timeout", process, error)
             raise DockerSbxError(operation, "timeout") from error
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
             if process is not None:
-                await _kill_and_reap(process)
+                await _raise_after_process_cleanup(
+                    operation, "cancelled", process, error
+                )
             raise
         except FileNotFoundError as error:
             raise DockerSbxError(operation, "executable_unavailable") from error
         except OSError as error:
             if process is not None:
-                await _kill_and_reap(process)
+                await _raise_after_process_cleanup(
+                    operation, "io_error", process, error
+                )
             raise DockerSbxError(operation, "io_error") from error
 
         return _CommandResult(
-            returncode=returncode,
-            stdout=stdout_bytes.decode("utf-8", errors="replace"),
-            stderr=stderr_bytes.decode("utf-8", errors="replace"),
+            returncode=returncode, stdout=stdout_bytes, stderr=stderr_bytes
         )
 
     def _require_active(self, sandbox_id: str) -> None:
-        if sandbox_id not in self._active_sandboxes:
+        if self._sandbox_states.get(sandbox_id) is not _SandboxState.ACTIVE:
             raise RuntimeError(f"sandbox is not active: {sandbox_id}")
 
 
@@ -405,15 +487,70 @@ async def _read_bounded(stream: asyncio.StreamReader) -> bytes:
 
 
 async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
+    kill_error = ""
     if process.returncode is None:
         try:
             process.kill()
-        except (OSError, ProcessLookupError):
-            pass
+        except (OSError, ProcessLookupError) as error:
+            kill_error = f"kill_failed: {error}"
     try:
         await asyncio.wait_for(process.wait(), timeout=REAP_TIMEOUT_SECONDS)
-    except (OSError, TimeoutError):
-        pass
+    except TimeoutError as error:
+        details = "; ".join(filter(None, (kill_error, "reap_timeout")))
+        raise _ProcessCleanupError(details) from error
+    except OSError as error:
+        details = "; ".join(filter(None, (kill_error, f"reap_failed: {error}")))
+        raise _ProcessCleanupError(details) from error
+
+
+async def _raise_after_process_cleanup(
+    operation: str,
+    reason: str,
+    process: asyncio.subprocess.Process,
+    primary_error: BaseException,
+) -> NoReturn:
+    cleanup_task = asyncio.create_task(_kill_and_reap(process))
+    cancellation = (
+        primary_error if isinstance(primary_error, asyncio.CancelledError) else None
+    )
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+        except _ProcessCleanupError:
+            pass
+
+    cleanup_error = cleanup_task.exception()
+    if cancellation is not None:
+        if not isinstance(primary_error, asyncio.CancelledError):
+            cancellation.add_note(
+                f"sbx {operation} was cancelled while handling {reason}"
+            )
+        if cleanup_error is not None:
+            cancellation.add_note(f"process cleanup unconfirmed: {cleanup_error}")
+        raise cancellation
+    if cleanup_error is not None:
+        raise DockerSbxError(
+            operation,
+            "process_cleanup_unconfirmed",
+            cleanup_error=str(cleanup_error),
+        ) from primary_error
+    raise DockerSbxError(operation, reason) from primary_error
+
+
+def _decode_human_output(output: bytes) -> str:
+    decoded = output.decode("utf-8", errors="replace")
+    encoded = decoded.encode("utf-8")
+    if len(encoded) <= MAX_OUTPUT_BYTES:
+        return decoded
+    prefix = encoded[: MAX_OUTPUT_BYTES - len(_TRUNCATION_MARKER)]
+    while True:
+        try:
+            return prefix.decode("utf-8") + _TRUNCATION_MARKER.decode("ascii")
+        except UnicodeDecodeError:
+            prefix = prefix[:-1]
 
 
 def _require_success(operation: str, result: _CommandResult) -> None:
@@ -422,12 +559,16 @@ def _require_success(operation: str, result: _CommandResult) -> None:
             operation,
             "nonzero_exit",
             returncode=result.returncode,
-            stderr=result.stderr,
+            stderr=_decode_human_output(result.stderr),
         )
 
 
-def _has_token(output: str, token: str) -> bool:
-    return re.search(rf"(?<![\w-]){re.escape(token)}(?![\w-])", output) is not None
+def _has_token(output: bytes, token: str) -> bool:
+    try:
+        decoded = output.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return re.search(rf"(?<![\w-]){re.escape(token)}(?![\w-])", decoded) is not None
 
 
 def _format_cpus(cpus: float) -> str:
@@ -441,10 +582,14 @@ def _new_sandbox_id(name: str) -> str:
     return f"repotrial-{safe_name}-{uuid.uuid4().hex[:12]}"
 
 
-def _parse_published_port(output: str, container_port: int) -> int:
+def _parse_published_port(output: bytes, container_port: int) -> int:
     try:
-        decoded: Any = json.loads(output)
-    except (json.JSONDecodeError, UnicodeError):
+        text = output.decode("utf-8")
+    except UnicodeDecodeError:
+        raise DockerSbxError("publish_port", "port_mapping_invalid_utf8") from None
+    try:
+        decoded: Any = json.loads(text)
+    except json.JSONDecodeError:
         raise DockerSbxError("publish_port", "port_mapping_invalid") from None
     if not isinstance(decoded, list) or len(decoded) > 128:
         raise DockerSbxError("publish_port", "port_mapping_invalid")
@@ -472,10 +617,16 @@ def _parse_published_port(output: str, container_port: int) -> int:
     return matches[0]
 
 
-def _parse_network_events(output: str, sandbox_id: str) -> list[dict[str, Any]] | None:
+def _parse_network_events(
+    output: bytes, sandbox_id: str
+) -> list[dict[str, Any]] | None:
     try:
-        decoded: Any = json.loads(output)
-    except (json.JSONDecodeError, UnicodeError):
+        text = output.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    try:
+        decoded: Any = json.loads(text)
+    except json.JSONDecodeError:
         return None
     if not isinstance(decoded, list) or len(decoded) > MAX_NETWORK_EVENTS:
         return None

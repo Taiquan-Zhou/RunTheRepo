@@ -1,6 +1,7 @@
 import asyncio
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -20,9 +21,18 @@ pytestmark = pytest.mark.skipif(
 def test_real_sbx_disposable_lifecycle(tmp_path: Path) -> None:
     if shutil.which("sbx") is None:
         pytest.skip("UNSUPPORTED: sbx executable is unavailable")
+    if shutil.which("git") is None:
+        pytest.skip("UNSUPPORTED: git executable is unavailable for clone smoke")
 
     workspace = tmp_path / "empty-workspace"
     workspace.mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet", str(workspace)],
+        check=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
     provider = DockerSbxProvider(
         DockerSbxPolicy(
             cpus=1,
