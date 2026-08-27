@@ -148,10 +148,6 @@ def test_crud_requests_support_json_path_and_text_assertions(tmp_path: Path) -> 
         tmp_path,
         httpx.MockTransport(handler),
     )
-    assert result.failure_reason == "step-0000:unsupported_content_encoding"
-    assert observed_headers == ["identity"]
-    assert [Path(path).name for path in result.evidence_paths] == ["step-0000.json"]
-
     assert result.verdict is Verdict.PASS
     assert result.passed_steps == 3
     assert [(request.method, request.url.path) for request in requests] == [
@@ -188,6 +184,9 @@ def test_failed_assertion_stops_later_steps_and_counts_only_fully_asserted_steps
         tmp_path,
         httpx.MockTransport(handler),
     )
+    assert result.failure_reason == "step-0000:unsupported_content_encoding"
+    assert observed_headers == ["identity"]
+    assert [Path(path).name for path in result.evidence_paths] == ["step-0000.json"]
 
     assert result.verdict is Verdict.FAIL
     assert result.failure_reason == "step-0000:assertion:status_code"
