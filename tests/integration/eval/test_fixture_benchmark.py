@@ -10,7 +10,9 @@ from typing import Any, cast
 import pytest
 from typer.testing import CliRunner
 
-from repotrial.domain.enums import ExperimentVerdict, MutationType
+from repotrial.domain.enums import ExperimentVerdict, MutationType, Verdict
+from repotrial.domain.models import JourneyResult
+from repotrial.trial.boot import BootResult
 
 ROOT = Path(__file__).parents[3]
 MANIFESTS = ROOT / "eval" / "manifests"
@@ -53,11 +55,12 @@ def _isolated_fixture_project(
     fixture_id: str = "single",
     http_status: int = 200,
     privileged: bool = False,
+    recoverable_env: str | None = None,
 ) -> Path:
     manifest_dir = tmp_path / "eval" / "manifests"
     fixture_dir = tmp_path / "tests" / "fixtures" / fixture_id
-    manifest_dir.mkdir(parents=True)
-    fixture_dir.mkdir(parents=True)
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    fixture_dir.mkdir(parents=True, exist_ok=True)
     (fixture_dir / "compose.yml").write_text(
         "services:\n"
         "  web:\n"
@@ -75,8 +78,8 @@ def _isolated_fixture_project(
         "container_port": 8080,
         "journey_path": "/health",
         "http_status": http_status,
-        "allowed_env_keys": [],
-        "recoverable_missing_env": None,
+        "allowed_env_keys": [recoverable_env] if recoverable_env is not None else [],
+        "recoverable_missing_env": recoverable_env,
         "writes_tmp": False,
         "required_capabilities": [],
         "expected_keep_mutations": ["drop_privileged"] if privileged else [],
@@ -95,6 +98,25 @@ def _isolated_fixture_project(
         json.dumps(manifest), encoding="utf-8"
     )
     return manifest_dir
+
+
+def _unsupported_boot_result(attempt: int) -> BootResult:
+    return BootResult(
+        verdict=Verdict.UNSUPPORTED,
+        service_states={},
+        logs={},
+        attempt=attempt,
+    )
+
+
+def _unsupported_journey_result(journey_id: str) -> JourneyResult:
+    return JourneyResult(
+        journey_id=journey_id,
+        verdict=Verdict.UNSUPPORTED,
+        passed_steps=0,
+        total_steps=1,
+        failure_reason="journey:fixture_unsupported",
+    )
 
 
 def test_all_shipped_fixtures_run_twice_through_fresh_provider_state(
@@ -237,6 +259,183 @@ def test_failed_fixture_is_retained_with_stable_stop_reason(tmp_path: Path) -> N
     assert fixture.status == "failed"
     assert fixture.stop_reason == "insufficient_coverage"
     assert all(run.stop_reason == "insufficient_coverage" for run in fixture.runs)
+
+
+def test_real_graph_unsupported_boot_projects_unavailable_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph = import_module("repotrial.agent.graph")
+    manifest_dir = _isolated_fixture_project(tmp_path, recoverable_env="APP_MODE")
+
+    async def unsupported_boot(*args: object) -> BootResult:
+        return _unsupported_boot_result(cast(int, args[-1]))
+
+    monkeypatch.setattr(graph, "boot_compose", unsupported_boot)
+
+    benchmark = _evaluator().evaluate_benchmark(manifest_dir)
+    fixture = benchmark.fixtures[0]
+
+    assert fixture.status == "unavailable"
+    assert fixture.replay_consistent is None
+    assert all(run.boot_verdict is Verdict.UNSUPPORTED for run in fixture.runs)
+    assert all(not run.comparable for run in fixture.runs)
+    assert benchmark.metrics["boot_recovery_rate"] == "unavailable"
+    assert benchmark.metrics["replay_consistency"] == "unavailable"
+
+
+def test_real_graph_unsupported_baseline_journey_projects_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph = import_module("repotrial.agent.graph")
+    manifest_dir = _isolated_fixture_project(tmp_path)
+
+    async def unsupported_journey(
+        journey: object, *args: object, **kwargs: object
+    ) -> JourneyResult:
+        del args, kwargs
+        return _unsupported_journey_result(cast(str, journey.journey_id))
+
+    monkeypatch.setattr(graph, "run_http_journey", unsupported_journey)
+
+    benchmark = _evaluator().evaluate_benchmark(manifest_dir)
+    fixture = benchmark.fixtures[0]
+
+    assert fixture.status == "unavailable"
+    assert all(run.journeys[0].verdict is Verdict.UNSUPPORTED for run in fixture.runs)
+    assert all(not run.comparable for run in fixture.runs)
+    assert benchmark.metrics["journey_success_rate"] == "unavailable"
+
+
+def test_real_graph_unsupported_experiment_stop_projects_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = import_module("repotrial.hardening.engine")
+    manifest_dir = _isolated_fixture_project(tmp_path, privileged=True)
+
+    async def unsupported_journey(
+        journey: object, *args: object, **kwargs: object
+    ) -> JourneyResult:
+        del args, kwargs
+        return _unsupported_journey_result(cast(str, journey.journey_id))
+
+    monkeypatch.setattr(engine, "run_http_journey", unsupported_journey)
+
+    benchmark = _evaluator().evaluate_benchmark(manifest_dir)
+    fixture = benchmark.fixtures[0]
+
+    assert fixture.status == "unavailable"
+    assert fixture.replay_consistent is None
+    assert all(
+        run.experiments[0].verdict is ExperimentVerdict.STOP
+        and run.experiments[0].reason == "journey_unsupported:readme-1"
+        for run in fixture.runs
+    )
+    assert all(not run.comparable for run in fixture.runs)
+    assert benchmark.metrics["hardening_acceptance_precision"] == "unavailable"
+
+
+def test_unavailable_replay_sample_is_not_omitted_from_aggregate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evaluator = _evaluator()
+    manifest_dir = _isolated_fixture_project(tmp_path, fixture_id="available")
+    _isolated_fixture_project(tmp_path, fixture_id="unavailable")
+    original_execute = evaluator._execute_fixture_once
+
+    async def unavailable_fixture_run(fixture: object, run_index: int) -> object:
+        fixture_data = cast(Any, fixture)
+        if fixture_data.manifest.fixture_id == "unavailable":
+            provider = evaluator._FixtureProvider(fixture_data.ground_truth)
+            return evaluator._failed_fixture_run(
+                fixture_data,
+                provider,
+                run_index,
+                RuntimeError("fixture execution unavailable"),
+            )
+        return await original_execute(fixture_data, run_index)
+
+    monkeypatch.setattr(evaluator, "_execute_fixture_once", unavailable_fixture_run)
+
+    benchmark = evaluator.evaluate_benchmark(manifest_dir)
+
+    fixtures = _fixture_map(benchmark)
+    assert fixtures["available"].replay_consistent is True
+    assert fixtures["unavailable"].replay_consistent is None
+    assert benchmark.metrics["replay_consistency"] == "unavailable"
+    result_path = evaluator.write_benchmark_result(benchmark, tmp_path / "results")
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert payload["fixtures"][1]["replay_consistent"] is None
+    assert payload["metrics"]["replay_consistency"] == "unavailable"
+
+
+def test_functional_boot_failure_remains_a_numeric_metric_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph = import_module("repotrial.agent.graph")
+    manifest_dir = _isolated_fixture_project(tmp_path, recoverable_env="APP_MODE")
+
+    async def failed_boot(*args: object) -> BootResult:
+        return BootResult(
+            verdict=Verdict.FAIL,
+            service_states={},
+            logs={"up": "functional failure"},
+            attempt=cast(int, args[-1]),
+        )
+
+    monkeypatch.setattr(graph, "boot_compose", failed_boot)
+
+    benchmark = _evaluator().evaluate_benchmark(manifest_dir)
+    fixture = benchmark.fixtures[0]
+
+    assert fixture.status == "failed"
+    assert fixture.replay_consistent is True
+    assert all(run.comparable for run in fixture.runs)
+    assert benchmark.metrics["boot_recovery_rate"] == 0.0
+
+
+def test_functional_journey_failure_remains_a_numeric_metric_failure(
+    tmp_path: Path,
+) -> None:
+    manifest_dir = _isolated_fixture_project(tmp_path, http_status=503)
+
+    benchmark = _evaluator().evaluate_benchmark(manifest_dir)
+    fixture = benchmark.fixtures[0]
+
+    assert fixture.status == "failed"
+    assert fixture.replay_consistent is True
+    assert all(run.comparable for run in fixture.runs)
+    assert benchmark.metrics["journey_success_rate"] == 0.0
+
+
+def test_deterministic_rollback_remains_comparable_to_replay(
+    tmp_path: Path,
+) -> None:
+    manifest_dir = _isolated_fixture_project(tmp_path, fixture_id="rollback")
+    ground_truth_path = (
+        tmp_path / "tests" / "fixtures" / "rollback" / "ground_truth.json"
+    )
+    ground_truth = json.loads(ground_truth_path.read_text(encoding="utf-8"))
+    ground_truth["required_capabilities"] = ["NET_ADMIN"]
+    ground_truth_path.write_text(json.dumps(ground_truth), encoding="utf-8")
+    compose_path = tmp_path / "tests" / "fixtures" / "rollback" / "compose.yml"
+    compose_path.write_text(
+        compose_path.read_text(encoding="utf-8").replace(
+            "cap_drop: [ALL]\n", "cap_add: [NET_ADMIN]\n"
+        ),
+        encoding="utf-8",
+    )
+
+    benchmark = _evaluator().evaluate_benchmark(manifest_dir)
+    fixture = benchmark.fixtures[0]
+
+    assert fixture.status == "completed"
+    assert fixture.replay_consistent is True
+    assert all(run.comparable for run in fixture.runs)
+    assert all(
+        run.experiments[0].verdict is ExperimentVerdict.ROLLBACK
+        and run.experiments[0].reason == "boot_regression"
+        for run in fixture.runs
+    )
 
 
 def test_malformed_or_duplicate_inputs_are_rejected_not_skipped(tmp_path: Path) -> None:

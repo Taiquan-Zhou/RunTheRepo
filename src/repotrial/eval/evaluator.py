@@ -584,7 +584,14 @@ def _project_run(
         for journey in run.journeys
     ]
     experiments = [_experiment_evaluation(record) for record in run.experiments]
-    status: FixtureStatus = "completed" if _is_completed_run(state) else "failed"
+    available = _is_available_run(state, journeys, experiments)
+    status: FixtureStatus
+    if not available:
+        status = "unavailable"
+    elif _is_completed_run(state):
+        status = "completed"
+    else:
+        status = "failed"
     stop_reason = run.stop_reason or "missing_stop_reason"
     projection = _verdict_projection(state, journeys, experiments)
     cleanup = [
@@ -593,7 +600,7 @@ def _project_run(
     return FixtureRunResult(
         run_index=run_index,
         status=status,
-        comparable=True,
+        comparable=available,
         stage_history=list(state.stage_history),
         boot_attempts=state.boot_attempt,
         boot_verdict=state.boot_verdict,
@@ -668,6 +675,38 @@ def _is_completed_run(state: GraphState) -> bool:
     )
 
 
+def _is_available_run(
+    state: GraphState,
+    journeys: Sequence[JourneyEvaluation],
+    experiments: Sequence[ExperimentEvaluation],
+) -> bool:
+    boot_outcome = _functional_outcome(state.boot_verdict)
+    if boot_outcome is not True:
+        return boot_outcome is False
+    journey_outcomes = [_functional_outcome(item.verdict) for item in journeys]
+    if any(outcome is None for outcome in journey_outcomes):
+        return False
+    if any(outcome is False for outcome in journey_outcomes):
+        return True
+    return all(_experiment_outcome(item.verdict) is not None for item in experiments)
+
+
+def _functional_outcome(verdict: Verdict | None) -> bool | None:
+    if verdict is Verdict.PASS:
+        return True
+    if verdict is Verdict.FAIL:
+        return False
+    return None
+
+
+def _experiment_outcome(verdict: ExperimentVerdict) -> bool | None:
+    if verdict is ExperimentVerdict.KEEP:
+        return True
+    if verdict is ExperimentVerdict.ROLLBACK:
+        return False
+    return None
+
+
 def _verdict_projection(
     state: GraphState,
     journeys: Sequence[JourneyEvaluation],
@@ -722,14 +761,12 @@ def _calculate_metrics(
                 recall_samples.extend(None for _ in truth.redundant_privileges)
                 continue
             if truth.recoverable_missing_env is not None:
+                boot_outcome = _functional_outcome(run.boot_verdict)
                 boot_samples.append(
-                    run.boot_verdict is Verdict.PASS and run.boot_attempts > 1
-                    if run.comparable
-                    else None
+                    run.boot_attempts > 1 if boot_outcome is True else boot_outcome
                 )
             journey_samples.extend(
-                journey.verdict is Verdict.PASS if journey.verdict is not None else None
-                for journey in run.journeys
+                _functional_outcome(journey.verdict) for journey in run.journeys
             )
             keep_types = [
                 experiment.mutation_type.value
@@ -742,8 +779,7 @@ def _calculate_metrics(
             recall_samples.extend(
                 mutation in keep_types for mutation in truth.redundant_privileges
             )
-        if result.replay_consistent is not None:
-            replay_samples.append(result.replay_consistent)
+        replay_samples.append(result.replay_consistent)
 
     return {
         "boot_recovery_rate": _render_metric(boot_recovery_rate(boot_samples)),
