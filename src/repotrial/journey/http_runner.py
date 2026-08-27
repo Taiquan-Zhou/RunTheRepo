@@ -25,6 +25,9 @@ _PEM_PRIVATE_KEY = re.compile(
     re.DOTALL,
 )
 _QUERY_SECRET = re.compile(r"(?i)([?&](?:password|token|secret|api[_-]?key)=)[^&]*")
+_YAML_SECRET_BLOCK = re.compile(
+    r"(?i)^(?P<indent>\s*)[\"']?(?:password|token|secret|api[_-]?key)[\"']?\s*:\s*[|>]"
+)
 
 
 def _failure_result(
@@ -167,11 +170,33 @@ def _canonical_json_hash(value: object) -> str:
 def _redacted_body_hash(body: bytes, truncated: bool) -> str:
     text = body.decode("utf-8", errors="replace")
     redacted = _PEM_PRIVATE_KEY.sub("<redacted-private-key>", text)
+    redacted = _redact_yaml_secret_blocks(redacted)
     redacted = _SECRET_ASSIGNMENT.sub(r"\1<redacted>", redacted)
     redacted = _BEARER_TOKEN.sub("Bearer <redacted>", redacted)
     if truncated:
         redacted += "\n[repotrial:truncated]\n"
     return hashlib.sha256(redacted.encode("utf-8")).hexdigest()
+
+
+def _redact_yaml_secret_blocks(text: str) -> str:
+    redacted_lines: list[str] = []
+    content_indent: int | None = None
+    for line in text.splitlines(keepends=True):
+        if content_indent is not None:
+            indentation = len(line) - len(line.lstrip(" \t"))
+            if line.strip() and indentation <= content_indent:
+                content_indent = None
+            else:
+                suffix = "\n" if line.endswith("\n") else ""
+                redacted_lines.append(
+                    " " * (content_indent + 1) + "<redacted>" + suffix
+                )
+                continue
+        redacted_lines.append(line)
+        match = _YAML_SECRET_BLOCK.match(line)
+        if match is not None:
+            content_indent = len(match.group("indent"))
+    return "".join(redacted_lines)
 
 
 def _safe_request_target(url: httpx.URL) -> str:

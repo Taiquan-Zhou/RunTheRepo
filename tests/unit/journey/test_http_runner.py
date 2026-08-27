@@ -15,7 +15,7 @@ from repotrial.domain.models import (
     JourneyResult,
     JourneyStep,
 )
-from repotrial.journey.http_runner import run_http_journey
+from repotrial.journey.http_runner import _redacted_body_hash, run_http_journey
 
 
 def run(
@@ -402,6 +402,23 @@ def test_redacted_hash_consumes_truncated_pem_and_multiline_credentials(
         )
         hashes.append(evidence["response"]["body_sha256"])
     assert hashes[0] == hashes[1]
+
+
+def test_redacted_hash_consumes_yaml_literal_and_folded_credential_blocks() -> None:
+    literal_alpha = b"password: |\n  alpha\n  omega\nnext: ordinary\n"
+    literal_beta = b"password: |\n  beta\n  omega\nnext: ordinary\n"
+    folded_alpha = b"token: >\n  alpha\n  omega\nnext: ordinary\n"
+    folded_beta = b"token: >\n  beta\n  omega\nnext: ordinary\n"
+
+    assert _redacted_body_hash(literal_alpha, False) == _redacted_body_hash(
+        literal_beta, False
+    )
+    assert _redacted_body_hash(folded_alpha, False) == _redacted_body_hash(
+        folded_beta, False
+    )
+    assert _redacted_body_hash(literal_alpha, False) != _redacted_body_hash(
+        b"password: |\n  alpha\n  omega\nnext: changed\n", False
+    )
 
 
 def test_evidence_collision_fails_without_replacing_existing_artifact(
