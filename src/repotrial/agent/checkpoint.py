@@ -159,7 +159,5 @@ async def _managed_checkpointer(
     if initialization_error is not None:
         raise initialization_error
 
-    try:
+    async with exit_stack:
         yield saver
-    finally:
-        await exit_stack.aclose()

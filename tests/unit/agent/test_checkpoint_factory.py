@@ -102,6 +102,34 @@ class _ExitFailingContext:
         raise self.error
 
 
+class _SuppressingExitContext:
+    def __init__(self, events: list[str], saver: _FakeAsyncSaver) -> None:
+        self.events = events
+        self.saver = saver
+        self.exit_args: (
+            tuple[
+                type[BaseException] | None,
+                BaseException | None,
+                object,
+            ]
+            | None
+        ) = None
+
+    async def __aenter__(self) -> _FakeAsyncSaver:
+        self.events.append("enter")
+        return self.saver
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: object,
+    ) -> bool:
+        self.exit_args = (exc_type, exc_value, traceback)
+        self.events.append("exit")
+        return True
+
+
 def _checkpoint_module() -> ModuleType:
     return importlib.import_module("repotrial.agent.checkpoint")
 
@@ -372,6 +400,42 @@ def test_postgres_enters_sets_up_yields_and_closes_in_order(
 
     assert calls[0][0] == "postgresql://repotrial:secret@db.invalid/repotrial"
     assert events == ["factory", "enter", "setup", "yield", "exit"]
+
+
+def test_postgres_context_receives_and_suppresses_consumer_body_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _checkpoint_module()
+    events: list[str] = []
+    saver = _FakeAsyncSaver(events)
+    context = _SuppressingExitContext(events, saver)
+    body_failure = RuntimeError("consumer body failure")
+
+    def factory(
+        database_url: str, *, serde: SerializerProtocol
+    ) -> _SuppressingExitContext:
+        del database_url, serde
+        events.append("factory")
+        return context
+
+    monkeypatch.setattr(
+        module.AsyncPostgresSaver,
+        "from_conn_string",
+        staticmethod(factory),
+    )
+
+    async def exercise() -> None:
+        async with module.build_checkpointer("postgresql://db.invalid/repotrial"):
+            raise body_failure
+
+    asyncio.run(exercise())
+
+    assert context.exit_args is not None
+    exit_type, exit_value, exit_traceback = context.exit_args
+    assert exit_type is type(body_failure)
+    assert exit_value is body_failure
+    assert exit_traceback is body_failure.__traceback__
+    assert events == ["factory", "enter", "setup", "exit"]
 
 
 @pytest.mark.parametrize("scheme", ["postgresql", "postgres"])
