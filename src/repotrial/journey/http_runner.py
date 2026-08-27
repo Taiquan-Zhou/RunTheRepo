@@ -24,9 +24,8 @@ _PEM_PRIVATE_KEY = re.compile(
     r"-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?(?:-----END [^-\r\n]*PRIVATE KEY-----|\Z)",
     re.DOTALL,
 )
-_QUERY_SECRET = re.compile(r"(?i)([?&](?:password|token|secret|api[_-]?key)=)[^&]*")
 _YAML_SECRET_BLOCK = re.compile(
-    r"(?i)^(?P<indent>\s*)[\"']?(?:password|token|secret|api[_-]?key)[\"']?\s*:\s*[|>]"
+    r"^(?P<indent>\s*)(?:-\s*)?[\"']?(?P<key>[A-Za-z0-9_-]+)[\"']?\s*:\s*[|>]"
 )
 
 
@@ -51,6 +50,28 @@ def _has_controls_or_backslash(value: str) -> bool:
     return any(ord(character) < 32 or ord(character) == 127 for character in value) or (
         "\\" in value or "%5c" in value.lower()
     )
+
+
+def _credential_key(value: str) -> bool:
+    normalized = unquote(value).lower().replace("-", "_")
+    parts = [part for part in normalized.split("_") if part]
+    return (
+        any(part in {"password", "token", "secret"} for part in parts)
+        or ("api" in parts and "key" in parts)
+        or ("private" in parts and "key" in parts)
+    )
+
+
+def _decoded_path(value: str) -> str | None:
+    if re.search(r"%(?![0-9A-Fa-f]{2})", value):
+        return None
+    decoded = value
+    for _ in range(3):
+        next_value = unquote(decoded)
+        if next_value == decoded:
+            return decoded
+        decoded = next_value
+    return None
 
 
 def _effective_port(url: httpx.URL) -> int:
@@ -135,13 +156,16 @@ def _validate_step(
         parsed_path = urlsplit(path)
     except ValueError:
         return "invalid_path", None, None, None, False
-    decoded_path = unquote(parsed_path.path)
+    decoded_path = _decoded_path(parsed_path.path)
     if (
-        not path.startswith("/")
+        decoded_path is None
+        or not path.startswith("/")
         or path.startswith("//")
         or parsed_path.scheme
         or parsed_path.netloc
         or parsed_path.fragment
+        or _has_controls_or_backslash(decoded_path)
+        or decoded_path.count("/") != parsed_path.path.count("/")
         or "//" in decoded_path
         or any(segment in {".", ".."} for segment in decoded_path.split("/"))
         or len(path) > 2_048
@@ -194,14 +218,23 @@ def _redact_yaml_secret_blocks(text: str) -> str:
                 continue
         redacted_lines.append(line)
         match = _YAML_SECRET_BLOCK.match(line)
-        if match is not None:
+        if match is not None and _credential_key(match.group("key")):
             content_indent = len(match.group("indent"))
     return "".join(redacted_lines)
 
 
 def _safe_request_target(url: httpx.URL) -> str:
     target = url.raw_path.decode("ascii")
-    return _QUERY_SECRET.sub(r"\1<redacted>", target)
+    path, marker, query = target.partition("?")
+    if not marker:
+        return target
+    safe_parts: list[str] = []
+    for part in query.split("&"):
+        key, equals, value = part.partition("=")
+        safe_parts.append(
+            key + equals + ("<redacted>" if equals and _credential_key(key) else value)
+        )
+    return path + marker + "&".join(safe_parts)
 
 
 async def _read_bounded_body(response: httpx.Response) -> tuple[bytes, bool]:
@@ -341,22 +374,30 @@ async def run_http_journey(
                         )
                     body, truncated = await _read_bounded_body(response)
             except httpx.HTTPError:
-                evidence_paths.append(
-                    _write_evidence(
-                        evidence_path,
-                        _evidence(
-                            method=method,
-                            path=path,
-                            json_body=json_body,
-                            has_json_body=has_json_body,
-                            status_code=None,
-                            truncated=None,
-                            body_hash=None,
-                            assertion_outcomes=[],
-                            failure_category="network_error",
-                        ),
+                try:
+                    evidence_paths.append(
+                        _write_evidence(
+                            evidence_path,
+                            _evidence(
+                                method=method,
+                                path=_safe_request_target(request_url),
+                                json_body=json_body,
+                                has_json_body=has_json_body,
+                                status_code=None,
+                                truncated=None,
+                                body_hash=None,
+                                assertion_outcomes=[],
+                                failure_category="network_error",
+                            ),
+                        )
                     )
-                )
+                except OSError:
+                    return _failure_result(
+                        journey,
+                        passed_steps,
+                        evidence_paths,
+                        f"{_step_token(index)}:evidence_write_error",
+                    )
                 return _failure_result(
                     journey,
                     passed_steps,

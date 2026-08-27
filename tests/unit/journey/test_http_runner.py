@@ -351,6 +351,41 @@ def test_evidence_uses_a_secret_safe_canonical_target(tmp_path: Path) -> None:
     assert evidence["request"]["path"] == "/items?token=<redacted>&page=2"
 
 
+@pytest.mark.parametrize(
+    "path", ["/safe%0Aevil", "/a%2fb", "/%252e%252e/private", "/bad%ZZ"]
+)
+def test_encoded_target_ambiguities_fail_before_transport(
+    tmp_path: Path, path: str
+) -> None:
+    result = run(
+        journey(step("encoded", "GET", path, [])),
+        tmp_path,
+        httpx.MockTransport(lambda request: httpx.Response(200)),
+    )
+    assert result.failure_reason == "step-0000:invalid_path"
+
+
+def test_query_credential_keys_are_decoded_and_redacted_in_network_evidence(
+    tmp_path: Path,
+) -> None:
+    def fail(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("x", request=request)
+
+    result = run(
+        journey(step("network", "GET", "/x?access%5Ftoken=alpha&mode=ok", [])),
+        tmp_path,
+        httpx.MockTransport(fail),
+    )
+    evidence = json.loads(Path(result.evidence_paths[0]).read_text(encoding="utf-8"))
+    assert evidence["request"]["path"] == "/x?access%5Ftoken=<redacted>&mode=ok"
+
+
+def test_body_redaction_uses_credential_key_grammar_for_nested_yaml() -> None:
+    assert _redacted_body_hash(
+        b"  - SSH_PRIVATE_KEY: |\n      alpha\nnext: keep\n", False
+    ) == _redacted_body_hash(b"  - SSH_PRIVATE_KEY: |\n      beta\nnext: keep\n", False)
+
+
 def test_compressed_response_fails_closed_and_requests_identity_encoding(
     tmp_path: Path,
 ) -> None:
