@@ -420,6 +420,29 @@ def test_unicode_service_without_category_c_characters_is_accepted(
     assert list(snapshot.inspect) == ["服务.一"]
 
 
+def test_literal_unicode_line_separator_in_service_is_preserved_with_crlf_framing(
+    tmp_path: Path,
+) -> None:
+    service = "api\u2028worker"
+    discovery_stdout = (
+        json.dumps(
+            {"Service": service, "ID": CONTAINER_A},
+            ensure_ascii=False,
+        )
+        + "\r\n"
+    )
+    provider = ScriptedProvider(
+        _scripts_for(
+            [(service, CONTAINER_A)],
+            discovery_stdout=discovery_stdout,
+        )
+    )
+
+    snapshot = _collect(provider, tmp_path / "observation.json")
+
+    assert list(snapshot.inspect) == [service]
+
+
 @pytest.mark.parametrize(
     ("network_result", "expected_unsupported"),
     [
@@ -551,6 +574,28 @@ def test_unknown_or_malformed_top_output_fails_closed(
     )
 
     _assert_parse_failure(tmp_path, scripts)
+
+
+@pytest.mark.parametrize("oversized_field", ["pid", "ppid"])
+def test_oversized_decimal_process_id_fails_as_context_free_parse_error(
+    tmp_path: Path, oversized_field: str
+) -> None:
+    fields = {
+        "pid": ["9" * 5_000, "0", "root", "app"],
+        "ppid": ["1", "9" * 5_000, "root", "app"],
+    }[oversized_field]
+    scripts = _scripts_for([("api", CONTAINER_A)])
+    scripts[("docker", "top", CONTAINER_A, "-eo", "pid=,ppid=,user=,comm=")] = _result(
+        " ".join(fields) + "\n"
+    )
+    artifact_path = tmp_path / "observation.json"
+
+    with pytest.raises(ObservationParseError) as raised:
+        _collect(ScriptedProvider(scripts), artifact_path)
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert not artifact_path.exists()
 
 
 @pytest.mark.parametrize("failing_command", ["discovery", "inspect", "diff", "top"])

@@ -266,7 +266,8 @@ async def _exec_collector(
 def _parse_discovery(stdout: str, budget: _CollectionBudget) -> list[tuple[str, str]]:
     containers: list[tuple[str, str]] = []
     seen_ids: set[str] = set()
-    for line in stdout.splitlines():
+    for line in stdout.split("\n"):
+        line = line.removesuffix("\r")
         if not line.strip():
             continue
         decoded = budget.copy_json(_decode_json(line))
@@ -352,10 +353,17 @@ def _parse_top(stdout: str, budget: _CollectionBudget) -> list[dict[str, JsonVal
         user, command = parts[2], parts[3]
         if not _valid_bounded_text(user) or not _valid_bounded_text(command):
             raise ObservationParseError("top output contains invalid text")
+        try:
+            process_ids = (int(parts[0]), int(parts[1]))
+        except ValueError:
+            process_ids = None
+        if process_ids is None:
+            raise ObservationParseError("top output contains a malformed row")
+        pid, ppid = process_ids
         copied = budget.copy_json(
             {
-                "pid": int(parts[0]),
-                "ppid": int(parts[1]),
+                "pid": pid,
+                "ppid": ppid,
                 "user": user,
                 "command": command,
             }
