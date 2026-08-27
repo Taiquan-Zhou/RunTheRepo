@@ -44,7 +44,7 @@ class _FakeAsyncSaver:
         self,
         events: list[str],
         *,
-        setup_error: RuntimeError | None = None,
+        setup_error: BaseException | None = None,
     ) -> None:
         self.events = events
         self.serde: SerializerProtocol | None = None
@@ -57,7 +57,7 @@ class _FakeAsyncSaver:
 
 
 class _FailingEntryContext:
-    def __init__(self, events: list[str], error: RuntimeError) -> None:
+    def __init__(self, events: list[str], error: BaseException) -> None:
         self.events = events
         self.error = error
 
@@ -206,6 +206,23 @@ def _postgres_factory(
     return calls
 
 
+def _assert_credential_safe_initialization_error(
+    error: BaseException,
+    *,
+    database_url: str,
+    username_sentinel: str,
+    password_sentinel: str,
+) -> None:
+    formatted = "".join(traceback.format_exception(error))
+
+    assert type(error).__name__ == "CheckpointInitializationError"
+    assert str(error) == "PostgreSQL checkpoint initialization failed"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    for secret in (database_url, username_sentinel, password_sentinel):
+        assert secret not in formatted
+
+
 def test_none_yields_memory_saver_usable_by_async_run_graph() -> None:
     module = _checkpoint_module()
 
@@ -220,6 +237,18 @@ def test_none_yields_memory_saver_usable_by_async_run_graph() -> None:
             assert snapshot.values == {}
 
     asyncio.run(exercise())
+
+
+def test_default_graph_serializer_leaves_unlisted_pydantic_payload_inert() -> None:
+    graph = build_run_graph()
+    unlisted = _UnlistedPayload(command="read-secret")
+
+    restored = graph.checkpointer.serde.loads_typed(
+        graph.checkpointer.serde.dumps_typed(unlisted)
+    )
+
+    assert restored == {"command": "read-secret"}
+    assert not isinstance(restored, _UnlistedPayload)
 
 
 def test_serializer_round_trips_only_checkpoint_safe_state_types() -> None:
@@ -390,11 +419,16 @@ def test_parser_valid_private_use_credential_reaches_postgres_factory(
     assert events == ["factory", "enter", "setup", "exit"]
 
 
-def test_postgres_factory_failure_propagates_without_yield(
+def test_postgres_factory_failure_becomes_credential_safe_initialization_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _checkpoint_module()
-    failure = RuntimeError("factory failed")
+    username_sentinel = "M6_FACTORY_USER"
+    password_sentinel = "M6_FACTORY_PASSWORD"
+    database_url = (
+        f"postgresql://{username_sentinel}:{password_sentinel}@db.invalid/repotrial"
+    )
+    failure = RuntimeError(f"factory failed for {database_url}")
     calls: list[str] = []
 
     def factory(
@@ -411,20 +445,30 @@ def test_postgres_factory_failure_propagates_without_yield(
     )
 
     async def exercise() -> None:
-        with pytest.raises(RuntimeError) as raised:
-            async with module.build_checkpointer("postgresql://db.invalid/repotrial"):
+        with pytest.raises(Exception) as raised:
+            async with module.build_checkpointer(database_url):
                 raise AssertionError("failed factory must not yield")
-        assert raised.value is failure
+        _assert_credential_safe_initialization_error(
+            raised.value,
+            database_url=database_url,
+            username_sentinel=username_sentinel,
+            password_sentinel=password_sentinel,
+        )
 
     asyncio.run(exercise())
-    assert calls == ["postgresql://db.invalid/repotrial"]
+    assert calls == [database_url]
 
 
-def test_postgres_entry_failure_follows_context_manager_contract(
+def test_postgres_entry_failure_becomes_credential_safe_initialization_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _checkpoint_module()
-    failure = RuntimeError("connection failed")
+    username_sentinel = "M6_ENTRY_USER"
+    password_sentinel = "M6_ENTRY_PASSWORD"
+    database_url = (
+        f"postgresql://{username_sentinel}:{password_sentinel}@db.invalid/repotrial"
+    )
+    failure = RuntimeError(f"connection failed for {database_url}")
     events: list[str] = []
 
     def factory(
@@ -441,29 +485,118 @@ def test_postgres_entry_failure_follows_context_manager_contract(
     )
 
     async def exercise() -> None:
-        with pytest.raises(RuntimeError) as raised:
-            async with module.build_checkpointer("postgresql://db.invalid/repotrial"):
+        with pytest.raises(Exception) as raised:
+            async with module.build_checkpointer(database_url):
                 raise AssertionError("failed entry must not yield")
-        assert raised.value is failure
+        _assert_credential_safe_initialization_error(
+            raised.value,
+            database_url=database_url,
+            username_sentinel=username_sentinel,
+            password_sentinel=password_sentinel,
+        )
 
     asyncio.run(exercise())
     assert events == ["factory", "enter"]
 
 
-def test_postgres_setup_failure_propagates_and_closes_context(
+def test_postgres_setup_failure_becomes_credential_safe_error_and_closes_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _checkpoint_module()
-    failure = RuntimeError("setup failed")
+    username_sentinel = "M6_SETUP_USER"
+    password_sentinel = "M6_SETUP_PASSWORD"
+    database_url = (
+        f"postgresql://{username_sentinel}:{password_sentinel}@db.invalid/repotrial"
+    )
+    failure = RuntimeError(f"setup failed for {database_url}")
     events: list[str] = []
     saver = _FakeAsyncSaver(events, setup_error=failure)
     _postgres_factory(monkeypatch, module, events, saver)
 
     async def exercise() -> None:
-        with pytest.raises(RuntimeError) as raised:
-            async with module.build_checkpointer("postgresql://db.invalid/repotrial"):
+        with pytest.raises(Exception) as raised:
+            async with module.build_checkpointer(database_url):
                 raise AssertionError("failed setup must not yield")
-        assert raised.value is failure
+        _assert_credential_safe_initialization_error(
+            raised.value,
+            database_url=database_url,
+            username_sentinel=username_sentinel,
+            password_sentinel=password_sentinel,
+        )
+
+    asyncio.run(exercise())
+    assert events == ["factory", "enter", "setup", "exit"]
+
+
+def test_postgres_factory_cancellation_propagates_without_translation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _checkpoint_module()
+
+    def factory(
+        database_url: str, *, serde: SerializerProtocol
+    ) -> AbstractAsyncContextManager[_FakeAsyncSaver]:
+        del database_url, serde
+        raise asyncio.CancelledError("factory cancellation")
+
+    monkeypatch.setattr(
+        module.AsyncPostgresSaver,
+        "from_conn_string",
+        staticmethod(factory),
+    )
+
+    async def exercise() -> None:
+        with pytest.raises(asyncio.CancelledError, match="factory cancellation"):
+            async with module.build_checkpointer("postgresql://db.invalid/repotrial"):
+                raise AssertionError("cancelled factory must not yield")
+
+    asyncio.run(exercise())
+
+
+def test_postgres_entry_cancellation_propagates_without_translation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _checkpoint_module()
+    events: list[str] = []
+
+    def factory(
+        database_url: str, *, serde: SerializerProtocol
+    ) -> _FailingEntryContext:
+        del database_url, serde
+        events.append("factory")
+        return _FailingEntryContext(
+            events, asyncio.CancelledError("entry cancellation")
+        )
+
+    monkeypatch.setattr(
+        module.AsyncPostgresSaver,
+        "from_conn_string",
+        staticmethod(factory),
+    )
+
+    async def exercise() -> None:
+        with pytest.raises(asyncio.CancelledError, match="entry cancellation"):
+            async with module.build_checkpointer("postgresql://db.invalid/repotrial"):
+                raise AssertionError("cancelled entry must not yield")
+
+    asyncio.run(exercise())
+    assert events == ["factory", "enter"]
+
+
+def test_postgres_setup_cancellation_closes_context_without_translation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _checkpoint_module()
+    events: list[str] = []
+    saver = _FakeAsyncSaver(
+        events, setup_error=asyncio.CancelledError("setup cancellation")
+    )
+    _postgres_factory(monkeypatch, module, events, saver)
+
+    async def exercise() -> None:
+        with pytest.raises(asyncio.CancelledError, match="setup cancellation"):
+            async with module.build_checkpointer("postgresql://db.invalid/repotrial"):
+                raise AssertionError("cancelled setup must not yield")
 
     asyncio.run(exercise())
     assert events == ["factory", "enter", "setup", "exit"]

@@ -1,6 +1,7 @@
+import asyncio
 import unicodedata
 from collections.abc import AsyncIterator
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
@@ -43,6 +44,11 @@ _CHECKPOINT_JSON_IDS = tuple(
     (*checkpoint_type.__module__.split("."), checkpoint_type.__name__)
     for checkpoint_type in _CHECKPOINT_TYPES
 )
+
+
+class CheckpointInitializationError(RuntimeError):
+    def __init__(self) -> None:
+        super().__init__("PostgreSQL checkpoint initialization failed")
 
 
 def build_checkpointer(
@@ -88,18 +94,62 @@ def _build_serializer() -> JsonPlusSerializer:
     )
 
 
+def build_memory_checkpointer() -> InMemorySaver:
+    return InMemorySaver(serde=_build_serializer())
+
+
 @asynccontextmanager
 async def _managed_checkpointer(
     database_url: str | None,
 ) -> AsyncIterator[BaseCheckpointSaver[str]]:
-    serializer = _build_serializer()
     if database_url is None:
-        yield InMemorySaver(serde=serializer)
+        yield build_memory_checkpointer()
         return
 
-    async with AsyncPostgresSaver.from_conn_string(
-        database_url,
-        serde=serializer,
-    ) as saver:
+    initialization_error: CheckpointInitializationError | None
+    try:
+        saver_context = AsyncPostgresSaver.from_conn_string(
+            database_url,
+            serde=_build_serializer(),
+        )
+    except asyncio.CancelledError:
+        raise
+    # This adapter boundary must translate every non-cancellation backend failure.
+    except Exception:  # noqa: BLE001
+        initialization_error = CheckpointInitializationError()
+    else:
+        initialization_error = None
+    if initialization_error is not None:
+        raise initialization_error
+
+    exit_stack = AsyncExitStack()
+    try:
+        saver = await exit_stack.enter_async_context(saver_context)
+    except asyncio.CancelledError:
+        raise
+    # This adapter boundary must translate every non-cancellation backend failure.
+    except Exception:  # noqa: BLE001
+        initialization_error = CheckpointInitializationError()
+    else:
+        initialization_error = None
+    if initialization_error is not None:
+        raise initialization_error
+
+    try:
         await saver.setup()
+    except asyncio.CancelledError:
+        await exit_stack.aclose()
+        raise
+    # This adapter boundary must translate every non-cancellation backend failure.
+    except Exception:  # noqa: BLE001
+        await exit_stack.aclose()
+        initialization_error = CheckpointInitializationError()
+    else:
+        initialization_error = None
+    if initialization_error is not None:
+        raise initialization_error
+
+    try:
         yield saver
+    finally:
+        await exit_stack.aclose()

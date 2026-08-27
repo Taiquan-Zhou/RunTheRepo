@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
-from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.runtime import Runtime
@@ -24,6 +23,7 @@ else:
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
 
+from repotrial.agent.checkpoint import build_memory_checkpointer
 from repotrial.agent.state import GraphContext, GraphState, StageName
 from repotrial.compose.mutations import apply_mutation
 from repotrial.compose.parser import canonical_compose_json, load_compose
@@ -85,7 +85,9 @@ def build_run_graph(
     builder.add_edge("decide", "report_or_next")
     builder.add_conditional_edges("report_or_next", _report_route)
     return builder.compile(
-        checkpointer=checkpointer if checkpointer is not None else InMemorySaver(),
+        checkpointer=(
+            checkpointer if checkpointer is not None else build_memory_checkpointer()
+        ),
         interrupt_after=list(interrupt_after),
         name="repotrial",
     )
