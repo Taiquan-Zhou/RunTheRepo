@@ -148,6 +148,9 @@ def test_crud_requests_support_json_path_and_text_assertions(tmp_path: Path) -> 
         tmp_path,
         httpx.MockTransport(handler),
     )
+    assert result.failure_reason == "step-0000:unsupported_content_encoding"
+    assert observed_headers == ["identity"]
+    assert [Path(path).name for path in result.evidence_paths] == ["step-0000.json"]
 
     assert result.verdict is Verdict.PASS
     assert result.passed_steps == 3
@@ -405,9 +408,17 @@ def test_compressed_response_fails_closed_and_requests_identity_encoding(
         httpx.MockTransport(handler),
     )
 
-    assert result.failure_reason == "step-0000:unsupported_content_encoding"
-    assert observed_headers == ["identity"]
-    assert [Path(path).name for path in result.evidence_paths] == ["step-0000.json"]
+
+def test_body_redaction_uses_credential_key_grammar_for_assignments() -> None:
+    alpha = b"db_password = alpha beta\nclient_secret:\n  one\n  two\nnext: ordinary\n"
+    beta = b"db_password = gamma delta\nclient_secret:\n  three\n  four\n  five\nnext: ordinary\n"
+    changed_sibling = b"db_password = gamma delta\nclient_secret:\n  three\n  four\n  five\nnext: changed\n"
+
+    assert _redacted_body_hash(alpha, False) == _redacted_body_hash(beta, False)
+    assert _redacted_body_hash(beta, False) != _redacted_body_hash(
+        changed_sibling, False
+    )
+
 
 
 def test_redacted_hash_consumes_truncated_pem_and_multiline_credentials(

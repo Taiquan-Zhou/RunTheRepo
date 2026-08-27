@@ -16,9 +16,6 @@ _BODY_LIMIT_BYTES = 65_536
 _REQUEST_TIMEOUT_SECONDS = 5.0
 _MAX_ASSERTIONS_PER_STEP = 64
 _ALLOWED_METHODS = frozenset({"GET", "POST", "DELETE"})
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?im)([\"']?(?:password|token|secret|api[_-]?key)[\"']?\s*[:=]\s*)(?:\r?\n\s*)?(?:\"[^\"]*\"|'[^']*'|[^\s,}]+)"
-)
 _BEARER_TOKEN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*")
 _PEM_PRIVATE_KEY = re.compile(
     r"-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?(?:-----END [^-\r\n]*PRIVATE KEY-----|\Z)",
@@ -26,6 +23,9 @@ _PEM_PRIVATE_KEY = re.compile(
 )
 _YAML_SECRET_BLOCK = re.compile(
     r"^(?P<indent>\s*)(?:-\s*)?[\"']?(?P<key>[A-Za-z0-9_-]+)[\"']?\s*:\s*[|>]"
+)
+_ASSIGNMENT_LINE = re.compile(
+    r"^(?P<prefix>\s*(?:-\s*)?[\"']?(?P<key>[A-Za-z0-9_-]+)[\"']?\s*[:=]\s*)(?P<value>.*)$"
 )
 
 
@@ -194,15 +194,14 @@ def _canonical_json_hash(value: object) -> str:
 def _redacted_body_hash(body: bytes, truncated: bool) -> str:
     text = body.decode("utf-8", errors="replace")
     redacted = _PEM_PRIVATE_KEY.sub("<redacted-private-key>", text)
-    redacted = _redact_yaml_secret_blocks(redacted)
-    redacted = _SECRET_ASSIGNMENT.sub(r"\1<redacted>", redacted)
+    redacted = _redact_credential_assignments(redacted)
     redacted = _BEARER_TOKEN.sub("Bearer <redacted>", redacted)
     if truncated:
         redacted += "\n[repotrial:truncated]\n"
     return hashlib.sha256(redacted.encode("utf-8")).hexdigest()
 
 
-def _redact_yaml_secret_blocks(text: str) -> str:
+def _redact_credential_assignments(text: str) -> str:
     redacted_lines: list[str] = []
     content_indent: int | None = None
     for line in text.splitlines(keepends=True):
@@ -211,15 +210,18 @@ def _redact_yaml_secret_blocks(text: str) -> str:
             if line.strip() and indentation <= content_indent:
                 content_indent = None
             else:
-                suffix = "\n" if line.endswith("\n") else ""
-                redacted_lines.append(
-                    " " * (content_indent + 1) + "<redacted>" + suffix
-                )
                 continue
-        redacted_lines.append(line)
-        match = _YAML_SECRET_BLOCK.match(line)
-        if match is not None and _credential_key(match.group("key")):
-            content_indent = len(match.group("indent"))
+        match = _ASSIGNMENT_LINE.match(line)
+        if match is None or not _credential_key(match.group("key")):
+            redacted_lines.append(line)
+            continue
+        suffix = "\n" if line.endswith("\n") else ""
+        redacted_lines.append(match.group("prefix") + "<redacted>" + suffix)
+        if not match.group("value").strip() or match.group("value").strip() in {
+            "|",
+            ">",
+        }:
+            content_indent = len(line) - len(line.lstrip(" \t"))
     return "".join(redacted_lines)
 
 
