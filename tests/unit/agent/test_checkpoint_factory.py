@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import json
+import traceback
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from types import ModuleType
@@ -505,3 +506,20 @@ def test_invalid_urls_fail_before_the_postgres_factory(
         module.build_checkpointer(database_url)
 
     assert calls == []
+
+
+def test_malformed_url_error_suppresses_password_and_parser_cause() -> None:
+    module = _checkpoint_module()
+    password_sentinel = "M6_3_PASSWORD_SENTINEL%ZZ"
+    database_url = f"postgresql://user:{password_sentinel}@db.invalid/repotrial"
+
+    with pytest.raises(ValueError) as raised:
+        module.build_checkpointer(database_url)
+
+    error = raised.value
+    formatted = "".join(traceback.format_exception(error))
+    assert str(error) == "database_url must be a valid PostgreSQL URL"
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    assert password_sentinel not in formatted
+    assert database_url not in formatted

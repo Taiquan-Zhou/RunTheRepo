@@ -65,8 +65,8 @@ def _validate_database_url(database_url: str | None) -> str | None:
         raise ValueError("database_url must be an explicit PostgreSQL URL")
     try:
         connection_info = conninfo_to_dict(database_url)
-    except ProgrammingError as error:
-        raise ValueError("database_url must be a valid PostgreSQL URL") from error
+    except ProgrammingError:
+        raise ValueError("database_url must be a valid PostgreSQL URL") from None
     if any(
         _contains_control(value)
         for value in connection_info.values()
