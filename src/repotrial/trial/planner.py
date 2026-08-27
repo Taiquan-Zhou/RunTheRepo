@@ -133,6 +133,8 @@ def _is_valid_action(action: RecoveryAction, allowed_env_keys: frozenset[str]) -
     reason = fields["reason"]
     if not _is_bounded_string(action_name) or not _is_bounded_string(reason):
         return False
+    if type(params) is not dict:
+        return False
     if action_name == "set_env":
         return _is_valid_set_env(params, allowed_env_keys)
     if action_name == "wait":

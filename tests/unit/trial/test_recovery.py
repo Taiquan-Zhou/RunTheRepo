@@ -55,6 +55,11 @@ class MutatingModelAdapter:
         )
 
 
+class EmptyLike:
+    def __eq__(self, other: object) -> bool:
+        return other == {}
+
+
 def _propose(
     logs: dict[str, str],
     readme_excerpt: str = "",
@@ -208,6 +213,19 @@ def test_incomplete_constructed_model_action_fails_closed() -> None:
     action = _propose(
         logs={"logs": "unrecognized startup failure"},
         model=FakeModelAdapter(incomplete),
+    )
+
+    assert action == RecoveryAction(action="stop", params={}, reason="unsafe proposal")
+
+
+def test_retry_with_non_dict_params_fails_closed() -> None:
+    malformed = RecoveryAction.model_construct(
+        action="retry", params=EmptyLike(), reason="retry"
+    )
+
+    action = _propose(
+        logs={"logs": "unrecognized startup failure"},
+        model=FakeModelAdapter(malformed),
     )
 
     assert action == RecoveryAction(action="stop", params={}, reason="unsafe proposal")
