@@ -22,6 +22,32 @@ PROJECT_ROOT = Path(__file__).parents[3]
 READINESS_TIMEOUT_S = 5.0
 READINESS_POLL_INTERVAL_S = 0.02
 READINESS_PROBE_TIMEOUT_S = READINESS_POLL_INTERVAL_S
+_LIFESPAN_MEASUREMENT_SCRIPT = """
+import asyncio
+import importlib.util
+import json
+import sys
+import time
+
+spec = importlib.util.spec_from_file_location(
+    "fixture_lifespan_timing_probe", sys.argv[1]
+)
+if spec is None or spec.loader is None:
+    raise RuntimeError("fixture application could not be imported")
+fixture_application = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = fixture_application
+spec.loader.exec_module(fixture_application)
+
+
+async def measure_lifespan() -> float:
+    started = time.monotonic()
+    async with fixture_application.app.router.lifespan_context(fixture_application.app):
+        pass
+    return time.monotonic() - started
+
+
+json.dump({"elapsed_s": asyncio.run(measure_lifespan())}, sys.stdout)
+"""
 
 
 @dataclass(frozen=True)
@@ -194,6 +220,34 @@ def _start_process(
     )
 
 
+def _measure_fixture_lifespan_elapsed_s(*, startup_delay_s: str) -> float:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "APP_REQUIRED_TOKEN": "contract-token",
+            "STARTUP_DELAY_S": startup_delay_s,
+        }
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _LIFESPAN_MEASUREMENT_SCRIPT,
+            str(FIXTURE_DIR / "app.py"),
+        ],
+        check=True,
+        capture_output=True,
+        cwd=PROJECT_ROOT,
+        env=environment,
+        text=True,
+        timeout=READINESS_TIMEOUT_S,
+    )
+    payload = json.loads(result.stdout)
+    elapsed_s = payload["elapsed_s"]
+    assert isinstance(elapsed_s, float)
+    return elapsed_s
+
+
 def test_fixture_requires_token_and_rejects_invalid_startup_delays(
     tmp_path: Path,
 ) -> None:
@@ -262,19 +316,14 @@ def test_fixture_health_crud_files_and_accessible_ui(tmp_path: Path) -> None:
         _assert_cap_net_raw(server, tmp_path / "status")
 
 
-def test_fixture_applies_non_negative_startup_delay(tmp_path: Path) -> None:
-    with _running_fixture(tmp_path / "zero-delay") as zero_delay_server:
-        assert _http_request(f"{zero_delay_server.base_url}/health")[0] == 200
-        zero_delay_readiness_s = zero_delay_server.readiness_elapsed_s
-    with _running_fixture(
-        tmp_path / "delayed", startup_delay_s="0.5"
-    ) as delayed_server:
-        assert _http_request(f"{delayed_server.base_url}/health")[0] == 200
-        delayed_readiness_s = delayed_server.readiness_elapsed_s
+def test_fixture_lifespan_applies_configured_startup_delay() -> None:
+    configured_startup_delay_s = "0.5"
 
-    assert zero_delay_readiness_s is not None
-    assert delayed_readiness_s is not None
-    assert delayed_readiness_s >= zero_delay_readiness_s + 0.25
+    elapsed_s = _measure_fixture_lifespan_elapsed_s(
+        startup_delay_s=configured_startup_delay_s
+    )
+
+    assert elapsed_s >= float(configured_startup_delay_s)
 
 
 def test_readiness_probe_preserves_startup_delay_with_controlled_clock(
