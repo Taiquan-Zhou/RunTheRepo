@@ -304,7 +304,7 @@ async def _journey_proposal_before_deadline(
     proposal = model_task.result()
     if type(proposal) is not _JourneyProposal:
         raise ValueError("invalid journey proposal type")
-    return _JourneyProposal.model_validate(proposal.__dict__)
+    return _JourneyProposal.model_validate(_proposal_transport_data(proposal))
 
 
 def _cancel_and_observe_journey_model_task(
@@ -320,6 +320,52 @@ def _cancel_and_observe_journey_model_task(
 def _observe_journey_model_task(task: asyncio.Task[_JourneyProposal]) -> None:
     if not task.cancelled():
         task.exception()
+
+
+def _proposal_transport_data(proposal: _JourneyProposal) -> dict[str, object]:
+    raw = proposal.__dict__
+    journeys = raw.get("journeys")
+    if type(journeys) is not list:
+        return {} if journeys is None else {"journeys": journeys}
+    return {"journeys": [_journey_transport_data(journey) for journey in journeys]}
+
+
+def _journey_transport_data(value: object) -> object:
+    if not isinstance(value, _JourneyTransport):
+        return value
+    raw = value.__dict__
+    data = _selected_transport_fields(raw, ("journey_id", "name", "steps"))
+    steps = data.get("steps")
+    if type(steps) is list:
+        data["steps"] = [_step_transport_data(step) for step in steps]
+    return data
+
+
+def _step_transport_data(value: object) -> object:
+    if not isinstance(value, _JourneyStepTransport):
+        return value
+    raw = value.__dict__
+    data = _selected_transport_fields(
+        raw, ("step_id", "tool", "action", "params", "assertions")
+    )
+    assertions = data.get("assertions")
+    if type(assertions) is list:
+        data["assertions"] = [
+            _assertion_transport_data(assertion) for assertion in assertions
+        ]
+    return data
+
+
+def _assertion_transport_data(value: object) -> object:
+    if not isinstance(value, _JourneyAssertionTransport):
+        return value
+    return _selected_transport_fields(value.__dict__, ("kind", "target", "expected"))
+
+
+def _selected_transport_fields(
+    raw: dict[str, object], fields: tuple[str, ...]
+) -> dict[str, object]:
+    return {field: raw[field] for field in fields if field in raw}
 
 
 def _validate_and_materialize_journey_collection(value: object) -> list[Journey] | None:

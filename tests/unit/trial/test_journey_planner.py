@@ -40,6 +40,18 @@ class ConstructedModelAdapter:
         return schema.model_construct(journeys=self.journeys)
 
 
+class ExactProposalModelAdapter:
+    def __init__(self, proposal: BaseModel) -> None:
+        self.proposal = proposal
+
+    async def structured(
+        self, *, system: str, user: str, schema: type[BaseModel]
+    ) -> BaseModel:
+        del system, user
+        assert schema is type(self.proposal)
+        return self.proposal
+
+
 class TimeoutModelAdapter:
     def __init__(self) -> None:
         self.cancelled = asyncio.Event()
@@ -503,6 +515,43 @@ def test_model_construct_bypass_is_revalidated_before_materialization() -> None:
 
     with pytest.raises(ValidationError):
         asyncio.run(planner_module._journey_proposal_before_deadline(model, ""))
+
+
+@pytest.mark.parametrize("missing", ["journey", "step", "assertion"])
+def test_nested_model_construct_bypass_fails_closed(
+    tmp_path: Path, missing: str
+) -> None:
+    assertion_values: dict[str, object] = {
+        "kind": "status_code",
+        "target": "response.status",
+        "expected": 200,
+    }
+    if missing == "assertion":
+        del assertion_values["expected"]
+    assertion = planner_module._JourneyAssertionTransport.model_construct(
+        **assertion_values
+    )
+    step_values: dict[str, object] = {
+        "step_id": "request",
+        "tool": "http",
+        "action": "request",
+        "params": {"method": "GET", "path": "/"},
+        "assertions": [assertion],
+    }
+    if missing == "step":
+        del step_values["step_id"]
+    step = planner_module._JourneyStepTransport.model_construct(**step_values)
+    journey_values: dict[str, object] = {
+        "journey_id": "health",
+        "name": "Health",
+        "steps": [step],
+    }
+    if missing == "journey":
+        del journey_values["journey_id"]
+    journey = planner_module._JourneyTransport.model_construct(**journey_values)
+    proposal = planner_module._JourneyProposal.model_construct(journeys=[journey])
+
+    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == []
 
 
 def test_model_timeout_fails_closed_and_cancels_inner_task(tmp_path: Path) -> None:
