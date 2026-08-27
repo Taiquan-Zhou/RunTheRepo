@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
 
+from langgraph.errors import NodeCancelledError
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -553,6 +554,10 @@ async def _execute_fixture_once(
             )
             graph_state = await ainvoke_run(build_run_graph(), state, context=context)
         return _project_run(fixture, provider, run_index, graph_state)
+    except NodeCancelledError as error:
+        if isinstance(error.__cause__, asyncio.CancelledError):
+            raise error.__cause__
+        raise
     except Exception as error:  # noqa: BLE001 -- Outer adapter retains failures.
         return _failed_fixture_run(fixture, provider, run_index, error)
 
@@ -787,10 +792,10 @@ def _load_fixtures(manifest_dir: Path) -> list[_LoadedFixture]:
         )
         if manifest.fixture_id in seen_ids:
             raise ValueError("duplicate fixture id")
-        inputs = {compose_path, ground_truth_path}
+        inputs = [compose_path, ground_truth_path]
         if readme_path is not None:
-            inputs.add(readme_path)
-        if seen_inputs & inputs:
+            inputs.append(readme_path)
+        if len(inputs) != len(set(inputs)) or seen_inputs.intersection(inputs):
             raise ValueError("duplicate fixture input")
         seen_ids.add(manifest.fixture_id)
         seen_inputs.update(inputs)

@@ -258,6 +258,28 @@ def test_malformed_or_duplicate_inputs_are_rejected_not_skipped(tmp_path: Path) 
         _evaluator().evaluate_benchmark(manifest_dir)
 
 
+@pytest.mark.parametrize(
+    ("aliased_role", "source_role"),
+    [
+        ("readme", "compose"),
+        ("ground_truth", "compose"),
+        ("readme", "ground_truth"),
+    ],
+    ids=["compose-readme", "compose-ground-truth", "ground-truth-readme"],
+)
+def test_manifest_rejects_one_file_used_for_multiple_semantic_roles(
+    tmp_path: Path, aliased_role: str, source_role: str
+) -> None:
+    manifest_dir = _isolated_fixture_project(tmp_path)
+    manifest_path = manifest_dir / "single.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest[aliased_role] = manifest[source_role]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate fixture input"):
+        _evaluator()._load_fixtures(manifest_dir)
+
+
 def test_unlisted_ordinary_failure_is_retained_without_dropping_later_fixtures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -478,6 +500,39 @@ def test_fixture_provider_binds_observer_commands_to_discovered_identity_and_for
     )
     assert len(provider.unexpected_commands) == len(results)
     assert len(set(provider.unexpected_commands)) == len(results)
+
+
+def test_graph_wrapped_provider_cancellation_propagates_after_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evaluator = _evaluator()
+    manifest_dir = _isolated_fixture_project(tmp_path)
+    original_provider = evaluator._FixtureProvider
+    instances: list[object] = []
+
+    class CancellingProvider(original_provider):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            instances.append(self)
+
+        async def exec(
+            self, sandbox_id: str, argv: list[str], timeout_s: int = 60
+        ) -> object:
+            del argv, timeout_s
+            assert sandbox_id in self._sandboxes
+            raise asyncio.CancelledError("provider cancellation")
+
+    monkeypatch.setattr(evaluator, "_FixtureProvider", CancellingProvider)
+
+    with pytest.raises(asyncio.CancelledError, match="provider cancellation"):
+        try:
+            evaluator.evaluate_benchmark(manifest_dir)
+        finally:
+            assert instances
+            for provider in instances:
+                assert provider.created_ids == ["eval-single-0001"]
+                assert provider.destroyed_ids == provider.created_ids
+                assert provider._sandboxes == {}
 
 
 def test_cancellation_is_not_converted_to_a_normal_fixture_verdict(
