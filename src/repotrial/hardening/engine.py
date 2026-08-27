@@ -217,17 +217,18 @@ def _compose_file(workspace: Path, value: object) -> tuple[str, Path]:
     relative = Path(value)
     if relative.is_absolute() or relative.drive or ".." in relative.parts:
         raise ValueError("compose_path must be a safe relative path")
-    target = workspace / relative
+    target = workspace
     try:
         target_stat = target.lstat()
+        for component in relative.parts:
+            target /= component
+            target_stat = target.lstat()
+            if _is_link(target, target_stat):
+                raise ValueError("compose_path must name an existing regular file")
         resolved = target.resolve(strict=True)
     except OSError:
         raise ValueError("compose_path must name an existing regular file") from None
-    if (
-        not resolved.is_relative_to(workspace)
-        or not stat.S_ISREG(target_stat.st_mode)
-        or _is_link(target, target_stat)
-    ):
+    if not resolved.is_relative_to(workspace) or not stat.S_ISREG(target_stat.st_mode):
         raise ValueError("compose_path must name an existing regular file")
     return value, resolved
 

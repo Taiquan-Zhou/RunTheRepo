@@ -734,3 +734,23 @@ def test_invalid_runtime_boundary_rejects_before_overlay_or_provider(
     assert provider.calls == []
     if context_change != "existing_overlay":
         assert not context.overlay_path.exists()
+
+
+def test_compose_path_rejects_linked_intermediate_directory_before_side_effects(
+    tmp_path: Path,
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    real_directory = context.workspace / "real"
+    real_directory.mkdir()
+    (real_directory / "compose.yaml").write_text(_compose_text(), encoding="utf-8")
+    linked_directory = context.workspace / "linked"
+    linked_directory.symlink_to(real_directory, target_is_directory=True)
+    state.compose_path = "linked/compose.yaml"
+    provider = RecordingProvider()
+
+    with pytest.raises(ValueError, match="existing regular file"):
+        _run(state, mutation, provider, context)
+
+    assert provider.calls == []
+    assert not context.overlay_path.exists()
+    assert list(context.artifact_dir.iterdir()) == []
