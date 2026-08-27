@@ -8,7 +8,7 @@ from pathlib import Path
 from unicodedata import category
 from urllib.parse import unquote, urlsplit
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from repotrial.domain.models import Journey, JourneyAssertion, JourneyStep
 from repotrial.models.base import ModelAdapter, RecoveryAction
@@ -45,6 +45,7 @@ _MAX_DECLARED_JOURNEYS_BYTES = 65_536
 _MAX_JOURNEYS = 5
 _MAX_STEPS_PER_JOURNEY = 8
 _MAX_ASSERTIONS_PER_STEP = 64
+_MAX_ACTION_PARAMS = 3
 _MAX_JOURNEY_TEXT_LENGTH = 4_096
 _MAX_PATH_LENGTH = 2_048
 _MAX_JSON_DEPTH = 16
@@ -77,18 +78,20 @@ class _JourneyStepTransport(_StrictJourneyTransport):
     step_id: str
     tool: str
     action: str
-    params: dict[str, object]
-    assertions: list[_JourneyAssertionTransport]
+    params: dict[str, object] = Field(max_length=_MAX_ACTION_PARAMS)
+    assertions: list[_JourneyAssertionTransport] = Field(
+        max_length=_MAX_ASSERTIONS_PER_STEP
+    )
 
 
 class _JourneyTransport(_StrictJourneyTransport):
     journey_id: str
     name: str
-    steps: list[_JourneyStepTransport]
+    steps: list[_JourneyStepTransport] = Field(max_length=_MAX_STEPS_PER_JOURNEY)
 
 
 class _JourneyProposal(_StrictJourneyTransport):
-    journeys: list[_JourneyTransport]
+    journeys: list[_JourneyTransport] = Field(max_length=_MAX_JOURNEYS)
 
 
 class _ModelDeadlineExpired:
@@ -304,7 +307,10 @@ async def _journey_proposal_before_deadline(
     proposal = model_task.result()
     if type(proposal) is not _JourneyProposal:
         raise ValueError("invalid journey proposal type")
-    return _JourneyProposal.model_validate(_proposal_transport_data(proposal))
+    transport = _preflight_transport_structure(proposal)
+    if transport is None:
+        return _JourneyProposal.model_validate({})
+    return _JourneyProposal.model_validate(transport)
 
 
 def _cancel_and_observe_journey_model_task(
@@ -322,55 +328,107 @@ def _observe_journey_model_task(task: asyncio.Task[_JourneyProposal]) -> None:
         task.exception()
 
 
-def _proposal_transport_data(proposal: _JourneyProposal) -> dict[str, object]:
-    raw = proposal.__dict__
-    journeys = raw.get("journeys")
-    if type(journeys) is not list:
-        return {} if journeys is None else {"journeys": journeys}
-    return {"journeys": [_journey_transport_data(journey) for journey in journeys]}
+_PROPOSAL_FIELDS = frozenset({"journeys"})
+_JOURNEY_FIELDS = frozenset({"journey_id", "name", "steps"})
+_STEP_FIELDS = frozenset({"step_id", "tool", "action", "params", "assertions"})
+_ASSERTION_FIELDS = frozenset({"kind", "target", "expected"})
 
 
-def _journey_transport_data(value: object) -> object:
-    if not isinstance(value, _JourneyTransport):
-        return value
-    raw = value.__dict__
-    data = _selected_transport_fields(raw, ("journey_id", "name", "steps"))
-    steps = data.get("steps")
-    if type(steps) is list:
-        data["steps"] = [_step_transport_data(step) for step in steps]
-    return data
+def _preflight_transport_structure(value: object) -> dict[str, object] | None:
+    raw = _exact_transport_mapping(value, _PROPOSAL_FIELDS)
+    if raw is None:
+        return None
+    journeys = raw["journeys"]
+    if type(journeys) is not list or len(journeys) > _MAX_JOURNEYS:
+        return None
+    checked_journeys: list[dict[str, object]] = []
+    for journey in journeys:
+        checked = _preflight_journey_transport(journey)
+        if checked is None:
+            return None
+        checked_journeys.append(checked)
+    return {"journeys": checked_journeys}
 
 
-def _step_transport_data(value: object) -> object:
-    if not isinstance(value, _JourneyStepTransport):
-        return value
-    raw = value.__dict__
-    data = _selected_transport_fields(
-        raw, ("step_id", "tool", "action", "params", "assertions")
-    )
-    assertions = data.get("assertions")
-    if type(assertions) is list:
-        data["assertions"] = [
-            _assertion_transport_data(assertion) for assertion in assertions
-        ]
-    return data
+def _preflight_journey_transport(value: object) -> dict[str, object] | None:
+    raw = _exact_transport_mapping(value, _JOURNEY_FIELDS)
+    if raw is None:
+        return None
+    steps = raw["steps"]
+    if type(steps) is not list or len(steps) > _MAX_STEPS_PER_JOURNEY:
+        return None
+    checked_steps: list[dict[str, object]] = []
+    for step in steps:
+        checked = _preflight_step_transport(step)
+        if checked is None:
+            return None
+        checked_steps.append(checked)
+    return {
+        "journey_id": raw["journey_id"],
+        "name": raw["name"],
+        "steps": checked_steps,
+    }
 
 
-def _assertion_transport_data(value: object) -> object:
-    if not isinstance(value, _JourneyAssertionTransport):
-        return value
-    return _selected_transport_fields(value.__dict__, ("kind", "target", "expected"))
+def _preflight_step_transport(value: object) -> dict[str, object] | None:
+    raw = _exact_transport_mapping(value, _STEP_FIELDS)
+    if raw is None:
+        return None
+    params = raw["params"]
+    assertions = raw["assertions"]
+    if (
+        type(params) is not dict
+        or len(params) > _MAX_ACTION_PARAMS
+        or type(assertions) is not list
+        or len(assertions) > _MAX_ASSERTIONS_PER_STEP
+    ):
+        return None
+    checked_assertions: list[dict[str, object]] = []
+    for assertion in assertions:
+        checked = _preflight_assertion_transport(assertion)
+        if checked is None:
+            return None
+        checked_assertions.append(checked)
+    return {
+        "step_id": raw["step_id"],
+        "tool": raw["tool"],
+        "action": raw["action"],
+        "params": params,
+        "assertions": checked_assertions,
+    }
 
 
-def _selected_transport_fields(
-    raw: dict[str, object], fields: tuple[str, ...]
-) -> dict[str, object]:
-    return {field: raw[field] for field in fields if field in raw}
+def _preflight_assertion_transport(value: object) -> dict[str, object] | None:
+    raw = _exact_transport_mapping(value, _ASSERTION_FIELDS)
+    if raw is None:
+        return None
+    return {
+        "kind": raw["kind"],
+        "target": raw["target"],
+        "expected": raw["expected"],
+    }
+
+
+def _exact_transport_mapping(
+    value: object, fields: frozenset[str]
+) -> dict[str, object] | None:
+    if isinstance(value, _StrictJourneyTransport):
+        raw = value.__dict__
+    elif type(value) is dict:
+        raw = value
+    else:
+        return None
+    if len(raw) != len(fields) or raw.keys() != fields:
+        return None
+    return raw
 
 
 def _validate_and_materialize_journey_collection(value: object) -> list[Journey] | None:
+    transport = _preflight_transport_structure(value)
+    if transport is None:
+        return None
     try:
-        proposal = _JourneyProposal.model_validate(value)
+        proposal = _JourneyProposal.model_validate(transport)
     except (ValidationError, RecursionError):
         return None
     return _materialize_journey_proposal(proposal)

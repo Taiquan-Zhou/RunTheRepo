@@ -501,6 +501,90 @@ def test_model_schema_has_strict_nested_journey_and_step_definitions(
         )
 
 
+def test_model_schema_exposes_transport_collection_bounds(tmp_path: Path) -> None:
+    model = FakeModelAdapter([])
+
+    assert _plan(tmp_path, model=model) == []
+    assert model.schema is not None
+    schema = model.schema.model_json_schema()
+    definitions = schema["$defs"]
+    journey = definitions[
+        schema["properties"]["journeys"]["items"]["$ref"].rsplit("/", 1)[-1]
+    ]
+    step = definitions[
+        journey["properties"]["steps"]["items"]["$ref"].rsplit("/", 1)[-1]
+    ]
+
+    assert schema["properties"]["journeys"]["maxItems"] == 5
+    assert journey["properties"]["steps"]["maxItems"] == 8
+    assert step["properties"]["assertions"]["maxItems"] == 64
+    assert step["properties"]["params"]["maxProperties"] == 3
+
+
+def test_over_limit_journeys_are_rejected_before_later_values_are_accessed(
+    tmp_path: Path,
+) -> None:
+    class ExplodingJourney(planner_module._JourneyTransport):
+        def __getattribute__(self, name: str) -> object:
+            if name == "__dict__":
+                raw = object.__getattribute__(self, "__dict__")
+                if raw.get("explode", False):
+                    raise AssertionError("over-limit journey was accessed")
+            return super().__getattribute__(name)
+
+    valid_journey = planner_module._JourneyTransport.model_construct(
+        journey_id="health",
+        name="Health",
+        steps=[],
+    )
+    exploding_journey = ExplodingJourney.model_construct(
+        journey_id="later",
+        name="Later",
+        steps=[],
+    )
+    object.__getattribute__(exploding_journey, "__dict__")["explode"] = True
+    proposal = planner_module._JourneyProposal.model_construct(
+        journeys=[valid_journey] * 5 + [exploding_journey]
+    )
+
+    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == []
+
+
+@pytest.mark.parametrize("over_limit", ["steps", "assertions", "params"])
+def test_nested_transport_collection_limits_fail_closed(
+    tmp_path: Path, over_limit: str
+) -> None:
+    assertion = planner_module._JourneyAssertionTransport.model_construct(
+        kind="status_code",
+        target="response.status",
+        expected=200,
+    )
+    assertions: list[object] = [assertion]
+    params: dict[str, object] = {"method": "GET", "path": "/"}
+    if over_limit == "assertions":
+        assertions = [assertion] * 65
+    if over_limit == "params":
+        params = {"method": "GET", "path": "/", "json": {}, "extra": True}
+    step = planner_module._JourneyStepTransport.model_construct(
+        step_id="request",
+        tool="http",
+        action="request",
+        params=params,
+        assertions=assertions,
+    )
+    steps: list[object] = [step]
+    if over_limit == "steps":
+        steps = [step] * 9
+    journey = planner_module._JourneyTransport.model_construct(
+        journey_id="health",
+        name="Health",
+        steps=steps,
+    )
+    proposal = planner_module._JourneyProposal.model_construct(journeys=[journey])
+
+    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == []
+
+
 def test_model_construct_bypass_is_revalidated_before_materialization() -> None:
     model = ConstructedModelAdapter(
         [
@@ -550,6 +634,35 @@ def test_nested_model_construct_bypass_fails_closed(
         del journey_values["journey_id"]
     journey = planner_module._JourneyTransport.model_construct(**journey_values)
     proposal = planner_module._JourneyProposal.model_construct(journeys=[journey])
+
+    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == []
+
+
+@pytest.mark.parametrize("extra_on", ["proposal", "journey", "step", "assertion"])
+def test_nested_model_construct_extra_fields_fail_closed(
+    tmp_path: Path, extra_on: str
+) -> None:
+    assertion = planner_module._JourneyAssertionTransport.model_construct(
+        kind="status_code",
+        target="response.status",
+        expected=200,
+    )
+    step = planner_module._JourneyStepTransport.model_construct(
+        step_id="request",
+        tool="http",
+        action="request",
+        params={"method": "GET", "path": "/"},
+        assertions=[assertion],
+    )
+    journey = planner_module._JourneyTransport.model_construct(
+        journey_id="health",
+        name="Health",
+        steps=[step],
+    )
+    proposal = planner_module._JourneyProposal.model_construct(journeys=[journey])
+    {"proposal": proposal, "journey": journey, "step": step, "assertion": assertion}[
+        extra_on
+    ].__dict__["unexpected"] = {"tool": "shell"}
 
     assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == []
 
