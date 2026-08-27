@@ -8,7 +8,7 @@ import stat
 import tempfile
 import unicodedata
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
@@ -49,6 +49,15 @@ type GroundTruthMutation = Literal[
     "remove_docker_socket",
     "bridge_network",
 ]
+type _FixtureCommandRoute = Literal[
+    "compose_up",
+    "compose_boot_ps",
+    "compose_observer_ps",
+    "compose_logs",
+    "inspect",
+    "diff",
+    "top",
+]
 
 _BoundedId = Annotated[str, StringConstraints(pattern=r"[a-z0-9][a-z0-9_-]{0,63}")]
 _BoundedText = Annotated[str, StringConstraints(min_length=1, max_length=256)]
@@ -56,14 +65,21 @@ _RelativePath = Annotated[str, StringConstraints(min_length=1, max_length=512)]
 _MAX_JSON_BYTES = 64 * 1024
 _MAX_README_BYTES = 64 * 1024
 _MAX_MANIFESTS = 64
-_EVALUATION_FAILURES = (
-    OSError,
-    RuntimeError,
-    TypeError,
-    ValueError,
-    KeyError,
-)
 _ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=(.*)\Z")
+_COMPOSE_ROUTES: dict[tuple[str, ...], _FixtureCommandRoute] = {
+    ("up", "-d"): "compose_up",
+    ("ps", "--all", "--format", "json"): "compose_boot_ps",
+    (
+        "ps",
+        "--all",
+        "--no-trunc",
+        "--orphans=false",
+        "--format",
+        "json",
+    ): "compose_observer_ps",
+    ("logs", "--no-color", "--tail", "200"): "compose_logs",
+}
+_TOP_FORMAT = "pid=,ppid=,user=,comm="
 
 
 class _StrictModel(BaseModel):
@@ -194,10 +210,21 @@ class _LoadedFixture:
 @dataclass(slots=True)
 class _SandboxState:
     workspace: Path
+    container_id: str
     active_config: dict[str, object] | None = None
+    active_compose_files: tuple[str, ...] | None = None
+    active_env: dict[str, str] | None = None
+    discovered_container_id: str | None = None
     readiness_failure: str | None = None
     server: asyncio.AbstractServer | None = None
     port: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _FixtureCommand:
+    route: _FixtureCommandRoute
+    compose_files: tuple[str, ...] = ()
+    env: Mapping[str, str] = field(default_factory=dict)
 
 
 class _FixtureProvider(SandboxProvider):
@@ -217,7 +244,10 @@ class _FixtureProvider(SandboxProvider):
         )
         if sandbox_id in self._sandboxes:
             raise ValueError("fixture sandbox identity collision")
-        self._sandboxes[sandbox_id] = _SandboxState(workspace=workspace)
+        self._sandboxes[sandbox_id] = _SandboxState(
+            workspace=workspace,
+            container_id=_container_id(sandbox_id),
+        )
         self.created_ids.append(sandbox_id)
         return sandbox_id
 
@@ -226,21 +256,23 @@ class _FixtureProvider(SandboxProvider):
     ) -> ExecResult:
         del timeout_s
         sandbox = self._owned_sandbox(sandbox_id)
-        env, command = _split_env_prefix(argv)
-        if command[:2] == ["docker", "compose"]:
-            return self._compose_command(sandbox, command, env)
-        if len(command) == 3 and command[:2] == ["docker", "inspect"]:
-            return self._inspect_result(sandbox_id, sandbox)
-        if len(command) == 3 and command[:2] == ["docker", "diff"]:
+        command = _route_fixture_command(sandbox, self._ground_truth, argv)
+        if command is None:
+            return self._unexpected(argv)
+        if command.route.startswith("compose_"):
+            return self._compose_command(sandbox, command)
+        if command.route == "inspect":
+            return self._inspect_result(sandbox)
+        if command.route == "diff":
             stdout = "C /tmp/repotrial-eval\n" if self._ground_truth.writes_tmp else ""
             return ExecResult(exit_code=0, stdout=stdout, stderr="")
-        if command[:2] == ["docker", "top"]:
+        if command.route == "top":
             return ExecResult(
                 exit_code=0,
                 stdout="1 0 65532 fixture-app\n",
                 stderr="",
             )
-        return self._unexpected(argv)
+        raise RuntimeError("fixture command route is unsupported")
 
     async def publish_port(self, sandbox_id: str, container_port: int) -> int:
         sandbox = self._owned_sandbox(sandbox_id)
@@ -299,21 +331,21 @@ class _FixtureProvider(SandboxProvider):
         return sandbox
 
     def _compose_command(
-        self, sandbox: _SandboxState, argv: list[str], env: Mapping[str, str]
+        self, sandbox: _SandboxState, command: _FixtureCommand
     ) -> ExecResult:
-        files, operation = _compose_files_and_operation(argv)
-        if operation not in {"up", "ps", "logs"}:
-            return self._unexpected(argv)
-        if operation == "up":
+        if command.route == "compose_up":
             sandbox.active_config = _effective_service_config(
                 sandbox.workspace,
-                files,
+                command.compose_files,
                 self._ground_truth.service,
             )
+            sandbox.active_compose_files = command.compose_files
+            sandbox.active_env = dict(command.env)
+            sandbox.discovered_container_id = None
             sandbox.readiness_failure = _readiness_failure(
                 self._ground_truth,
                 sandbox.active_config,
-                env,
+                command.env,
             )
             return ExecResult(
                 exit_code=0 if sandbox.readiness_failure is None else 1,
@@ -322,16 +354,19 @@ class _FixtureProvider(SandboxProvider):
             )
         if sandbox.active_config is None:
             return ExecResult(exit_code=1, stdout="", stderr="compose not started")
-        if operation == "logs":
+        if command.route == "compose_logs":
             return ExecResult(
                 exit_code=0,
                 stdout=(sandbox.readiness_failure or "fixture ready") + "\n",
                 stderr="",
             )
         row: dict[str, object]
-        if "--no-trunc" in argv:
-            container_id = _container_id(self._ground_truth.fixture_id)
-            row = {"Service": self._ground_truth.service, "ID": container_id}
+        if command.route == "compose_observer_ps":
+            sandbox.discovered_container_id = sandbox.container_id
+            row = {
+                "Service": self._ground_truth.service,
+                "ID": sandbox.discovered_container_id,
+            }
         else:
             ready = sandbox.readiness_failure is None
             row = {
@@ -346,11 +381,11 @@ class _FixtureProvider(SandboxProvider):
             stderr="",
         )
 
-    def _inspect_result(self, sandbox_id: str, sandbox: _SandboxState) -> ExecResult:
+    def _inspect_result(self, sandbox: _SandboxState) -> ExecResult:
         config = sandbox.active_config or {}
         payload: list[dict[str, object]] = [
             {
-                "Id": _container_id(sandbox_id),
+                "Id": sandbox.container_id,
                 "Config": {"User": str(config.get("user", "")), "Env": []},
                 "HostConfig": {
                     "Privileged": config.get("privileged") is True,
@@ -517,9 +552,9 @@ async def _execute_fixture_once(
                 compose_path="compose.yml",
             )
             graph_state = await ainvoke_run(build_run_graph(), state, context=context)
-    except _EVALUATION_FAILURES as error:
+        return _project_run(fixture, provider, run_index, graph_state)
+    except Exception as error:  # noqa: BLE001 -- Outer adapter retains failures.
         return _failed_fixture_run(fixture, provider, run_index, error)
-    return _project_run(fixture, provider, run_index, graph_state)
 
 
 def _project_run(
@@ -931,38 +966,70 @@ def _is_link(path: Path, metadata: os.stat_result) -> bool:
     return path.is_symlink() or bool(reparse and attributes & reparse)
 
 
-def _split_env_prefix(argv: Sequence[str]) -> tuple[dict[str, str], list[str]]:
+def _route_fixture_command(
+    sandbox: _SandboxState,
+    truth: _GroundTruth,
+    argv: Sequence[str],
+) -> _FixtureCommand | None:
     if not argv or any(not isinstance(item, str) for item in argv):
         raise ValueError("fixture provider requires argv-style commands")
     command = list(argv)
     env: dict[str, str] = {}
-    if command[0] == "env":
+    has_env_prefix = command[0] == "env"
+    if has_env_prefix:
         try:
             docker_index = command.index("docker", 1)
         except ValueError:
-            return {}, command
-        for assignment in command[1:docker_index]:
-            match = _ENV_ASSIGNMENT.fullmatch(assignment)
-            if match is None:
-                return {}, command
+            return None
+        assignments = command[1:docker_index]
+        if not assignments:
+            return None
+        for assignment in assignments:
+            if _ENV_ASSIGNMENT.fullmatch(assignment) is None:
+                return None
             key, value = assignment.split("=", 1)
+            if key not in truth.allowed_env_keys or key in env:
+                return None
             env[key] = value
         command = command[docker_index:]
-    return env, command
 
+    if command[:2] == ["docker", "compose"]:
+        files: list[str] = []
+        index = 2
+        while index < len(command) and command[index] == "-f":
+            if index + 1 >= len(command):
+                return None
+            files.append(command[index + 1])
+            index += 2
+        if len(files) not in {1, 2} or len(files) != len(set(files)):
+            return None
+        route = _COMPOSE_ROUTES.get(tuple(command[index:]))
+        if route is None:
+            return None
+        compose_files = tuple(files)
+        if route == "compose_observer_ps":
+            if has_env_prefix or compose_files != sandbox.active_compose_files:
+                return None
+        elif route != "compose_up" and (
+            compose_files != sandbox.active_compose_files or env != sandbox.active_env
+        ):
+            return None
+        return _FixtureCommand(
+            route=route,
+            compose_files=compose_files,
+            env=env,
+        )
 
-def _compose_files_and_operation(argv: Sequence[str]) -> tuple[list[str], str]:
-    if list(argv[:2]) != ["docker", "compose"]:
-        return [], ""
-    files: list[str] = []
-    index = 2
-    while index < len(argv) and argv[index] == "-f":
-        if index + 1 >= len(argv):
-            return [], ""
-        files.append(argv[index + 1])
-        index += 2
-    operation = argv[index] if index < len(argv) else ""
-    return files, operation
+    if has_env_prefix or sandbox.discovered_container_id is None:
+        return None
+    container_id = sandbox.discovered_container_id
+    if command == ["docker", "inspect", container_id]:
+        return _FixtureCommand(route="inspect")
+    if command == ["docker", "diff", container_id]:
+        return _FixtureCommand(route="diff")
+    if command == ["docker", "top", container_id, "-eo", _TOP_FORMAT]:
+        return _FixtureCommand(route="top")
+    return None
 
 
 def _effective_service_config(

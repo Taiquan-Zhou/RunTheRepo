@@ -25,6 +25,28 @@ def _fixture_map(benchmark: object) -> dict[str, object]:
     return {fixture.fixture_id: fixture for fixture in fixtures}
 
 
+def _fixture_provider(fixture_id: str) -> tuple[Any, Path]:
+    evaluator = _evaluator()
+    loaded = next(
+        fixture
+        for fixture in evaluator._load_fixtures(MANIFESTS)
+        if fixture.manifest.fixture_id == fixture_id
+    )
+    return evaluator._FixtureProvider(loaded.ground_truth), loaded.compose_path.parent
+
+
+def _assert_unexpected(result: object, provider: object) -> None:
+    result_data = cast(Any, result)
+    provider_data = cast(Any, provider)
+    assert result_data.exit_code == 127
+    assert result_data.stderr == "unsupported fixture command"
+    assert len(provider_data.unexpected_commands) == 1
+    digest = provider_data.unexpected_commands[0]
+    assert digest.startswith("sha256-")
+    assert len(digest) == 23
+    int(digest.removeprefix("sha256-"), 16)
+
+
 def _isolated_fixture_project(
     tmp_path: Path,
     *,
@@ -236,7 +258,7 @@ def test_malformed_or_duplicate_inputs_are_rejected_not_skipped(tmp_path: Path) 
         _evaluator().evaluate_benchmark(manifest_dir)
 
 
-def test_unavailable_fixture_cannot_inflate_observed_hardening_metrics(
+def test_unlisted_ordinary_failure_is_retained_without_dropping_later_fixtures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     evaluator = _evaluator()
@@ -247,7 +269,7 @@ def test_unavailable_fixture_cannot_inflate_observed_hardening_metrics(
             self, sandbox_id: str, argv: list[str], timeout_s: int = 60
         ) -> object:
             if self._ground_truth.fixture_id == "redundant_privileged":
-                raise RuntimeError("synthetic evaluator failure")
+                raise AssertionError("synthetic ordinary evaluator failure")
             return await super().exec(sandbox_id, argv, timeout_s)
 
     monkeypatch.setattr(evaluator, "_FixtureProvider", FailingProvider)
@@ -255,9 +277,207 @@ def test_unavailable_fixture_cannot_inflate_observed_hardening_metrics(
     benchmark = evaluator.evaluate_benchmark(MANIFESTS)
     failed = _fixture_map(benchmark)["redundant_privileged"]
 
+    assert len(benchmark.fixtures) == 5
+    assert all(len(fixture.runs) == 2 for fixture in benchmark.fixtures)
     assert failed.status == "unavailable"
+    assert failed.stop_reason == "evaluator_error:assertion_error"
+    assert all(run.status == "unavailable" for run in failed.runs)
+    assert all(
+        run.stop_reason == "evaluator_error:assertion_error" for run in failed.runs
+    )
+    assert _fixture_map(benchmark)["required_capability"].status == "completed"
     assert benchmark.metrics["hardening_acceptance_precision"] == "unavailable"
     assert benchmark.metrics["unnecessary_privilege_removal_recall"] == "unavailable"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["docker", "compose", "-f", "compose.yml", "up"],
+        ["docker", "compose", "-f", "compose.yml", "up", "-d", "--wait"],
+        [
+            "docker",
+            "compose",
+            "-f",
+            "compose.yml",
+            "-f",
+            "compose.yml",
+            "-f",
+            "compose.yml",
+            "up",
+            "-d",
+        ],
+        ["docker", "compose", "-f", "compose.yml", "ps", "--format", "json"],
+        [
+            "docker",
+            "compose",
+            "-f",
+            "compose.yml",
+            "ps",
+            "--all",
+            "--no-trunc",
+            "--format",
+            "json",
+        ],
+        [
+            "docker",
+            "compose",
+            "-f",
+            "compose.yml",
+            "logs",
+            "--no-color",
+            "--tail",
+            "200",
+            "--since",
+            "1h",
+        ],
+    ],
+    ids=[
+        "up-missing-detach",
+        "up-extra-flag",
+        "three-compose-files",
+        "boot-ps-missing-flags",
+        "observer-ps-missing-orphans-flag",
+        "logs-arbitrary-tail",
+    ],
+)
+def test_fixture_provider_rejects_non_exact_compose_dialect(argv: list[str]) -> None:
+    provider, workspace = _fixture_provider("redundant_privileged")
+
+    async def exercise() -> object:
+        sandbox_id = await provider.create(workspace, "negative-compose")
+        try:
+            return await provider.exec(sandbox_id, argv)
+        finally:
+            await provider.destroy(sandbox_id)
+
+    result = asyncio.run(exercise())
+
+    _assert_unexpected(result, provider)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [
+            "env",
+            "HOST_SSH_KEY=secret",
+            "docker",
+            "compose",
+            "-f",
+            "compose.yml",
+            "up",
+            "-d",
+        ],
+        [
+            "env",
+            "APP_MODE=one",
+            "APP_MODE=two",
+            "docker",
+            "compose",
+            "-f",
+            "compose.yml",
+            "up",
+            "-d",
+        ],
+        [
+            "env",
+            "docker",
+            "compose",
+            "-f",
+            "compose.yml",
+            "up",
+            "-d",
+        ],
+    ],
+    ids=["unexpected-env", "duplicate-env", "missing-env-assignment"],
+)
+def test_fixture_provider_rejects_env_outside_fixed_authority(argv: list[str]) -> None:
+    provider, workspace = _fixture_provider("prompt_injection")
+
+    async def exercise() -> object:
+        sandbox_id = await provider.create(workspace, "negative-env")
+        try:
+            return await provider.exec(sandbox_id, argv)
+        finally:
+            await provider.destroy(sandbox_id)
+
+    result = asyncio.run(exercise())
+
+    _assert_unexpected(result, provider)
+
+
+def test_fixture_provider_binds_observer_commands_to_discovered_identity_and_format() -> (
+    None
+):
+    provider, workspace = _fixture_provider("redundant_privileged")
+
+    async def exercise() -> tuple[list[object], str]:
+        sandbox_id = await provider.create(workspace, "negative-observer")
+        try:
+            up = await provider.exec(
+                sandbox_id,
+                ["docker", "compose", "-f", "compose.yml", "up", "-d"],
+            )
+            assert up.exit_code == 0
+            discovery = await provider.exec(
+                sandbox_id,
+                [
+                    "docker",
+                    "compose",
+                    "-f",
+                    "compose.yml",
+                    "ps",
+                    "--all",
+                    "--no-trunc",
+                    "--orphans=false",
+                    "--format",
+                    "json",
+                ],
+            )
+            discovered = json.loads(discovery.stdout)["ID"]
+            wrong = "0" * 12
+            commands = [
+                ["docker", "inspect", wrong],
+                ["docker", "diff", wrong],
+                [
+                    "docker",
+                    "top",
+                    wrong,
+                    "-eo",
+                    "pid=,ppid=,user=,comm=",
+                ],
+                [
+                    "docker",
+                    "top",
+                    discovered,
+                    "-o",
+                    "pid=,ppid=,user=,comm=",
+                ],
+                ["docker", "top", discovered, "-eo", "pid="],
+                [
+                    "docker",
+                    "top",
+                    discovered,
+                    "-eo",
+                    "pid=,ppid=,user=,comm=",
+                    "--arbitrary-tail",
+                ],
+            ]
+            results = [await provider.exec(sandbox_id, command) for command in commands]
+            return results, discovered
+        finally:
+            await provider.destroy(sandbox_id)
+
+    results, discovered = asyncio.run(exercise())
+
+    assert discovered != "0" * 12
+    assert all(cast(Any, result).exit_code == 127 for result in results)
+    assert all(
+        cast(Any, result).stderr == "unsupported fixture command" for result in results
+    )
+    assert len(provider.unexpected_commands) == len(results)
+    assert len(set(provider.unexpected_commands)) == len(results)
 
 
 def test_cancellation_is_not_converted_to_a_normal_fixture_verdict(
