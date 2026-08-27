@@ -704,6 +704,56 @@ def test_stop_rejects_selected_overlay_replaced_by_link(tmp_path: Path) -> None:
     assert _candidate_create_calls(provider) == []
 
 
+def test_materialized_stop_overlay_deleted_after_checkpoint_fails_closed(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port, candidate_publish=False)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+        graph = build_run_graph(interrupt_after=("experiment",))
+        state = _state(source.parent, run_id="deleted-stop-overlay")
+
+        interrupted = asyncio.run(ainvoke_run(graph, state, context=context))
+        assert interrupted.pending_experiment is not None
+        assert interrupted.pending_experiment.verdict is ExperimentVerdict.STOP
+        assert interrupted.pending_experiment.reason == "publish_failed"
+        assert interrupted.pending_overlay_path is not None
+        assert interrupted.pending_overlay_materialized is True
+        selected = context.workspace / interrupted.pending_overlay_path
+        assert selected.is_file()
+        selected.unlink()
+
+        with pytest.raises(ValueError, match="overlay"):
+            asyncio.run(aresume_run(graph, state.run_id, context=context))
+
+
+def test_prematerialization_stop_overlay_inserted_after_checkpoint_fails_closed(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+        graph = build_run_graph(interrupt_after=("experiment",))
+        state = _state(source.parent, run_id="inserted-stop-overlay")
+        state.journeys = [_journey(), _journey()]
+
+        interrupted = asyncio.run(ainvoke_run(graph, state, context=context))
+        assert interrupted.pending_experiment is not None
+        assert interrupted.pending_experiment.verdict is ExperimentVerdict.STOP
+        assert (
+            interrupted.pending_experiment.reason
+            == "invalid_baseline:duplicate_result_id"
+        )
+        assert interrupted.pending_overlay_path is not None
+        assert interrupted.pending_overlay_materialized is False
+        selected = context.workspace / interrupted.pending_overlay_path
+        assert not selected.exists()
+        selected.write_text("services: {}\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="overlay"):
+            asyncio.run(aresume_run(graph, state.run_id, context=context))
+
+
 def test_default_graph_composes_real_baseline_services_in_one_sandbox(
     tmp_path: Path,
 ) -> None:

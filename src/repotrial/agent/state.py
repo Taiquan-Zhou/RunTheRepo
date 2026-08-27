@@ -71,3 +71,4 @@ class GraphState(BaseModel):
     pending_mutation: Mutation | None = None
     pending_experiment: ExperimentRecord | None = None
     pending_overlay_path: str | None = None
+    pending_overlay_materialized: bool | None = None

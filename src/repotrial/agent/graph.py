@@ -353,6 +353,7 @@ def _propose_mutation(state: GraphState) -> NodeUpdate:
         "pending_mutation": decision.mutation,
         "pending_experiment": None,
         "pending_overlay_path": None,
+        "pending_overlay_materialized": None,
         "stage_history": _visit(state, "propose_mutation"),
     }
 
@@ -398,9 +399,15 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
         context.provider,
         context=experiment_context,
     )
+    overlay_materialized = overlay_path.exists() or overlay_path.is_symlink()
+    if overlay_materialized:
+        _existing_regular_file(overlay_path, workspace, "overlay")
+    elif record.verdict is not ExperimentVerdict.STOP:
+        raise ValueError("KEEP/ROLLBACK experiment must materialize an overlay")
     return {
         "pending_experiment": record,
         "pending_overlay_path": overlay_path.relative_to(workspace).as_posix(),
+        "pending_overlay_materialized": overlay_materialized,
         "stage_history": _visit(state, "experiment"),
     }
 
@@ -431,6 +438,7 @@ def _decide(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate:
         "pending_mutation": None,
         "pending_experiment": None,
         "pending_overlay_path": None,
+        "pending_overlay_materialized": None,
         "stage_history": _visit(state, "decide"),
     }
 
@@ -591,10 +599,18 @@ def _selected_overlay_relative_path(
         raise ValueError("selected overlay parent is invalid") from None
     if parent != overlay_dir:
         raise ValueError("selected overlay must be inside overlay_dir")
+    materialized = state.pending_overlay_materialized
+    if materialized is None:
+        raise ValueError("decide requires the overlay materialization state")
+    if not materialized:
+        if record.verdict is not ExperimentVerdict.STOP:
+            raise ValueError("only STOP may omit an overlay")
+        if path.exists() or path.is_symlink():
+            _existing_regular_file(path, workspace, "overlay")
+            raise ValueError("pre-materialization STOP overlay must remain absent")
+        return None
     if not path.exists() and not path.is_symlink():
-        if record.verdict is ExperimentVerdict.STOP:
-            return None
-        raise ValueError("non-stop experiment must produce an overlay")
+        raise ValueError("materialized overlay must remain present")
     resolved = _existing_regular_file(path, workspace, "overlay")
     return resolved.relative_to(workspace).as_posix()
 
