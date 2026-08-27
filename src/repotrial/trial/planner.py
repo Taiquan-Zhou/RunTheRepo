@@ -502,6 +502,10 @@ def _parse_journey(value: object) -> Journey | None:
         if step is None:
             return None
         steps.append(step)
+    if not steps or len({step.tool for step in steps}) != 1:
+        return None
+    if steps[0].tool == "http" and not any(step.assertions for step in steps):
+        return None
     return Journey(journey_id=journey_id, name=name, steps=steps)
 
 

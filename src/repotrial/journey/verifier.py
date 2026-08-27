@@ -60,7 +60,7 @@ def evaluate_assertion(
     if assertion.kind == "json_path_equals":
         try:
             parsed: Any = json.loads(text)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError, ValueError):
             return False, "malformed_json"
         current: object = parsed
         for part in assertion.target.split("."):

@@ -24,7 +24,11 @@ _PEM_PRIVATE_KEY = re.compile(
 
 
 def _failure_result(
-    journey: Journey, passed_steps: int, evidence_paths: list[str], reason: str
+    journey: Journey,
+    passed_steps: int,
+    evidence_paths: list[str],
+    reason: str,
+    evidence_failure_reason: str | None = None,
 ) -> JourneyResult:
     return JourneyResult(
         journey_id=journey.journey_id,
@@ -33,6 +37,7 @@ def _failure_result(
         total_steps=len(journey.steps),
         evidence_paths=evidence_paths,
         failure_reason=reason,
+        evidence_failure_reason=evidence_failure_reason,
     )
 
 
@@ -428,6 +433,10 @@ async def run_http_journey(
     origin = _validate_base_url(base_url)
     if origin is None:
         return _failure_result(journey, 0, [], "journey:invalid_base_url")
+    if not journey.steps:
+        return _failure_result(journey, 0, [], "journey:empty_steps")
+    if not any(step.assertions for step in journey.steps):
+        return _failure_result(journey, 0, [], "journey:missing_assertions")
 
     for index, step in enumerate(journey.steps):
         validation_error, _, preflight_path, _, _ = _validate_step(step)
@@ -439,7 +448,16 @@ async def run_http_journey(
         if _request_url(origin, preflight_path) is None:
             return _failure_result(journey, 0, [], f"{_step_token(index)}:invalid_path")
 
-    evidence_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return _failure_result(
+            journey,
+            0,
+            [],
+            "journey:evidence_failure",
+            "journey:evidence_initialization_failure",
+        )
     evidence_paths: list[str] = []
     passed_steps = 0
     async with httpx.AsyncClient(

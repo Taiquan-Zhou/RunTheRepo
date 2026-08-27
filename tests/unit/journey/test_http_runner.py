@@ -109,6 +109,82 @@ def test_health_status_assertion_passes_and_writes_canonical_evidence(
     assert evidence["response"]["status_code"] == 200
 
 
+def test_empty_journey_fails_before_network_or_evidence_side_effects(
+    tmp_path: Path,
+) -> None:
+    invoked = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal invoked
+        invoked = True
+        return httpx.Response(200)
+
+    evidence_dir = tmp_path / "evidence"
+    result = run(journey(), evidence_dir, httpx.MockTransport(handler))
+
+    assert result.verdict is Verdict.FAIL
+    assert result.failure_reason == "journey:empty_steps"
+    assert result.evidence_paths == []
+    assert not evidence_dir.exists()
+    assert invoked is False
+
+
+def test_assertion_free_http_journey_fails_before_network_or_evidence_side_effects(
+    tmp_path: Path,
+) -> None:
+    invoked = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal invoked
+        invoked = True
+        return httpx.Response(500)
+
+    evidence_dir = tmp_path / "evidence"
+    result = run(
+        journey(step("unchecked", "GET", "/unchecked", [])),
+        evidence_dir,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.verdict is Verdict.FAIL
+    assert result.failure_reason == "journey:missing_assertions"
+    assert result.evidence_paths == []
+    assert not evidence_dir.exists()
+    assert invoked is False
+
+
+def test_evidence_directory_initialization_failure_is_structured_and_skips_request(
+    tmp_path: Path,
+) -> None:
+    invoked = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal invoked
+        invoked = True
+        return httpx.Response(200)
+
+    evidence_path = tmp_path / "evidence-file"
+    evidence_path.write_text("not a directory", encoding="utf-8")
+    result = run(
+        journey(
+            step(
+                "health",
+                "GET",
+                "/health",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
+        evidence_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.verdict is Verdict.FAIL
+    assert result.failure_reason == "journey:evidence_failure"
+    assert result.evidence_failure_reason == "journey:evidence_initialization_failure"
+    assert result.evidence_paths == []
+    assert invoked is False
+
+
 def test_crud_requests_support_json_path_and_text_assertions(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
@@ -221,7 +297,9 @@ def test_invalid_execution_capabilities_fail_closed_without_transport(
         invoked = True
         return httpx.Response(200)
 
-    original = step("invalid", "GET", "/x", [])
+    original = step(
+        "invalid", "GET", "/x", [assertion("status_code", "response.status", 200)]
+    )
     invalid_step = mutate(original)
     result = run(journey(invalid_step), tmp_path, httpx.MockTransport(handler))
 
@@ -302,7 +380,14 @@ def test_request_url_preserves_the_frozen_origin_scheme_host_and_effective_port(
         return httpx.Response(200)
 
     result = run(
-        journey(step("origin", "GET", "/health?probe=1", [])),
+        journey(
+            step(
+                "origin",
+                "GET",
+                "/health?probe=1",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
         tmp_path,
         httpx.MockTransport(handler),
         "https://fixture.test:443",
@@ -328,7 +413,16 @@ def test_ambiguous_relative_targets_fail_before_transport(
         return httpx.Response(200)
 
     result = run(
-        journey(step("target", "GET", path, [])), tmp_path, httpx.MockTransport(handler)
+        journey(
+            step(
+                "target",
+                "GET",
+                path,
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
     )
 
     assert result.failure_reason == "step-0000:invalid_path"
@@ -340,7 +434,14 @@ def test_evidence_uses_a_secret_safe_canonical_target(tmp_path: Path) -> None:
         return httpx.Response(200, stream=ChunkedStream([b""]))
 
     result = run(
-        journey(step("query", "GET", "/items?token=raw-secret&page=2", [])),
+        journey(
+            step(
+                "query",
+                "GET",
+                "/items?token=raw-secret&page=2",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
         tmp_path,
         httpx.MockTransport(handler),
     )
@@ -356,7 +457,14 @@ def test_encoded_target_ambiguities_fail_before_transport(
     tmp_path: Path, path: str
 ) -> None:
     result = run(
-        journey(step("encoded", "GET", path, [])),
+        journey(
+            step(
+                "encoded",
+                "GET",
+                path,
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
         tmp_path,
         httpx.MockTransport(lambda request: httpx.Response(200)),
     )
@@ -370,7 +478,14 @@ def test_query_credential_keys_are_decoded_and_redacted_in_network_evidence(
         raise httpx.ReadTimeout("x", request=request)
 
     result = run(
-        journey(step("network", "GET", "/x?access%5Ftoken=alpha&mode=ok", [])),
+        journey(
+            step(
+                "network",
+                "GET",
+                "/x?access%5Ftoken=alpha&mode=ok",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
         tmp_path,
         httpx.MockTransport(fail),
     )
@@ -426,7 +541,14 @@ def test_runner_writes_evidence_for_deep_legal_json_without_escaping(
 ) -> None:
     body = b"[" * 1_100 + b"0" + b"]" * 1_100
     result = run(
-        journey(step("deep-json", "GET", "/deep", [])),
+        journey(
+            step(
+                "deep-json",
+                "GET",
+                "/deep",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
         tmp_path,
         httpx.MockTransport(
             lambda request: httpx.Response(200, stream=ChunkedStream([body]))
@@ -443,7 +565,14 @@ def test_runner_writes_evidence_for_legal_long_json_integer_without_escaping(
 ) -> None:
     body = b'{"value":' + b"9" * 5_000 + b"}"
     result = run(
-        journey(step("long-json", "GET", "/long", [])),
+        journey(
+            step(
+                "long-json",
+                "GET",
+                "/long",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
         tmp_path,
         httpx.MockTransport(
             lambda request: httpx.Response(200, stream=ChunkedStream([body]))
@@ -480,7 +609,14 @@ def test_truncated_structured_response_redacts_credential_substitutions(
     hashes: list[str] = []
     for secret in ("alpha", "bravo"):
         result = run(
-            journey(step("truncated-json", "GET", "/truncated", [])),
+            journey(
+                step(
+                    "truncated-json",
+                    "GET",
+                    "/truncated",
+                    [assertion("status_code", "response.status", 200)],
+                )
+            ),
             tmp_path / secret,
             httpx.MockTransport(
                 lambda request, value=secret: httpx.Response(
@@ -574,7 +710,14 @@ def test_truncated_quoted_credential_consumes_assignment_like_content(
     hashes: list[str] = []
     for secret, status in (("alpha", "one"), ("bravo", "two")):
         result = run(
-            journey(step("truncated-quoted", "GET", "/truncated-quoted", [])),
+            journey(
+                step(
+                    "truncated-quoted",
+                    "GET",
+                    "/truncated-quoted",
+                    [assertion("status_code", "response.status", 200)],
+                )
+            ),
             tmp_path / status,
             httpx.MockTransport(
                 lambda request, value=secret, inner_status=status: httpx.Response(
@@ -603,7 +746,7 @@ def test_network_evidence_redacts_apikey_and_preserves_noncredential_query_value
                 "network",
                 "GET",
                 "/x?apikey=alpha&client%5Fsecret=beta&token_type=bearer&password_policy=long",
-                [],
+                [assertion("status_code", "response.status", 200)],
             )
         ),
         tmp_path,
@@ -636,7 +779,14 @@ def test_compressed_response_fails_closed_and_requests_identity_encoding(
         )
 
     result = run(
-        journey(step("compressed", "GET", "/compressed", [])),
+        journey(
+            step(
+                "compressed",
+                "GET",
+                "/compressed",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
         tmp_path,
         httpx.MockTransport(handler),
     )
@@ -675,7 +825,14 @@ def test_redacted_hash_consumes_truncated_pem_and_multiline_credentials(
             return httpx.Response(200, stream=ChunkedStream([body(value)]))
 
         result = run(
-            journey(step("redact", "GET", "/redact", [])),
+            journey(
+                step(
+                    "redact",
+                    "GET",
+                    "/redact",
+                    [assertion("status_code", "response.status", 200)],
+                )
+            ),
             tmp_path / secret,
             httpx.MockTransport(handler),
         )
@@ -713,7 +870,14 @@ def test_evidence_collision_fails_without_replacing_existing_artifact(
         return httpx.Response(200, stream=ChunkedStream([b""]))
 
     result = run(
-        journey(step("collision", "GET", "/collision", [])),
+        journey(
+            step(
+                "collision",
+                "GET",
+                "/collision",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
         tmp_path,
         httpx.MockTransport(handler),
     )
@@ -736,7 +900,16 @@ def test_non_origin_relative_paths_fail_before_transport(
         return httpx.Response(200)
 
     result = run(
-        journey(step("path", "GET", path, [])), tmp_path, httpx.MockTransport(handler)
+        journey(
+            step(
+                "path",
+                "GET",
+                path,
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
     )
 
     assert result.verdict is Verdict.FAIL
@@ -774,6 +947,29 @@ def test_json_path_errors_are_stable_failures(
 
     assert result.verdict is Verdict.FAIL
     assert result.failure_reason == f"step-0000:{reason}"
+
+
+def test_json_integer_exceeding_conversion_limit_is_malformed_json(
+    tmp_path: Path,
+) -> None:
+    body = b'{"value":' + b"9" * 5_000 + b"}"
+    result = run(
+        journey(
+            step(
+                "bounded-integer",
+                "GET",
+                "/value",
+                [assertion("json_path_equals", "value", 0)],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=ChunkedStream([body]))
+        ),
+    )
+
+    assert result.verdict is Verdict.FAIL
+    assert result.failure_reason == "step-0000:malformed_json"
 
 
 @pytest.mark.parametrize(
@@ -895,7 +1091,12 @@ def test_response_body_is_capped_during_streaming_before_extra_bytes_can_match(
 def test_evidence_paths_are_safe_and_deterministic_for_hostile_ids(
     tmp_path: Path,
 ) -> None:
-    hostile = step("../../secret", "GET", "/safe", [])
+    hostile = step(
+        "../../secret",
+        "GET",
+        "/safe",
+        [assertion("status_code", "response.status", 200)],
+    )
     result = run(
         journey(hostile),
         tmp_path,
@@ -942,6 +1143,7 @@ def test_explicit_json_null_has_a_canonical_request_hash(tmp_path: Path) -> None
                 tool="http",
                 action="request",
                 params={"method": "POST", "path": "/null", "json": None},
+                assertions=[assertion("status_code", "response.status", 200)],
             )
         ),
         tmp_path,
@@ -984,7 +1186,14 @@ def test_network_timeout_returns_failure_without_retry(tmp_path: Path) -> None:
         raise httpx.ReadTimeout("slow", request=request)
 
     result = run(
-        journey(step("timeout", "GET", "/slow", [])),
+        journey(
+            step(
+                "timeout",
+                "GET",
+                "/slow",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
         tmp_path,
         httpx.MockTransport(handler),
     )

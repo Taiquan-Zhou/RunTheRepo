@@ -228,6 +228,102 @@ def test_valid_model_output_is_materialized_only_when_other_sources_are_empty(
     assert "no safe markdown links" in model.user
 
 
+def test_mixed_tool_declared_journey_fails_closed_without_model_fallback(
+    tmp_path: Path,
+) -> None:
+    declared = _http_journey()
+    declared["steps"].append(
+        {
+            "step_id": "confirm",
+            "tool": "browser",
+            "action": "assert_text_visible",
+            "params": {"text": "ready"},
+            "assertions": [],
+        }
+    )
+    (tmp_path / "repotrial.journeys.json").write_text(
+        json.dumps({"journeys": [declared]}), encoding="utf-8"
+    )
+    model = FakeModelAdapter([_http_journey("/model")])
+
+    with pytest.raises(ValueError, match="invalid declared journeys"):
+        _plan(tmp_path, model=model)
+
+    assert model.calls == 0
+
+
+def test_mixed_tool_model_journey_is_rejected(tmp_path: Path) -> None:
+    proposed = _http_journey()
+    proposed["steps"].append(
+        {
+            "step_id": "confirm",
+            "tool": "browser",
+            "action": "assert_text_visible",
+            "params": {"text": "ready"},
+            "assertions": [],
+        }
+    )
+
+    assert _plan(tmp_path, model=FakeModelAdapter([proposed])) == []
+
+
+@pytest.mark.parametrize(
+    "proposed",
+    [
+        {"journey_id": "empty", "name": "Empty", "steps": []},
+        {
+            "journey_id": "unchecked",
+            "name": "Unchecked",
+            "steps": [
+                {
+                    "step_id": "request",
+                    "tool": "http",
+                    "action": "request",
+                    "params": {"method": "GET", "path": "/"},
+                    "assertions": [],
+                }
+            ],
+        },
+    ],
+)
+def test_model_journeys_without_a_deterministic_success_condition_are_rejected(
+    tmp_path: Path, proposed: dict[str, object]
+) -> None:
+    assert _plan(tmp_path, model=FakeModelAdapter([proposed])) == []
+
+
+def test_browser_journey_uses_its_bounded_action_dsl_without_step_assertions(
+    tmp_path: Path,
+) -> None:
+    proposed = {
+        "journey_id": "browser-check",
+        "name": "Browser check",
+        "steps": [
+            {
+                "step_id": "goto",
+                "tool": "browser",
+                "action": "goto",
+                "params": {"path": "/"},
+                "assertions": [],
+            },
+            {
+                "step_id": "confirm",
+                "tool": "browser",
+                "action": "assert_text_visible",
+                "params": {"text": "ready"},
+                "assertions": [],
+            },
+        ],
+    }
+
+    journeys = _plan(tmp_path, model=FakeModelAdapter([proposed]))
+
+    assert [step.action for step in journeys[0].steps] == [
+        "goto",
+        "assert_text_visible",
+    ]
+
+
 @pytest.mark.parametrize(
     "step",
     [
