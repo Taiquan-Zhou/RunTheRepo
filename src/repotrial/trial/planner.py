@@ -77,6 +77,8 @@ async def propose_recovery(
             readme_excerpt,
             authority,
         )
+    except TimeoutError:
+        return _stop("model timeout")
     except ValidationError:
         return _stop("unsafe proposal")
     if proposal is _MODEL_DEADLINE_EXPIRED:

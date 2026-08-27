@@ -98,6 +98,17 @@ class CancellationTrackingModelAdapter:
         raise AssertionError("model wait unexpectedly completed")
 
 
+class NativeTimeoutModelAdapter:
+    async def structured(
+        self,
+        *,
+        system: str,
+        user: str,
+        schema: type[RecoveryAction],
+    ) -> RecoveryAction:
+        raise TimeoutError("adapter transport timeout")
+
+
 class EmptyLike:
     def __eq__(self, other: object) -> bool:
         return other == {}
@@ -372,6 +383,15 @@ def test_model_timeout_wins_when_adapter_swallows_cancellation() -> None:
         await asyncio.wait_for(model.late_completed.wait(), timeout=0.5)
 
     asyncio.run(exercise())
+
+
+def test_adapter_native_timeout_fails_closed_as_a_model_timeout() -> None:
+    action = _propose(
+        logs={"logs": "unrecognized startup failure"},
+        model=NativeTimeoutModelAdapter(),
+    )
+
+    assert action == RecoveryAction(action="stop", params={}, reason="model timeout")
 
 
 def test_caller_cancellation_cancels_and_observes_the_inner_model_task() -> None:
