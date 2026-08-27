@@ -2,7 +2,13 @@
 
 from copy import deepcopy
 
-from repotrial.compose.risk import _is_docker_socket, _recognized_host_bind
+from repotrial.compose.risk import (
+    _RESET,
+    _UNSUPPORTED,
+    _effective_value,
+    _is_docker_socket,
+    _recognized_host_bind,
+)
 from repotrial.domain.enums import MutationType
 from repotrial.domain.models import Mutation
 
@@ -24,15 +30,15 @@ def apply_mutation(base: dict[str, object], mutation: Mutation) -> dict[str, obj
 
     match mutation.type:
         case MutationType.SET_NON_ROOT:
-            _set_scalar(target, "user", "65532:65532")
+            _set_scalar(target, "user", "65532:65532", None)
         case MutationType.DROP_ALL_CAPS:
-            _set_scalar(target, "cap_drop", ["ALL"])
+            _set_scalar(target, "cap_drop", ["ALL"], None)
         case MutationType.SET_READ_ONLY:
-            _set_scalar(target, "read_only", True)
+            _set_scalar(target, "read_only", True, False)
         case MutationType.ADD_TMPFS:
             _add_tmpfs(target)
         case MutationType.DROP_PRIVILEGED:
-            _set_scalar(target, "privileged", False)
+            _set_scalar(target, "privileged", False, False)
         case MutationType.REMOVE_DOCKER_SOCKET:
             _remove_docker_socket(target)
         case MutationType.BRIDGE_NETWORK:
@@ -62,17 +68,32 @@ def _validate_mutation_request(base: object, mutation: object) -> None:
         raise MutationError("invalid service")
 
 
-def _set_scalar(service: dict[object, object], key: str, value: object) -> None:
-    if service.get(key) == value:
+def _set_scalar(
+    service: dict[object, object], key: str, value: object, default: object
+) -> None:
+    if _effective_field(service, key, default) == value:
         raise MutationError("mutation already satisfied")
     service[key] = value
 
 
+def _effective_field(
+    service: dict[object, object], key: str, default: object
+) -> object:
+    effective = _effective_value(service.get(key, default))
+    if effective is _UNSUPPORTED:
+        raise MutationError("unsupported compose tag")
+    if effective is _RESET:
+        return default
+    return effective
+
+
 def _add_tmpfs(service: dict[object, object]) -> None:
-    current = service.get("tmpfs")
+    current = _effective_field(service, "tmpfs", None)
     if current is None:
         service["tmpfs"] = ["/tmp"]
         return
+    if isinstance(current, str):
+        current = [current]
     if not isinstance(current, list) or not all(
         isinstance(item, str) for item in current
     ):
@@ -84,7 +105,7 @@ def _add_tmpfs(service: dict[object, object]) -> None:
 
 
 def _remove_docker_socket(service: dict[object, object]) -> None:
-    volumes = service.get("volumes")
+    volumes = _effective_field(service, "volumes", None)
     if not isinstance(volumes, list):
         raise MutationError("invalid volumes")
     removable = [
@@ -100,6 +121,6 @@ def _remove_docker_socket(service: dict[object, object]) -> None:
 
 
 def _remove_host_network(service: dict[object, object]) -> None:
-    if service.get("network_mode") != "host":
+    if _effective_field(service, "network_mode", None) != "host":
         raise MutationError("mutation already satisfied")
     del service["network_mode"]

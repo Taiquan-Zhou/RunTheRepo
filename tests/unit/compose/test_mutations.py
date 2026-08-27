@@ -4,6 +4,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
+from ruamel.yaml.comments import TaggedScalar
 
 from repotrial.compose.mutations import MutationError, apply_mutation
 from repotrial.compose.overlay import write_overlay
@@ -20,6 +21,12 @@ def _mutation(kind: MutationType, **overrides: object) -> Mutation:
     }
     data.update(overrides)
     return Mutation.model_validate(data)
+
+
+def _load_tagged_service(tmp_path: Path, name: str, body: str) -> dict[str, object]:
+    path = tmp_path / name
+    path.write_text(f"services:\n  app:\n{body}", encoding="utf-8")
+    return load_compose(path)
 
 
 @pytest.mark.parametrize(
@@ -148,6 +155,73 @@ def test_add_tmpfs_preserves_other_entries_and_deduplicates_tmp() -> None:
     assert candidate["services"]["app"]["tmpfs"] == ["/run", "/tmp"]
 
 
+@pytest.mark.parametrize("entry", ["/run", "/run:size=64m"])
+def test_add_tmpfs_normalizes_a_valid_scalar_entry_without_losing_options(
+    entry: str,
+) -> None:
+    """Rejecting Compose's scalar tmpfs form would discard a valid mount option."""
+    base = {"services": {"app": {"tmpfs": entry}}}
+
+    candidate = apply_mutation(base, _mutation(MutationType.ADD_TMPFS))
+
+    assert candidate["services"]["app"]["tmpfs"] == [entry, "/tmp"]
+
+
+def test_add_tmpfs_rejects_an_effectively_present_scalar_tmp() -> None:
+    """Creating a candidate for an existing scalar /tmp mount is a semantic no-op."""
+    base = {"services": {"app": {"tmpfs": "/tmp"}}}
+
+    with pytest.raises(MutationError):
+        apply_mutation(base, _mutation(MutationType.ADD_TMPFS))
+
+
+@pytest.mark.parametrize(
+    ("kind", "body"),
+    [
+        (MutationType.SET_NON_ROOT, "    user: !override '65532:65532'\n"),
+        (MutationType.DROP_ALL_CAPS, "    cap_drop: !override [ALL]\n"),
+        (MutationType.SET_READ_ONLY, "    read_only: !override true\n"),
+        (MutationType.ADD_TMPFS, "    tmpfs: !override /tmp\n"),
+        (MutationType.DROP_PRIVILEGED, ""),
+        (MutationType.DROP_PRIVILEGED, "    privileged: !reset null\n"),
+        (MutationType.DROP_PRIVILEGED, "    privileged: !override false\n"),
+        (MutationType.REMOVE_DOCKER_SOCKET, "    volumes: !reset []\n"),
+    ],
+)
+def test_apply_mutation_rejects_effective_noop_values(
+    tmp_path: Path, kind: MutationType, body: str
+) -> None:
+    """Ignoring Compose tags/defaults would create candidates with no semantic change."""
+    base = _load_tagged_service(tmp_path, f"{kind.value}-{len(body)}.yml", body)
+
+    with pytest.raises(MutationError):
+        apply_mutation(base, _mutation(kind))
+
+
+def test_bridge_network_removes_an_effective_override_host_declaration(
+    tmp_path: Path,
+) -> None:
+    """A tagged host network is still host networking and must be removed."""
+    base = _load_tagged_service(
+        tmp_path, "override-host.yml", "    network_mode: !override host\n"
+    )
+
+    candidate = apply_mutation(base, _mutation(MutationType.BRIDGE_NETWORK))
+
+    assert "network_mode" not in candidate["services"]["app"]
+
+
+def test_apply_mutation_rejects_unknown_tag_values_before_mutating() -> None:
+    """Treating an unknown YAML tag as a scalar could turn ambiguity into a false fix."""
+    unknown = TaggedScalar("true", tag="!unknown")
+    base = {"services": {"app": {"privileged": unknown}}}
+
+    with pytest.raises(MutationError):
+        apply_mutation(base, _mutation(MutationType.DROP_PRIVILEGED))
+
+    assert base["services"]["app"]["privileged"] is unknown
+
+
 @pytest.mark.parametrize(
     "base, mutation",
     [
@@ -164,7 +238,7 @@ def test_add_tmpfs_preserves_other_entries_and_deduplicates_tmp() -> None:
         ),
         ({"services": {"other": {}}}, _mutation(MutationType.SET_READ_ONLY)),
         (
-            {"services": {"app": {"tmpfs": "not-a-sequence"}}},
+            {"services": {"app": {"tmpfs": 7}}},
             _mutation(MutationType.ADD_TMPFS),
         ),
     ],
@@ -214,7 +288,7 @@ def test_remove_docker_socket_uses_existing_short_and_long_bind_grammar() -> Non
 def _merge_service(
     base: dict[str, object], overlay: dict[str, object]
 ) -> dict[str, object]:
-    """Tiny test-only checker for the merge rules exercised by this task."""
+    """Tiny test-only checker for the recursive merge rules exercised here."""
     result = deepcopy(base)
     for key, value in overlay.items():
         tag = getattr(getattr(value, "tag", None), "value", None)
@@ -222,6 +296,8 @@ def _merge_service(
             result.pop(key, None)
         elif tag == "!override":
             result[key] = list(value)
+        elif isinstance(result.get(key), dict) and isinstance(value, dict):
+            result[key] = _merge_service(result[key], value)
         else:
             result[key] = value
     return result
@@ -263,6 +339,41 @@ def test_write_overlay_is_minimal_loadable_and_merges_to_candidate(
         assert getattr(app_overlay["cap_drop"].tag, "value", None) == "!override"
     if kind is MutationType.BRIDGE_NETWORK:
         assert getattr(app_overlay["network_mode"].tag, "value", None) == "!reset"
+
+
+def test_write_overlay_recursively_merges_mapping_add_change_and_removal(
+    tmp_path: Path,
+) -> None:
+    """A shallow overlay merge would keep the removed nested environment entry."""
+    base = {
+        "services": {
+            "app": {
+                "image": "nginx",
+                "environment": {
+                    "KEEP": "base",
+                    "CHANGE": "before",
+                    "REMOVE": "obsolete",
+                },
+            }
+        }
+    }
+    candidate = {
+        "services": {
+            "app": {
+                "image": "nginx",
+                "environment": {"KEEP": "base", "CHANGE": "after", "ADD": "new"},
+            }
+        }
+    }
+    output = tmp_path / "recursive-overlay.yml"
+
+    write_overlay(base, candidate, output)
+    overlay = load_compose(output)
+
+    assert (
+        _merge_service(base["services"]["app"], overlay["services"]["app"])
+        == candidate["services"]["app"]
+    )
 
 
 def test_write_overlay_rejects_non_single_service_candidates_and_preserves_inputs(

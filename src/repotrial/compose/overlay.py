@@ -9,7 +9,11 @@ from ruamel.yaml.comments import CommentedMap, CommentedSeq, TaggedScalar
 from ruamel.yaml.tag import Tag
 
 from repotrial.compose.mutations import MutationError
-from repotrial.compose.parser import ComposeParseError, canonical_compose_json
+from repotrial.compose.parser import (
+    _MAX_OPEN_COLLECTIONS,
+    ComposeParseError,
+    canonical_compose_json,
+)
 
 
 def write_overlay(
@@ -69,8 +73,10 @@ def _single_changed_service(base: object, candidate: object) -> str:
 
 
 def _service_changes(
-    base: Mapping[object, object], candidate: Mapping[object, object]
+    base: Mapping[object, object], candidate: Mapping[object, object], depth: int = 0
 ) -> CommentedMap:
+    if depth >= _MAX_OPEN_COLLECTIONS:
+        raise MutationError("overlay nesting limit")
     changes = CommentedMap()
     for key in base:
         if not isinstance(key, str):
@@ -80,12 +86,26 @@ def _service_changes(
     for key, candidate_value in candidate.items():
         if not isinstance(key, str):
             raise MutationError("invalid service")
-        if key in base and _same_value(base[key], candidate_value):
+        base_value = base.get(key)
+        if key in base and _same_value(base_value, candidate_value):
+            continue
+        if (
+            key in base
+            and isinstance(base_value, Mapping)
+            and isinstance(candidate_value, Mapping)
+            and _yaml_tag(candidate_value) is None
+        ):
+            changes[key] = _service_changes(base_value, candidate_value, depth + 1)
             continue
         changes[key] = _override_value(candidate_value)
     if not changes:
         raise MutationError("candidate unchanged")
     return changes
+
+
+def _yaml_tag(value: object) -> str | None:
+    tag_value = getattr(getattr(value, "tag", None), "value", None)
+    return tag_value if isinstance(tag_value, str) else None
 
 
 def _override_value(value: object) -> object:
