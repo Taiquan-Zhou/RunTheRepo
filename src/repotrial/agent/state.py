@@ -2,7 +2,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -12,11 +12,12 @@ from repotrial.domain.models import (
     JourneyResult,
     Mutation,
     ObservationSnapshot,
+    PinnedRepo,
     RunState,
 )
+from repotrial.intake.github import pin_repository
 from repotrial.models.base import ModelAdapter
 from repotrial.sandbox.base import SandboxProvider
-from repotrial.trial.boot import BootResult
 
 type StageName = Literal[
     "intake",
@@ -30,30 +31,7 @@ type StageName = Literal[
     "report_or_next",
 ]
 type RecoverySleep = Callable[[float], Awaitable[None]]
-
-
-class StageOperations(Protocol):
-    """Exact baseline service seam; each call must finish owned lifecycles."""
-
-    async def intake(self, state: RunState) -> RunState: ...
-
-    async def baseline(self, state: RunState) -> RunState: ...
-
-    async def boot(
-        self,
-        state: RunState,
-        provider: SandboxProvider,
-        env: Mapping[str, str],
-        attempt: int,
-    ) -> BootResult: ...
-
-    async def journeys(
-        self, state: RunState, provider: SandboxProvider
-    ) -> list[JourneyResult]: ...
-
-    async def observe(
-        self, state: RunState, provider: SandboxProvider
-    ) -> ObservationSnapshot: ...
+type RepositoryPinner = Callable[[str, Path, str | None], Awaitable[PinnedRepo]]
 
 
 async def _default_sleep(seconds: float) -> None:
@@ -62,7 +40,6 @@ async def _default_sleep(seconds: float) -> None:
 
 @dataclass(frozen=True, slots=True)
 class GraphContext:
-    operations: StageOperations
     provider: SandboxProvider
     workspace: Path
     artifact_dir: Path
@@ -73,6 +50,7 @@ class GraphContext:
     readme_excerpt: str
     container_port: int
     model: ModelAdapter | None = None
+    repository_pinner: RepositoryPinner = pin_repository
     sleep: RecoverySleep = _default_sleep
 
 
@@ -88,5 +66,8 @@ class GraphState(BaseModel):
     boot_error_hash: str | None = None
     repeated_error_count: int = Field(default=0, ge=0, le=3)
     recovery_env: dict[str, str] = Field(default_factory=dict)
+    pending_journey_results: list[JourneyResult] | None = None
+    pending_observation: ObservationSnapshot | None = None
     pending_mutation: Mutation | None = None
     pending_experiment: ExperimentRecord | None = None
+    pending_overlay_path: str | None = None

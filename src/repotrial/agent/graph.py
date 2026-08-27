@@ -1,31 +1,51 @@
 import hashlib
 import json
 import os
+import re
 import stat
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
-from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.runtime import Runtime
+
+if TYPE_CHECKING:
+    # langgraph.types exposes this open config at runtime but omits it from __all__.
+    type RunnableConfig = dict[str, Any]
+
+else:
+    from langgraph.types import RunnableConfig
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
 
 from repotrial.agent.state import GraphContext, GraphState, StageName
 from repotrial.compose.mutations import apply_mutation
 from repotrial.compose.parser import canonical_compose_json, load_compose
+from repotrial.compose.risk import analyze_risk
 from repotrial.domain.enums import ExperimentVerdict, Verdict
-from repotrial.domain.models import ExperimentRecord, RunState
+from repotrial.domain.models import (
+    ExperimentRecord,
+    Journey,
+    JourneyResult,
+    PinnedRepo,
+    RunState,
+)
 from repotrial.hardening.engine import ExperimentContext, run_experiment
 from repotrial.hardening.policy import propose_mutation
+from repotrial.intake.compose_discovery import discover_compose
+from repotrial.journey.http_runner import run_http_journey
+from repotrial.journey.playwright_runner import run_playwright_journey
 from repotrial.models.base import RecoveryAction
-from repotrial.trial.planner import propose_recovery
+from repotrial.sandbox.lifecycle import managed_sandbox
+from repotrial.trial.boot import boot_compose
+from repotrial.trial.observer import collect_observation
+from repotrial.trial.planner import plan_journeys, propose_recovery
 
 type RunGraph = CompiledStateGraph[GraphState, GraphContext, GraphState, GraphState]
 type NodeUpdate = dict[str, object]
@@ -35,6 +55,8 @@ type ReportRoute = Literal["propose_mutation", "__end__"]
 
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
 _GRAPH_RECURSION_LIMIT = 64
+_FULL_COMMIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
+_MAX_ATTEMPT_SLOTS = 4
 
 
 def build_run_graph(
@@ -80,7 +102,7 @@ async def ainvoke_run(
     prepared_config = _run_config(state.run_id, config)
     result = await graph.ainvoke(
         GraphState(run=state.model_copy(deep=True)),
-        prepared_config,
+        cast(Any, prepared_config),
         context=run_context,
     )
     return _validated_result(result, state.run_id)
@@ -97,19 +119,79 @@ async def aresume_run(
         raise ValueError("run_id must be a non-empty string")
     run_context = _snapshot_context(context)
     prepared_config = _run_config(run_id, config)
-    result = await graph.ainvoke(None, prepared_config, context=run_context)
+    result = await graph.ainvoke(None, cast(Any, prepared_config), context=run_context)
     return _validated_result(result, run_id)
 
 
 async def _intake(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate:
-    run = await runtime.context.operations.intake(state.run.model_copy(deep=True))
-    return {"run": _same_run(state.run, run), "stage_history": _visit(state, "intake")}
+    context = runtime.context
+    run = state.run.model_copy(deep=True)
+    if run.commit_sha is None:
+        pinned = await context.repository_pinner(run.repo_url, context.workspace, None)
+        if not isinstance(pinned, PinnedRepo):
+            raise TypeError("repository pinner must return PinnedRepo")
+        workspace = _real_directory(context.workspace, "workspace")
+        try:
+            pinned_path = pinned.local_path.resolve(strict=True)
+        except OSError:
+            raise ValueError("pinned repository path is invalid") from None
+        if pinned_path != workspace:
+            raise ValueError("pinned repository path must equal workspace")
+        if _FULL_COMMIT_SHA.fullmatch(pinned.commit_sha) is None:
+            raise ValueError("repository pinner returned an invalid commit SHA")
+        run.repo_url = pinned.repo.url
+        run.commit_sha = pinned.commit_sha
+    else:
+        if _FULL_COMMIT_SHA.fullmatch(run.commit_sha) is None:
+            raise ValueError("commit_sha must be a lowercase full commit SHA")
+        _real_directory(context.workspace, "workspace")
+    run.sandbox_id = None
+    return {"run": run, "stage_history": _visit(state, "intake")}
 
 
 async def _baseline(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate:
-    run = await runtime.context.operations.baseline(state.run.model_copy(deep=True))
+    context = runtime.context
+    workspace = _real_directory(context.workspace, "workspace")
+    _ensure_directory_inside(context.overlay_dir, workspace, "overlay_dir")
+    _ensure_directory_inside(
+        context.accepted_compose_dir, workspace, "accepted_compose_dir"
+    )
+    if state.run.compose_path is None:
+        compose_source = discover_compose(workspace)
+    else:
+        compose_source = _compose_source(workspace, state.run.compose_path)
+    compose_relative = compose_source.relative_to(workspace).as_posix()
+    compose = load_compose(compose_source)
+    compose_hash = _compose_hash(compose)
+    if (
+        state.run.baseline_config_hash is not None
+        and state.run.baseline_config_hash != compose_hash
+    ):
+        raise ValueError("baseline_config_hash does not match compose")
+    if (
+        state.run.current_config_hash is not None
+        and state.run.current_config_hash != compose_hash
+    ):
+        raise ValueError("current_config_hash does not match compose")
+    journeys = list(state.run.journeys)
+    if not journeys:
+        journeys = await plan_journeys(
+            workspace,
+            context.readme_excerpt,
+            context.model,
+        )
+    run = state.run.model_copy(
+        deep=True,
+        update={
+            "compose_path": compose_relative,
+            "baseline_config_hash": compose_hash,
+            "current_config_hash": compose_hash,
+            "risk_findings": analyze_risk(compose),
+            "journeys": journeys,
+        },
+    )
     return {
-        "run": _same_run(state.run, run),
+        "run": run,
         "stage_history": _visit(state, "baseline"),
     }
 
@@ -125,20 +207,55 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
         }
     env = dict(runtime.context.env)
     env.update(state.recovery_env)
-    result = await runtime.context.operations.boot(
-        state.run.model_copy(deep=True),
-        runtime.context.provider,
-        env,
-        attempt,
+    context = runtime.context
+    compose_path = _required_compose_path(state.run)
+    attempt_dir, attempt_slot = _claim_attempt_directory(
+        state.run,
+        context,
+        purpose="baseline",
+        index=attempt,
     )
-    if result.attempt != attempt:
-        raise ValueError("boot result attempt does not match requested attempt")
+    lifecycle_artifact = attempt_dir / "baseline-lifecycle.jsonl"
+    observation_artifact = attempt_dir / "baseline-observation.json"
+    async with managed_sandbox(
+        context.provider,
+        context.workspace,
+        (
+            f"repotrial-baseline-{_run_token(state.run.run_id)}-"
+            f"{attempt:02d}-{attempt_slot:02d}"
+        ),
+        lifecycle_artifact=lifecycle_artifact,
+    ) as sandbox_id:
+        result = await boot_compose(
+            context.provider,
+            sandbox_id,
+            compose_path,
+            env,
+            attempt,
+        )
+        journey_results: list[JourneyResult] | None = None
+        observation = None
+        if result.verdict is Verdict.PASS:
+            journey_results = await _run_baseline_journeys(
+                state.run.journeys,
+                context,
+                sandbox_id,
+                attempt_dir,
+            )
+            observation = await collect_observation(
+                context.provider,
+                sandbox_id,
+                compose_path,
+                observation_artifact,
+            )
     update: NodeUpdate = {
         "boot_attempt": attempt,
         "boot_verdict": result.verdict,
         "stage_history": _visit(state, "boot"),
     }
     if result.verdict is Verdict.PASS:
+        update["pending_journey_results"] = journey_results
+        update["pending_observation"] = observation
         return update
     if result.verdict is Verdict.UNSUPPORTED:
         update["run"] = state.run.model_copy(update={"stop_reason": "boot_unsupported"})
@@ -201,19 +318,29 @@ def _boot_route(state: GraphState) -> BootRoute:
 
 
 async def _journeys(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate:
-    results = await runtime.context.operations.journeys(
-        state.run.model_copy(deep=True), runtime.context.provider
-    )
+    del runtime
+    results = state.pending_journey_results
+    if results is None:
+        raise ValueError("journeys requires results produced by boot")
     run = state.run.model_copy(update={"baseline_journey_results": list(results)})
-    return {"run": run, "stage_history": _visit(state, "journeys")}
+    return {
+        "run": run,
+        "pending_journey_results": None,
+        "stage_history": _visit(state, "journeys"),
+    }
 
 
 async def _observe(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate:
-    observation = await runtime.context.operations.observe(
-        state.run.model_copy(deep=True), runtime.context.provider
-    )
+    del runtime
+    observation = state.pending_observation
+    if observation is None:
+        raise ValueError("observe requires an observation produced by boot")
     run = state.run.model_copy(update={"baseline_observation": observation})
-    return {"run": run, "stage_history": _visit(state, "observe")}
+    return {
+        "run": run,
+        "pending_observation": None,
+        "stage_history": _visit(state, "observe"),
+    }
 
 
 def _propose_mutation(state: GraphState) -> NodeUpdate:
@@ -225,6 +352,7 @@ def _propose_mutation(state: GraphState) -> NodeUpdate:
         "run": run,
         "pending_mutation": decision.mutation,
         "pending_experiment": None,
+        "pending_overlay_path": None,
         "stage_history": _visit(state, "propose_mutation"),
     }
 
@@ -240,10 +368,27 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
     context = runtime.context
     token = _run_token(state.run.run_id)
     index = len(state.run.experiments)
+    attempt_dir, attempt_slot = _claim_attempt_directory(
+        state.run,
+        context,
+        purpose="experiment",
+        index=index,
+    )
+    overlay_path = (
+        context.overlay_dir
+        / f"{token}-{index:04d}-attempt-{attempt_slot:02d}.overlay.yaml"
+    )
+    workspace = _real_directory(context.workspace, "workspace")
+    overlay_dir = _real_directory_inside(context.overlay_dir, workspace, "overlay_dir")
+    _require_lexical_path_inside(overlay_path, workspace, "overlay")
+    if overlay_path.parent.resolve(strict=True) != overlay_dir:
+        raise ValueError("overlay must be a direct child of overlay_dir")
+    if overlay_path.exists() or overlay_path.is_symlink():
+        raise ValueError("overlay attempt target is already in use")
     experiment_context = ExperimentContext(
         workspace=context.workspace,
-        overlay_path=context.overlay_dir / f"{token}-{index:04d}.overlay.yaml",
-        artifact_dir=context.artifact_dir,
+        overlay_path=overlay_path,
+        artifact_dir=attempt_dir,
         env={**context.env, **state.recovery_env},
         container_port=context.container_port,
     )
@@ -255,6 +400,7 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
     )
     return {
         "pending_experiment": record,
+        "pending_overlay_path": overlay_path.relative_to(workspace).as_posix(),
         "stage_history": _visit(state, "experiment"),
     }
 
@@ -269,8 +415,9 @@ def _decide(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate:
         raise ValueError("experiment record was already appended")
 
     run = state.run.model_copy(deep=True)
-    overlay = _overlay_relative_path(state, runtime.context)
-    _append_artifact(run, overlay)
+    overlay = _selected_overlay_relative_path(state, record, runtime.context)
+    if overlay is not None:
+        _append_artifact(run, overlay)
     run.experiments.append(record)
     if record.verdict is ExperimentVerdict.KEEP:
         accepted = _materialize_accepted_compose(run, record, runtime.context)
@@ -283,6 +430,7 @@ def _decide(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate:
         "run": run,
         "pending_mutation": None,
         "pending_experiment": None,
+        "pending_overlay_path": None,
         "stage_history": _visit(state, "decide"),
     }
 
@@ -293,14 +441,6 @@ def _report_or_next(state: GraphState) -> NodeUpdate:
 
 def _report_route(state: GraphState) -> ReportRoute:
     return "__end__" if state.run.stop_reason is not None else "propose_mutation"
-
-
-def _same_run(previous: RunState, returned: object) -> RunState:
-    if not isinstance(returned, RunState):
-        raise TypeError("stage operation must return RunState")
-    if returned.run_id != previous.run_id:
-        raise ValueError("stage operation cannot change run_id")
-    return returned
 
 
 def _visit(state: GraphState, stage: StageName) -> list[StageName]:
@@ -320,12 +460,141 @@ def _run_token(run_id: str) -> str:
     return hashlib.sha256(run_id.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
-def _overlay_relative_path(state: GraphState, context: GraphContext) -> str:
-    index = len(state.run.experiments)
-    path = (
-        context.overlay_dir / f"{_run_token(state.run.run_id)}-{index:04d}.overlay.yaml"
-    )
+async def _run_baseline_journeys(
+    journeys: Sequence[Journey],
+    context: GraphContext,
+    sandbox_id: str,
+    artifact_dir: Path,
+) -> list[JourneyResult]:
+    if not journeys:
+        return []
+    host_port = await context.provider.publish_port(sandbox_id, context.container_port)
+    if type(host_port) is not int or not 1 <= host_port <= 65_535:
+        raise ValueError("published port is outside the valid range")
+    base_url = f"http://127.0.0.1:{host_port}"
+    results: list[JourneyResult] = []
+    for index, journey in enumerate(journeys):
+        evidence_dir = artifact_dir / f"baseline-journey-{index:04d}"
+        tools = {step.tool for step in journey.steps}
+        if tools == {"http"}:
+            result = await run_http_journey(
+                journey,
+                base_url=base_url,
+                evidence_dir=evidence_dir,
+            )
+        elif tools == {"browser"}:
+            result = await run_playwright_journey(
+                journey,
+                base_url=base_url,
+                evidence_dir=evidence_dir,
+            )
+        else:
+            result = JourneyResult(
+                journey_id=journey.journey_id,
+                verdict=Verdict.UNSUPPORTED,
+                passed_steps=0,
+                total_steps=len(journey.steps),
+                failure_reason="journey:unsupported_tool_mix",
+            )
+        results.append(result)
+    return results
+
+
+def _required_compose_path(run: RunState) -> str:
+    if not isinstance(run.compose_path, str) or not run.compose_path:
+        raise ValueError("boot requires a compose path")
+    return run.compose_path
+
+
+def _claim_attempt_directory(
+    run: RunState,
+    context: GraphContext,
+    *,
+    purpose: Literal["baseline", "experiment"],
+    index: int,
+) -> tuple[Path, int]:
     workspace = _real_directory(context.workspace, "workspace")
+    artifact_root = _real_directory(context.artifact_dir, "artifact_dir")
+    if artifact_root.is_relative_to(workspace):
+        raise ValueError("artifact_dir must resolve outside workspace")
+    token = _run_token(run.run_id)
+    for slot in range(1, _MAX_ATTEMPT_SLOTS + 1):
+        directory = artifact_root / f"{purpose}-{token}-{index:04d}-attempt-{slot:02d}"
+        marker = directory / ".repotrial-attempt.json"
+        expected = (
+            json.dumps(
+                {
+                    "index": index,
+                    "purpose": purpose,
+                    "run_token": token,
+                    "slot": slot,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        if directory.exists() or directory.is_symlink():
+            existing = _real_directory(directory, "attempt directory")
+            if existing.parent != artifact_root:
+                raise ValueError("attempt directory must resolve inside artifact_dir")
+            try:
+                marker_stat = marker.lstat()
+                if (
+                    _is_link(marker, marker_stat)
+                    or not stat.S_ISREG(marker_stat.st_mode)
+                    or marker_stat.st_size != len(expected)
+                ):
+                    raise ValueError("attempt directory ownership marker is invalid")
+                with marker.open("rb") as marker_file:
+                    marker_bytes = marker_file.read(len(expected) + 1)
+            except OSError:
+                raise ValueError(
+                    "attempt directory ownership marker is invalid"
+                ) from None
+            if marker_bytes != expected:
+                raise ValueError("attempt directory ownership marker is invalid")
+            continue
+        try:
+            directory.mkdir()
+            with marker.open("xb") as marker_file:
+                marker_file.write(expected)
+        except OSError:
+            raise ValueError("attempt namespace could not be claimed") from None
+        claimed = _real_directory(directory, "attempt directory")
+        if claimed.parent != artifact_root:
+            raise ValueError("attempt directory must resolve inside artifact_dir")
+        return claimed, slot
+    raise ValueError("attempt slots exhausted")
+
+
+def _selected_overlay_relative_path(
+    state: GraphState,
+    record: ExperimentRecord,
+    context: GraphContext,
+) -> str | None:
+    selected = state.pending_overlay_path
+    if not isinstance(selected, str) or not selected:
+        raise ValueError("decide requires the selected overlay path")
+    if _contains_controls(selected) or "\\" in selected:
+        raise ValueError("selected overlay path is unsafe")
+    relative = Path(selected)
+    if relative.is_absolute() or relative.drive or ".." in relative.parts:
+        raise ValueError("selected overlay path is unsafe")
+    workspace = _real_directory(context.workspace, "workspace")
+    overlay_dir = _real_directory_inside(context.overlay_dir, workspace, "overlay_dir")
+    path = workspace / relative
+    _require_lexical_path_inside(path, workspace, "overlay")
+    try:
+        parent = path.parent.resolve(strict=True)
+    except OSError:
+        raise ValueError("selected overlay parent is invalid") from None
+    if parent != overlay_dir:
+        raise ValueError("selected overlay must be inside overlay_dir")
+    if not path.exists() and not path.is_symlink():
+        if record.verdict is ExperimentVerdict.STOP:
+            return None
+        raise ValueError("non-stop experiment must produce an overlay")
     resolved = _existing_regular_file(path, workspace, "overlay")
     return resolved.relative_to(workspace).as_posix()
 
@@ -418,6 +687,22 @@ def _real_directory_inside(path: object, workspace: Path, label: str) -> Path:
     if not resolved.is_relative_to(workspace):
         raise ValueError(f"{label} must resolve inside workspace")
     return resolved
+
+
+def _ensure_directory_inside(path: object, workspace: Path, label: str) -> Path:
+    if not isinstance(path, Path):
+        raise TypeError(f"{label} must be a Path")
+    _require_lexical_path_inside(path, workspace, label)
+    if path.exists() or path.is_symlink():
+        return _real_directory_inside(path, workspace, label)
+    parent = _real_directory_inside(path.parent, workspace, f"{label} parent")
+    if not parent.is_relative_to(workspace):
+        raise ValueError(f"{label} parent must resolve inside workspace")
+    try:
+        path.mkdir()
+    except OSError:
+        raise ValueError(f"{label} could not be created") from None
+    return _real_directory_inside(path, workspace, label)
 
 
 def _existing_regular_file(path: Path, workspace: Path, label: str) -> Path:

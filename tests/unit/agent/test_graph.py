@@ -2,7 +2,7 @@ import asyncio
 import hashlib
 import json
 import threading
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,14 +10,11 @@ from pathlib import Path
 from typing import TypeVar
 
 import pytest
+from langgraph.errors import NodeCancelledError
 from pydantic import BaseModel
 from ruamel.yaml import YAML
 
-from repotrial.agent.graph import (
-    ainvoke_run,
-    aresume_run,
-    build_run_graph,
-)
+from repotrial.agent.graph import ainvoke_run, aresume_run, build_run_graph
 from repotrial.agent.state import GraphContext, GraphState
 from repotrial.compose.mutations import apply_mutation
 from repotrial.compose.parser import canonical_compose_json, load_compose
@@ -25,37 +22,20 @@ from repotrial.domain.enums import ExperimentVerdict, MutationType, Verdict
 from repotrial.domain.models import (
     Journey,
     JourneyAssertion,
-    JourneyResult,
     JourneyStep,
     Mutation,
-    ObservationSnapshot,
-    RiskFinding,
+    PinnedRepo,
+    RepoRef,
     RunState,
 )
 from repotrial.models.base import RecoveryAction
 from repotrial.sandbox.base import ExecResult, SandboxProvider
 from repotrial.sandbox.fake import FakeSandboxProvider
-from repotrial.trial.boot import BootResult
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
-def _compose_text() -> str:
-    return "services:\n  web:\n    image: example/web:1\n"
-
-
-def _compose_hash(path: Path) -> str:
-    material = canonical_compose_json(load_compose(path)).encode("utf-8")
-    return f"sha256:{hashlib.sha256(material).hexdigest()}"
-
-
-def _write_compose(path: Path, compose: dict[str, object]) -> None:
-    yaml = YAML(typ="rt", pure=True)
-    with path.open("x", encoding="utf-8") as output:
-        yaml.dump(compose, output)
-
-
-def _journey() -> Journey:
+def _journey(*, expected_status: int = 200) -> Journey:
     return Journey(
         journey_id="health",
         name="Health",
@@ -69,7 +49,7 @@ def _journey() -> Journey:
                     JourneyAssertion(
                         kind="status_code",
                         target="response.status",
-                        expected=200,
+                        expected=expected_status,
                     )
                 ],
             )
@@ -77,96 +57,39 @@ def _journey() -> Journey:
     )
 
 
-def _journey_result(verdict: Verdict) -> JourneyResult:
-    return JourneyResult(
-        journey_id="health",
-        verdict=verdict,
-        passed_steps=1 if verdict is Verdict.PASS else 0,
-        total_steps=1,
-    )
+def _compose_hash(path: Path) -> str:
+    material = canonical_compose_json(load_compose(path)).encode("utf-8")
+    return f"sha256:{hashlib.sha256(material).hexdigest()}"
 
 
-def _risk(kind: str) -> RiskFinding:
-    return RiskFinding(
-        finding_id=f"{kind}-web",
-        kind=kind,
-        service="web",
-        severity=50,
-        evidence={"source": "test"},
+def _write_compose(path: Path, compose: dict[str, object]) -> None:
+    yaml = YAML(typ="rt", pure=True)
+    with path.open("x", encoding="utf-8") as output:
+        yaml.dump(compose, output)
+
+
+def _compose_text(risks: tuple[str, ...]) -> str:
+    user = "'0'" if "root_user" in risks else "'1000'"
+    cap_add = "    cap_add: [NET_RAW]\n" if "cap_add" in risks else ""
+    cap_drop = "" if "cap_add" in risks else "    cap_drop: [ALL]\n"
+    return (
+        "services:\n"
+        "  web:\n"
+        "    image: example/web:1\n"
+        f"    user: {user}\n"
+        "    read_only: true\n"
+        f"{cap_drop}"
+        f"{cap_add}"
     )
 
 
 def _state(workspace: Path, *, run_id: str = "run-1") -> RunState:
-    compose_path = workspace / "compose.yaml"
-    compose_hash = _compose_hash(compose_path)
+    del workspace
     return RunState(
         run_id=run_id,
         repo_url="https://example.invalid/repo.git",
         commit_sha="a" * 40,
-        compose_path="compose.yaml",
-        baseline_config_hash=compose_hash,
-        current_config_hash=compose_hash,
-        journeys=[_journey()],
     )
-
-
-def _boot(
-    verdict: Verdict, attempt: int, logs: dict[str, str] | None = None
-) -> BootResult:
-    return BootResult(
-        verdict=verdict,
-        service_states={"web": "running" if verdict is Verdict.PASS else "exited"},
-        logs=logs or {},
-        attempt=attempt,
-    )
-
-
-class FakeStageOperations:
-    def __init__(
-        self,
-        *,
-        boots: list[tuple[Verdict, dict[str, str]]] | None = None,
-        journey_verdict: Verdict = Verdict.PASS,
-    ) -> None:
-        self.boots = list(boots or [(Verdict.PASS, {})])
-        self.journey_verdict = journey_verdict
-        self.calls: list[str] = []
-        self.boot_inputs: list[tuple[SandboxProvider, dict[str, str], int]] = []
-
-    async def intake(self, state: RunState) -> RunState:
-        self.calls.append("intake")
-        return state.model_copy(deep=True)
-
-    async def baseline(self, state: RunState) -> RunState:
-        self.calls.append("baseline")
-        return state.model_copy(deep=True)
-
-    async def boot(
-        self,
-        state: RunState,
-        provider: SandboxProvider,
-        env: Mapping[str, str],
-        attempt: int,
-    ) -> BootResult:
-        del state
-        self.calls.append("boot")
-        self.boot_inputs.append((provider, dict(env), attempt))
-        verdict, logs = self.boots.pop(0)
-        return _boot(verdict, attempt, logs)
-
-    async def journeys(
-        self, state: RunState, provider: SandboxProvider
-    ) -> list[JourneyResult]:
-        del state, provider
-        self.calls.append("journeys")
-        return [_journey_result(self.journey_verdict)]
-
-    async def observe(
-        self, state: RunState, provider: SandboxProvider
-    ) -> ObservationSnapshot:
-        del state, provider
-        self.calls.append("observe")
-        return ObservationSnapshot(unsupported_collectors=["network_runtime"])
 
 
 class FakeModelAdapter:
@@ -182,28 +105,34 @@ class FakeModelAdapter:
         return schema.model_validate(self.action.model_dump())
 
 
-class WrongAttemptOperations(FakeStageOperations):
-    async def boot(
-        self,
-        state: RunState,
-        provider: SandboxProvider,
-        env: Mapping[str, str],
-        attempt: int,
-    ) -> BootResult:
-        result = await super().boot(state, provider, env, attempt)
-        return result.model_copy(update={"attempt": attempt + 1})
-
-
-class WrongRunOperations(FakeStageOperations):
-    async def intake(self, state: RunState) -> RunState:
-        returned = await super().intake(state)
-        return returned.model_copy(update={"run_id": "different-run"})
-
-
 class GraphProvider(FakeSandboxProvider):
-    def __init__(self, *, healthy: bool = True, host_port: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        baseline_boots: list[tuple[bool, str]] | None = None,
+        candidate_healthy: bool = True,
+        host_port: int | None = None,
+        candidate_publish: bool = True,
+    ) -> None:
         super().__init__(ports={} if host_port is None else {8080: host_port})
-        self.healthy = healthy
+        self.baseline_boots = list(baseline_boots or [(True, "")])
+        self.candidate_healthy = candidate_healthy
+        self.candidate_publish = candidate_publish
+        self._healthy: dict[str, bool] = {}
+        self._logs: dict[str, str] = {}
+        self._roles: dict[str, str] = {}
+
+    async def create(self, workspace: Path, name: str) -> str:
+        sandbox_id = await super().create(workspace, name)
+        role = "baseline" if name.startswith("repotrial-baseline-") else "candidate"
+        self._roles[sandbox_id] = role
+        if role == "baseline":
+            healthy, logs = self.baseline_boots.pop(0)
+        else:
+            healthy, logs = self.candidate_healthy, ""
+        self._healthy[sandbox_id] = healthy
+        self._logs[sandbox_id] = logs
+        return sandbox_id
 
     async def exec(
         self, sandbox_id: str, argv: list[str], timeout_s: int = 60
@@ -211,23 +140,28 @@ class GraphProvider(FakeSandboxProvider):
         self._require_active(sandbox_id)
         snapshot = tuple(argv)
         self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+        healthy = self._healthy[sandbox_id]
         if snapshot[-2:] == ("up", "-d"):
-            return ExecResult(exit_code=0 if self.healthy else 1, stdout="", stderr="")
+            return ExecResult(exit_code=0 if healthy else 1, stdout="", stderr="")
         if snapshot[-4:] == ("ps", "--all", "--format", "json"):
             return ExecResult(
                 exit_code=0,
                 stdout=json.dumps(
                     {
                         "Service": "web",
-                        "State": "running" if self.healthy else "exited",
-                        "Health": "healthy" if self.healthy else "",
-                        "ExitCode": 0 if self.healthy else 1,
+                        "State": "running" if healthy else "exited",
+                        "Health": "healthy" if healthy else "",
+                        "ExitCode": 0 if healthy else 1,
                     }
                 ),
                 stderr="",
             )
         if snapshot[-4:] == ("logs", "--no-color", "--tail", "200"):
-            return ExecResult(exit_code=0, stdout="", stderr="")
+            return ExecResult(
+                exit_code=0,
+                stdout=self._logs[sandbox_id],
+                stderr="",
+            )
         if snapshot[-6:] == (
             "ps",
             "--all",
@@ -238,6 +172,31 @@ class GraphProvider(FakeSandboxProvider):
         ):
             return ExecResult(exit_code=0, stdout="", stderr="")
         raise AssertionError(f"unexpected provider command: {snapshot!r}")
+
+    async def publish_port(self, sandbox_id: str, container_port: int) -> int:
+        if self._roles[sandbox_id] == "candidate" and not self.candidate_publish:
+            self.calls.append(("publish_port", sandbox_id, container_port))
+            raise KeyError("candidate port is unavailable")
+        return await super().publish_port(sandbox_id, container_port)
+
+
+class CancelOnceProvider(GraphProvider):
+    def __init__(self, *, host_port: int) -> None:
+        super().__init__(host_port=host_port)
+        self.cancel_next_candidate = True
+
+    async def create(self, workspace: Path, name: str) -> str:
+        if name.startswith("repotrial-candidate-") and self.cancel_next_candidate:
+            self.cancel_next_candidate = False
+            raise asyncio.CancelledError
+        return await super().create(workspace, name)
+
+
+class AlwaysCancelCandidateProvider(GraphProvider):
+    async def create(self, workspace: Path, name: str) -> str:
+        if name.startswith("repotrial-candidate-"):
+            raise asyncio.CancelledError
+        return await super().create(workspace, name)
 
 
 class _HealthyHandler(BaseHTTPRequestHandler):
@@ -267,9 +226,10 @@ def _healthy_server() -> tuple[str, int]:
 
 def _context(
     tmp_path: Path,
-    operations: FakeStageOperations,
     provider: SandboxProvider,
     *,
+    risks: tuple[str, ...] = (),
+    journeys: list[Journey] | None = None,
     model: FakeModelAdapter | None = None,
     sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> tuple[GraphContext, Path]:
@@ -282,10 +242,16 @@ def _context(
     overlay_dir.mkdir()
     accepted_dir.mkdir()
     source = workspace / "compose.yaml"
-    source.write_text(_compose_text(), encoding="utf-8")
+    source.write_text(_compose_text(risks), encoding="utf-8")
+    declared = [_journey()] if journeys is None else journeys
+    (workspace / "repotrial.journeys.json").write_text(
+        json.dumps(
+            {"journeys": [journey.model_dump(mode="json") for journey in declared]}
+        ),
+        encoding="utf-8",
+    )
     return (
         GraphContext(
-            operations=operations,
             provider=provider,
             model=model,
             workspace=workspace,
@@ -304,6 +270,14 @@ def _context(
 
 def _run(state: RunState, context: GraphContext) -> GraphState:
     return asyncio.run(ainvoke_run(build_run_graph(), state, context=context))
+
+
+def _candidate_create_calls(provider: FakeSandboxProvider) -> list[tuple[object, ...]]:
+    return [
+        call
+        for call in provider.calls
+        if call[0] == "create" and str(call[2]).startswith("repotrial-candidate-")
+    ]
 
 
 def test_graph_contains_only_the_frozen_named_stages() -> None:
@@ -327,43 +301,42 @@ def test_graph_contains_only_the_frozen_named_stages() -> None:
 def test_boot_failure_uses_bounded_recovery_then_returns_to_boot(
     tmp_path: Path,
 ) -> None:
-    operations = FakeStageOperations(
-        boots=[
-            (Verdict.FAIL, {"logs": "APP_REQUIRED_TOKEN is required"}),
-            (Verdict.PASS, {}),
+    provider = GraphProvider(
+        baseline_boots=[
+            (False, "APP_REQUIRED_TOKEN is required"),
+            (True, ""),
         ]
     )
-    provider = FakeSandboxProvider()
-    context, source = _context(tmp_path, operations, provider)
+    context, source = _context(tmp_path, provider, journeys=[])
 
     result = _run(_state(source.parent), context)
 
-    assert [item[2] for item in operations.boot_inputs] == [1, 2]
-    assert operations.boot_inputs[0][0] is provider
-    assert operations.boot_inputs[0][1] == {}
-    assert operations.boot_inputs[1][1] == {
-        "APP_REQUIRED_TOKEN": "repotrial-synthetic-value"
-    }
-    assert result.stage_history[:5] == [
-        "intake",
-        "baseline",
-        "boot",
-        "boot",
-        "journeys",
+    create_calls = [call for call in provider.calls if call[0] == "create"]
+    assert len(create_calls) == 2
+    boot_commands = [
+        call[2]
+        for call in provider.calls
+        if call[0] == "exec" and call[2][-2:] == ("up", "-d")
     ]
-    assert result.run.stop_reason == "no_remaining_mutations"
+    assert boot_commands[0][0] == "docker"
+    assert boot_commands[1][0:2] == (
+        "env",
+        "APP_REQUIRED_TOKEN=repotrial-synthetic-value",
+    )
+    assert result.stage_history[:4] == ["intake", "baseline", "boot", "boot"]
+    assert result.run.stop_reason == "insufficient_coverage"
 
 
 def test_repeated_boot_error_stops_after_four_attempts_without_retry_storm(
     tmp_path: Path,
 ) -> None:
-    repeated = (Verdict.FAIL, {"logs": "APP_REQUIRED_TOKEN is required"})
-    operations = FakeStageOperations(boots=[repeated, repeated, repeated, repeated])
-    context, source = _context(tmp_path, operations, FakeSandboxProvider())
+    repeated = (False, "APP_REQUIRED_TOKEN is required")
+    provider = GraphProvider(baseline_boots=[repeated] * 4)
+    context, source = _context(tmp_path, provider, journeys=[])
 
     result = _run(_state(source.parent), context)
 
-    assert [item[2] for item in operations.boot_inputs] == [1, 2, 3, 4]
+    assert len([call for call in provider.calls if call[0] == "create"]) == 4
     assert result.stage_history.count("boot") == 4
     assert result.run.stop_reason == "boot_recovery_stopped"
     assert "journeys" not in result.stage_history
@@ -372,9 +345,7 @@ def test_repeated_boot_error_stops_after_four_attempts_without_retry_storm(
 def test_unsafe_model_recovery_cannot_bypass_propose_recovery_policy(
     tmp_path: Path,
 ) -> None:
-    operations = FakeStageOperations(
-        boots=[(Verdict.FAIL, {"logs": "unclassified failure"})]
-    )
+    provider = GraphProvider(baseline_boots=[(False, "unclassified failure")])
     model = FakeModelAdapter(
         RecoveryAction(
             action="shell",
@@ -382,12 +353,12 @@ def test_unsafe_model_recovery_cannot_bypass_propose_recovery_policy(
             reason="untrusted proposal",
         )
     )
-    context, source = _context(tmp_path, operations, FakeSandboxProvider(), model=model)
+    context, source = _context(tmp_path, provider, journeys=[], model=model)
 
     result = _run(_state(source.parent), context)
 
     assert model.calls == 1
-    assert len(operations.boot_inputs) == 1
+    assert len([call for call in provider.calls if call[0] == "create"]) == 1
     assert result.run.stop_reason == "boot_recovery_stopped"
 
 
@@ -406,11 +377,8 @@ def test_validated_retry_and_wait_actions_return_to_boot_without_real_sleep(
     action: RecoveryAction,
     expected_sleeps: list[float],
 ) -> None:
-    operations = FakeStageOperations(
-        boots=[
-            (Verdict.FAIL, {"logs": "unclassified failure"}),
-            (Verdict.PASS, {}),
-        ]
+    provider = GraphProvider(
+        baseline_boots=[(False, "unclassified failure"), (True, "")]
     )
     model = FakeModelAdapter(action)
     sleeps: list[float] = []
@@ -420,61 +388,33 @@ def test_validated_retry_and_wait_actions_return_to_boot_without_real_sleep(
 
     context, source = _context(
         tmp_path,
-        operations,
-        FakeSandboxProvider(),
+        provider,
+        journeys=[],
         model=model,
         sleeper=fake_sleep,
     )
 
     result = _run(_state(source.parent), context)
 
-    assert len(operations.boot_inputs) == 2
+    assert len([call for call in provider.calls if call[0] == "create"]) == 2
     assert sleeps == expected_sleeps
-    assert result.run.stop_reason == "no_remaining_mutations"
+    assert result.run.stop_reason == "insufficient_coverage"
 
 
-def test_unsupported_boot_is_terminal_without_recovery(tmp_path: Path) -> None:
-    operations = FakeStageOperations(boots=[(Verdict.UNSUPPORTED, {})])
-    context, source = _context(tmp_path, operations, FakeSandboxProvider())
-
-    result = _run(_state(source.parent), context)
-
-    assert len(operations.boot_inputs) == 1
-    assert result.run.stop_reason == "boot_unsupported"
-    assert result.stage_history[-1] == "report_or_next"
-    assert "journeys" not in result.stage_history
-
-
-def test_boot_result_cannot_claim_a_different_attempt(tmp_path: Path) -> None:
-    operations = WrongAttemptOperations()
-    context, source = _context(tmp_path, operations, FakeSandboxProvider())
-
-    with pytest.raises(ValueError, match="attempt does not match"):
-        _run(_state(source.parent), context)
-
-
-def test_stage_operation_cannot_change_checkpoint_identity(tmp_path: Path) -> None:
-    operations = WrongRunOperations()
-    context, source = _context(tmp_path, operations, FakeSandboxProvider())
-
-    with pytest.raises(ValueError, match="cannot change run_id"):
-        _run(_state(source.parent), context)
-
-
-def test_total_boot_attempt_cap_stops_alternating_retry_errors(tmp_path: Path) -> None:
-    operations = FakeStageOperations(
-        boots=[
-            (Verdict.FAIL, {"logs": f"different failure {index}"}) for index in range(4)
-        ]
+def test_total_boot_attempt_cap_stops_alternating_retry_errors(
+    tmp_path: Path,
+) -> None:
+    provider = GraphProvider(
+        baseline_boots=[(False, f"different failure {index}") for index in range(4)]
     )
     model = FakeModelAdapter(
         RecoveryAction(action="retry", params={}, reason="bounded retry")
     )
-    context, source = _context(tmp_path, operations, FakeSandboxProvider(), model=model)
+    context, source = _context(tmp_path, provider, journeys=[], model=model)
 
     result = _run(_state(source.parent), context)
 
-    assert len(operations.boot_inputs) == 4
+    assert len([call for call in provider.calls if call[0] == "create"]) == 4
     assert result.stage_history.count("boot") == 5
     assert result.run.stop_reason == "boot_recovery_stopped"
 
@@ -482,25 +422,27 @@ def test_total_boot_attempt_cap_stops_alternating_retry_errors(tmp_path: Path) -
 def test_journey_existence_without_actual_pass_stops_before_experiment(
     tmp_path: Path,
 ) -> None:
-    operations = FakeStageOperations(journey_verdict=Verdict.FAIL)
-    provider = FakeSandboxProvider()
-    context, source = _context(tmp_path, operations, provider)
-    state = _state(source.parent)
-    state.risk_findings = [_risk("root_user")]
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port)
+        context, source = _context(
+            tmp_path,
+            provider,
+            risks=("root_user",),
+            journeys=[_journey(expected_status=201)],
+        )
 
-    result = _run(state, context)
+        result = _run(_state(source.parent), context)
 
     assert result.run.stop_reason == "insufficient_coverage"
     assert result.run.experiments == []
     assert "experiment" not in result.stage_history
-    assert operations.calls == ["intake", "baseline", "boot", "journeys", "observe"]
-    assert provider.calls == []
+    assert _candidate_create_calls(provider) == []
 
 
 @pytest.mark.parametrize(
     ("healthy", "publish", "expected_verdict", "expected_reason"),
     [
-        (False, False, ExperimentVerdict.ROLLBACK, "boot_regression"),
+        (False, True, ExperimentVerdict.ROLLBACK, "boot_regression"),
         (True, False, ExperimentVerdict.STOP, "publish_failed"),
     ],
 )
@@ -511,19 +453,20 @@ def test_run_experiment_is_the_only_verdict_engine_and_nonkeep_preserves_hash(
     expected_verdict: ExperimentVerdict,
     expected_reason: str,
 ) -> None:
-    operations = FakeStageOperations()
-    provider = GraphProvider(healthy=healthy, host_port=9 if publish else None)
-    context, source = _context(tmp_path, operations, provider)
-    state = _state(source.parent)
-    original_hash = state.current_config_hash
-    state.risk_findings = [_risk("root_user")]
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(
+            candidate_healthy=healthy,
+            host_port=port,
+            candidate_publish=publish,
+        )
+        context, source = _context(tmp_path, provider, risks=("root_user",))
 
-    result = _run(state, context)
+        result = _run(_state(source.parent), context)
 
     assert len(result.run.experiments) == 1
     assert result.run.experiments[0].verdict is expected_verdict
     assert result.run.experiments[0].reason == expected_reason
-    assert result.run.current_config_hash == original_hash
+    assert result.run.current_config_hash == result.run.baseline_config_hash
     if expected_verdict is ExperimentVerdict.STOP:
         assert result.run.stop_reason == f"experiment:{expected_reason}"
 
@@ -532,14 +475,11 @@ def test_two_keeps_materialize_full_compose_chain_without_mutating_source(
     tmp_path: Path,
 ) -> None:
     with _healthy_server() as (_, port):
-        operations = FakeStageOperations()
         provider = GraphProvider(host_port=port)
-        context, source = _context(tmp_path, operations, provider)
+        context, source = _context(tmp_path, provider, risks=("root_user", "cap_add"))
         original = source.read_bytes()
-        state = _state(source.parent)
-        state.risk_findings = [_risk("root_user"), _risk("cap_add")]
 
-        result = _run(state, context)
+        result = _run(_state(source.parent), context)
 
     assert [record.verdict for record in result.run.experiments] == [
         ExperimentVerdict.KEEP,
@@ -561,37 +501,18 @@ def test_two_keeps_materialize_full_compose_chain_without_mutating_source(
     ]
     assert len(overlay_artifacts) == 2
     assert all(path.is_file() for path in overlay_artifacts)
-    assert len([call for call in provider.calls if call[0] == "create"]) == 2
-    assert len([call for call in provider.calls if call[0] == "destroy"]) == 2
+    assert len(_candidate_create_calls(provider)) == 2
     assert not any(
         record.reason == "parent_hash_mismatch" for record in result.run.experiments
     )
-    assert result.stage_history == [
-        "intake",
-        "baseline",
-        "boot",
-        "journeys",
-        "observe",
-        "propose_mutation",
-        "experiment",
-        "decide",
-        "report_or_next",
-        "propose_mutation",
-        "experiment",
-        "decide",
-        "report_or_next",
-        "propose_mutation",
-        "report_or_next",
-    ]
 
 
 def test_keep_rejects_accepted_directory_reached_through_intermediate_link(
     tmp_path: Path,
 ) -> None:
     with _healthy_server() as (_, port):
-        operations = FakeStageOperations()
         provider = GraphProvider(host_port=port)
-        context, source = _context(tmp_path, operations, provider)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
         real_parent = context.workspace / "real-parent"
         real_parent.mkdir()
         accepted = real_parent / "accepted"
@@ -599,11 +520,9 @@ def test_keep_rejects_accepted_directory_reached_through_intermediate_link(
         linked_parent = context.workspace / "linked-parent"
         linked_parent.symlink_to(real_parent, target_is_directory=True)
         context = replace(context, accepted_compose_dir=linked_parent / accepted.name)
-        state = _state(source.parent)
-        state.risk_findings = [_risk("root_user")]
 
         with pytest.raises(ValueError, match="link"):
-            _run(state, context)
+            _run(_state(source.parent), context)
 
     assert list(accepted.iterdir()) == []
 
@@ -614,11 +533,8 @@ def test_keep_materialization_replay_reuses_only_matching_candidate(
     matching: bool,
 ) -> None:
     with _healthy_server() as (_, port):
-        operations = FakeStageOperations()
         provider = GraphProvider(host_port=port)
-        context, source = _context(tmp_path, operations, provider)
-        state = _state(source.parent)
-        state.risk_findings = [_risk("root_user")]
+        context, source = _context(tmp_path, provider, risks=("root_user",))
         mutation = Mutation(
             mutation_id="policy:set_non_root:web",
             type=MutationType.SET_NON_ROOT,
@@ -634,7 +550,7 @@ def test_keep_materialization_replay_reuses_only_matching_candidate(
         _write_compose(target, candidate if matching else load_compose(source))
 
         if matching:
-            result = _run(state, context)
+            result = _run(_state(source.parent), context)
             assert (
                 result.run.compose_path
                 == target.relative_to(context.workspace).as_posix()
@@ -642,28 +558,30 @@ def test_keep_materialization_replay_reuses_only_matching_candidate(
             assert _compose_hash(target) == candidate_hash
         else:
             with pytest.raises(ValueError, match="replay hash mismatch"):
-                _run(state, context)
+                _run(_state(source.parent), context)
 
 
 def test_checkpoint_resume_is_scoped_to_run_id_and_rejects_conflicts(
     tmp_path: Path,
 ) -> None:
-    operations = FakeStageOperations(boots=[(Verdict.PASS, {}), (Verdict.PASS, {})])
-    context, source = _context(tmp_path, operations, FakeSandboxProvider())
-    graph = build_run_graph(interrupt_after=("boot",))
-    first_state = _state(source.parent, run_id="checkpoint-run")
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(
+            baseline_boots=[(True, ""), (True, "")], host_port=port
+        )
+        context, source = _context(tmp_path, provider)
+        graph = build_run_graph(interrupt_after=("boot",))
+        first_state = _state(source.parent, run_id="checkpoint-run")
 
-    interrupted = asyncio.run(ainvoke_run(graph, first_state, context=context))
-    resumed = asyncio.run(aresume_run(graph, "checkpoint-run", context=context))
+        interrupted = asyncio.run(ainvoke_run(graph, first_state, context=context))
+        resumed = asyncio.run(aresume_run(graph, "checkpoint-run", context=context))
+        other = _state(source.parent, run_id="other-run")
+        other_result = asyncio.run(ainvoke_run(graph, other, context=context))
 
     assert interrupted.stage_history == ["intake", "baseline", "boot"]
     assert resumed.run.run_id == "checkpoint-run"
     assert resumed.stage_history[-1] == "report_or_next"
-    other = _state(source.parent, run_id="other-run")
-    other_result = asyncio.run(ainvoke_run(graph, other, context=context))
     assert other_result.run.run_id == "other-run"
     assert other_result.stage_history == ["intake", "baseline", "boot"]
-
     with pytest.raises(ValueError, match="thread_id must equal run_id"):
         asyncio.run(
             ainvoke_run(
@@ -673,3 +591,198 @@ def test_checkpoint_resume_is_scoped_to_run_id_and_rejects_conflicts(
                 config={"configurable": {"thread_id": "conflicting-run"}},
             )
         )
+
+
+def test_stop_before_overlay_appends_duplicate_baseline_record_once(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+        state = _state(source.parent, run_id="duplicate-baseline")
+        state.journeys = [_journey(), _journey()]
+
+        result = _run(state, context)
+
+    assert len(result.run.experiments) == 1
+    assert result.run.experiments[0].verdict is ExperimentVerdict.STOP
+    assert result.run.experiments[0].reason == "invalid_baseline:duplicate_result_id"
+    assert result.run.stop_reason == "experiment:invalid_baseline:duplicate_result_id"
+    assert not list(context.overlay_dir.iterdir())
+    assert _candidate_create_calls(provider) == []
+
+
+def test_stop_before_overlay_appends_parent_mismatch_record_once(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+        graph = build_run_graph(interrupt_after=("propose_mutation",))
+        state = _state(source.parent, run_id="parent-mismatch")
+
+        interrupted = asyncio.run(ainvoke_run(graph, state, context=context))
+        source.write_text(
+            _compose_text(("root_user",)).replace(
+                "example/web:1", "example/web:changed"
+            ),
+            encoding="utf-8",
+        )
+        resumed = asyncio.run(aresume_run(graph, state.run_id, context=context))
+
+    assert interrupted.pending_mutation is not None
+    assert len(resumed.run.experiments) == 1
+    assert resumed.run.experiments[0].verdict is ExperimentVerdict.STOP
+    assert resumed.run.experiments[0].reason == "parent_hash_mismatch"
+    assert resumed.run.stop_reason == "experiment:parent_hash_mismatch"
+    assert not list(context.overlay_dir.iterdir())
+    assert _candidate_create_calls(provider) == []
+
+
+def test_cancelled_experiment_resume_uses_fresh_attempt_namespace(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = CancelOnceProvider(host_port=port)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+        graph = build_run_graph(interrupt_after=("propose_mutation",))
+        state = _state(source.parent, run_id="cancelled-experiment")
+
+        interrupted = asyncio.run(ainvoke_run(graph, state, context=context))
+        with pytest.raises(NodeCancelledError):
+            asyncio.run(aresume_run(graph, state.run_id, context=context))
+        resumed = asyncio.run(aresume_run(graph, state.run_id, context=context))
+
+    assert interrupted.pending_mutation is not None
+    assert resumed.run.experiments[0].verdict is ExperimentVerdict.KEEP
+    assert resumed.run.stop_reason == "no_remaining_mutations"
+    overlay_files = sorted(context.overlay_dir.glob("*.overlay.yaml"))
+    assert len(overlay_files) == 2
+    lifecycle_files = sorted(context.artifact_dir.rglob("candidate-*-lifecycle.jsonl"))
+    assert len(lifecycle_files) == 2
+    assert all(path.is_file() for path in [*overlay_files, *lifecycle_files])
+
+
+def test_experiment_attempts_fail_closed_after_four_cancellations(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = AlwaysCancelCandidateProvider(host_port=port)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+        graph = build_run_graph(interrupt_after=("propose_mutation",))
+        state = _state(source.parent, run_id="exhausted-experiment")
+
+        asyncio.run(ainvoke_run(graph, state, context=context))
+        for _ in range(4):
+            with pytest.raises(NodeCancelledError):
+                asyncio.run(aresume_run(graph, state.run_id, context=context))
+        with pytest.raises(ValueError, match="attempt slots exhausted"):
+            asyncio.run(aresume_run(graph, state.run_id, context=context))
+
+    assert len(list(context.overlay_dir.glob("*.overlay.yaml"))) == 4
+    assert len(list(context.artifact_dir.rglob("candidate-*-lifecycle.jsonl"))) == 4
+
+
+def test_stop_rejects_selected_overlay_replaced_by_link(tmp_path: Path) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+        graph = build_run_graph(interrupt_after=("experiment",))
+        state = _state(source.parent, run_id="unsafe-stop-overlay")
+        state.journeys = [_journey(), _journey()]
+
+        interrupted = asyncio.run(ainvoke_run(graph, state, context=context))
+        assert interrupted.pending_overlay_path is not None
+        selected = context.workspace / interrupted.pending_overlay_path
+        outside = tmp_path / "outside-overlay.yaml"
+        outside.write_text("services: {}\n", encoding="utf-8")
+        selected.symlink_to(outside)
+
+        with pytest.raises(ValueError, match="regular file"):
+            asyncio.run(aresume_run(graph, state.run_id, context=context))
+
+    assert _candidate_create_calls(provider) == []
+
+
+def test_default_graph_composes_real_baseline_services_in_one_sandbox(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port)
+        context, source = _context(tmp_path, provider)
+        state = RunState(
+            run_id="concrete-baseline",
+            repo_url="https://example.invalid/repo.git",
+            commit_sha="a" * 40,
+        )
+
+        result = _run(state, context)
+
+    assert result.run.compose_path == source.relative_to(context.workspace).as_posix()
+    assert result.run.baseline_config_hash == _compose_hash(source)
+    assert result.run.current_config_hash == _compose_hash(source)
+    assert result.run.risk_findings == []
+    assert result.run.journeys == [_journey()]
+    assert result.run.baseline_journey_results[0].verdict is Verdict.PASS
+    assert result.run.baseline_observation is not None
+    assert result.run.stop_reason == "no_remaining_mutations"
+    assert len([call for call in provider.calls if call[0] == "create"]) == 1
+    assert len([call for call in provider.calls if call[0] == "destroy"]) == 1
+    assert result.run.sandbox_id is None
+
+
+def test_missing_commit_uses_narrow_repository_pinner_then_real_baseline(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port)
+        workspace = tmp_path / "pinned-workspace"
+        artifact_dir = tmp_path / "pinned-artifacts"
+        artifact_dir.mkdir()
+
+        async def fake_pinner(
+            url: str, destination: Path, requested_ref: str | None
+        ) -> PinnedRepo:
+            del url, requested_ref
+            destination.mkdir()
+            (destination / "compose.yaml").write_text(
+                _compose_text(()), encoding="utf-8"
+            )
+            (destination / "repotrial.journeys.json").write_text(
+                json.dumps({"journeys": [_journey().model_dump(mode="json")]}),
+                encoding="utf-8",
+            )
+            return PinnedRepo(
+                repo=RepoRef(
+                    url="https://github.com/example/repo",
+                    owner="example",
+                    repo="repo",
+                ),
+                commit_sha="b" * 40,
+                local_path=destination,
+            )
+
+        context = GraphContext(
+            provider=provider,
+            workspace=workspace,
+            artifact_dir=artifact_dir,
+            overlay_dir=workspace / ".repotrial-overlays",
+            accepted_compose_dir=workspace / ".repotrial-accepted",
+            env={},
+            allowed_env_keys=frozenset(),
+            readme_excerpt="",
+            container_port=8080,
+            repository_pinner=fake_pinner,
+        )
+        state = RunState(
+            run_id="pinned-intake",
+            repo_url="https://github.com/example/repo",
+        )
+
+        result = _run(state, context)
+
+    assert result.run.repo_url == "https://github.com/example/repo"
+    assert result.run.commit_sha == "b" * 40
+    assert result.run.compose_path == "compose.yaml"
+    assert result.run.baseline_journey_results[0].verdict is Verdict.PASS
+    assert result.run.sandbox_id is None
