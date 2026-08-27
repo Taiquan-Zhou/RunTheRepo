@@ -184,10 +184,6 @@ def test_failed_assertion_stops_later_steps_and_counts_only_fully_asserted_steps
         tmp_path,
         httpx.MockTransport(handler),
     )
-    assert result.failure_reason == "step-0000:unsupported_content_encoding"
-    assert observed_headers == ["identity"]
-    assert [Path(path).name for path in result.evidence_paths] == ["step-0000.json"]
-
     assert result.verdict is Verdict.FAIL
     assert result.failure_reason == "step-0000:assertion:status_code"
     assert result.passed_steps == 0
@@ -407,6 +403,10 @@ def test_compressed_response_fails_closed_and_requests_identity_encoding(
         httpx.MockTransport(handler),
     )
 
+    assert result.failure_reason == "step-0000:unsupported_content_encoding"
+    assert observed_headers == ["identity"]
+    assert [Path(path).name for path in result.evidence_paths] == ["step-0000.json"]
+
 
 def test_body_redaction_uses_credential_key_grammar_for_assignments() -> None:
     alpha = b"db_password = alpha beta\nclient_secret:\n  one\n  two\nnext: ordinary\n"
@@ -417,7 +417,6 @@ def test_body_redaction_uses_credential_key_grammar_for_assignments() -> None:
     assert _redacted_body_hash(beta, False) != _redacted_body_hash(
         changed_sibling, False
     )
-
 
 
 def test_redacted_hash_consumes_truncated_pem_and_multiline_credentials(
