@@ -339,6 +339,56 @@ def test_postgres_library_url_schemes_reach_the_async_factory(
     assert events == ["factory", "enter", "setup", "exit"]
 
 
+@pytest.mark.parametrize(
+    "database_url",
+    [
+        "postgresql://user:p%0A@db.invalid/repotrial",
+        ("postgresql://user:pass@db.invalid/repotrial?application_name=worker%0Aname"),
+    ],
+    ids=["credential", "query"],
+)
+def test_percent_encoded_controls_fail_before_the_postgres_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    database_url: str,
+) -> None:
+    module = _checkpoint_module()
+    events: list[str] = []
+    saver = _FakeAsyncSaver(events)
+    calls = _postgres_factory(monkeypatch, module, events, saver)
+
+    async def exercise() -> None:
+        try:
+            manager = module.build_checkpointer(database_url)
+        except ValueError:
+            return
+        async with manager:
+            pass
+
+    asyncio.run(exercise())
+
+    assert calls == []
+    assert events == []
+
+
+def test_parser_valid_private_use_credential_reaches_postgres_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _checkpoint_module()
+    events: list[str] = []
+    saver = _FakeAsyncSaver(events)
+    calls = _postgres_factory(monkeypatch, module, events, saver)
+    database_url = "postgresql://user:p\ue000@db.invalid/repotrial"
+
+    async def exercise() -> None:
+        async with module.build_checkpointer(database_url):
+            pass
+
+    asyncio.run(exercise())
+
+    assert [call[0] for call in calls] == [database_url]
+    assert events == ["factory", "enter", "setup", "exit"]
+
+
 def test_postgres_factory_failure_propagates_without_yield(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

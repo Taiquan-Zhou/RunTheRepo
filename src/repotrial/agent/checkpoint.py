@@ -59,18 +59,25 @@ def _validate_database_url(database_url: str | None) -> str | None:
         raise TypeError("database_url must be a string or None")
     if (
         not database_url.strip()
-        or any(
-            unicodedata.category(character).startswith("C")
-            for character in database_url
-        )
+        or _contains_control(database_url)
         or not database_url.startswith(_POSTGRESQL_URL_PREFIXES)
     ):
         raise ValueError("database_url must be an explicit PostgreSQL URL")
     try:
-        conninfo_to_dict(database_url)
+        connection_info = conninfo_to_dict(database_url)
     except ProgrammingError as error:
         raise ValueError("database_url must be a valid PostgreSQL URL") from error
+    if any(
+        _contains_control(value)
+        for value in connection_info.values()
+        if isinstance(value, str)
+    ):
+        raise ValueError("database_url must not contain control characters")
     return database_url
+
+
+def _contains_control(value: str) -> bool:
+    return any(unicodedata.category(character) == "Cc" for character in value)
 
 
 def _build_serializer() -> JsonPlusSerializer:
