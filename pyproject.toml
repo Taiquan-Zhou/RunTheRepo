@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 repotrial = "repotrial.cli:app"
+repotrial-eval = "repotrial.eval.cli:app"
 
 [dependency-groups]
 dev = [

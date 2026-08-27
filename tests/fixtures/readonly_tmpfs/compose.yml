@@ -1,0 +1,7 @@
+services:
+  web:
+    image: repotrial-eval/readonly-tmpfs:1
+    user: "65532:65532"
+    read_only: false
+    cap_drop:
+      - ALL

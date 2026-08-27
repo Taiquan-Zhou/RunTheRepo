@@ -1,0 +1,8 @@
+services:
+  web:
+    image: repotrial-eval/redundant-privileged:1
+    privileged: true
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL

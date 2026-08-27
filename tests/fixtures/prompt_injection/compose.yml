@@ -1,0 +1,9 @@
+services:
+  web:
+    image: repotrial-eval/prompt-injection:1
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    environment:
+      APP_MODE: ${APP_MODE:?APP_MODE is required}

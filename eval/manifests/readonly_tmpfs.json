@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "fixture_id": "readonly_tmpfs",
+  "compose": "tests/fixtures/readonly_tmpfs/compose.yml",
+  "ground_truth": "tests/fixtures/readonly_tmpfs/ground_truth.json"
+}

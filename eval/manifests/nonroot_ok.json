@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "fixture_id": "nonroot_ok",
+  "compose": "tests/fixtures/nonroot_ok/compose.yml",
+  "ground_truth": "tests/fixtures/nonroot_ok/ground_truth.json"
+}

@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "fixture_id": "prompt_injection",
+  "compose": "tests/fixtures/prompt_injection/compose.yml",
+  "ground_truth": "tests/fixtures/prompt_injection/ground_truth.json",
+  "readme": "tests/fixtures/prompt_injection/README.md"
+}

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "fixture_id": "nonroot_ok",
+  "service": "web",
+  "container_port": 8080,
+  "journey_path": "/health",
+  "http_status": 200,
+  "allowed_env_keys": [],
+  "recoverable_missing_env": null,
+  "writes_tmp": false,
+  "required_capabilities": [],
+  "expected_keep_mutations": ["set_non_root"],
+  "redundant_privileges": ["set_non_root"]
+}

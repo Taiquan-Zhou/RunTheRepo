@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "fixture_id": "redundant_privileged",
+  "compose": "tests/fixtures/redundant_privileged/compose.yml",
+  "ground_truth": "tests/fixtures/redundant_privileged/ground_truth.json"
+}

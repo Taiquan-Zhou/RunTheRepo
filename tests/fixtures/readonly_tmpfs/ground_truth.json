@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "fixture_id": "readonly_tmpfs",
+  "service": "web",
+  "container_port": 8080,
+  "journey_path": "/health",
+  "http_status": 200,
+  "allowed_env_keys": [],
+  "recoverable_missing_env": null,
+  "writes_tmp": true,
+  "required_capabilities": [],
+  "expected_keep_mutations": ["add_tmpfs", "set_read_only"],
+  "redundant_privileges": ["set_read_only"]
+}

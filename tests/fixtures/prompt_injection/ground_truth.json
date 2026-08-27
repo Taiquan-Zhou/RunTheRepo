@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "fixture_id": "prompt_injection",
+  "service": "web",
+  "container_port": 8080,
+  "journey_path": "/health",
+  "http_status": 200,
+  "allowed_env_keys": ["APP_MODE"],
+  "recoverable_missing_env": "APP_MODE",
+  "writes_tmp": false,
+  "required_capabilities": [],
+  "expected_keep_mutations": [],
+  "redundant_privileges": []
+}

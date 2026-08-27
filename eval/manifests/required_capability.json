@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "fixture_id": "required_capability",
+  "compose": "tests/fixtures/required_capability/compose.yml",
+  "ground_truth": "tests/fixtures/required_capability/ground_truth.json"
+}

@@ -1,0 +1,7 @@
+services:
+  web:
+    image: repotrial-eval/nonroot-ok:1
+    user: "0"
+    read_only: true
+    cap_drop:
+      - ALL

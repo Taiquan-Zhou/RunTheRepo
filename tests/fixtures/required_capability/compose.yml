@@ -1,0 +1,7 @@
+services:
+  web:
+    image: repotrial-eval/required-capability:1
+    user: "65532:65532"
+    read_only: true
+    cap_add:
+      - NET_ADMIN
