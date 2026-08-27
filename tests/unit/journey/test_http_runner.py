@@ -421,6 +421,93 @@ def test_valid_json_body_redaction_recurses_through_nested_values() -> None:
     assert _redacted_body_hash(beta, False) != _redacted_body_hash(changed_field, False)
 
 
+def test_runner_writes_evidence_for_deep_legal_json_without_escaping(
+    tmp_path: Path,
+) -> None:
+    body = b"[" * 1_100 + b"0" + b"]" * 1_100
+    result = run(
+        journey(step("deep-json", "GET", "/deep", [])),
+        tmp_path,
+        httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=ChunkedStream([body]))
+        ),
+    )
+
+    evidence = json.loads(Path(result.evidence_paths[0]).read_text(encoding="utf-8"))
+    assert result.verdict is Verdict.PASS
+    assert evidence["response"]["body_sha256"]
+
+
+def test_runner_writes_evidence_for_legal_long_json_integer_without_escaping(
+    tmp_path: Path,
+) -> None:
+    body = b'{"value":' + b"9" * 5_000 + b"}"
+    result = run(
+        journey(step("long-json", "GET", "/long", [])),
+        tmp_path,
+        httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=ChunkedStream([body]))
+        ),
+    )
+
+    evidence = json.loads(Path(result.evidence_paths[0]).read_text(encoding="utf-8"))
+    assert result.verdict is Verdict.PASS
+    assert evidence["response"]["body_sha256"]
+
+
+def test_malformed_json_fallback_redacts_quoted_credentials_and_keeps_fields() -> None:
+    assert _redacted_body_hash(
+        b'{"password":"alpha","next":', False
+    ) == _redacted_body_hash(b'{"password":"beta","next":', False)
+
+    alpha = b'{"password":"alpha","status":"ready","next":'
+    beta = b'{"password":"beta","status":"ready","next":'
+    changed_field = b'{"password":"beta","status":"changed","next":'
+
+    assert _redacted_body_hash(alpha, False) == _redacted_body_hash(beta, False)
+    assert _redacted_body_hash(beta, False) != _redacted_body_hash(changed_field, False)
+
+
+def test_truncated_structured_response_redacts_credential_substitutions(
+    tmp_path: Path,
+) -> None:
+    def body(secret: str) -> bytes:
+        return (
+            f'{{"password":"{secret}","status":"ready","payload":"'.encode()
+            + b"x" * 70_000
+        )
+
+    hashes: list[str] = []
+    for secret in ("alpha", "bravo"):
+        result = run(
+            journey(step("truncated-json", "GET", "/truncated", [])),
+            tmp_path / secret,
+            httpx.MockTransport(
+                lambda request, value=secret: httpx.Response(
+                    200, stream=ChunkedStream([body(value)])
+                )
+            ),
+        )
+        evidence = json.loads(
+            Path(result.evidence_paths[0]).read_text(encoding="utf-8")
+        )
+        assert evidence["response"]["truncated"] is True
+        hashes.append(evidence["response"]["body_sha256"])
+
+    assert hashes[0] == hashes[1]
+
+
+def test_malformed_embedded_list_object_redacts_quoted_credentials() -> None:
+    alpha = b'prefix {"items":[{"client_secret":"alpha","status":"ready"}],"next":'
+    beta = b'prefix {"items":[{"client_secret":"beta","status":"ready"}],"next":'
+    changed_field = (
+        b'prefix {"items":[{"client_secret":"beta","status":"changed"}],"next":'
+    )
+
+    assert _redacted_body_hash(alpha, False) == _redacted_body_hash(beta, False)
+    assert _redacted_body_hash(beta, False) != _redacted_body_hash(changed_field, False)
+
+
 def test_yaml_sequence_credential_block_preserves_same_mapping_sibling() -> None:
     alpha = b"- password: |\n    alpha\n    omega\n  status: ready\n"
     beta = b"- password: |\n    beta\n  status: ready\n"

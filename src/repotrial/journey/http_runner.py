@@ -22,9 +22,9 @@ _PEM_PRIVATE_KEY = re.compile(
     re.DOTALL,
 )
 _ASSIGNMENT = re.compile(
-    r"(?<!\S)(?:-\s*)?[\"']?(?P<key>[A-Za-z0-9_-]+)[\"']?\s*"
+    r"(?<![^\s{,\[])(?:-\s*)?[\"']?(?P<key>[A-Za-z0-9_-]+)[\"']?\s*"
     r"(?P<separator>[:=])\s*(?P<value>.*?)"
-    r"(?=(?:\s+[\"']?[A-Za-z0-9_-]+[\"']?\s*[:=])|(?:\r?\n)?\Z)"
+    r"(?=(?:\s+|,\s*|\{\s*|\[\s*(?:\{\s*)?)[\"']?[A-Za-z0-9_-]+[\"']?\s*[:=]|(?:\r?\n)?\Z)"
 )
 
 
@@ -208,14 +208,17 @@ def _redacted_body_hash(body: bytes, truncated: bool) -> str:
 def _redact_json_body(text: str) -> str | None:
     try:
         value: object = json.loads(text)
+        redacted = _redact_json_value(value)
+        return json.dumps(
+            redacted,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
     except json.JSONDecodeError:
         return None
-    return json.dumps(
-        _redact_json_value(value),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
+    except (ValueError, RecursionError):
+        return None
 
 
 def _redact_json_value(value: object) -> object:
