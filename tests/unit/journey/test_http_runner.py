@@ -1,4 +1,6 @@
 import asyncio
+import gzip
+import inspect
 import json
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -17,12 +19,32 @@ from repotrial.journey.http_runner import run_http_journey
 
 
 def run(
-    journey: Journey, evidence_dir: Path, transport: httpx.AsyncBaseTransport
+    journey: Journey,
+    evidence_dir: Path,
+    transport: httpx.AsyncBaseTransport,
+    base_url: str = "https://fixture.test",
 ) -> JourneyResult:
+    if isinstance(transport, httpx.MockTransport):
+        fixture_handler = transport.handler
+
+        async def raw_fixture_handler(request: httpx.Request) -> httpx.Response:
+            response = fixture_handler(request)
+            if inspect.isawaitable(response):
+                response = await response
+            if not isinstance(response.stream, ChunkedStream):
+                response = httpx.Response(
+                    response.status_code,
+                    headers=response.headers,
+                    stream=ChunkedStream([response.content]),
+                    request=request,
+                )
+            return response
+
+        transport = httpx.MockTransport(raw_fixture_handler)
     return asyncio.run(
         run_http_journey(
             journey,
-            base_url="https://fixture.test",
+            base_url=base_url,
             evidence_dir=evidence_dir,
             transport=transport,
         )
@@ -165,7 +187,7 @@ def test_failed_assertion_stops_later_steps_and_counts_only_fully_asserted_steps
     )
 
     assert result.verdict is Verdict.FAIL
-    assert result.failure_reason == "first:assertion:status_code"
+    assert result.failure_reason == "step-0000:assertion:status_code"
     assert result.passed_steps == 0
     assert result.total_steps == 2
     assert [request.url.path for request in requests] == ["/first"]
@@ -206,8 +228,199 @@ def test_invalid_execution_capabilities_fail_closed_without_transport(
     result = run(journey(invalid_step), tmp_path, httpx.MockTransport(handler))
 
     assert result.verdict is Verdict.FAIL
-    assert result.failure_reason == f"invalid:{expected_reason}"
+    assert result.failure_reason == f"step-0000:{expected_reason}"
     assert invoked is False
+
+
+def test_preflight_rejects_a_later_invalid_assertion_before_an_earlier_post(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(201)
+
+    result = run(
+        journey(
+            step("create", "POST", "/items", [], {"name": "must-not-send"}),
+            step(
+                "invalid-later",
+                "GET",
+                "/items",
+                [assertion("xpath", "response.body", "unsupported")],
+            ),
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.verdict is Verdict.FAIL
+    assert result.failure_reason == "step-0001:invalid_assertion"
+    assert requests == []
+    assert result.evidence_paths == []
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://user:password@fixture.test",
+        "https://fixture.test/api",
+        "https://fixture.test?query=1",
+        "https://fixture.test\\@attacker.test",
+        "https://fixture.test%5c@attacker.test",
+        "https://[::1",
+    ],
+)
+def test_invalid_trusted_origins_fail_before_transport(
+    tmp_path: Path, base_url: str
+) -> None:
+    invoked = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal invoked
+        invoked = True
+        return httpx.Response(200)
+
+    result = run(
+        journey(step("origin", "GET", "/health", [])),
+        tmp_path,
+        httpx.MockTransport(handler),
+        base_url,
+    )
+
+    assert result.verdict is Verdict.FAIL
+    assert result.failure_reason == "journey:invalid_base_url"
+    assert invoked is False
+
+
+def test_request_url_preserves_the_frozen_origin_scheme_host_and_effective_port(
+    tmp_path: Path,
+) -> None:
+    observed: list[httpx.URL] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(request.url)
+        return httpx.Response(200)
+
+    result = run(
+        journey(step("origin", "GET", "/health?probe=1", [])),
+        tmp_path,
+        httpx.MockTransport(handler),
+        "https://fixture.test:443",
+    )
+
+    assert result.verdict is Verdict.PASS
+    assert [
+        (url.scheme, url.host, url.port or 443, url.raw_path) for url in observed
+    ] == [("https", "fixture.test", 443, b"/health?probe=1")]
+
+
+@pytest.mark.parametrize(
+    "path", ["/safe#fragment", "/a/../b", "/%2e%2e/private", "/bad\\path"]
+)
+def test_ambiguous_relative_targets_fail_before_transport(
+    tmp_path: Path, path: str
+) -> None:
+    invoked = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal invoked
+        invoked = True
+        return httpx.Response(200)
+
+    result = run(
+        journey(step("target", "GET", path, [])), tmp_path, httpx.MockTransport(handler)
+    )
+
+    assert result.failure_reason == "step-0000:invalid_path"
+    assert invoked is False
+
+
+def test_evidence_uses_a_secret_safe_canonical_target(tmp_path: Path) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=ChunkedStream([b""]))
+
+    result = run(
+        journey(step("query", "GET", "/items?token=raw-secret&page=2", [])),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    evidence = json.loads(Path(result.evidence_paths[0]).read_text(encoding="utf-8"))
+    assert evidence["request"]["path"] == "/items?token=<redacted>&page=2"
+
+
+def test_compressed_response_fails_closed_and_requests_identity_encoding(
+    tmp_path: Path,
+) -> None:
+    observed_headers: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed_headers.append(request.headers.get("accept-encoding"))
+        return httpx.Response(
+            200,
+            content=gzip.compress(b"needle" * 20_000),
+            headers={"content-encoding": "gzip"},
+        )
+
+    result = run(
+        journey(step("compressed", "GET", "/compressed", [])),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.failure_reason == "step-0000:unsupported_content_encoding"
+    assert observed_headers == ["identity"]
+    assert [Path(path).name for path in result.evidence_paths] == ["step-0000.json"]
+
+
+def test_redacted_hash_consumes_truncated_pem_and_multiline_credentials(
+    tmp_path: Path,
+) -> None:
+    def body(secret: str) -> bytes:
+        prefix = (
+            f"password =\n  {secret}\n-----BEGIN PRIVATE KEY-----\n{secret}\n".encode()
+        )
+        return prefix + b"x" * (65_536 - len(prefix))
+
+    hashes: list[str] = []
+    for secret in ("first-secret", "second-secret"):
+
+        async def handler(
+            request: httpx.Request, value: str = secret
+        ) -> httpx.Response:
+            return httpx.Response(200, stream=ChunkedStream([body(value)]))
+
+        result = run(
+            journey(step("redact", "GET", "/redact", [])),
+            tmp_path / secret,
+            httpx.MockTransport(handler),
+        )
+        evidence = json.loads(
+            Path(result.evidence_paths[0]).read_text(encoding="utf-8")
+        )
+        hashes.append(evidence["response"]["body_sha256"])
+    assert hashes[0] == hashes[1]
+
+
+def test_evidence_collision_fails_without_replacing_existing_artifact(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "step-0000.json"
+    artifact.write_text("sentinel", encoding="utf-8")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=ChunkedStream([b""]))
+
+    result = run(
+        journey(step("collision", "GET", "/collision", [])),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.failure_reason == "step-0000:evidence_write_error"
+    assert artifact.read_text(encoding="utf-8") == "sentinel"
 
 
 @pytest.mark.parametrize(
@@ -228,7 +441,7 @@ def test_non_origin_relative_paths_fail_before_transport(
     )
 
     assert result.verdict is Verdict.FAIL
-    assert result.failure_reason == "path:invalid_path"
+    assert result.failure_reason == "step-0000:invalid_path"
     assert invoked is False
 
 
@@ -261,7 +474,37 @@ def test_json_path_errors_are_stable_failures(
     )
 
     assert result.verdict is Verdict.FAIL
-    assert result.failure_reason == f"json:{reason}"
+    assert result.failure_reason == f"step-0000:{reason}"
+
+
+@pytest.mark.parametrize(
+    ("actual", "expected"),
+    [
+        (True, 1),
+        ({"enabled": True}, {"enabled": 1}),
+        ([True, {"count": 1}], [1, {"count": True}]),
+    ],
+)
+def test_json_path_equals_preserves_json_types_recursively(
+    tmp_path: Path, actual: object, expected: object
+) -> None:
+    result = run(
+        journey(
+            step(
+                "typed-json",
+                "GET",
+                "/typed-json",
+                [assertion("json_path_equals", "value", expected)],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"value": actual})
+        ),
+    )
+
+    assert result.verdict is Verdict.FAIL
+    assert result.failure_reason == "step-0000:assertion:json_path_equals"
 
 
 @pytest.mark.parametrize(
@@ -281,7 +524,7 @@ def test_unsupported_or_malformed_assertions_fail_closed(
     )
 
     assert result.verdict is Verdict.FAIL
-    assert result.failure_reason == f"assertion:{reason}"
+    assert result.failure_reason == f"step-0000:{reason}"
 
 
 def test_redirect_response_is_not_followed_even_cross_origin(tmp_path: Path) -> None:
@@ -344,7 +587,7 @@ def test_response_body_is_capped_during_streaming_before_extra_bytes_can_match(
     )
 
     assert result.verdict is Verdict.FAIL
-    assert result.failure_reason == "large:assertion:text_contains"
+    assert result.failure_reason == "step-0000:assertion:text_contains"
     assert stream.yielded == 2
     evidence = json.loads(Path(result.evidence_paths[0]).read_text(encoding="utf-8"))
     assert evidence["response"]["truncated"] is True
@@ -430,7 +673,7 @@ def test_too_many_assertions_fail_before_writing_unbounded_evidence(
     )
 
     assert result.verdict is Verdict.FAIL
-    assert result.failure_reason == "many-assertions:invalid_assertions"
+    assert result.failure_reason == "step-0000:invalid_assertions"
 
 
 def test_network_timeout_returns_failure_without_retry(tmp_path: Path) -> None:
@@ -448,8 +691,27 @@ def test_network_timeout_returns_failure_without_retry(tmp_path: Path) -> None:
     )
 
     assert result.verdict is Verdict.FAIL
-    assert result.failure_reason == "timeout:network_error"
+    assert result.failure_reason == "step-0000:network_error"
     assert attempts == 1
+
+
+def test_failure_token_does_not_include_an_unbounded_or_secret_step_id(
+    tmp_path: Path,
+) -> None:
+    result = run(
+        journey(
+            step(
+                "step-id-with-a-secret-value-and-unbounded-context",
+                "GET",
+                "/failure",
+                [assertion("status_code", "response.status", 201)],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(lambda request: httpx.Response(200)),
+    )
+
+    assert result.failure_reason == "step-0000:assertion:status_code"
 
 
 def test_input_journey_is_not_mutated(tmp_path: Path) -> None:
