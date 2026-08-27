@@ -39,8 +39,8 @@ _CHECKPOINT_TYPES: tuple[type[object], ...] = (
     ExperimentVerdict,
     MutationType,
 )
-_CHECKPOINT_SYMBOLS = tuple(
-    (checkpoint_type.__module__, checkpoint_type.__name__)
+_CHECKPOINT_JSON_IDS = tuple(
+    (*checkpoint_type.__module__.split("."), checkpoint_type.__name__)
     for checkpoint_type in _CHECKPOINT_TYPES
 )
 
@@ -76,7 +76,7 @@ def _validate_database_url(database_url: str | None) -> str | None:
 def _build_serializer() -> JsonPlusSerializer:
     return JsonPlusSerializer(
         pickle_fallback=False,
-        allowed_json_modules=_CHECKPOINT_SYMBOLS,
+        allowed_json_modules=_CHECKPOINT_JSON_IDS,
         allowed_msgpack_modules=_CHECKPOINT_TYPES,
     )
 

@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from types import ModuleType
@@ -27,6 +28,14 @@ from repotrial.domain.models import (
 
 class _UnlistedPayload(BaseModel):
     command: str
+
+
+class _UnlistedJsonPayload:
+    constructed = False
+
+    def __init__(self, command: str) -> None:
+        del command
+        type(self).constructed = True
 
 
 class _FakeAsyncSaver:
@@ -232,6 +241,59 @@ def test_serializer_round_trips_only_checkpoint_safe_state_types() -> None:
                 saver.serde.dumps_typed(object())
 
     asyncio.run(exercise())
+
+
+def test_serializer_revives_split_id_json_for_checkpoint_safe_run_state() -> None:
+    module = _checkpoint_module()
+    payload = {
+        "lc": 2,
+        "type": "constructor",
+        "id": ["repotrial", "domain", "models", "RunState"],
+        "kwargs": {
+            "run_id": "legacy-run",
+            "repo_url": "https://github.com/example/repo",
+        },
+    }
+
+    async def exercise() -> object:
+        async with module.build_checkpointer(None) as saver:
+            return saver.serde.loads_typed(
+                ("json", json.dumps(payload).encode("utf-8"))
+            )
+
+    restored = asyncio.run(exercise())
+
+    assert isinstance(restored, RunState)
+    assert restored == RunState(
+        run_id="legacy-run",
+        repo_url="https://github.com/example/repo",
+    )
+
+
+def test_serializer_leaves_unlisted_split_id_json_inert() -> None:
+    module = _checkpoint_module()
+    _UnlistedJsonPayload.constructed = False
+    payload = {
+        "lc": 2,
+        "type": "constructor",
+        "id": [
+            *_UnlistedJsonPayload.__module__.split("."),
+            _UnlistedJsonPayload.__name__,
+        ],
+        "kwargs": {"command": "read-secret"},
+    }
+
+    async def exercise() -> object:
+        async with module.build_checkpointer(None) as saver:
+            return saver.serde.loads_typed(
+                ("json", json.dumps(payload).encode("utf-8"))
+            )
+
+    restored = asyncio.run(exercise())
+
+    assert isinstance(restored, dict)
+    assert restored == payload
+    assert _UnlistedJsonPayload.constructed is False
 
 
 def test_postgres_enters_sets_up_yields_and_closes_in_order(
