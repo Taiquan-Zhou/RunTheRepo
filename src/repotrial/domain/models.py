@@ -54,6 +54,7 @@ class JourneyResult(BaseModel):
     total_steps: int
     evidence_paths: list[str] = Field(default_factory=list)
     failure_reason: str | None = None
+    evidence_failure_reason: str | None = None
 
 
 class Mutation(BaseModel):

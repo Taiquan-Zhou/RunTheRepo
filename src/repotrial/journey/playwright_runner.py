@@ -1,5 +1,8 @@
-"""A bounded, deterministic Playwright runner for declared browser journeys."""
+"""A bounded fixture-only Playwright runner for declared browser journeys."""
 
+import asyncio
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Literal, cast
 from unicodedata import category
@@ -11,6 +14,7 @@ from playwright.async_api import (
     BrowserContext,
     Page,
     Route,
+    ViewportSize,
     async_playwright,
 )
 from playwright.async_api import (
@@ -33,6 +37,11 @@ _MAX_STEPS = 64
 _MAX_STRING_LENGTH = 4_096
 _MAX_PATH_LENGTH = 2_048
 _TIMEOUT_MS = 5_000
+_CLEANUP_TIMEOUT_SECONDS = 2
+_MAX_TRACE_BYTES = 8 * 1024 * 1024
+_MAX_SCREENSHOT_BYTES = 2 * 1024 * 1024
+_MAX_TOTAL_ARTIFACT_BYTES = _MAX_TRACE_BYTES + _MAX_SCREENSHOT_BYTES
+_VIEWPORT: ViewportSize = {"width": 1280, "height": 720}
 AllowedRole = Literal[
     "button", "link", "checkbox", "radio", "menuitem", "option", "tab"
 ]
@@ -50,6 +59,7 @@ def _failure_result(
     passed_steps: int,
     evidence_paths: list[str],
     reason: str,
+    evidence_failure_reason: str | None = None,
 ) -> JourneyResult:
     return JourneyResult(
         journey_id=journey.journey_id,
@@ -58,6 +68,17 @@ def _failure_result(
         total_steps=len(journey.steps),
         evidence_paths=evidence_paths,
         failure_reason=reason,
+        evidence_failure_reason=evidence_failure_reason,
+    )
+
+
+def _unsupported_result(journey: Journey) -> JourneyResult:
+    return JourneyResult(
+        journey_id=journey.journey_id,
+        verdict=Verdict.UNSUPPORTED,
+        passed_steps=0,
+        total_steps=len(journey.steps),
+        failure_reason="isolated browser execution unavailable",
     )
 
 
@@ -70,10 +91,15 @@ def _valid_text(value: object) -> bool:
     )
 
 
+def _valid_target(value: object) -> bool:
+    return _valid_text(value) and isinstance(value, str) and value.isascii()
+
+
 def _valid_path(path: object) -> bool:
     if (
         not isinstance(path, str)
         or len(path) > _MAX_PATH_LENGTH
+        or not path.isascii()
         or _has_controls_or_backslash(path)
         or not path.startswith("/")
         or path.startswith("//")
@@ -114,7 +140,7 @@ def _validate_step(step: JourneyStep) -> str | None:
             return "invalid_params"
         return (
             None
-            if _valid_text(params["label"]) and _valid_text(params["value"])
+            if _valid_target(params["label"]) and _valid_text(params["value"])
             else "invalid_params"
         )
     if step.action == "click_by_role":
@@ -124,13 +150,13 @@ def _validate_step(step: JourneyStep) -> str | None:
             None
             if isinstance(params["role"], str)
             and params["role"] in _ALLOWED_ROLES
-            and _valid_text(params["name"])
+            and _valid_target(params["name"])
             else "invalid_params"
         )
     if step.action == "assert_text_visible":
         return (
             None
-            if set(params) == {"text"} and _valid_text(params["text"])
+            if set(params) == {"text"} and _valid_target(params["text"])
             else "invalid_params"
         )
     return "invalid_action"
@@ -177,25 +203,50 @@ def _write_exclusive(path: Path, content: bytes) -> str:
     return str(path)
 
 
-async def _close_context(context: BrowserContext | None) -> None:
+async def _close_context(context: BrowserContext | None) -> bool:
     if context is not None:
         try:
-            await context.close()
-        except PlaywrightError:
-            pass
+            await asyncio.wait_for(context.close(), timeout=_CLEANUP_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            return True
+        except (TimeoutError, PlaywrightError):
+            return False
+    return False
 
 
-async def _close_browser(browser: Browser | None) -> None:
+async def _close_browser(browser: Browser | None) -> bool:
     if browser is not None:
         try:
-            await browser.close()
-        except PlaywrightError:
-            pass
+            await asyncio.wait_for(browser.close(), timeout=_CLEANUP_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            return True
+        except (TimeoutError, PlaywrightError):
+            return False
+    return False
+
+
+def _publish_staged_artifact(
+    staged_path: Path,
+    target: Path,
+    *,
+    maximum_size: int,
+    total_size: int,
+    maximum_total_size: int,
+) -> tuple[str | None, int]:
+    try:
+        size = staged_path.stat().st_size
+        if size > maximum_size or total_size + size > maximum_total_size:
+            return None, 0
+        return _write_exclusive(target, staged_path.read_bytes()), size
+    except OSError:
+        return None, 0
 
 
 async def _capture_failure(page: Page, path: Path) -> str | None:
     try:
-        image = await page.screenshot(full_page=True)
+        image = await page.screenshot(full_page=False)
+        if len(image) > _MAX_SCREENSHOT_BYTES:
+            return None
         return _write_exclusive(path, image)
     except (OSError, PlaywrightError):
         return None
@@ -207,7 +258,18 @@ async def run_playwright_journey(
     base_url: str,
     evidence_dir: Path,
 ) -> JourneyResult:
-    """Replay one frozen browser journey against exactly one trusted origin."""
+    """Refuse browser execution until a sandbox-backed runner is available."""
+    del base_url, evidence_dir
+    return _unsupported_result(journey)
+
+
+async def _run_trusted_fixture_playwright_journey(
+    journey: Journey,
+    *,
+    base_url: str,
+    evidence_dir: Path,
+) -> JourneyResult:
+    """Replay a Journey only when trusted test control flow selects this helper."""
     origin = _validate_base_url(base_url)
     if origin is None:
         return _failure_result(journey, 0, [], "journey:invalid_base_url")
@@ -232,41 +294,78 @@ async def run_playwright_journey(
         (target for target in targets if target.exists() or target.is_symlink()), None
     )
     if collision is not None:
-        reason = (
+        evidence_reason = (
             "journey:trace_failure"
             if collision.name == "trace.zip"
-            else "journey:evidence_failure"
+            else "journey:screenshot_failure"
         )
-        return _failure_result(journey, 0, [], reason)
+        return _failure_result(
+            journey,
+            0,
+            [],
+            "journey:evidence_failure",
+            evidence_reason,
+        )
     try:
         evidence_dir.mkdir(parents=True, exist_ok=True)
+        staging_dir = Path(tempfile.mkdtemp(prefix=".playwright-", dir=evidence_dir))
     except OSError:
-        return _failure_result(journey, 0, [], "journey:evidence_failure")
+        return _failure_result(
+            journey, 0, [], "journey:evidence_failure", "journey:staging_failure"
+        )
 
     browser: Browser | None = None
     context: BrowserContext | None = None
     trace_started = False
-    trace_error = False
     evidence_paths: list[str] = []
+    evidence_size = 0
+    evidence_failure_reason: str | None = None
     runtime_reason: str | None = None
     failed_index: int | None = None
-    screenshot_path: str | None = None
     passed_steps = 0
     blocked_cross_origin = False
+    cancelled = False
+
+    def record_evidence_failure(reason: str) -> None:
+        nonlocal evidence_failure_reason
+        if evidence_failure_reason is None:
+            evidence_failure_reason = reason
+
+    async def capture_and_publish_failure(page: Page, index: int) -> None:
+        nonlocal evidence_size
+        staged_path = await _capture_failure(
+            page, staging_dir / f"{_step_token(index)}-failure.png"
+        )
+        if staged_path is None:
+            record_evidence_failure("journey:screenshot_failure")
+            return
+        published, size = _publish_staged_artifact(
+            Path(staged_path),
+            evidence_dir / f"{_step_token(index)}-failure.png",
+            maximum_size=_MAX_SCREENSHOT_BYTES,
+            total_size=evidence_size,
+            maximum_total_size=_MAX_TOTAL_ARTIFACT_BYTES,
+        )
+        if published is None:
+            record_evidence_failure("journey:screenshot_failure")
+            return
+        evidence_size += size
+        evidence_paths.append(published)
 
     try:
         async with async_playwright() as playwright:
             try:
                 browser = await playwright.chromium.launch(headless=True)
-                context = await browser.new_context(service_workers="block")
+                context = await browser.new_context(
+                    service_workers="block", viewport=_VIEWPORT
+                )
                 context.set_default_timeout(_TIMEOUT_MS)
                 context.set_default_navigation_timeout(_TIMEOUT_MS)
 
                 async def route_request(route: Route) -> None:
                     nonlocal blocked_cross_origin
-                    request_url = route.request.url
                     try:
-                        candidate = httpx.URL(request_url)
+                        candidate = httpx.URL(route.request.url)
                     except httpx.InvalidURL:
                         await route.abort()
                         return
@@ -295,12 +394,23 @@ async def run_playwright_journey(
 
                 await context.route("**/*", route_request)
                 await context.tracing.start(
-                    screenshots=True,
-                    snapshots=True,
-                    sources=False,
+                    screenshots=True, snapshots=True, sources=False
                 )
                 trace_started = True
                 page = await context.new_page()
+                unexpected_popup = False
+                unexpected_download = False
+
+                def note_popup(_popup: Page) -> None:
+                    nonlocal unexpected_popup
+                    unexpected_popup = True
+
+                def note_download(_download: object) -> None:
+                    nonlocal unexpected_download
+                    unexpected_download = True
+
+                page.on("popup", note_popup)
+                page.on("download", note_download)
 
                 for index, step in enumerate(journey.steps):
                     try:
@@ -322,14 +432,24 @@ async def run_playwright_journey(
                             await page.get_by_role(
                                 cast(AllowedRole, role), name=name, exact=True
                             ).click()
-                            await page.wait_for_load_state("networkidle")
+                            await page.wait_for_timeout(50)
                         else:
                             text = step.params["text"]
                             assert isinstance(text, str)
                             await page.get_by_text(text, exact=True).wait_for(
                                 state="visible"
                             )
-                        if step.action in {
+                        if (
+                            unexpected_popup
+                            or len(context.pages) > 1
+                            or unexpected_download
+                        ):
+                            runtime_reason = (
+                                "unexpected_popup"
+                                if unexpected_popup or len(context.pages) > 1
+                                else "unexpected_download"
+                            )
+                        elif step.action in {
                             "goto",
                             "click_by_role",
                         } and not _page_is_on_origin(page, origin):
@@ -338,12 +458,9 @@ async def run_playwright_journey(
                                 if blocked_cross_origin
                                 else "cross_origin_navigation"
                             )
+                        if runtime_reason is not None:
                             failed_index = index
-                            screenshot_path = await _capture_failure(
-                                page, evidence_dir / f"{_step_token(index)}-failure.png"
-                            )
-                            if screenshot_path is None:
-                                runtime_reason = "evidence_failure"
+                            await capture_and_publish_failure(page, index)
                             break
                     except (PlaywrightError, PlaywrightTimeoutError, httpx.InvalidURL):
                         runtime_reason = (
@@ -358,11 +475,7 @@ async def run_playwright_journey(
                             )
                         )
                         failed_index = index
-                        screenshot_path = await _capture_failure(
-                            page, evidence_dir / f"{_step_token(index)}-failure.png"
-                        )
-                        if screenshot_path is None:
-                            runtime_reason = "evidence_failure"
+                        await capture_and_publish_failure(page, index)
                         break
                     passed_steps += 1
             except PlaywrightError:
@@ -372,36 +485,56 @@ async def run_playwright_journey(
             finally:
                 if context is not None and trace_started:
                     try:
-                        await context.tracing.stop(path=str(evidence_dir / "trace.zip"))
-                        evidence_paths.append(str(evidence_dir / "trace.zip"))
-                    except (OSError, PlaywrightError):
-                        trace_error = True
-                await _close_context(context)
-                await _close_browser(browser)
+                        await asyncio.wait_for(
+                            context.tracing.stop(path=str(staging_dir / "trace.zip")),
+                            timeout=_CLEANUP_TIMEOUT_SECONDS,
+                        )
+                        published, size = _publish_staged_artifact(
+                            staging_dir / "trace.zip",
+                            evidence_dir / "trace.zip",
+                            maximum_size=_MAX_TRACE_BYTES,
+                            total_size=evidence_size,
+                            maximum_total_size=_MAX_TOTAL_ARTIFACT_BYTES,
+                        )
+                        if published is None:
+                            record_evidence_failure("journey:trace_failure")
+                        else:
+                            evidence_size += size
+                            evidence_paths.insert(0, published)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                    except (TimeoutError, OSError, PlaywrightError):
+                        record_evidence_failure("journey:trace_failure")
+                cancelled = await _close_context(context) or cancelled
+                cancelled = await _close_browser(browser) or cancelled
     except PlaywrightError:
         runtime_reason = "browser_unavailable"
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
-    if screenshot_path is not None:
-        evidence_paths.append(screenshot_path)
-    if trace_error:
-        return _failure_result(
-            journey, passed_steps, evidence_paths, "journey:trace_failure"
-        )
-    if runtime_reason is None:
-        return JourneyResult(
-            journey_id=journey.journey_id,
-            verdict=Verdict.PASS,
-            passed_steps=passed_steps,
-            total_steps=len(journey.steps),
-            evidence_paths=evidence_paths,
-        )
-    return _failure_result(
-        journey,
-        passed_steps,
-        evidence_paths,
-        (
+    if cancelled:
+        raise asyncio.CancelledError
+    if runtime_reason is not None:
+        reason = (
             f"{_step_token(failed_index)}:{runtime_reason}"
             if failed_index is not None
             else f"journey:{runtime_reason}"
-        ),
+        )
+        return _failure_result(
+            journey, passed_steps, evidence_paths, reason, evidence_failure_reason
+        )
+    if evidence_failure_reason is not None:
+        return _failure_result(
+            journey,
+            passed_steps,
+            evidence_paths,
+            "journey:evidence_failure",
+            evidence_failure_reason,
+        )
+    return JourneyResult(
+        journey_id=journey.journey_id,
+        verdict=Verdict.PASS,
+        passed_steps=passed_steps,
+        total_steps=len(journey.steps),
+        evidence_paths=evidence_paths,
     )
