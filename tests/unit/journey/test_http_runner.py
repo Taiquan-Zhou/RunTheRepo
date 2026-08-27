@@ -530,6 +530,67 @@ def test_plain_text_multiple_assignments_redact_each_credential_independently() 
     )
 
 
+def test_quoted_credential_value_keeps_assignment_like_whitespace_text_secret() -> None:
+    alpha = b'password="alpha status=one" status=ready\n'
+    beta = b'password="beta status=two" status=ready\n'
+    changed_sibling = b'password="beta status=two" status=changed\n'
+
+    assert _redacted_body_hash(alpha, False) == _redacted_body_hash(beta, False)
+    assert _redacted_body_hash(beta, False) != _redacted_body_hash(
+        changed_sibling, False
+    )
+
+
+def test_quoted_credential_value_keeps_assignment_like_comma_text_secret() -> None:
+    alpha = b'password="alpha, status=one" status=ready\n'
+    beta = b'password="beta, status=two" status=ready\n'
+    changed_sibling = b'password="beta, status=two" status=changed\n'
+
+    assert _redacted_body_hash(alpha, False) == _redacted_body_hash(beta, False)
+    assert _redacted_body_hash(beta, False) != _redacted_body_hash(
+        changed_sibling, False
+    )
+
+
+def test_quoted_credential_value_consumes_escaped_quotes() -> None:
+    alpha = b'password="alpha\\" status=one" status=ready\n'
+    beta = b'password="bravo\\" status=two" status=ready\n'
+    changed_sibling = b'password="bravo\\" status=two" status=changed\n'
+
+    assert _redacted_body_hash(alpha, False) == _redacted_body_hash(beta, False)
+    assert _redacted_body_hash(beta, False) != _redacted_body_hash(
+        changed_sibling, False
+    )
+
+
+def test_truncated_quoted_credential_consumes_assignment_like_content(
+    tmp_path: Path,
+) -> None:
+    def body(secret: str, status: str) -> bytes:
+        return (
+            f'password="{secret} status={status}, status:two '.encode() + b"x" * 70_000
+        )
+
+    hashes: list[str] = []
+    for secret, status in (("alpha", "one"), ("bravo", "two")):
+        result = run(
+            journey(step("truncated-quoted", "GET", "/truncated-quoted", [])),
+            tmp_path / status,
+            httpx.MockTransport(
+                lambda request, value=secret, inner_status=status: httpx.Response(
+                    200, stream=ChunkedStream([body(value, inner_status)])
+                )
+            ),
+        )
+        evidence = json.loads(
+            Path(result.evidence_paths[0]).read_text(encoding="utf-8")
+        )
+        assert evidence["response"]["truncated"] is True
+        hashes.append(evidence["response"]["body_sha256"])
+
+    assert hashes[0] == hashes[1]
+
+
 def test_network_evidence_redacts_apikey_and_preserves_noncredential_query_values(
     tmp_path: Path,
 ) -> None:

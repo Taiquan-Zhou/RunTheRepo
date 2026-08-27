@@ -21,11 +21,6 @@ _PEM_PRIVATE_KEY = re.compile(
     r"-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?(?:-----END [^-\r\n]*PRIVATE KEY-----|\Z)",
     re.DOTALL,
 )
-_ASSIGNMENT = re.compile(
-    r"(?<![^\s{,\[])(?:-\s*)?[\"']?(?P<key>[A-Za-z0-9_-]+)[\"']?\s*"
-    r"(?P<separator>[:=])\s*(?P<value>.*?)"
-    r"(?=(?:\s+|,\s*|\{\s*|\[\s*(?:\{\s*)?)[\"']?[A-Za-z0-9_-]+[\"']?\s*[:=]|(?:\r?\n)?\Z)"
-)
 
 
 def _failure_result(
@@ -236,6 +231,83 @@ def _redact_json_value(value: object) -> object:
     return value
 
 
+def _line_content_end(line: str) -> int:
+    end = len(line)
+    while end and line[end - 1] in "\r\n":
+        end -= 1
+    return end
+
+
+def _quoted_end(line: str, start: int, end: int) -> tuple[int, bool]:
+    quote = line[start]
+    index = start + 1
+    while index < end:
+        if line[index] == "\\":
+            index += 2
+        elif line[index] == quote:
+            return index + 1, True
+        else:
+            index += 1
+    return end, False
+
+
+def _assignment_start(line: str, start: int, end: int) -> tuple[str, int, int] | None:
+    if start and not (line[start - 1].isspace() or line[start - 1] in "{,["):
+        return None
+
+    index = start
+    if line[index : index + 1] == "-" and index + 1 < end and line[index + 1].isspace():
+        index += 1
+        while index < end and line[index].isspace():
+            index += 1
+    key_start = index
+    if index >= end:
+        return None
+    if line[index] in "\"'":
+        key_end, closed = _quoted_end(line, index, end)
+        if not closed:
+            return None
+        key = line[index + 1 : key_end - 1]
+        index = key_end
+    else:
+        while index < end and (line[index].isalnum() or line[index] in "_-"):
+            index += 1
+        key = line[key_start:index]
+    if not key:
+        return None
+    while index < end and line[index] in " \t":
+        index += 1
+    if index >= end or line[index] not in ":=":
+        return None
+    index += 1
+    while index < end and line[index] in " \t":
+        index += 1
+    return key, key_start, index
+
+
+def _assignment_value_end(line: str, start: int, end: int) -> int:
+    if start >= end:
+        return end
+    if line[start] in "\"'":
+        quoted_end, _ = _quoted_end(line, start, end)
+        return quoted_end
+
+    index = start
+    while index < end:
+        if index > start and _assignment_start(line, index, end) is not None:
+            boundary = index
+            while boundary > start and line[boundary - 1] in " \t":
+                boundary -= 1
+            if boundary > start and line[boundary - 1] == ",":
+                boundary -= 1
+            return boundary
+        if line[index] in "\"'":
+            index, _ = _quoted_end(line, index, end)
+        else:
+            index += 1
+    return end
+
+
 def _redact_credential_assignments(text: str) -> str:
     redacted_lines: list[str] = []
     block_key_column: int | None = None
@@ -246,23 +318,32 @@ def _redact_credential_assignments(text: str) -> str:
                 continue
             block_key_column = None
 
-        matches = list(_ASSIGNMENT.finditer(line))
-        if not matches:
-            redacted_lines.append(line)
-            continue
-
+        end = _line_content_end(line)
         cursor = 0
         redacted_line: list[str] = []
-        for match in matches:
-            redacted_line.append(line[cursor : match.start("value")])
-            value = match.group("value")
-            if _credential_key(match.group("key")):
+        index = 0
+        while index < end:
+            assignment = _assignment_start(line, index, end)
+            if assignment is None:
+                if line[index] in "\"'":
+                    index, _ = _quoted_end(line, index, end)
+                else:
+                    index += 1
+                continue
+
+            key, key_column, value_start = assignment
+            if _credential_key(key):
+                value_end = _assignment_value_end(line, value_start, end)
+                redacted_line.append(line[cursor:value_start])
                 redacted_line.append("<redacted>")
-                if not value.strip() or value.lstrip().startswith(("|", ">")):
-                    block_key_column = match.start("key")
+                if not line[value_start:value_end].strip() or line[
+                    value_start:value_end
+                ].lstrip().startswith(("|", ">")):
+                    block_key_column = key_column
+                cursor = value_end
+                index = value_end
             else:
-                redacted_line.append(value)
-            cursor = match.end("value")
+                index = value_start
         redacted_line.append(line[cursor:])
         redacted_lines.append("".join(redacted_line))
     return "".join(redacted_lines)
