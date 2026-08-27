@@ -254,6 +254,13 @@ async def _capture_failure(page: Page, path: Path) -> str | None:
         return None
 
 
+async def _abort_route_safely(route: Route) -> None:
+    try:
+        await route.abort()
+    except PlaywrightError:
+        return
+
+
 async def run_playwright_journey(
     journey: Journey,
     *,
@@ -370,13 +377,13 @@ async def _run_trusted_fixture_playwright_journey(
                     try:
                         candidate = httpx.URL(route.request.url)
                     except httpx.InvalidURL:
-                        await route.abort()
+                        await _abort_route_safely(route)
                         return
                     if candidate.scheme in {"http", "https"} and not _same_origin(
                         origin, candidate
                     ):
                         blocked_cross_origin = True
-                        await route.abort()
+                        await _abort_route_safely(route)
                         return
                     if candidate.scheme not in {"http", "https"}:
                         await route.continue_()
@@ -384,14 +391,14 @@ async def _run_trusted_fixture_playwright_journey(
                     try:
                         response = await route.fetch(max_redirects=0, max_retries=0)
                     except PlaywrightError:
-                        await route.abort()
+                        await _abort_route_safely(route)
                         return
                     if 300 <= response.status < 400:
                         if not _redirect_is_same_origin(
                             origin, candidate, response.headers.get("location")
                         ):
                             blocked_cross_origin = True
-                        await route.abort()
+                        await _abort_route_safely(route)
                         return
                     try:
                         await route.fulfill(response=response)

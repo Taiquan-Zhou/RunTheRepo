@@ -383,8 +383,10 @@ def test_unexpected_popup_fails_the_click_step(tmp_path: Path) -> None:
     assert result.failure_reason == "step-0001:unexpected_popup"
 
 
-def test_slow_popup_request_fails_the_click_step(tmp_path: Path) -> None:
-    """Catches a popup request that starts before its page event but still passes."""
+def test_slow_popup_close_race_fails_without_route_callback_noise(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Catches close-race abort errors escaping an already-failed popup click."""
     request_started = threading.Event()
     release = threading.Event()
     with _slow_popup_server(request_started, release) as base_url:
@@ -400,6 +402,9 @@ def test_slow_popup_request_fails_the_click_step(tmp_path: Path) -> None:
 
     assert result.verdict is Verdict.FAIL
     assert result.failure_reason == "step-0001:unexpected_popup"
+    stderr = capfd.readouterr().err
+    assert "Error occurred in event listener" not in stderr
+    assert "TargetClosedError" not in stderr
 
 
 def test_unexpected_download_fails_the_click_step(tmp_path: Path) -> None:
