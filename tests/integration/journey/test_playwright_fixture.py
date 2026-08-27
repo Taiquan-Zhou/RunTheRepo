@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.request import urlopen
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api._generated import Browser as GeneratedBrowser
 from playwright.async_api._generated import BrowserContext as GeneratedBrowserContext
 from playwright.async_api._generated import Tracing
@@ -246,6 +247,47 @@ def _browser_server(pages: dict[str, tuple[bytes, dict[str, str]]]) -> Iterator[
         server.server_close()
 
 
+@contextmanager
+def _slow_popup_server(
+    request_started: threading.Event, release: threading.Event
+) -> Iterator[str]:
+    class SlowPopupHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path == "/":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(
+                    b"<!doctype html><button onclick=\"window.open('/slow', '_blank')\">Open</button>"
+                )
+                return
+            if self.path == "/slow":
+                request_started.set()
+                if not release.wait(timeout=3):
+                    self.send_error(503)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"<!doctype html><title>popup</title>")
+                return
+            self.send_error(404)
+
+        def log_message(self, _format: str, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowPopupHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        release.set()
+        server.shutdown()
+        thread.join(timeout=3)
+        server.server_close()
+
+
 def test_replays_create_delete_flow_and_writes_readable_trace(tmp_path: Path) -> None:
     """Catches a runner that skips a browser action or fails to preserve trace evidence."""
     journey = _journey(
@@ -336,6 +378,25 @@ def test_unexpected_popup_fails_the_click_step(tmp_path: Path) -> None:
             base_url,
             tmp_path / "evidence",
         )
+
+    assert result.verdict is Verdict.FAIL
+    assert result.failure_reason == "step-0001:unexpected_popup"
+
+
+def test_slow_popup_request_fails_the_click_step(tmp_path: Path) -> None:
+    """Catches a popup request that starts before its page event but still passes."""
+    request_started = threading.Event()
+    release = threading.Event()
+    with _slow_popup_server(request_started, release) as base_url:
+        result = _run_trusted(
+            _journey(
+                _step("goto", {"path": "/"}),
+                _step("click_by_role", {"role": "button", "name": "Open"}),
+            ),
+            base_url,
+            tmp_path / "evidence",
+        )
+        assert request_started.wait(timeout=3)
 
     assert result.verdict is Verdict.FAIL
     assert result.failure_reason == "step-0001:unexpected_popup"
@@ -683,3 +744,60 @@ def test_cancellation_during_trace_stop_closes_context_and_browser(
 
     with _fixture_server(tmp_path) as base_url:
         asyncio.run(cancel_during_trace_stop(base_url))
+
+
+@pytest.mark.parametrize(
+    "failure", [PlaywrightError, TimeoutError], ids=("playwright-error", "timeout")
+)
+def test_context_close_failure_is_evidence_failure_and_browser_close_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: type[Exception],
+) -> None:
+    """Catches context-close errors or timeouts discarded while reporting PASS."""
+    browser_close_called = threading.Event()
+    original_browser_close = GeneratedBrowser.close
+
+    async def fail_context_close(
+        self: GeneratedBrowserContext, **_kwargs: object
+    ) -> None:
+        raise failure("forced context close failure")
+
+    async def record_browser_close(self: GeneratedBrowser, **kwargs: object) -> None:
+        browser_close_called.set()
+        await original_browser_close(self, **kwargs)
+
+    monkeypatch.setattr(GeneratedBrowserContext, "close", fail_context_close)
+    monkeypatch.setattr(GeneratedBrowser, "close", record_browser_close)
+    with _fixture_server(tmp_path) as base_url:
+        result = _run_trusted(
+            _journey(_step("goto", {"path": "/"})),
+            base_url,
+            tmp_path / "evidence",
+        )
+
+    assert browser_close_called.is_set()
+    assert result.verdict is Verdict.FAIL
+    assert result.failure_reason == "journey:evidence_failure"
+    assert result.evidence_failure_reason == "journey:context_close_failure"
+
+
+def test_browser_close_failure_is_evidence_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a browser-close error discarded while the Journey is reported PASS."""
+
+    async def fail_browser_close(self: GeneratedBrowser, **_kwargs: object) -> None:
+        raise PlaywrightError("forced browser close failure")
+
+    monkeypatch.setattr(GeneratedBrowser, "close", fail_browser_close)
+    with _fixture_server(tmp_path) as base_url:
+        result = _run_trusted(
+            _journey(_step("goto", {"path": "/"})),
+            base_url,
+            tmp_path / "evidence",
+        )
+
+    assert result.verdict is Verdict.FAIL
+    assert result.failure_reason == "journey:evidence_failure"
+    assert result.evidence_failure_reason == "journey:browser_close_failure"

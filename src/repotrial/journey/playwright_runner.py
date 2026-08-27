@@ -13,6 +13,7 @@ from playwright.async_api import (
     Browser,
     BrowserContext,
     Page,
+    Request,
     Route,
     ViewportSize,
     async_playwright,
@@ -42,6 +43,7 @@ _MAX_TRACE_BYTES = 8 * 1024 * 1024
 _MAX_SCREENSHOT_BYTES = 2 * 1024 * 1024
 _MAX_TOTAL_ARTIFACT_BYTES = _MAX_TRACE_BYTES + _MAX_SCREENSHOT_BYTES
 _VIEWPORT: ViewportSize = {"width": 1280, "height": 720}
+CleanupOutcome = Literal["success", "cancelled", "failure"]
 AllowedRole = Literal[
     "button", "link", "checkbox", "radio", "menuitem", "option", "tab"
 ]
@@ -203,26 +205,26 @@ def _write_exclusive(path: Path, content: bytes) -> str:
     return str(path)
 
 
-async def _close_context(context: BrowserContext | None) -> bool:
+async def _close_context(context: BrowserContext | None) -> CleanupOutcome:
     if context is not None:
         try:
             await asyncio.wait_for(context.close(), timeout=_CLEANUP_TIMEOUT_SECONDS)
         except asyncio.CancelledError:
-            return True
+            return "cancelled"
         except (TimeoutError, PlaywrightError):
-            return False
-    return False
+            return "failure"
+    return "success"
 
 
-async def _close_browser(browser: Browser | None) -> bool:
+async def _close_browser(browser: Browser | None) -> CleanupOutcome:
     if browser is not None:
         try:
             await asyncio.wait_for(browser.close(), timeout=_CLEANUP_TIMEOUT_SECONDS)
         except asyncio.CancelledError:
-            return True
+            return "cancelled"
         except (TimeoutError, PlaywrightError):
-            return False
-    return False
+            return "failure"
+    return "success"
 
 
 def _publish_staged_artifact(
@@ -325,6 +327,7 @@ async def _run_trusted_fixture_playwright_journey(
     passed_steps = 0
     blocked_cross_origin = False
     cancelled = False
+    page: Page | None = None
 
     def record_evidence_failure(reason: str) -> None:
         nonlocal evidence_failure_reason
@@ -390,7 +393,10 @@ async def _run_trusted_fixture_playwright_journey(
                             blocked_cross_origin = True
                         await route.abort()
                         return
-                    await route.fulfill(response=response)
+                    try:
+                        await route.fulfill(response=response)
+                    except PlaywrightError:
+                        return
 
                 await context.route("**/*", route_request)
                 await context.tracing.start(
@@ -400,6 +406,17 @@ async def _run_trusted_fixture_playwright_journey(
                 page = await context.new_page()
                 unexpected_popup = False
                 unexpected_download = False
+
+                def note_request(request: Request) -> None:
+                    nonlocal unexpected_popup
+                    if not request.is_navigation_request():
+                        return
+                    try:
+                        is_primary_page = request.frame.page == page
+                    except PlaywrightError:
+                        is_primary_page = False
+                    if not is_primary_page:
+                        unexpected_popup = True
 
                 def note_popup(_popup: Page) -> None:
                     nonlocal unexpected_popup
@@ -411,6 +428,7 @@ async def _run_trusted_fixture_playwright_journey(
 
                 page.on("popup", note_popup)
                 page.on("download", note_download)
+                context.on("request", note_request)
 
                 for index, step in enumerate(journey.steps):
                     try:
@@ -432,7 +450,6 @@ async def _run_trusted_fixture_playwright_journey(
                             await page.get_by_role(
                                 cast(AllowedRole, role), name=name, exact=True
                             ).click()
-                            await page.wait_for_timeout(50)
                         else:
                             text = step.params["text"]
                             assert isinstance(text, str)
@@ -505,8 +522,16 @@ async def _run_trusted_fixture_playwright_journey(
                         cancelled = True
                     except (TimeoutError, OSError, PlaywrightError):
                         record_evidence_failure("journey:trace_failure")
-                cancelled = await _close_context(context) or cancelled
-                cancelled = await _close_browser(browser) or cancelled
+                context_cleanup = await _close_context(context)
+                if context_cleanup == "cancelled":
+                    cancelled = True
+                elif context_cleanup == "failure":
+                    record_evidence_failure("journey:context_close_failure")
+                browser_cleanup = await _close_browser(browser)
+                if browser_cleanup == "cancelled":
+                    cancelled = True
+                elif browser_cleanup == "failure":
+                    record_evidence_failure("journey:browser_close_failure")
     except PlaywrightError:
         runtime_reason = "browser_unavailable"
     finally:
