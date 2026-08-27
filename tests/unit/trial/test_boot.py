@@ -39,7 +39,9 @@ def _result(*, exit_code: int = 0, stdout: str = "", stderr: str = "") -> ExecRe
 
 
 def _healthy_ps() -> str:
-    return json.dumps({"Service": "web", "State": "running", "Health": "healthy"})
+    return json.dumps(
+        {"Service": "web", "State": "running", "Health": "healthy", "ExitCode": 0}
+    )
 
 
 def _run_with_active_sandbox(
@@ -67,8 +69,8 @@ def test_empty_env_uses_direct_fixed_commands_and_returns_healthy_pass() -> None
             UP_ARGV: _result(stdout="created"),
             PS_ARGV: _result(
                 stdout=(
-                    '{"Service":"web","State":"RUNNING","Health":"HEALTHY"}\n'
-                    '{"Service":"worker","State":"running","Health":null}\n'
+                    '{"Service":"web","State":"RUNNING","Health":"HEALTHY","ExitCode":0}\n'
+                    '{"Service":"worker","State":"running","Health":null,"ExitCode":0}\n'
                 )
             ),
             LOGS_ARGV: _result(stdout="ready", stderr="warning"),
@@ -86,8 +88,8 @@ def test_empty_env_uses_direct_fixed_commands_and_returns_healthy_pass() -> None
     assert result.logs == {
         "up": "created",
         "ps": (
-            '{"Service":"web","State":"RUNNING","Health":"HEALTHY"}\n'
-            '{"Service":"worker","State":"running","Health":null}\n'
+            '{"Service":"web","State":"RUNNING","Health":"HEALTHY","ExitCode":0}\n'
+            '{"Service":"worker","State":"running","Health":null,"ExitCode":0}\n'
         ),
         "logs": "ready\nwarning",
     }
@@ -130,15 +132,25 @@ def test_nonempty_env_is_sorted_prefixed_and_not_mutated() -> None:
     ("row", "expected_state"),
     [
         (
-            {"Service": "web", "State": "exited", "Health": None},
+            {"Service": "web", "State": "exited", "Health": None, "ExitCode": 0},
             "exited",
         ),
         (
-            {"Service": "web", "State": "running", "Health": "unhealthy"},
+            {
+                "Service": "web",
+                "State": "running",
+                "Health": "unhealthy",
+                "ExitCode": 0,
+            },
             "running/unhealthy",
         ),
         (
-            {"Service": "web", "State": "starting", "Health": "healthy"},
+            {
+                "Service": "web",
+                "State": "starting",
+                "Health": "healthy",
+                "ExitCode": 0,
+            },
             "starting/healthy",
         ),
     ],
@@ -163,9 +175,30 @@ def test_nonready_state_or_health_fails_closed(
 def test_scaled_replica_states_are_aggregated_without_good_overwriting_bad() -> None:
     ps_output = "\n".join(
         [
-            json.dumps({"Service": "web", "State": "running", "Health": "unhealthy"}),
-            json.dumps({"Service": "web", "State": "running", "Health": "healthy"}),
-            json.dumps({"Service": "web", "State": "running", "Health": "healthy"}),
+            json.dumps(
+                {
+                    "Service": "web",
+                    "State": "running",
+                    "Health": "unhealthy",
+                    "ExitCode": 0,
+                }
+            ),
+            json.dumps(
+                {
+                    "Service": "web",
+                    "State": "running",
+                    "Health": "healthy",
+                    "ExitCode": 0,
+                }
+            ),
+            json.dumps(
+                {
+                    "Service": "web",
+                    "State": "running",
+                    "Health": "healthy",
+                    "ExitCode": 0,
+                }
+            ),
         ]
     )
     provider = FakeSandboxProvider(
@@ -183,17 +216,17 @@ def test_scaled_replica_states_are_aggregated_without_good_overwriting_bad() -> 
 
 
 @pytest.mark.parametrize(
-    ("up_code", "ps_code", "logs_code"),
-    [(17, 0, 0), (0, 18, 0), (0, 0, 19)],
+    ("up_code", "ps_code"),
+    [(17, 0), (0, 18)],
 )
 def test_any_nonzero_command_fails_but_all_evidence_calls_still_run(
-    up_code: int, ps_code: int, logs_code: int
+    up_code: int, ps_code: int
 ) -> None:
     provider = FakeSandboxProvider(
         scripts={
             UP_ARGV: _result(exit_code=up_code),
             PS_ARGV: _result(exit_code=ps_code, stdout=_healthy_ps()),
-            LOGS_ARGV: _result(exit_code=logs_code),
+            LOGS_ARGV: _result(),
         }
     )
 
@@ -206,6 +239,91 @@ def test_any_nonzero_command_fails_but_all_evidence_calls_still_run(
         ("exec", "sandbox-1", PS_ARGV, 30),
         ("exec", "sandbox-1", LOGS_ARGV, 30),
     ]
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"Service": "web", "State": "running", "Health": "healthy"},
+        {
+            "Service": "web",
+            "State": "running",
+            "Health": "healthy",
+            "ExitCode": True,
+        },
+        {
+            "Service": "web",
+            "State": "running",
+            "Health": "healthy",
+            "ExitCode": "0",
+        },
+        {
+            "Service": "web",
+            "State": "running",
+            "Health": "healthy",
+            "ExitCode": -1,
+        },
+        {
+            "Service": "web",
+            "State": "running",
+            "Health": "healthy",
+            "ExitCode": 7,
+        },
+        {"Service": "web", "State": "exited", "Health": None, "ExitCode": 7},
+    ],
+)
+def test_ps_requires_nonnegative_integer_exit_codes_for_every_service_record(
+    row: dict[str, str | int | bool | None],
+) -> None:
+    provider = FakeSandboxProvider(
+        scripts={
+            UP_ARGV: _result(),
+            PS_ARGV: _result(stdout=json.dumps(row)),
+            LOGS_ARGV: _result(),
+        }
+    )
+
+    result = _run_with_active_sandbox(provider)
+
+    assert result.verdict is Verdict.FAIL
+
+
+def test_logs_failure_is_auditable_but_does_not_override_valid_workload() -> None:
+    provider = FakeSandboxProvider(
+        scripts={
+            UP_ARGV: _result(),
+            PS_ARGV: _result(stdout=_healthy_ps()),
+            LOGS_ARGV: _result(
+                exit_code=23,
+                stderr="TOKEN=logs-only-secret\\ncollector unavailable",
+            ),
+        }
+    )
+
+    result = _run_with_active_sandbox(provider)
+
+    assert result.verdict is Verdict.PASS
+    assert "exit_code=23" in result.logs["logs"]
+    assert "logs-only-secret" not in result.logs["logs"]
+    assert "[REDACTED]" in result.logs["logs"]
+
+
+def test_logs_failure_context_keeps_persisted_evidence_within_the_log_budget() -> None:
+    provider = FakeSandboxProvider(
+        scripts={
+            UP_ARGV: _result(),
+            PS_ARGV: _result(stdout=_healthy_ps()),
+            LOGS_ARGV: _result(
+                exit_code=23, stderr="collector output\\n" + ("x" * 70_000)
+            ),
+        }
+    )
+
+    result = _run_with_active_sandbox(provider)
+
+    assert result.verdict is Verdict.PASS
+    assert "exit_code=23" in result.logs["logs"]
+    assert len(result.logs["logs"]) <= 65_536
 
 
 @pytest.mark.parametrize(
@@ -395,6 +513,43 @@ def test_complete_sensitive_value_containing_marker_is_redacted_atomically() -> 
     assert result.logs["up"] == "leaked=[REDACTED]\ntrailing"
     assert "atomic-secret-prefix" not in result.logs["up"]
     assert "atomic-secret-suffix" not in result.logs["up"]
+
+
+def test_private_key_evidence_is_redacted_before_persistence_and_truncation() -> None:
+    supplied_private_key = (
+        "-----BEGIN OPENSSH PRIVATE KEY-----\\n"
+        "env-private-key-material\\n"
+        "-----END OPENSSH PRIVATE KEY-----"
+    )
+    boundary_crossing_pem = "-----BEGIN RSA PRIVATE KEY-----\\n" + ("A" * 70_000)
+    evidence = (
+        "ordinary diagnostic remains visible\\n"
+        "SSH_PRIVATE_KEY=log-only-private-key-material\\n"
+        f"leaked={supplied_private_key}\\n"
+        f"{boundary_crossing_pem}"
+    )
+    prefix = ("env", f"SSH_PRIVATE_KEY={supplied_private_key}")
+    provider = FakeSandboxProvider(
+        scripts={
+            (*prefix, *UP_ARGV): _result(stdout=evidence),
+            (*prefix, *PS_ARGV): _result(stdout=_healthy_ps()),
+            (*prefix, *LOGS_ARGV): _result(),
+        }
+    )
+
+    result = _run_with_active_sandbox(
+        provider, env={"SSH_PRIVATE_KEY": supplied_private_key}
+    )
+
+    persisted = result.logs["up"]
+    assert result.verdict is Verdict.PASS
+    assert "ordinary diagnostic remains visible" in persisted
+    assert "env-private-key-material" not in persisted
+    assert "log-only-private-key-material" not in persisted
+    assert "BEGIN OPENSSH PRIVATE KEY" not in persisted
+    assert "BEGIN RSA PRIVATE KEY" not in persisted
+    assert "A" * 100 not in persisted
+    assert "[REDACTED]" in persisted
 
 
 def test_many_markers_collapse_to_deterministic_redacted_overflow() -> None:

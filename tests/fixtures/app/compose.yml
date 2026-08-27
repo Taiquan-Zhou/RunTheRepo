@@ -4,6 +4,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      APP_REQUIRED_TOKEN: fixture-token
+      APP_REQUIRED_TOKEN: ${APP_REQUIRED_TOKEN-}
+      STARTUP_DELAY_S: ${STARTUP_DELAY_S:-0}
       REPOTRIAL_FIXTURE_DATA_PATH: /data/items.json
       REPOTRIAL_FIXTURE_TMP_PATH: /tmp/repotrial.tmp

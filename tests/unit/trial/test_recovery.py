@@ -55,6 +55,33 @@ class MutatingModelAdapter:
         )
 
 
+class SlowModelAdapter:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def structured(
+        self,
+        *,
+        system: str,
+        user: str,
+        schema: type[RecoveryAction],
+    ) -> RecoveryAction:
+        self.calls += 1
+        await asyncio.sleep(1)
+        return RecoveryAction(action="retry", params={}, reason="too late")
+
+
+class CancellingModelAdapter:
+    async def structured(
+        self,
+        *,
+        system: str,
+        user: str,
+        schema: type[RecoveryAction],
+    ) -> RecoveryAction:
+        raise asyncio.CancelledError
+
+
 class EmptyLike:
     def __eq__(self, other: object) -> bool:
         return other == {}
@@ -252,6 +279,77 @@ def test_model_cannot_expand_authority_while_awaiting() -> None:
     )
 
     assert action == RecoveryAction(action="stop", params={}, reason="unsafe proposal")
+
+
+@pytest.mark.parametrize(
+    ("logs", "readme_excerpt", "allowed_env_keys"),
+    [
+        ({"x" * 129: "unrecognized startup failure"}, "", set()),
+        (
+            {f"log_{index}": "unrecognized startup failure" for index in range(33)},
+            "",
+            set(),
+        ),
+        ({"logs": "x" * 4_097}, "", set()),
+        (
+            {
+                "first": "x" * 4_096,
+                "second": "x" * 4_096,
+                "third": "x" * 4_096,
+                "fourth": "x" * 4_096,
+                "fifth": "x" * 4_096,
+            },
+            "",
+            set(),
+        ),
+        ({"logs": "unrecognized startup failure"}, "x" * 4_097, set()),
+        (
+            {"logs": "unrecognized startup failure"},
+            "",
+            {"K" * 129},
+        ),
+        (
+            {"logs": "unrecognized startup failure"},
+            "",
+            {f"KEY_{index}" for index in range(33)},
+        ),
+    ],
+)
+def test_oversized_proposal_inputs_stop_before_model_invocation(
+    logs: dict[str, str], readme_excerpt: str, allowed_env_keys: set[str]
+) -> None:
+    model = FakeModelAdapter(
+        RecoveryAction(action="retry", params={}, reason="should not be proposed")
+    )
+
+    action = _propose(
+        logs=logs,
+        readme_excerpt=readme_excerpt,
+        allowed_env_keys=allowed_env_keys,
+        model=model,
+    )
+
+    assert action == RecoveryAction(
+        action="stop", params={}, reason="invalid recovery evidence"
+    )
+    assert model.calls == 0
+
+
+def test_model_timeout_stops_once_without_converting_cancellation_to_success() -> None:
+    model = SlowModelAdapter()
+
+    action = _propose(logs={"logs": "unrecognized startup failure"}, model=model)
+
+    assert action == RecoveryAction(action="stop", params={}, reason="model timeout")
+    assert model.calls == 1
+
+
+def test_caller_cancellation_propagates_without_an_ordinary_proposal() -> None:
+    with pytest.raises(asyncio.CancelledError):
+        _propose(
+            logs={"logs": "unrecognized startup failure"},
+            model=CancellingModelAdapter(),
+        )
 
 
 def test_repeated_error_count_is_explicit_per_call() -> None:

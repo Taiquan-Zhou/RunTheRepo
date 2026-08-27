@@ -7,11 +7,13 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
+from ruamel.yaml import YAML
 
 from repotrial.domain.models import Journey
 
@@ -341,3 +343,14 @@ def test_fixture_journey_asset_is_valid_current_domain_data() -> None:
     journeys = [Journey.model_validate(item) for item in payload]
 
     assert [journey.journey_id for journey in journeys] == ["health", "items"]
+
+
+def test_compose_passes_invoker_controls_without_hardcoded_values() -> None:
+    compose = YAML(typ="safe", pure=True).load(
+        StringIO((FIXTURE_DIR / "compose.yml").read_text(encoding="utf-8"))
+    )
+
+    environment = compose["services"]["app"]["environment"]
+
+    assert environment["APP_REQUIRED_TOKEN"] == "${APP_REQUIRED_TOKEN-}"
+    assert environment["STARTUP_DELAY_S"] == "${STARTUP_DELAY_S:-0}"

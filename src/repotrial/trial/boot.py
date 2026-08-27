@@ -20,6 +20,12 @@ _ASSIGNMENT_START_PATTERN = re.compile(
     r"(?P<name>[A-Za-z_][A-Za-z0-9_-]*)(?P=quote)[ \t]*[:=][ \t]*)"
 )
 _BEARER_PATTERN = re.compile(r"(?i)\bbearer[ \t]+[^\s,;]+")
+_PEM_PRIVATE_KEY_PATTERN = re.compile(
+    r"-----BEGIN [A-Z0-9 ]{0,64}PRIVATE KEY-----"
+    r".{0,65536}?"
+    r"(?:-----END [A-Z0-9 ]{0,64}PRIVATE KEY-----|(?=\n\.\.\.\[truncated\]|\Z))",
+    re.DOTALL,
+)
 _REDACTION = "[REDACTED]"
 _MARKER_OVERFLOW_REDACTION = "[REDACTED: excessive truncation markers]"
 _LOG_LIMIT = 65_536
@@ -60,9 +66,11 @@ async def boot_compose(
     )
 
     service_states, all_services_ready = _parse_service_states(ps.stdout)
-    all_commands_succeeded = all(result.exit_code == 0 for result in (up, ps, logs))
+    workload_commands_succeeded = up.exit_code == 0 and ps.exit_code == 0
     verdict = (
-        Verdict.PASS if all_commands_succeeded and all_services_ready else Verdict.FAIL
+        Verdict.PASS
+        if workload_commands_succeeded and all_services_ready
+        else Verdict.FAIL
     )
     sensitive_values = _sensitive_env_values(env)
 
@@ -72,7 +80,7 @@ async def boot_compose(
         logs={
             "up": _sanitize_result(up, sensitive_values),
             "ps": _sanitize_result(ps, sensitive_values),
-            "logs": _sanitize_result(logs, sensitive_values),
+            "logs": _sanitize_logs_result(logs, sensitive_values),
         },
         attempt=attempt,
     )
@@ -133,18 +141,21 @@ def _parse_service_states(output: str) -> tuple[dict[str, str], bool]:
         if not isinstance(decoded, dict):
             valid = False
             continue
-        if not {"Service", "State", "Health"}.issubset(decoded):
+        if not {"Service", "State", "Health", "ExitCode"}.issubset(decoded):
             valid = False
             continue
 
         service = decoded["Service"]
         state = decoded["State"]
         health = decoded["Health"]
+        exit_code = decoded["ExitCode"]
         if (
             not isinstance(service, str)
             or not service.strip()
             or not isinstance(state, str)
             or not (isinstance(health, str) or health is None)
+            or type(exit_code) is not int
+            or exit_code < 0
         ):
             valid = False
             continue
@@ -156,10 +167,11 @@ def _parse_service_states(output: str) -> tuple[dict[str, str], bool]:
         if normalized_health:
             label = f"{label}/{normalized_health}"
         labels_by_service.setdefault(service, set()).add(label)
-        if normalized_state != "running" or normalized_health not in {
-            "",
-            "healthy",
-        }:
+        if (
+            normalized_state != "running"
+            or normalized_health not in {"", "healthy"}
+            or exit_code != 0
+        ):
             ready = False
 
     service_states = {
@@ -194,8 +206,14 @@ def _sensitive_env_values(env: dict[str, str]) -> tuple[str, ...]:
 
 def _is_sensitive_env_key(key: str) -> bool:
     parts = re.split(r"[_-]+", key.lower())
-    return any(part in {"token", "password", "secret"} for part in parts) or any(
-        parts[index : index + 2] == ["api", "key"] for index in range(len(parts) - 1)
+    return (
+        any(part in {"token", "password", "secret"} for part in parts)
+        or any(
+            parts[index : index + 2] == ["api", "key"]
+            for index in range(len(parts) - 1)
+        )
+        or "private" in parts
+        and "key" in parts
     )
 
 
@@ -211,10 +229,25 @@ def _sanitize_result(result: ExecResult, sensitive_values: tuple[str, ...]) -> s
     combined = _redact_truncated_sensitive_prefixes(combined, sensitive_values)
     combined = _BEARER_PATTERN.sub(lambda match: f"Bearer {_REDACTION}", combined)
     combined = _redact_sensitive_assignments(combined)
+    combined = _PEM_PRIVATE_KEY_PATTERN.sub(_REDACTION, combined)
     if len(combined) <= _LOG_LIMIT:
         return combined
     retained = _LOG_LIMIT - len(_TRUNCATION_MARKER)
     return f"{combined[:retained]}{_TRUNCATION_MARKER}"
+
+
+def _sanitize_logs_result(result: ExecResult, sensitive_values: tuple[str, ...]) -> str:
+    sanitized = _sanitize_result(result, sensitive_values)
+    if result.exit_code == 0:
+        return sanitized
+    context = f"[logs command failed: exit_code={result.exit_code}]"
+    if not sanitized:
+        return context
+    evidence_limit = _LOG_LIMIT - len(context) - 1
+    if len(sanitized) > evidence_limit:
+        retained = evidence_limit - len(_TRUNCATION_MARKER)
+        sanitized = f"{sanitized[:retained]}{_TRUNCATION_MARKER}"
+    return f"{context}\n{sanitized}"
 
 
 def _bound_raw_evidence(text: str) -> str:
