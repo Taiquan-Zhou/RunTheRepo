@@ -107,21 +107,29 @@ async def collect_observation(
     sandbox_id: str,
     compose_path: str,
     artifact_path: Path,
+    *,
+    overlay_path: str | None = None,
 ) -> ObservationSnapshot:
-    _validate_inputs(sandbox_id, compose_path, artifact_path)
+    _validate_inputs(sandbox_id, compose_path, artifact_path, overlay_path)
     budget = _CollectionBudget()
     discovery_argv = [
         "docker",
         "compose",
         "-f",
         compose_path,
-        "ps",
-        "--all",
-        "--no-trunc",
-        "--orphans=false",
-        "--format",
-        "json",
     ]
+    if overlay_path is not None:
+        discovery_argv.extend(["-f", overlay_path])
+    discovery_argv.extend(
+        [
+            "ps",
+            "--all",
+            "--no-trunc",
+            "--orphans=false",
+            "--format",
+            "json",
+        ]
+    )
     discovery_result = await _exec_collector(
         provider, sandbox_id, discovery_argv, budget
     )
@@ -218,25 +226,36 @@ async def collect_observation(
     return snapshot
 
 
-def _validate_inputs(sandbox_id: str, compose_path: str, artifact_path: Path) -> None:
+def _validate_inputs(
+    sandbox_id: str,
+    compose_path: str,
+    artifact_path: Path,
+    overlay_path: str | None,
+) -> None:
     if not isinstance(sandbox_id, str):
         raise TypeError("sandbox_id must be a string")
     if not sandbox_id:
         raise ValueError("sandbox_id must not be empty")
-    if not isinstance(compose_path, str):
-        raise TypeError("compose_path must be a string")
-    if not compose_path:
-        raise ValueError("compose_path must not be empty")
-    if len(compose_path) > _MAX_COMPOSE_PATH_LENGTH:
-        raise ValueError("compose_path exceeds length limit")
-    if _contains_unicode_category_c(compose_path):
-        raise ValueError("compose_path contains a control character")
+    _validate_compose_path(compose_path, "compose_path")
+    if overlay_path is not None:
+        _validate_compose_path(overlay_path, "overlay_path")
     if not isinstance(artifact_path, Path):
         raise TypeError("artifact_path must be a Path")
     if artifact_path.exists() or artifact_path.is_symlink():
         raise ObservationCollectionError("artifact target is already in use")
     if not artifact_path.parent.is_dir():
         raise ObservationCollectionError("artifact parent does not exist")
+
+
+def _validate_compose_path(path: object, label: str) -> None:
+    if not isinstance(path, str):
+        raise TypeError(f"{label} must be a string")
+    if not path:
+        raise ValueError(f"{label} must not be empty")
+    if len(path) > _MAX_COMPOSE_PATH_LENGTH:
+        raise ValueError(f"{label} exceeds length limit")
+    if _contains_unicode_category_c(path):
+        raise ValueError(f"{label} contains a control character")
 
 
 async def _exec_collector(

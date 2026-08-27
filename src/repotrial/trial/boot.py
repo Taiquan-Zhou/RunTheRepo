@@ -43,9 +43,14 @@ async def boot_compose(
     compose_path: str,
     env: dict[str, str],
     attempt: int,
+    *,
+    overlay_path: str | None = None,
 ) -> BootResult:
     prefix = _validated_env_prefix(compose_path, env)
     docker_compose = ["docker", "compose", "-f", compose_path]
+    if overlay_path is not None:
+        _validate_compose_path(overlay_path, "overlay_path")
+        docker_compose.extend(["-f", overlay_path])
 
     up = await provider.exec(
         sandbox_id,
@@ -85,10 +90,7 @@ async def boot_compose(
 
 
 def _validated_env_prefix(compose_path: str, env: dict[str, str]) -> list[str]:
-    if not isinstance(compose_path, str):
-        raise TypeError("compose_path must be a string")
-    if "\0" in compose_path:
-        raise ValueError("compose_path must not contain NUL")
+    _validate_compose_path(compose_path, "compose_path")
 
     assignments: list[str] = []
     for key, value in env.items():
@@ -112,6 +114,13 @@ def _validated_env_prefix(compose_path: str, env: dict[str, str]) -> list[str]:
     if not assignments:
         return []
     return ["env", *sorted(assignments)]
+
+
+def _validate_compose_path(path: object, label: str) -> None:
+    if not isinstance(path, str):
+        raise TypeError(f"{label} must be a string")
+    if "\0" in path:
+        raise ValueError(f"{label} must not contain NUL")
 
 
 def _parse_service_states(output: str) -> tuple[dict[str, str], bool]:

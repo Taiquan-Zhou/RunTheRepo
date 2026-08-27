@@ -32,6 +32,20 @@ DISCOVERY_ARGV = (
     "--format",
     "json",
 )
+OVERLAY_DISCOVERY_ARGV = (
+    "docker",
+    "compose",
+    "-f",
+    "compose.yaml",
+    "-f",
+    "candidate.overlay.yml",
+    "ps",
+    "--all",
+    "--no-trunc",
+    "--orphans=false",
+    "--format",
+    "json",
+)
 
 
 class ScriptedProvider(SandboxProvider):
@@ -313,6 +327,7 @@ def test_collects_two_containers_in_sorted_order_with_exact_commands_and_audit(
         ),
         ("network_log", "sandbox-1"),
     ]
+
     assert network_events == original_network_events
     snapshot.network_events[0]["bytes"] = 99
     assert network_events == original_network_events
@@ -397,6 +412,51 @@ def test_collects_two_containers_in_sorted_order_with_exact_commands_and_audit(
         )
         + "\n"
     ).encode("utf-8")
+
+
+def test_overlay_discovery_uses_base_then_overlay_in_exact_order(
+    tmp_path: Path,
+) -> None:
+    provider = ScriptedProvider({OVERLAY_DISCOVERY_ARGV: _result()})
+    artifact_path = tmp_path / "observation.json"
+
+    snapshot = asyncio.run(
+        collect_observation(
+            provider,
+            "sandbox-1",
+            "compose.yaml",
+            artifact_path,
+            overlay_path="candidate.overlay.yml",
+        )
+    )
+
+    assert snapshot == ObservationSnapshot()
+    assert provider.calls == [
+        ("exec", "sandbox-1", OVERLAY_DISCOVERY_ARGV, 30),
+        ("network_log", "sandbox-1"),
+    ]
+    audit = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert audit["discovery"]["argv"] == list(OVERLAY_DISCOVERY_ARGV)
+
+
+@pytest.mark.parametrize("overlay_path", [cast(str, 7), "bad\0overlay.yml"])
+def test_invalid_overlay_fails_before_observer_provider_calls(
+    tmp_path: Path, overlay_path: str
+) -> None:
+    provider = ScriptedProvider(_scripts_for([]))
+
+    with pytest.raises((TypeError, ValueError)):
+        asyncio.run(
+            collect_observation(
+                provider,
+                "sandbox-1",
+                "compose.yaml",
+                tmp_path / "observation.json",
+                overlay_path=overlay_path,
+            )
+        )
+
+    assert provider.calls == []
 
 
 def test_identical_inputs_create_byte_identical_artifacts(tmp_path: Path) -> None:

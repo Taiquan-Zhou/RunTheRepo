@@ -32,6 +32,41 @@ LOGS_ARGV = (
     "--tail",
     "200",
 )
+OVERLAY_PATH = "/workspace/candidate.overlay.yml"
+OVERLAY_UP_ARGV = (
+    "docker",
+    "compose",
+    "-f",
+    COMPOSE_PATH,
+    "-f",
+    OVERLAY_PATH,
+    "up",
+    "-d",
+)
+OVERLAY_PS_ARGV = (
+    "docker",
+    "compose",
+    "-f",
+    COMPOSE_PATH,
+    "-f",
+    OVERLAY_PATH,
+    "ps",
+    "--all",
+    "--format",
+    "json",
+)
+OVERLAY_LOGS_ARGV = (
+    "docker",
+    "compose",
+    "-f",
+    COMPOSE_PATH,
+    "-f",
+    OVERLAY_PATH,
+    "logs",
+    "--no-color",
+    "--tail",
+    "200",
+)
 
 
 def _result(*, exit_code: int = 0, stdout: str = "", stderr: str = "") -> ExecResult:
@@ -99,6 +134,55 @@ def test_empty_env_uses_direct_fixed_commands_and_returns_healthy_pass() -> None
         ("exec", "sandbox-1", PS_ARGV, 30),
         ("exec", "sandbox-1", LOGS_ARGV, 30),
     ]
+
+
+def test_overlay_is_applied_after_base_for_every_compose_command() -> None:
+    provider = FakeSandboxProvider(
+        scripts={
+            OVERLAY_UP_ARGV: _result(),
+            OVERLAY_PS_ARGV: _result(stdout=_healthy_ps()),
+            OVERLAY_LOGS_ARGV: _result(),
+        }
+    )
+
+    async def exercise() -> BootResult:
+        sandbox_id = await provider.create(Path("missing-workspace"), "trial")
+        return await boot_compose(
+            provider,
+            sandbox_id,
+            COMPOSE_PATH,
+            {},
+            attempt=2,
+            overlay_path=OVERLAY_PATH,
+        )
+
+    result = asyncio.run(exercise())
+
+    assert result.verdict is Verdict.PASS
+    assert provider.calls[1:] == [
+        ("exec", "sandbox-1", OVERLAY_UP_ARGV, 120),
+        ("exec", "sandbox-1", OVERLAY_PS_ARGV, 30),
+        ("exec", "sandbox-1", OVERLAY_LOGS_ARGV, 30),
+    ]
+
+
+@pytest.mark.parametrize("overlay_path", [cast(str, 7), "bad\0overlay.yml"])
+def test_invalid_overlay_fails_before_any_provider_call(overlay_path: str) -> None:
+    provider = FakeSandboxProvider()
+
+    with pytest.raises((TypeError, ValueError)):
+        asyncio.run(
+            boot_compose(
+                provider,
+                "sandbox-not-needed",
+                COMPOSE_PATH,
+                {},
+                attempt=1,
+                overlay_path=overlay_path,
+            )
+        )
+
+    assert provider.calls == []
 
 
 def test_nonempty_env_is_sorted_prefixed_and_not_mutated() -> None:
