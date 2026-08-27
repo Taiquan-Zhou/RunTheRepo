@@ -552,6 +552,69 @@ def test_private_key_evidence_is_redacted_before_persistence_and_truncation() ->
     assert "[REDACTED]" in persisted
 
 
+def test_multiline_private_key_assignment_is_redacted_before_assignment_lines() -> None:
+    private_key = (
+        "PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\n"
+        "multiline-private-key-body\n"
+        "-----END RSA PRIVATE KEY-----"
+    )
+    provider = FakeSandboxProvider(
+        scripts={
+            UP_ARGV: _result(stdout=f"ordinary before\n{private_key}\nordinary after"),
+            PS_ARGV: _result(stdout=_healthy_ps()),
+            LOGS_ARGV: _result(),
+        }
+    )
+
+    result = _run_with_active_sandbox(provider)
+
+    assert (
+        result.logs["up"] == "ordinary before\nPRIVATE_KEY=[REDACTED]\nordinary after"
+    )
+    assert "multiline-private-key-body" not in result.logs["up"]
+
+
+def test_repeated_pem_headers_are_redacted_as_one_bounded_scan() -> None:
+    repeated_headers = "\n".join(
+        "-----BEGIN RSA PRIVATE KEY-----" for _ in range(1_900)
+    )
+    provider = FakeSandboxProvider(
+        scripts={
+            UP_ARGV: _result(stdout=f"ordinary before\n{repeated_headers}"),
+            PS_ARGV: _result(stdout=_healthy_ps()),
+            LOGS_ARGV: _result(),
+        }
+    )
+
+    result = _run_with_active_sandbox(provider)
+
+    assert result.logs["up"] == "ordinary before\n[REDACTED]"
+
+
+def test_pem_crossing_stdout_stderr_and_log_limit_is_fully_redacted() -> None:
+    stdout = "ordinary stdout\nPRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\n" + (
+        "A" * 65_400
+    )
+    stderr = ("B" * 1_000) + "\n-----END RSA PRIVATE KEY-----\nordinary stderr"
+    provider = FakeSandboxProvider(
+        scripts={
+            UP_ARGV: _result(stdout=stdout, stderr=stderr),
+            PS_ARGV: _result(stdout=_healthy_ps()),
+            LOGS_ARGV: _result(),
+        }
+    )
+
+    result = _run_with_active_sandbox(provider)
+
+    persisted = result.logs["up"]
+    assert len(persisted) <= 65_536
+    assert persisted == "ordinary stdout\nPRIVATE_KEY=[REDACTED]\nordinary stderr"
+    assert "BEGIN RSA PRIVATE KEY" not in persisted
+    assert "END RSA PRIVATE KEY" not in persisted
+    assert "A" * 100 not in persisted
+    assert "B" * 100 not in persisted
+
+
 def test_many_markers_collapse_to_deterministic_redacted_overflow() -> None:
     supplied_secret = "sensitive-" + ("x" * 128)
     marker = "\n...[truncated]"

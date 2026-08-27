@@ -55,9 +55,10 @@ class MutatingModelAdapter:
         )
 
 
-class SlowModelAdapter:
+class CancellationSwallowingModelAdapter:
     def __init__(self) -> None:
-        self.calls = 0
+        self.cancelled = asyncio.Event()
+        self.late_completed = asyncio.Event()
 
     async def structured(
         self,
@@ -66,12 +67,21 @@ class SlowModelAdapter:
         user: str,
         schema: type[RecoveryAction],
     ) -> RecoveryAction:
-        self.calls += 1
-        await asyncio.sleep(1)
-        return RecoveryAction(action="retry", params={}, reason="too late")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            await asyncio.sleep(0.2)
+            self.late_completed.set()
+            return RecoveryAction(action="retry", params={}, reason="late retry")
+        raise AssertionError("model wait unexpectedly completed")
 
 
-class CancellingModelAdapter:
+class CancellationTrackingModelAdapter:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
     async def structured(
         self,
         *,
@@ -79,7 +89,13 @@ class CancellingModelAdapter:
         user: str,
         schema: type[RecoveryAction],
     ) -> RecoveryAction:
-        raise asyncio.CancelledError
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        raise AssertionError("model wait unexpectedly completed")
 
 
 class EmptyLike:
@@ -335,21 +351,49 @@ def test_oversized_proposal_inputs_stop_before_model_invocation(
     assert model.calls == 0
 
 
-def test_model_timeout_stops_once_without_converting_cancellation_to_success() -> None:
-    model = SlowModelAdapter()
+def test_model_timeout_wins_when_adapter_swallows_cancellation() -> None:
+    model = CancellationSwallowingModelAdapter()
 
-    action = _propose(logs={"logs": "unrecognized startup failure"}, model=model)
-
-    assert action == RecoveryAction(action="stop", params={}, reason="model timeout")
-    assert model.calls == 1
-
-
-def test_caller_cancellation_propagates_without_an_ordinary_proposal() -> None:
-    with pytest.raises(asyncio.CancelledError):
-        _propose(
-            logs={"logs": "unrecognized startup failure"},
-            model=CancellingModelAdapter(),
+    async def exercise() -> None:
+        proposal = asyncio.create_task(
+            propose_recovery(
+                logs={"logs": "unrecognized startup failure"},
+                readme_excerpt="",
+                allowed_env_keys=set(),
+                repeated_error_count=0,
+                model=model,
+            )
         )
+        action = await asyncio.wait_for(proposal, timeout=0.5)
+        assert action == RecoveryAction(
+            action="stop", params={}, reason="model timeout"
+        )
+        await asyncio.wait_for(model.cancelled.wait(), timeout=0.1)
+        await asyncio.wait_for(model.late_completed.wait(), timeout=0.5)
+
+    asyncio.run(exercise())
+
+
+def test_caller_cancellation_cancels_and_observes_the_inner_model_task() -> None:
+    model = CancellationTrackingModelAdapter()
+
+    async def exercise() -> None:
+        proposal = asyncio.create_task(
+            propose_recovery(
+                logs={"logs": "unrecognized startup failure"},
+                readme_excerpt="",
+                allowed_env_keys=set(),
+                repeated_error_count=0,
+                model=model,
+            )
+        )
+        await asyncio.wait_for(model.started.wait(), timeout=0.1)
+        proposal.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await proposal
+        await asyncio.wait_for(model.cancelled.wait(), timeout=0.1)
+
+    asyncio.run(exercise())
 
 
 def test_repeated_error_count_is_explicit_per_call() -> None:

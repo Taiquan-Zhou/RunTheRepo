@@ -20,16 +20,14 @@ _ASSIGNMENT_START_PATTERN = re.compile(
     r"(?P<name>[A-Za-z_][A-Za-z0-9_-]*)(?P=quote)[ \t]*[:=][ \t]*)"
 )
 _BEARER_PATTERN = re.compile(r"(?i)\bbearer[ \t]+[^\s,;]+")
-_PEM_PRIVATE_KEY_PATTERN = re.compile(
-    r"-----BEGIN [A-Z0-9 ]{0,64}PRIVATE KEY-----"
-    r".{0,65536}?"
-    r"(?:-----END [A-Z0-9 ]{0,64}PRIVATE KEY-----|(?=\n\.\.\.\[truncated\]|\Z))",
-    re.DOTALL,
-)
 _REDACTION = "[REDACTED]"
 _MARKER_OVERFLOW_REDACTION = "[REDACTED: excessive truncation markers]"
 _LOG_LIMIT = 65_536
 _TRUNCATION_MARKER = "\n...[truncated]"
+_PEM_BEGIN = "-----BEGIN "
+_PEM_END = "-----END "
+_PEM_TERMINATOR = "-----"
+_MAX_PEM_LABEL_LENGTH = 64
 
 
 class BootResult(BaseModel):
@@ -228,8 +226,8 @@ def _sanitize_result(result: ExecResult, sensitive_values: tuple[str, ...]) -> s
         return _MARKER_OVERFLOW_REDACTION
     combined = _redact_truncated_sensitive_prefixes(combined, sensitive_values)
     combined = _BEARER_PATTERN.sub(lambda match: f"Bearer {_REDACTION}", combined)
+    combined = _redact_pem_private_keys(combined)
     combined = _redact_sensitive_assignments(combined)
-    combined = _PEM_PRIVATE_KEY_PATTERN.sub(_REDACTION, combined)
     if len(combined) <= _LOG_LIMIT:
         return combined
     retained = _LOG_LIMIT - len(_TRUNCATION_MARKER)
@@ -267,6 +265,63 @@ def _redact_sensitive_assignments(text: str) -> str:
                 break
         redacted_lines.append(f"{body}{ending}")
     return "".join(redacted_lines)
+
+
+def _redact_pem_private_keys(text: str) -> str:
+    redacted_parts: list[str] = []
+    retained_start = 0
+    scan_start = 0
+    while True:
+        header_start = text.find(_PEM_BEGIN, scan_start)
+        if header_start < 0:
+            redacted_parts.append(text[retained_start:])
+            return "".join(redacted_parts)
+        header_end = _private_key_marker_end(text, header_start, _PEM_BEGIN)
+        if header_end is None:
+            scan_start = header_start + len(_PEM_BEGIN)
+            continue
+        footer_end = _find_private_key_footer(text, header_end)
+        redacted_parts.append(text[retained_start:header_start])
+        redacted_parts.append(_REDACTION)
+        if footer_end is None:
+            return "".join(redacted_parts)
+        retained_start = footer_end
+        scan_start = footer_end
+
+
+def _find_private_key_footer(text: str, start: int) -> int | None:
+    scan_start = start
+    while True:
+        footer_start = text.find(_PEM_END, scan_start)
+        if footer_start < 0:
+            return None
+        footer_end = _private_key_marker_end(text, footer_start, _PEM_END)
+        if footer_end is not None:
+            return footer_end
+        scan_start = footer_start + len(_PEM_END)
+
+
+def _private_key_marker_end(text: str, start: int, prefix: str) -> int | None:
+    label_start = start + len(prefix)
+    terminator_start = text.find(
+        _PEM_TERMINATOR,
+        label_start,
+        label_start + _MAX_PEM_LABEL_LENGTH + len(_PEM_TERMINATOR),
+    )
+    if terminator_start < 0:
+        return None
+    label = text[label_start:terminator_start]
+    if (
+        not label
+        or len(label) > _MAX_PEM_LABEL_LENGTH
+        or not (label == "PRIVATE KEY" or label.endswith(" PRIVATE KEY"))
+        or any(
+            not (character.isupper() or character.isdigit() or character == " ")
+            for character in label
+        )
+    ):
+        return None
+    return terminator_start + len(_PEM_TERMINATOR)
 
 
 def _split_line_ending(line: str) -> tuple[str, str]:
