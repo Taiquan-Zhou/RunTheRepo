@@ -378,6 +378,96 @@ def test_query_credential_keys_are_decoded_and_redacted_in_network_evidence(
     assert evidence["request"]["path"] == "/x?access%5Ftoken=<redacted>&mode=ok"
 
 
+def test_credential_key_grammar_uses_only_terminal_credential_semantics() -> None:
+    alpha = b"password=alpha secret=beta db_password=gamma access_token=delta client_secret=epsilon api_key=zeta apikey=eta private_key=theta ssh_private_key=iota\n"
+    beta = b"password=one secret=two db_password=three access_token=four client_secret=five api_key=six apikey=seven private_key=eight ssh_private_key=nine\n"
+
+    assert _redacted_body_hash(alpha, False) == _redacted_body_hash(beta, False)
+    assert _redacted_body_hash(b"token_type=bearer\n", False) != _redacted_body_hash(
+        b"token_type=mac\n", False
+    )
+    assert _redacted_body_hash(b"password_policy=long\n", False) != _redacted_body_hash(
+        b"password_policy=short\n", False
+    )
+
+
+def test_valid_json_body_redaction_recurses_through_nested_values() -> None:
+    alpha = json.dumps(
+        {
+            "items": [
+                {"client_secret": "alpha", "status": "ready"},
+                {"nested": {"apikey": "beta"}},
+            ]
+        }
+    ).encode()
+    beta = json.dumps(
+        {
+            "items": [
+                {"client_secret": "gamma", "status": "ready"},
+                {"nested": {"apikey": "delta"}},
+            ]
+        }
+    ).encode()
+    changed_field = json.dumps(
+        {
+            "items": [
+                {"client_secret": "gamma", "status": "changed"},
+                {"nested": {"apikey": "delta"}},
+            ]
+        }
+    ).encode()
+
+    assert _redacted_body_hash(alpha, False) == _redacted_body_hash(beta, False)
+    assert _redacted_body_hash(beta, False) != _redacted_body_hash(changed_field, False)
+
+
+def test_yaml_sequence_credential_block_preserves_same_mapping_sibling() -> None:
+    alpha = b"- password: |\n    alpha\n    omega\n  status: ready\n"
+    beta = b"- password: |\n    beta\n  status: ready\n"
+    changed_sibling = b"- password: |\n    beta\n  status: changed\n"
+
+    assert _redacted_body_hash(alpha, False) == _redacted_body_hash(beta, False)
+    assert _redacted_body_hash(beta, False) != _redacted_body_hash(
+        changed_sibling, False
+    )
+
+
+def test_plain_text_multiple_assignments_redact_each_credential_independently() -> None:
+    alpha = b"password=alpha token=beta status=ok\n"
+    beta = b"password=gamma token=delta status=ok\n"
+    changed_status = b"password=gamma token=delta status=changed\n"
+
+    assert _redacted_body_hash(alpha, False) == _redacted_body_hash(beta, False)
+    assert _redacted_body_hash(beta, False) != _redacted_body_hash(
+        changed_status, False
+    )
+
+
+def test_network_evidence_redacts_apikey_and_preserves_noncredential_query_values(
+    tmp_path: Path,
+) -> None:
+    def fail(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("x", request=request)
+
+    result = run(
+        journey(
+            step(
+                "network",
+                "GET",
+                "/x?apikey=alpha&client%5Fsecret=beta&token_type=bearer&password_policy=long",
+                [],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(fail),
+    )
+
+    evidence = json.loads(Path(result.evidence_paths[0]).read_text(encoding="utf-8"))
+    assert evidence["request"]["path"] == (
+        "/x?apikey=<redacted>&client%5Fsecret=<redacted>&token_type=bearer&password_policy=long"
+    )
+
+
 def test_body_redaction_uses_credential_key_grammar_for_nested_yaml() -> None:
     assert _redacted_body_hash(
         b"  - SSH_PRIVATE_KEY: |\n      alpha\nnext: keep\n", False

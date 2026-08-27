@@ -21,11 +21,10 @@ _PEM_PRIVATE_KEY = re.compile(
     r"-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?(?:-----END [^-\r\n]*PRIVATE KEY-----|\Z)",
     re.DOTALL,
 )
-_YAML_SECRET_BLOCK = re.compile(
-    r"^(?P<indent>\s*)(?:-\s*)?[\"']?(?P<key>[A-Za-z0-9_-]+)[\"']?\s*:\s*[|>]"
-)
-_ASSIGNMENT_LINE = re.compile(
-    r"^(?P<prefix>\s*(?:-\s*)?[\"']?(?P<key>[A-Za-z0-9_-]+)[\"']?\s*[:=]\s*)(?P<value>.*)$"
+_ASSIGNMENT = re.compile(
+    r"(?<!\S)(?:-\s*)?[\"']?(?P<key>[A-Za-z0-9_-]+)[\"']?\s*"
+    r"(?P<separator>[:=])\s*(?P<value>.*?)"
+    r"(?=(?:\s+[\"']?[A-Za-z0-9_-]+[\"']?\s*[:=])|(?:\r?\n)?\Z)"
 )
 
 
@@ -55,11 +54,14 @@ def _has_controls_or_backslash(value: str) -> bool:
 def _credential_key(value: str) -> bool:
     normalized = unquote(value).lower().replace("-", "_")
     parts = [part for part in normalized.split("_") if part]
-    return (
-        any(part in {"password", "token", "secret"} for part in parts)
-        or ("api" in parts and "key" in parts)
-        or ("private" in parts and "key" in parts)
-    )
+    if not parts:
+        return False
+    if parts[-1] in {"password", "token", "secret", "apikey"}:
+        return True
+    return len(parts) >= 2 and tuple(parts[-2:]) in {
+        ("api", "key"),
+        ("private", "key"),
+    }
 
 
 def _decoded_path(value: str) -> str | None:
@@ -193,35 +195,73 @@ def _canonical_json_hash(value: object) -> str:
 
 def _redacted_body_hash(body: bytes, truncated: bool) -> str:
     text = body.decode("utf-8", errors="replace")
-    redacted = _PEM_PRIVATE_KEY.sub("<redacted-private-key>", text)
-    redacted = _redact_credential_assignments(redacted)
+    redacted = _redact_json_body(text)
+    if redacted is None:
+        redacted = _redact_credential_assignments(text)
+    redacted = _PEM_PRIVATE_KEY.sub("<redacted-private-key>", redacted)
     redacted = _BEARER_TOKEN.sub("Bearer <redacted>", redacted)
     if truncated:
         redacted += "\n[repotrial:truncated]\n"
     return hashlib.sha256(redacted.encode("utf-8")).hexdigest()
 
 
+def _redact_json_body(text: str) -> str | None:
+    try:
+        value: object = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return json.dumps(
+        _redact_json_value(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def _redact_json_value(value: object) -> object:
+    if isinstance(value, dict):
+        redacted: dict[object, object] = {}
+        for key, nested_value in value.items():
+            redacted[key] = (
+                "<redacted>"
+                if isinstance(key, str) and _credential_key(key)
+                else _redact_json_value(nested_value)
+            )
+        return redacted
+    if isinstance(value, list):
+        return [_redact_json_value(item) for item in value]
+    return value
+
+
 def _redact_credential_assignments(text: str) -> str:
     redacted_lines: list[str] = []
-    content_indent: int | None = None
+    block_key_column: int | None = None
     for line in text.splitlines(keepends=True):
-        if content_indent is not None:
+        if block_key_column is not None:
             indentation = len(line) - len(line.lstrip(" \t"))
-            if line.strip() and indentation <= content_indent:
-                content_indent = None
-            else:
+            if not line.strip() or indentation > block_key_column:
                 continue
-        match = _ASSIGNMENT_LINE.match(line)
-        if match is None or not _credential_key(match.group("key")):
+            block_key_column = None
+
+        matches = list(_ASSIGNMENT.finditer(line))
+        if not matches:
             redacted_lines.append(line)
             continue
-        suffix = "\n" if line.endswith("\n") else ""
-        redacted_lines.append(match.group("prefix") + "<redacted>" + suffix)
-        if not match.group("value").strip() or match.group("value").strip() in {
-            "|",
-            ">",
-        }:
-            content_indent = len(line) - len(line.lstrip(" \t"))
+
+        cursor = 0
+        redacted_line: list[str] = []
+        for match in matches:
+            redacted_line.append(line[cursor : match.start("value")])
+            value = match.group("value")
+            if _credential_key(match.group("key")):
+                redacted_line.append("<redacted>")
+                if not value.strip() or value.lstrip().startswith(("|", ">")):
+                    block_key_column = match.start("key")
+            else:
+                redacted_line.append(value)
+            cursor = match.end("value")
+        redacted_line.append(line[cursor:])
+        redacted_lines.append("".join(redacted_line))
     return "".join(redacted_lines)
 
 
