@@ -1,6 +1,7 @@
 import asyncio
 import json
 import math
+import os
 import re
 import stat
 from pathlib import Path
@@ -46,20 +47,48 @@ _MAX_STEPS_PER_JOURNEY = 8
 _MAX_ASSERTIONS_PER_STEP = 64
 _MAX_JOURNEY_TEXT_LENGTH = 4_096
 _MAX_PATH_LENGTH = 2_048
-_MARKDOWN_LINK = re.compile(r"\[[^\]\r\n]*\]\(([^()\s]+)\)")
+_MAX_JSON_DEPTH = 16
+_MAX_JSON_NODES = 256
+_MAX_JSON_CONTAINER_ITEMS = 64
+_MAX_JSON_AGGREGATE_CONTENT = 16_384
+_MARKDOWN_LINK = re.compile(r"(?<!!)\[[^\]\r\n]*\]\(([^()\s]+)\)")
 _DOTTED_PATH = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*$")
+_SAFE_ROUTE_SEGMENT = re.compile(r"[A-Za-z0-9._~@=+,-]*\Z")
+_SAFE_QUERY = re.compile(r"[A-Za-z0-9._~=&,-]*\Z")
 _ALLOWED_HTTP_METHODS = frozenset({"GET", "POST", "DELETE"})
 _ALLOWED_BROWSER_ROLES = frozenset(
     {"button", "link", "checkbox", "radio", "menuitem", "option", "tab"}
 )
 
 
-class _JourneyProposal(BaseModel):
-    """Transport-only envelope; untrusted nested values are checked manually."""
+class _StrictJourneyTransport(BaseModel):
+    """Private strict schema used only at the untrusted model boundary."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    journeys: list[object]
+
+class _JourneyAssertionTransport(_StrictJourneyTransport):
+    kind: str
+    target: str
+    expected: object
+
+
+class _JourneyStepTransport(_StrictJourneyTransport):
+    step_id: str
+    tool: str
+    action: str
+    params: dict[str, object]
+    assertions: list[_JourneyAssertionTransport]
+
+
+class _JourneyTransport(_StrictJourneyTransport):
+    journey_id: str
+    name: str
+    steps: list[_JourneyStepTransport]
+
+
+class _JourneyProposal(_StrictJourneyTransport):
+    journeys: list[_JourneyTransport]
 
 
 class _ModelDeadlineExpired:
@@ -138,9 +167,9 @@ async def plan_journeys(
         proposal = await _journey_proposal_before_deadline(model, readme_excerpt)
     except (TimeoutError, ValidationError, TypeError, ValueError):
         return []
-    if proposal is _MODEL_DEADLINE_EXPIRED:
+    if not isinstance(proposal, _JourneyProposal):
         return []
-    return _parse_journey_collection(proposal.__dict__) or []
+    return _materialize_journey_proposal(proposal) or []
 
 
 def _read_declared_journeys(repo_root: Path) -> list[Journey] | None:
@@ -158,16 +187,51 @@ def _read_declared_journeys(repo_root: Path) -> list[Journey] | None:
     ):
         raise ValueError("invalid declared journeys")
     try:
-        raw = declaration_path.read_bytes()
-        if len(raw) > _MAX_DECLARED_JOURNEYS_BYTES:
-            raise ValueError("too large")
+        raw = _read_declared_bytes(declaration_path, metadata)
         parsed = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+    except (
+        OSError,
+        RecursionError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+    ) as error:
         raise ValueError("invalid declared journeys") from error
-    journeys = _parse_journey_collection(parsed)
+    journeys = _validate_and_materialize_journey_collection(parsed)
     if journeys is None:
         raise ValueError("invalid declared journeys")
     return journeys
+
+
+def _read_declared_bytes(declaration_path: Path, initial: os.stat_result) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(declaration_path, flags)
+        opened = os.fstat(descriptor)
+        current = declaration_path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or opened.st_size > _MAX_DECLARED_JOURNEYS_BYTES
+            or not _same_file_identity(initial, opened)
+            or not _same_file_identity(opened, current)
+        ):
+            raise ValueError("invalid declaration handle")
+        with os.fdopen(descriptor, "rb", closefd=True) as declaration_file:
+            descriptor = None
+            raw = declaration_file.read(_MAX_DECLARED_JOURNEYS_BYTES + 1)
+        if len(raw) > _MAX_DECLARED_JOURNEYS_BYTES:
+            raise ValueError("invalid declaration length")
+        return raw
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
 
 
 def _journeys_from_readme(readme_excerpt: str) -> list[Journey]:
@@ -238,11 +302,9 @@ async def _journey_proposal_before_deadline(
         _cancel_and_observe_journey_model_task(model_task)
         return _MODEL_DEADLINE_EXPIRED
     proposal = model_task.result()
-    return (
-        proposal
-        if type(proposal) is _JourneyProposal
-        else _JourneyProposal.model_construct()
-    )
+    if type(proposal) is not _JourneyProposal:
+        raise ValueError("invalid journey proposal type")
+    return _JourneyProposal.model_validate(proposal.__dict__)
 
 
 def _cancel_and_observe_journey_model_task(
@@ -258,6 +320,44 @@ def _cancel_and_observe_journey_model_task(
 def _observe_journey_model_task(task: asyncio.Task[_JourneyProposal]) -> None:
     if not task.cancelled():
         task.exception()
+
+
+def _validate_and_materialize_journey_collection(value: object) -> list[Journey] | None:
+    try:
+        proposal = _JourneyProposal.model_validate(value)
+    except (ValidationError, RecursionError):
+        return None
+    return _materialize_journey_proposal(proposal)
+
+
+def _materialize_journey_proposal(proposal: _JourneyProposal) -> list[Journey] | None:
+    collection: dict[str, object] = {
+        "journeys": [
+            {
+                "journey_id": journey.journey_id,
+                "name": journey.name,
+                "steps": [
+                    {
+                        "step_id": step.step_id,
+                        "tool": step.tool,
+                        "action": step.action,
+                        "params": step.params,
+                        "assertions": [
+                            {
+                                "kind": assertion.kind,
+                                "target": assertion.target,
+                                "expected": assertion.expected,
+                            }
+                            for assertion in step.assertions
+                        ],
+                    }
+                    for step in journey.steps
+                ],
+            }
+            for journey in proposal.journeys
+        ]
+    }
+    return _parse_journey_collection(collection)
 
 
 def _parse_journey_collection(value: object) -> list[Journey] | None:
@@ -463,17 +563,22 @@ def _valid_root_relative_path(value: object) -> bool:
         parsed = urlsplit(value)
     except ValueError:
         return False
-    decoded_path = _decoded_path(parsed.path)
+    decoded_path = _decoded_component(parsed.path)
+    decoded_query = _decoded_component(parsed.query)
     return not (
         parsed.scheme
         or parsed.netloc
         or parsed.fragment
         or decoded_path is None
-        or not _valid_ascii_text(decoded_path)
+        or decoded_query is None
         or "\\" in decoded_path
         or decoded_path.count("/") != parsed.path.count("/")
         or "//" in decoded_path
         or any(part in {".", ".."} for part in decoded_path.split("/"))
+        or not all(
+            _SAFE_ROUTE_SEGMENT.fullmatch(part) for part in decoded_path.split("/")
+        )
+        or _SAFE_QUERY.fullmatch(decoded_query) is None
     )
 
 
@@ -486,7 +591,7 @@ def _valid_browser_path(value: object) -> bool:
         return False
 
 
-def _decoded_path(value: str) -> str | None:
+def _decoded_component(value: str) -> str | None:
     if re.search(r"%(?![0-9A-Fa-f]{2})", value):
         return None
     decoded = value
@@ -499,19 +604,45 @@ def _decoded_path(value: str) -> str | None:
 
 
 def _valid_json_value(value: object) -> bool:
-    if value is None or isinstance(value, (bool, int)):
-        return True
-    if isinstance(value, float):
-        return math.isfinite(value)
-    if isinstance(value, str):
-        return _valid_text(value)
-    if type(value) is list:
-        return all(_valid_json_value(item) for item in value)
-    if type(value) is dict:
-        return all(
-            _valid_text(key) and _valid_json_value(item) for key, item in value.items()
-        )
-    return False
+    nodes = 0
+    aggregate_content = 0
+    pending: list[tuple[object, int]] = [(value, 0)]
+    while pending:
+        current, depth = pending.pop()
+        nodes += 1
+        if nodes > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
+            return False
+        if current is None or isinstance(current, (bool, int)):
+            continue
+        if isinstance(current, float):
+            if not math.isfinite(current):
+                return False
+            continue
+        if isinstance(current, str):
+            aggregate_content += len(current)
+            if aggregate_content > _MAX_JSON_AGGREGATE_CONTENT or not _valid_text(
+                current
+            ):
+                return False
+            continue
+        if type(current) is list:
+            if len(current) > _MAX_JSON_CONTAINER_ITEMS:
+                return False
+            pending.extend((item, depth + 1) for item in current)
+            continue
+        if type(current) is dict:
+            if len(current) > _MAX_JSON_CONTAINER_ITEMS:
+                return False
+            for key, item in current.items():
+                if not _valid_text(key):
+                    return False
+                aggregate_content += len(key)
+                if aggregate_content > _MAX_JSON_AGGREGATE_CONTENT:
+                    return False
+                pending.append((item, depth + 1))
+            continue
+        return False
+    return True
 
 
 async def _model_proposal_before_deadline(

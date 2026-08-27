@@ -3,9 +3,10 @@ import json
 from pathlib import Path
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from repotrial.domain.models import Journey, JourneyAssertion, JourneyStep
+from repotrial.trial import planner as planner_module
 from repotrial.trial.planner import plan_journeys
 
 
@@ -15,6 +16,7 @@ class FakeModelAdapter:
         self.calls = 0
         self.system = ""
         self.user = ""
+        self.schema: type[BaseModel] | None = None
 
     async def structured(
         self, *, system: str, user: str, schema: type[BaseModel]
@@ -22,8 +24,20 @@ class FakeModelAdapter:
         self.calls += 1
         self.system = system
         self.user = user
+        self.schema = schema
         assert "untrusted" in system.lower()
         return schema.model_validate({"journeys": self.response})
+
+
+class ConstructedModelAdapter:
+    def __init__(self, journeys: object) -> None:
+        self.journeys = journeys
+
+    async def structured(
+        self, *, system: str, user: str, schema: type[BaseModel]
+    ) -> BaseModel:
+        del system, user
+        return schema.model_construct(journeys=self.journeys)
 
 
 class TimeoutModelAdapter:
@@ -82,6 +96,24 @@ def _http_step(path: str = "/health") -> dict[str, object]:
 
 def _http_journey(path: str = "/health") -> dict[str, object]:
     return {"journey_id": "health", "name": "Health", "steps": [_http_step(path)]}
+
+
+def _journey_with_json_body(body: object) -> dict[str, object]:
+    journey = _http_journey()
+    journey["steps"] = [_http_step()]
+    step = journey["steps"][0]
+    assert isinstance(step, dict)
+    params = step["params"]
+    assert isinstance(params, dict)
+    params["json"] = body
+    return journey
+
+
+def _nested_json(depth: int) -> object:
+    value: object = "leaf"
+    for _ in range(depth):
+        value = [value]
+    return value
 
 
 def test_declared_journeys_are_authoritative_and_never_call_model(
@@ -154,6 +186,22 @@ def test_readme_links_are_deterministic_deduplicated_and_preempt_model(
         for journey in journeys
     )
     assert model.calls == 0
+
+
+def test_readme_images_and_encoded_command_text_do_not_block_model_fallback(
+    tmp_path: Path,
+) -> None:
+    model = FakeModelAdapter([_http_journey("/from-model")])
+
+    journeys = _plan(
+        tmp_path,
+        "![Screenshot](/docs/screenshot.png) ![Badge](/badge.svg) "
+        "[cmd](/bin/sh%20-c%20id) [curl](/curl%20https%3Aexample.test)",
+        model,
+    )
+
+    assert [journey.steps[0].params["path"] for journey in journeys] == ["/from-model"]
+    assert model.calls == 1
 
 
 def test_valid_model_output_is_materialized_only_when_other_sources_are_empty(
@@ -313,6 +361,148 @@ def test_oversized_declaration_is_rejected_before_model_fallback(
         _plan(tmp_path, model=model)
 
     assert model.calls == 0
+
+
+def test_declaration_swap_to_symlink_fails_closed_before_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    declaration = tmp_path / "repotrial.journeys.json"
+    declaration.write_text(json.dumps({"journeys": [_http_journey("/inside")]}))
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"journeys": [_http_journey("/outside")]}))
+    original_lstat = Path.lstat
+    swapped = False
+
+    def swap_after_lstat(path: Path) -> object:
+        nonlocal swapped
+        metadata = original_lstat(path)
+        if path == declaration and not swapped:
+            swapped = True
+            declaration.unlink()
+            declaration.symlink_to(outside)
+        return metadata
+
+    monkeypatch.setattr(Path, "lstat", swap_after_lstat)
+
+    with pytest.raises(ValueError, match="invalid declared journeys"):
+        _plan(tmp_path)
+
+
+def test_declaration_growth_after_stat_never_uses_unbounded_read_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    declaration = tmp_path / "repotrial.journeys.json"
+    declaration.write_text(json.dumps({"journeys": [_http_journey()]}))
+    original_lstat = Path.lstat
+    grew = False
+
+    def grow_after_lstat(path: Path) -> object:
+        nonlocal grew
+        metadata = original_lstat(path)
+        if path == declaration and not grew:
+            grew = True
+            declaration.write_bytes(b"x" * 65_537)
+        return metadata
+
+    def fail_if_full_reader_is_used(path: Path) -> bytes:
+        pytest.fail(f"unbounded declaration reader used for {path}")
+
+    monkeypatch.setattr(Path, "lstat", grow_after_lstat)
+    monkeypatch.setattr(Path, "read_bytes", fail_if_full_reader_is_used)
+
+    with pytest.raises(ValueError, match="invalid declared journeys"):
+        _plan(tmp_path)
+
+
+def test_deep_declaration_json_is_normalized_to_fixed_value_error(
+    tmp_path: Path,
+) -> None:
+    body = "[" * 1_500 + "0" + "]" * 1_500
+    encoded_journey = json.dumps(_journey_with_json_body(None))
+    declaration = '{"journeys": [' + encoded_journey.replace("null", body, 1) + "]}"
+    (tmp_path / "repotrial.journeys.json").write_text(declaration, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid declared journeys"):
+        _plan(tmp_path)
+
+
+def test_deep_model_json_fails_closed_without_recursion_error(tmp_path: Path) -> None:
+    model = FakeModelAdapter([_journey_with_json_body(_nested_json(1_500))])
+
+    assert _plan(tmp_path, model=model) == []
+
+
+def test_json_body_depth_boundary_is_exact(tmp_path: Path) -> None:
+    at_limit = FakeModelAdapter([_journey_with_json_body(_nested_json(16))])
+    above_limit = FakeModelAdapter([_journey_with_json_body(_nested_json(17))])
+
+    assert _plan(tmp_path, model=at_limit)
+    assert _plan(tmp_path, model=above_limit) == []
+
+
+def test_json_body_node_and_container_boundaries_are_exact(tmp_path: Path) -> None:
+    at_container_limit = FakeModelAdapter([_journey_with_json_body([0] * 64)])
+    above_container_limit = FakeModelAdapter([_journey_with_json_body([0] * 65)])
+    at_node_limit = FakeModelAdapter(
+        [_journey_with_json_body([[0] * 64, [0] * 64, [0] * 64])]
+    )
+    above_node_limit = FakeModelAdapter(
+        [_journey_with_json_body([[0] * 64, [0] * 64, [0] * 64, [0] * 64])]
+    )
+
+    assert _plan(tmp_path, model=at_container_limit)
+    assert _plan(tmp_path, model=above_container_limit) == []
+    assert _plan(tmp_path, model=at_node_limit)
+    assert _plan(tmp_path, model=above_node_limit) == []
+
+
+def test_json_body_aggregate_content_boundary_is_exact(tmp_path: Path) -> None:
+    at_limit = FakeModelAdapter([_journey_with_json_body(["x" * 4_096] * 4)])
+    above_limit = FakeModelAdapter([_journey_with_json_body(["x" * 4_096] * 4 + ["x"])])
+
+    assert _plan(tmp_path, model=at_limit)
+    assert _plan(tmp_path, model=above_limit) == []
+
+
+def test_model_schema_has_strict_nested_journey_and_step_definitions(
+    tmp_path: Path,
+) -> None:
+    model = FakeModelAdapter([])
+
+    assert _plan(tmp_path, model=model) == []
+    assert model.schema is not None
+    schema = model.schema
+    journey_items = schema.model_json_schema()["properties"]["journeys"]["items"]
+    assert journey_items != {}
+    with pytest.raises(ValidationError):
+        schema.model_validate(
+            {
+                "journeys": [
+                    {
+                        "journey_id": 123,
+                        "name": "bad",
+                        "steps": {},
+                        "unexpected": True,
+                    }
+                ]
+            }
+        )
+
+
+def test_model_construct_bypass_is_revalidated_before_materialization() -> None:
+    model = ConstructedModelAdapter(
+        [
+            {
+                "journey_id": "health",
+                "name": "Health",
+                "steps": [],
+                "unexpected": True,
+            }
+        ]
+    )
+
+    with pytest.raises(ValidationError):
+        asyncio.run(planner_module._journey_proposal_before_deadline(model, ""))
 
 
 def test_model_timeout_fails_closed_and_cancels_inner_task(tmp_path: Path) -> None:
