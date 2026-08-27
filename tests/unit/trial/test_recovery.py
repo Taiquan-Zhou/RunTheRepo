@@ -1,4 +1,5 @@
 import asyncio
+from typing import cast
 
 import pytest
 
@@ -22,6 +23,36 @@ class FakeModelAdapter:
         assert "untrusted" in system.lower()
         assert schema is RecoveryAction
         return self.response
+
+
+class ValidationErrorModelAdapter:
+    async def structured(
+        self,
+        *,
+        system: str,
+        user: str,
+        schema: type[RecoveryAction],
+    ) -> RecoveryAction:
+        return RecoveryAction.model_validate({})
+
+
+class MutatingModelAdapter:
+    def __init__(self, authority: set[str]) -> None:
+        self.authority = authority
+
+    async def structured(
+        self,
+        *,
+        system: str,
+        user: str,
+        schema: type[RecoveryAction],
+    ) -> RecoveryAction:
+        self.authority.add("MUTATED_KEY")
+        return RecoveryAction(
+            action="set_env",
+            params={"key": "MUTATED_KEY", "value": "repotrial-synthetic-value"},
+            reason="set the newly-authorized key",
+        )
 
 
 def _propose(
@@ -157,6 +188,49 @@ def test_model_proposal_outside_exact_policy_is_refused(
         logs={"logs": "unrecognized startup failure"},
         allowed_env_keys={"APP_REQUIRED_TOKEN"},
         model=FakeModelAdapter(proposal),
+    )
+
+    assert action == RecoveryAction(action="stop", params={}, reason="unsafe proposal")
+
+
+def test_model_validation_error_fails_closed() -> None:
+    action = _propose(
+        logs={"logs": "unrecognized startup failure"},
+        model=ValidationErrorModelAdapter(),
+    )
+
+    assert action == RecoveryAction(action="stop", params={}, reason="unsafe proposal")
+
+
+def test_incomplete_constructed_model_action_fails_closed() -> None:
+    incomplete = RecoveryAction.model_construct(action="retry", params={})
+
+    action = _propose(
+        logs={"logs": "unrecognized startup failure"},
+        model=FakeModelAdapter(incomplete),
+    )
+
+    assert action == RecoveryAction(action="stop", params={}, reason="unsafe proposal")
+
+
+@pytest.mark.parametrize("repeated_error_count", [float("nan"), "3", True])
+def test_non_integer_repeated_error_count_is_invalid(
+    repeated_error_count: object,
+) -> None:
+    with pytest.raises(ValueError, match="repeated_error_count"):
+        _propose(
+            logs={"logs": "unrecognized startup failure"},
+            repeated_error_count=cast(int, repeated_error_count),
+        )
+
+
+def test_model_cannot_expand_authority_while_awaiting() -> None:
+    authority = {"UNCHANGED_KEY"}
+
+    action = _propose(
+        logs={"logs": "unrecognized startup failure"},
+        allowed_env_keys=authority,
+        model=MutatingModelAdapter(authority),
     )
 
     assert action == RecoveryAction(action="stop", params={}, reason="unsafe proposal")
