@@ -76,6 +76,32 @@ class _FailingEntryContext:
         return False
 
 
+class _ExitFailingContext:
+    def __init__(
+        self,
+        events: list[str],
+        saver: _FakeAsyncSaver,
+        error: BaseException,
+    ) -> None:
+        self.events = events
+        self.saver = saver
+        self.error = error
+
+    async def __aenter__(self) -> _FakeAsyncSaver:
+        self.events.append("enter")
+        return self.saver
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: object,
+    ) -> bool:
+        del exc_type, exc_value, traceback
+        self.events.append("exit")
+        raise self.error
+
+
 def _checkpoint_module() -> ModuleType:
     return importlib.import_module("repotrial.agent.checkpoint")
 
@@ -597,6 +623,104 @@ def test_postgres_setup_cancellation_closes_context_without_translation(
         with pytest.raises(asyncio.CancelledError, match="setup cancellation"):
             async with module.build_checkpointer("postgresql://db.invalid/repotrial"):
                 raise AssertionError("cancelled setup must not yield")
+
+    asyncio.run(exercise())
+    assert events == ["factory", "enter", "setup", "exit"]
+
+
+def test_postgres_setup_and_cleanup_failures_leave_credentials_out_of_boundary_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _checkpoint_module()
+    username_sentinel = "M6_EXIT_USER"
+    password_sentinel = "M6_EXIT_PASSWORD"
+    database_url = (
+        f"postgresql://{username_sentinel}:{password_sentinel}@db.invalid/repotrial"
+    )
+    setup_error = RuntimeError(f"setup failed for {database_url}")
+    exit_error = RuntimeError(f"cleanup failed for {database_url}")
+    events: list[str] = []
+    saver = _FakeAsyncSaver(events, setup_error=setup_error)
+
+    def factory(accepted_url: str, *, serde: SerializerProtocol) -> _ExitFailingContext:
+        del accepted_url, serde
+        events.append("factory")
+        return _ExitFailingContext(events, saver, exit_error)
+
+    monkeypatch.setattr(
+        module.AsyncPostgresSaver,
+        "from_conn_string",
+        staticmethod(factory),
+    )
+
+    async def exercise() -> None:
+        with pytest.raises(Exception) as raised:
+            async with module.build_checkpointer(database_url):
+                raise AssertionError("failed setup must not yield")
+        _assert_credential_safe_initialization_error(
+            raised.value,
+            database_url=database_url,
+            username_sentinel=username_sentinel,
+            password_sentinel=password_sentinel,
+        )
+
+    asyncio.run(exercise())
+    assert events == ["factory", "enter", "setup", "exit"]
+
+
+def test_postgres_setup_cancellation_survives_non_cancellation_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _checkpoint_module()
+    events: list[str] = []
+    setup_cancellation = asyncio.CancelledError("setup cancellation")
+    saver = _FakeAsyncSaver(events, setup_error=setup_cancellation)
+
+    def factory(accepted_url: str, *, serde: SerializerProtocol) -> _ExitFailingContext:
+        del accepted_url, serde
+        events.append("factory")
+        return _ExitFailingContext(events, saver, RuntimeError("cleanup failed"))
+
+    monkeypatch.setattr(
+        module.AsyncPostgresSaver,
+        "from_conn_string",
+        staticmethod(factory),
+    )
+
+    async def exercise() -> None:
+        with pytest.raises(asyncio.CancelledError) as raised:
+            async with module.build_checkpointer("postgresql://db.invalid/repotrial"):
+                raise AssertionError("cancelled setup must not yield")
+        assert raised.value is setup_cancellation
+
+    asyncio.run(exercise())
+    assert events == ["factory", "enter", "setup", "exit"]
+
+
+def test_postgres_cleanup_cancellation_propagates_without_translation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _checkpoint_module()
+    events: list[str] = []
+    saver = _FakeAsyncSaver(events, setup_error=RuntimeError("setup failed"))
+    cleanup_cancellation = asyncio.CancelledError("cleanup cancellation")
+
+    def factory(accepted_url: str, *, serde: SerializerProtocol) -> _ExitFailingContext:
+        del accepted_url, serde
+        events.append("factory")
+        return _ExitFailingContext(events, saver, cleanup_cancellation)
+
+    monkeypatch.setattr(
+        module.AsyncPostgresSaver,
+        "from_conn_string",
+        staticmethod(factory),
+    )
+
+    async def exercise() -> None:
+        with pytest.raises(asyncio.CancelledError) as raised:
+            async with module.build_checkpointer("postgresql://db.invalid/repotrial"):
+                raise AssertionError("failed setup must not yield")
+        assert raised.value is cleanup_cancellation
 
     asyncio.run(exercise())
     assert events == ["factory", "enter", "setup", "exit"]

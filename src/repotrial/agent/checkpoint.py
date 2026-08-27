@@ -98,6 +98,16 @@ def build_memory_checkpointer() -> InMemorySaver:
     return InMemorySaver(serde=_build_serializer())
 
 
+async def _close_after_setup_failure(exit_stack: AsyncExitStack) -> None:
+    try:
+        await exit_stack.aclose()
+    except asyncio.CancelledError:
+        raise
+    # A cleanup failure cannot replace the setup failure at this adapter boundary.
+    except Exception:  # noqa: BLE001
+        return
+
+
 @asynccontextmanager
 async def _managed_checkpointer(
     database_url: str | None,
@@ -138,11 +148,11 @@ async def _managed_checkpointer(
     try:
         await saver.setup()
     except asyncio.CancelledError:
-        await exit_stack.aclose()
+        await _close_after_setup_failure(exit_stack)
         raise
     # This adapter boundary must translate every non-cancellation backend failure.
     except Exception:  # noqa: BLE001
-        await exit_stack.aclose()
+        await _close_after_setup_failure(exit_stack)
         initialization_error = CheckpointInitializationError()
     else:
         initialization_error = None
