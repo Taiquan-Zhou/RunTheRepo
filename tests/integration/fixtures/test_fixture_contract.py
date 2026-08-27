@@ -18,6 +18,8 @@ from repotrial.domain.models import Journey
 FIXTURE_DIR = Path(__file__).parents[2] / "fixtures" / "app"
 PROJECT_ROOT = Path(__file__).parents[3]
 READINESS_TIMEOUT_S = 5.0
+READINESS_POLL_INTERVAL_S = 0.02
+READINESS_PROBE_TIMEOUT_S = READINESS_POLL_INTERVAL_S
 
 
 @dataclass(frozen=True)
@@ -38,7 +40,11 @@ def _random_local_port() -> int:
 
 
 def _http_request(
-    url: str, *, method: str = "GET", payload: dict[str, str] | None = None
+    url: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, str] | None = None,
+    timeout_s: float = 1.0,
 ) -> tuple[int, bytes]:
     data = None if payload is None else json.dumps(payload).encode()
     request = Request(
@@ -48,7 +54,7 @@ def _http_request(
         method=method,
     )
     try:
-        with urlopen(request, timeout=1) as response:
+        with urlopen(request, timeout=timeout_s) as response:
             return response.status, response.read()
     except HTTPError as error:
         return error.code, error.read()
@@ -66,13 +72,15 @@ def _wait_for_ready(server: FixtureServer) -> float:
             )
             pytest.fail(f"fixture exited before readiness: {output}")
         try:
-            status, body = _http_request(f"{server.base_url}/health")
+            status, body = _http_request(
+                f"{server.base_url}/health", timeout_s=READINESS_PROBE_TIMEOUT_S
+            )
         except OSError:
-            time.sleep(0.02)
+            time.sleep(READINESS_POLL_INTERVAL_S)
             continue
         if status == 200 and body == b'{"status":"ok"}':
             return time.monotonic() - started
-        time.sleep(0.02)
+        time.sleep(READINESS_POLL_INTERVAL_S)
     pytest.fail("fixture did not become ready before the bounded deadline")
 
 
@@ -264,6 +272,47 @@ def test_fixture_applies_non_negative_startup_delay(tmp_path: Path) -> None:
 
     assert zero_delay_readiness_s is not None
     assert delayed_readiness_s is not None
+    assert delayed_readiness_s >= zero_delay_readiness_s + 0.25
+
+
+def test_readiness_probe_preserves_startup_delay_with_controlled_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ControlledClock:
+        def __init__(self) -> None:
+            self.elapsed_s = 0.0
+
+        def monotonic(self) -> float:
+            return self.elapsed_s
+
+        def sleep(self, seconds: float) -> None:
+            self.elapsed_s += seconds
+
+    class RunningProcess:
+        def poll(self) -> None:
+            return None
+
+    clock = ControlledClock()
+    ready_at_s_by_port = {41001: 0.0, 41002: 0.5}
+
+    def controlled_probe(url: str, *, timeout_s: float = 1.0) -> tuple[int, bytes]:
+        clock.elapsed_s += timeout_s
+        port = int(url.rsplit(":", maxsplit=1)[1].split("/", maxsplit=1)[0])
+        if clock.elapsed_s >= ready_at_s_by_port[port]:
+            return 200, b'{"status":"ok"}'
+        raise OSError("fixture is not ready")
+
+    def readiness_elapsed_s(port: int) -> float:
+        clock.elapsed_s = 0.0
+        return _wait_for_ready(FixtureServer(port=port, process=RunningProcess()))
+
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(time, "sleep", clock.sleep)
+    monkeypatch.setattr(sys.modules[__name__], "_http_request", controlled_probe)
+
+    zero_delay_readiness_s = readiness_elapsed_s(41001)
+    delayed_readiness_s = readiness_elapsed_s(41002)
+
     assert delayed_readiness_s >= zero_delay_readiness_s + 0.25
 
 
