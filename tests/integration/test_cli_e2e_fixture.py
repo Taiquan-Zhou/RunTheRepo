@@ -12,7 +12,10 @@ from pydantic import BaseModel
 from typer.testing import CliRunner
 
 from repotrial import cli
+from repotrial.agent.state import GraphState
 from repotrial.cli import create_app
+from repotrial.domain.enums import ExperimentVerdict, MutationType, Verdict
+from repotrial.domain.models import ExperimentRecord, JourneyResult, Mutation, RunState
 from repotrial.models.base import RecoveryAction
 from repotrial.sandbox.base import ExecResult
 from repotrial.sandbox.fake import FakeSandboxProvider
@@ -221,15 +224,26 @@ def test_inspect_runs_local_git_fixture_to_a_report_and_cleans_up(
     run_path = artifacts_root / FIXED_RUN_ID
     report_path = run_path / "report" / "trial-report.json"
     report = json.loads(report_path.read_text(encoding="utf-8"))
+    source_head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=source, text=True
+    ).strip()
+    workspace = run_path / "workspace"
     assert result.exit_code == 0, result.output
-    assert (run_path / "workspace" / "compose.yaml").is_file()
+    assert (workspace / ".git").is_dir()
     assert (
-        report["identity"]["commit_sha"]
-        == subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=source, text=True
+        subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=workspace, text=True
         ).strip()
+        == source_head
     )
-    assert report["artifacts"]["experiment_overlays"]
+    assert report["identity"]["commit_sha"] == source_head
+    assert (workspace / "compose.yaml").is_file()
+    overlays = report["artifacts"]["experiment_overlays"]
+    assert overlays
+    for overlay in overlays:
+        overlay_path = (workspace / overlay).resolve(strict=True)
+        assert overlay_path.is_relative_to(workspace.resolve())
+        assert overlay_path.is_file()
     assert (run_path / "report" / "trial-report.html").is_file()
     assert list((run_path / "evidence").rglob("*.json"))
     assert any(call[0] == "create" for call in provider.calls)
@@ -321,3 +335,132 @@ def test_inspect_returns_internal_error_when_report_rendering_fails(
         )
 
     assert result.exit_code == 4, result.output
+
+
+def test_inspect_returns_unsupported_for_an_unsupported_baseline_journey(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = create_fixture_repo(tmp_path)
+    artifacts_root = tmp_path / "artifacts"
+
+    async def unsupported_baseline(
+        graph: object, state: RunState, *, context: object
+    ) -> GraphState:
+        del graph, context
+        return GraphState(
+            run=state.model_copy(
+                update={
+                    "baseline_journey_results": [
+                        JourneyResult(
+                            journey_id="unsupported-baseline",
+                            verdict=Verdict.UNSUPPORTED,
+                            passed_steps=0,
+                            total_steps=1,
+                        )
+                    ],
+                    "stop_reason": "insufficient_coverage",
+                }
+            )
+        )
+
+    monkeypatch.setattr(cli, "ainvoke_run", unsupported_baseline)
+    result = CliRunner().invoke(
+        make_app(artifacts_root, FixtureProvider()),
+        ["inspect", str(source), "--provider", "fake", "--max-experiments", "8"],
+    )
+
+    assert result.exit_code == 2, result.output
+
+
+def test_inspect_returns_unsupported_for_an_unsupported_experiment_journey(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = create_fixture_repo(tmp_path)
+    artifacts_root = tmp_path / "artifacts"
+
+    async def unsupported_experiment(
+        graph: object, state: RunState, *, context: object
+    ) -> GraphState:
+        del graph, context
+        return GraphState(
+            run=state.model_copy(
+                update={
+                    "baseline_journey_results": [
+                        JourneyResult(
+                            journey_id="baseline",
+                            verdict=Verdict.PASS,
+                            passed_steps=1,
+                            total_steps=1,
+                        )
+                    ],
+                    "experiments": [
+                        ExperimentRecord(
+                            experiment_id="unsupported-experiment",
+                            parent_config_hash="sha256:parent",
+                            candidate_config_hash="sha256:candidate",
+                            mutation=Mutation(
+                                mutation_id="policy:set_non_root:web",
+                                type=MutationType.SET_NON_ROOT,
+                                service="web",
+                            ),
+                            boot=Verdict.PASS,
+                            journeys=[
+                                JourneyResult(
+                                    journey_id="unsupported-experiment",
+                                    verdict=Verdict.UNSUPPORTED,
+                                    passed_steps=0,
+                                    total_steps=1,
+                                )
+                            ],
+                            verdict=ExperimentVerdict.STOP,
+                            reason="journey_unsupported",
+                        )
+                    ],
+                    "stop_reason": "experiment:journey_unsupported",
+                }
+            )
+        )
+
+    monkeypatch.setattr(cli, "ainvoke_run", unsupported_experiment)
+    result = CliRunner().invoke(
+        make_app(artifacts_root, FixtureProvider()),
+        ["inspect", str(source), "--provider", "fake", "--max-experiments", "8"],
+    )
+
+    assert result.exit_code == 2, result.output
+
+
+def test_inspect_rejects_uninjected_fake_provider_before_artifacts(
+    tmp_path: Path,
+) -> None:
+    source = create_fixture_repo(tmp_path)
+    artifacts_root = tmp_path / "artifacts"
+
+    result = CliRunner().invoke(
+        create_app(artifacts_root=artifacts_root, run_id_generator=fixed_run_id),
+        ["inspect", str(source), "--provider", "fake", "--max-experiments", "8"],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "--provider fake is unavailable without test injection" in result.output
+    assert not artifacts_root.exists()
+
+
+def test_inspect_returns_internal_error_when_run_layout_creation_fails(
+    tmp_path: Path,
+) -> None:
+    source = create_fixture_repo(tmp_path)
+    artifacts_root = tmp_path / "artifacts"
+    (artifacts_root / FIXED_RUN_ID).mkdir(parents=True)
+    provider = FixtureProvider()
+
+    result = CliRunner().invoke(
+        make_app(artifacts_root, provider),
+        ["inspect", str(source), "--provider", "fake", "--max-experiments", "8"],
+    )
+
+    assert result.exit_code == 4, result.output
+    assert "inspect failed: FileExistsError" in result.output
+    assert provider.calls == []

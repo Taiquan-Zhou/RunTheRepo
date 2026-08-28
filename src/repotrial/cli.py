@@ -70,13 +70,18 @@ def create_app(
                 f"--max-experiments must be {_FROZEN_MAX_EXPERIMENTS}"
             )
         selected_provider = _validate_provider(provider)
+        if selected_provider == "fake" and provider_factory is None:
+            typer.echo(
+                "--provider fake is unavailable without test injection", err=True
+            )
+            raise typer.Exit(2)
         repository_pinner = _repository_pinner_for(url)
 
-        run_id, run_path = create_run_layout(artifacts_root, run_id_generator)
-        workspace = run_path / "workspace"
-        typer.echo(f"run_id={run_id}")
-        typer.echo(f"artifact_path={run_path}")
         try:
+            run_id, run_path = create_run_layout(artifacts_root, run_id_generator)
+            workspace = run_path / "workspace"
+            typer.echo(f"run_id={run_id}")
+            typer.echo(f"artifact_path={run_path}")
             result = asyncio.run(
                 ainvoke_run(
                     build_run_graph(),
@@ -174,6 +179,14 @@ def _local_repository_pinner(source: Path) -> RepositoryPinner:
 def _exit_code(run: RunState) -> int:
     if run.stop_reason == "boot_unsupported" or any(
         record.boot is Verdict.UNSUPPORTED for record in run.experiments
+    ):
+        return 2
+    if any(
+        result.verdict is Verdict.UNSUPPORTED for result in run.baseline_journey_results
+    ) or any(
+        result.verdict is Verdict.UNSUPPORTED
+        for record in run.experiments
+        for result in record.journeys
     ):
         return 2
     baseline_passed = bool(run.baseline_journey_results) and all(
