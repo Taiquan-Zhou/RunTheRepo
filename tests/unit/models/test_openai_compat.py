@@ -2,7 +2,7 @@ import asyncio
 import json
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from types import TracebackType
 from typing import Self
 
@@ -300,27 +300,39 @@ def test_chunked_response_over_limit_stops_before_the_full_body_is_consumed() ->
     assert sent_chunks < chunks
 
 
-def test_transport_failure_completes_zero_requests_without_a_fallback() -> None:
-    reserved = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    reserved.bind(("127.0.0.1", 0))
-    port = reserved.getsockname()[1]
-    reserved.close()
-    adapter = OpenAICompatibleModelAdapter(f"http://127.0.0.1:{port}/v1", "model")
+def test_transport_failure_makes_exactly_one_request_attempt() -> None:
+    attempts = _RequestAttempts()
 
-    with pytest.raises(ModelAdapterError, match="model request failed"):
-        asyncio.run(adapter.structured(system="system", user="user", schema=_Answer))
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            attempts.add()
+            self.connection.shutdown(socket.SHUT_RDWR)
+            self.connection.close()
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    with _temporary_server(Handler) as server:
+        adapter = OpenAICompatibleModelAdapter(f"{server}/v1", "model")
+
+        with pytest.raises(ModelAdapterError, match="model request failed"):
+            asyncio.run(
+                adapter.structured(system="system", user="user", schema=_Answer)
+            )
+
+        assert attempts.value == 1
 
 
 def test_timeout_does_not_trigger_a_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    request_seen = Event()
+    attempts = _RequestAttempts()
     release_server = Event()
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
-            request_seen.set()
-            release_server.wait(timeout=1)
+            attempts.add()
+            release_server.wait()
 
         def log_message(self, format: str, *args: object) -> None:
             del format, args
@@ -333,9 +345,23 @@ def test_timeout_does_not_trigger_a_fallback(
             asyncio.run(
                 adapter.structured(system="system", user="user", schema=_Answer)
             )
+        release_server.set()
+        assert attempts.value == 1
 
-    release_server.set()
-    assert request_seen.is_set()
+
+class _RequestAttempts:
+    def __init__(self) -> None:
+        self._count = 0
+        self._lock = Lock()
+
+    def add(self) -> None:
+        with self._lock:
+            self._count += 1
+
+    @property
+    def value(self) -> int:
+        with self._lock:
+            return self._count
 
 
 class _TemporaryServer:
