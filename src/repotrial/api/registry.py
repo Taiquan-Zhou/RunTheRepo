@@ -154,8 +154,8 @@ class PostgresRunRegistry:
                 )
         except asyncio.CancelledError:
             raise
-        except Exception as error:  # pragma: no cover - driver boundary
-            raise RegistryUnavailableError() from error
+        except (OSError, PsycopgError, RuntimeError, TypeError, ValueError):
+            raise RegistryUnavailableError() from None
 
     async def health(self) -> bool:
         try:
@@ -203,8 +203,8 @@ class PostgresRunRegistry:
                 row = cast(tuple[object, ...] | None, await cursor.fetchone())
         except asyncio.CancelledError:
             raise
-        except Exception as error:  # pragma: no cover - driver boundary
-            raise RegistryUnavailableError() from error
+        except (OSError, PsycopgError, RuntimeError, TypeError, ValueError):
+            raise RegistryUnavailableError() from None
         return None if row is None else _record_from_row(row)
 
     async def complete(
@@ -236,8 +236,8 @@ class PostgresRunRegistry:
                 await cursor.execute(statement, parameters)
         except asyncio.CancelledError:
             raise
-        except Exception as error:  # pragma: no cover - driver boundary
-            raise RegistryUnavailableError() from error
+        except (OSError, PsycopgError, RuntimeError, TypeError, ValueError):
+            raise RegistryUnavailableError() from None
 
     async def _fetch_one(
         self, statement: str, parameters: tuple[object, ...]
@@ -251,8 +251,8 @@ class PostgresRunRegistry:
                 row = cast(tuple[object, ...] | None, await cursor.fetchone())
         except asyncio.CancelledError:
             raise
-        except Exception as error:  # pragma: no cover - driver boundary
-            raise RegistryUnavailableError() from error
+        except (OSError, PsycopgError, RuntimeError, TypeError, ValueError):
+            raise RegistryUnavailableError() from None
         if row is None:
             raise RegistryUnavailableError()
         return _record_from_row(row)

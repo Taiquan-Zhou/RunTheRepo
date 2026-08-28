@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Request, status
-from fastapi.responses import FileResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from repotrial.agent.checkpoint import build_checkpointer
@@ -19,10 +20,7 @@ from repotrial.config import generate_run_id
 from repotrial.domain.models import RunState
 from repotrial.intake.github import RepoIntakeError, parse_github_url, pin_repository
 from repotrial.models.base import ModelAdapter
-from repotrial.models.openai_compat import (
-    ModelAdapterError,
-    OpenAICompatibleModelAdapter,
-)
+from repotrial.models.openai_compat import OpenAICompatibleModelAdapter
 from repotrial.report.render import TrialReportPaths, render_trial_report
 from repotrial.run_outcome import TerminalOutcome, classify_terminal_outcome
 from repotrial.sandbox.base import SandboxProvider
@@ -54,7 +52,7 @@ type ReportRenderer = Callable[[RunState, Path], TrialReportPaths]
 
 
 class RunRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    model_config = ConfigDict(extra="forbid")
 
     repo_url: Annotated[str, Field(min_length=1, max_length=_MAX_REPO_URL_LENGTH)]
     model_endpoint: Annotated[
@@ -141,6 +139,31 @@ def create_app(
 
     app = FastAPI(lifespan=lifespan)
 
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(
+        _request: Request, _error: RequestValidationError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": "invalid_request"},
+        )
+
+    @app.exception_handler(Exception)
+    async def internal_error(request: Request, _error: Exception) -> JSONResponse:
+        run_id = getattr(request.state, "run_id", None)
+        if isinstance(run_id, str):
+            await _complete_safely(
+                selected_registry, run_id, RunLifecycle.INTERNAL_ERROR
+            )
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={"detail": {"run_id": run_id, "outcome": "internal_error"}},
+            )
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": "internal_error"},
+        )
+
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         if app.state.services.graph is None or not await _registry_healthy(
@@ -150,11 +173,12 @@ def create_app(
         return {"status": "ok"}
 
     @app.post("/runs", status_code=status.HTTP_201_CREATED, response_model=RunResponse)
-    async def create_run(request: RunRequest) -> RunResponse:
+    async def create_run(request: RunRequest, raw_request: Request) -> RunResponse:
         services: _Services = app.state.services
         if services.graph is None or not await _registry_healthy(selected_registry):
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
         run_id = run_id_generator()
+        raw_request.state.run_id = run_id
         try:
             await selected_registry.create_running(run_id, request.repo_url)
         except asyncio.CancelledError:
@@ -185,6 +209,11 @@ def create_app(
                 commit_sha=final_state.commit_sha,
                 report_available=True,
             )
+            if classified.outcome is TerminalOutcome.EXECUTION_UNSUPPORTED:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={"run_id": run_id, "outcome": "execution_unsupported"},
+                )
             return RunResponse(run_id=run_id, outcome=classified.outcome.value)
         except asyncio.CancelledError:
             raise
@@ -193,21 +222,6 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"run_id": run_id, "outcome": "execution_unsupported"},
-            ) from None
-        except (
-            ModelAdapterError,
-            OSError,
-            RepoIntakeError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-        ):
-            await _complete_safely(
-                selected_registry, run_id, RunLifecycle.INTERNAL_ERROR
-            )
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail={"run_id": run_id, "outcome": "internal_error"},
             ) from None
 
     @app.get("/runs/{run_id}", response_model=RunMetadata)
@@ -284,7 +298,7 @@ def _graph_context(
 def _create_run_layout(artifacts_root: Path, run_id: str) -> Path:
     run_path = artifacts_root / run_id
     run_path.mkdir(parents=True, exist_ok=False)
-    for name in ("evidence", "experiments", "report", "workspace"):
+    for name in ("evidence", "experiments", "report"):
         (run_path / name).mkdir()
     return run_path
 
@@ -332,20 +346,39 @@ def _lifecycle_for(outcome: TerminalOutcome) -> RunLifecycle:
 
 
 def _representation(accept: str | None) -> str | None:
-    if accept is None or "*/*" in accept or "application/json" in accept:
+    if accept is None:
         return "trial-report.json"
-    if "text/html" in accept:
-        return "trial-report.html"
+    for item in accept.split(","):
+        parts = [part.strip() for part in item.split(";")]
+        media_type = parts[0].lower()
+        if not media_type or any(part.lower() == "q=0" for part in parts[1:]):
+            continue
+        if media_type in {"*/*", "application/json"}:
+            return "trial-report.json"
+        if media_type == "text/html":
+            return "trial-report.html"
     return None
 
 
 def _safe_regular_file(path: Path, artifacts_root: Path) -> bool:
     try:
         root = artifacts_root.resolve(strict=True)
-        candidate = path.resolve(strict=True)
-        mode = path.lstat().st_mode
-    except OSError:
+        relative = path.relative_to(root)
+        if len(relative.parts) != 3:
+            return False
+        current = root
+        for component in relative.parts:
+            current = current / component
+            metadata = current.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+                return False
+        mode = current.lstat().st_mode
+    except (OSError, ValueError):
         return False
-    return (
-        candidate.is_relative_to(root) and stat.S_ISREG(mode) and not path.is_symlink()
+    return stat.S_ISREG(mode)
+
+
+def _is_reparse_point(metadata: os.stat_result) -> bool:
+    return bool(
+        metadata.st_file_attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     )
