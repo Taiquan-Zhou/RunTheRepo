@@ -9,11 +9,15 @@ import pytest
 
 from repotrial.sandbox.base import ExecResult, NetworkLogResult
 from repotrial.sandbox.docker_sbx import (
+    DOCKER_FLOOR_MB,
     MANDATORY_DENY_NETWORK,
+    ROOT_FLOOR_MB,
+    WORKSPACE_FLOOR_MB,
     DockerSbxError,
     DockerSbxPolicy,
     DockerSbxProvider,
     DockerSbxUnsupportedError,
+    calculate_disk_allocation,
 )
 from repotrial.sandbox.fake import FakeSandboxProvider
 from repotrial.sandbox.lifecycle import CleanupError, managed_sandbox
@@ -25,7 +29,6 @@ CREATE_FLAGS = (
     "--memory",
     "--deny-network",
     "--pids-limit",
-    "--disk-limit",
     "--total-duration",
 )
 HELP_OUTPUTS = {
@@ -235,6 +238,54 @@ def test_policy_is_immutable_and_mandatory_denies_cannot_be_removed() -> None:
         policy.memory_mb = 1024
 
 
+@pytest.mark.parametrize(
+    ("disk_mb", "expected_docker_mb"),
+    [(7, 1), (8, 2), (2048, 2042), (4096, 4090)],
+)
+def test_disk_allocation_preserves_budget_and_uses_calibrated_floors(
+    disk_mb: int, expected_docker_mb: int
+) -> None:
+    allocation = calculate_disk_allocation(disk_mb)
+
+    assert ROOT_FLOOR_MB == 1
+    assert DOCKER_FLOOR_MB == 1
+    assert WORKSPACE_FLOOR_MB == 5
+    assert allocation.root_mb == 1
+    assert allocation.docker_mb == expected_docker_mb
+    assert allocation.workspace_mb == 5
+    assert (
+        allocation.root_mb + allocation.docker_mb + allocation.workspace_mb == disk_mb
+    )
+
+
+def test_disk_allocation_rejects_budget_below_calibrated_floors() -> None:
+    with pytest.raises(DockerSbxUnsupportedError, match="disk_budget_insufficient"):
+        calculate_disk_allocation(
+            ROOT_FLOOR_MB + WORKSPACE_FLOOR_MB + DOCKER_FLOOR_MB - 1
+        )
+
+
+def test_insufficient_disk_budget_fails_before_any_sbx_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawner)
+    provider = DockerSbxProvider(
+        DockerSbxPolicy(
+            cpus=1,
+            memory_mb=512,
+            pids_limit=64,
+            disk_mb=6,
+            total_duration_s=300,
+        )
+    )
+
+    with pytest.raises(DockerSbxUnsupportedError, match="disk_budget_insufficient"):
+        _create(provider, tmp_path)
+
+    assert spawner.calls == []
+
+
 @pytest.mark.parametrize("bad_resource", ["", "two hosts", "line\nbreak"])
 def test_policy_rejects_ambiguous_network_deny_resources(bad_resource: str) -> None:
     with pytest.raises(ValueError, match="deny_network"):
@@ -399,6 +450,14 @@ def test_complete_help_tokens_cannot_attest_runtime_policy_enforcement(
 def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    disk_keys = {
+        "DOCKER_SANDBOXES_ROOT_SIZE",
+        "DOCKER_SANDBOXES_DOCKER_SIZE",
+        "DOCKER_SANDBOXES_CLONED_WORKSPACE_SIZE",
+    }
+    for key in disk_keys:
+        monkeypatch.setenv(key, "host-value-must-not-leak")
+    monkeypatch.setenv("REPOTRIAL_TEST_SENTINEL", "preserved")
     spawner = _SbxSpawner()
     provider = _provider(monkeypatch, spawner)
 
@@ -417,8 +476,6 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
         "512m",
         "--pids-limit",
         "64",
-        "--disk-limit",
-        "2048m",
         "--total-duration",
         "300s",
     ]
@@ -428,6 +485,27 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
     assert _actual_create_call(spawner) == tuple(expected)
     assert sandbox_id.startswith("repotrial-trial-")
     assert all("shell" not in kwargs for kwargs in spawner.kwargs)
+    create_index = next(
+        index
+        for index, call in enumerate(spawner.calls)
+        if call[:2] == ("sbx", "create") and call[-1] != "--help"
+    )
+    create_env = cast(dict[str, str], spawner.kwargs[create_index].get("env"))
+    assert create_env["DOCKER_SANDBOXES_ROOT_SIZE"] == "1m"
+    assert create_env["DOCKER_SANDBOXES_DOCKER_SIZE"] == "2042m"
+    assert create_env["DOCKER_SANDBOXES_CLONED_WORKSPACE_SIZE"] == "5m"
+    assert create_env["REPOTRIAL_TEST_SENTINEL"] == "preserved"
+    for index, kwargs in enumerate(spawner.kwargs):
+        if index == create_index:
+            continue
+        environment = cast(dict[str, str], kwargs.get("env"))
+        assert environment["REPOTRIAL_TEST_SENTINEL"] == "preserved"
+        assert disk_keys.isdisjoint(environment)
+    assert not any(
+        call[:2] == ("sbx", "exec")
+        and any("df -B1 -P" in argument for argument in call)
+        for call in spawner.calls
+    )
 
 
 def test_optional_network_log_probe_does_not_weaken_create_gate(
@@ -1147,7 +1225,7 @@ def test_timeout_kills_and_reaps_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     spawner = _SbxSpawner()
-    provider = _provider(monkeypatch, spawner, command_timeout_s=0.01)
+    provider = _provider(monkeypatch, spawner, command_timeout_s=0.05)
     sandbox_id = _create(provider, tmp_path)
     command = ("sbx", "cp", f"{sandbox_id}:/a", str(tmp_path / "a"))
     spawner.overrides[command] = _Outcome(hang=True)
@@ -1201,7 +1279,7 @@ def test_timeout_exposes_unconfirmed_process_cleanup(
 ) -> None:
     monkeypatch.setattr("repotrial.sandbox.docker_sbx.REAP_TIMEOUT_SECONDS", 0.01)
     spawner = _SbxSpawner()
-    provider = _provider(monkeypatch, spawner, command_timeout_s=0.01)
+    provider = _provider(monkeypatch, spawner, command_timeout_s=0.05)
     sandbox_id = _create(provider, tmp_path)
     command = ("sbx", "cp", f"{sandbox_id}:/a", str(tmp_path / "a"))
     spawner.overrides[command] = outcome

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import math
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -21,6 +22,18 @@ MAX_OUTPUT_BYTES = 65_536
 MAX_NETWORK_EVENTS = 100
 REAP_TIMEOUT_SECONDS = 5
 _TRUNCATION_MARKER = b"\n...[truncated]"
+# Calibrated against Docker Sandboxes v0.39.0 on Windows. Root and Docker
+# filesystems work at the smallest positive integer MiB policy value. The
+# cloned-workspace floor is the smallest value that clones this trusted fixture
+# without warnings and passes git fsck with positive free capacity.
+ROOT_FLOOR_MB = 1
+DOCKER_FLOOR_MB = 1
+WORKSPACE_FLOOR_MB = 5
+_DISK_SIZE_ENVIRONMENT_VARIABLES = (
+    "DOCKER_SANDBOXES_ROOT_SIZE",
+    "DOCKER_SANDBOXES_DOCKER_SIZE",
+    "DOCKER_SANDBOXES_CLONED_WORKSPACE_SIZE",
+)
 _CREATE_FLAGS = (
     "--name",
     "--clone",
@@ -28,7 +41,6 @@ _CREATE_FLAGS = (
     "--memory",
     "--deny-network",
     "--pids-limit",
-    "--disk-limit",
     "--total-duration",
 )
 _PORT_KEYS = {"host_ip", "host_port", "sandbox_port", "protocol"}
@@ -115,6 +127,27 @@ class DockerSbxError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class DiskAllocation:
+    root_mb: int
+    docker_mb: int
+    workspace_mb: int
+
+
+def calculate_disk_allocation(disk_mb: int) -> DiskAllocation:
+    """Allocate the policy disk budget across Docker Sandboxes filesystems."""
+    if isinstance(disk_mb, bool) or not isinstance(disk_mb, int) or disk_mb <= 0:
+        raise ValueError("disk_mb must be a positive integer")
+    docker_mb = disk_mb - ROOT_FLOOR_MB - WORKSPACE_FLOOR_MB
+    if docker_mb < DOCKER_FLOOR_MB:
+        raise DockerSbxUnsupportedError("disk_budget_insufficient")
+    return DiskAllocation(
+        root_mb=ROOT_FLOOR_MB,
+        docker_mb=docker_mb,
+        workspace_mb=WORKSPACE_FLOOR_MB,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class DockerSbxPolicy:
     """Immutable resource and network limits applied to every new sandbox."""
 
@@ -186,10 +219,12 @@ class DockerSbxProvider(SandboxProvider):
             raise ValueError("command_timeout_s must be positive and finite")
         self._policy = policy
         self._command_timeout_s = float(command_timeout_s)
+        self._subprocess_environment = _sanitized_environment()
         self._sandbox_states: dict[str, _SandboxState] = {}
         self._network_log_sandboxes: set[str] = set()
 
     async def create(self, workspace: Path, name: str) -> str:
+        allocation = calculate_disk_allocation(self._policy.disk_mb)
         network_log_supported = await self._probe()
         self._require_runtime_policy_enforcement()
         sandbox_id = _new_sandbox_id(name)
@@ -205,8 +240,6 @@ class DockerSbxProvider(SandboxProvider):
             f"{self._policy.memory_mb}m",
             "--pids-limit",
             str(self._policy.pids_limit),
-            "--disk-limit",
-            f"{self._policy.disk_mb}m",
             "--total-duration",
             f"{self._policy.total_duration_s}s",
         ]
@@ -214,7 +247,12 @@ class DockerSbxProvider(SandboxProvider):
             arguments.extend(("--deny-network", resource))
         arguments.extend(("shell", str(workspace)))
         try:
-            result = await self._run("create", arguments, self._command_timeout_s)
+            result = await self._run(
+                "create",
+                arguments,
+                self._command_timeout_s,
+                env=self._disk_environment(allocation),
+            )
             _require_success("create", result)
         except (DockerSbxError, asyncio.CancelledError) as error:
             await self._cleanup_after_uncertain_failure(
@@ -231,6 +269,19 @@ class DockerSbxProvider(SandboxProvider):
         raise DockerSbxUnsupportedError(
             "runtime_policy_enforcement_unproven:pids,disk,total_duration"
         )
+
+    def _disk_environment(self, allocation: DiskAllocation) -> dict[str, str]:
+        environment = self._subprocess_environment.copy()
+        environment.update(
+            {
+                "DOCKER_SANDBOXES_ROOT_SIZE": f"{allocation.root_mb}m",
+                "DOCKER_SANDBOXES_DOCKER_SIZE": f"{allocation.docker_mb}m",
+                "DOCKER_SANDBOXES_CLONED_WORKSPACE_SIZE": (
+                    f"{allocation.workspace_mb}m"
+                ),
+            }
+        )
+        return environment
 
     async def exec(
         self, sandbox_id: str, argv: list[str], timeout_s: int = 60
@@ -454,17 +505,26 @@ class DockerSbxProvider(SandboxProvider):
             ) from error
 
     async def _run(
-        self, operation: str, arguments: list[str], timeout_s: float
+        self,
+        operation: str,
+        arguments: list[str],
+        timeout_s: float,
+        *,
+        env: dict[str, str] | None = None,
     ) -> _CommandResult:
         process: asyncio.subprocess.Process | None = None
         try:
             async with asyncio.timeout(timeout_s):
+                spawn_kwargs: dict[str, Any] = {
+                    "stdin": asyncio.subprocess.DEVNULL,
+                    "stdout": asyncio.subprocess.PIPE,
+                    "stderr": asyncio.subprocess.PIPE,
+                    "env": env if env is not None else self._subprocess_environment,
+                }
                 process = await asyncio.create_subprocess_exec(
                     "sbx",
                     *arguments,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    **spawn_kwargs,
                 )
                 if process.stdout is None or process.stderr is None:
                     raise OSError("sbx pipes unavailable")
@@ -606,6 +666,13 @@ def _has_token(output: bytes, token: str) -> bool:
 
 def _format_cpus(cpus: float) -> str:
     return str(int(cpus)) if float(cpus).is_integer() else str(cpus)
+
+
+def _sanitized_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for variable in _DISK_SIZE_ENVIRONMENT_VARIABLES:
+        environment.pop(variable, None)
+    return environment
 
 
 def _new_sandbox_id(name: str) -> str:
