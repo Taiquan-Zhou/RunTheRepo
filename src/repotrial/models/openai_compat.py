@@ -12,16 +12,14 @@ _REQUEST_TIMEOUT: Final = httpx.Timeout(10.0, connect=3.0)
 _MAX_PROMPT_CHARS: Final = 16_384
 _MAX_SCHEMA_BYTES: Final = 65_536
 _MAX_RESPONSE_BYTES: Final = 1_048_576
-_FORBIDDEN_ERROR_DISCRIMINATORS: Final = (
-    "authentication",
-    "model_not_found",
-    "model not found",
-    "rate_limit",
-    "rate limit",
+_GENERIC_REQUEST_ERROR_TYPES: Final = (
+    "invalid_request_error",
+    "bad_request",
+    "request_error",
 )
 
 
-class ModelAdapterError(RuntimeError):
+class ModelAdapterError(TimeoutError):
     """Credential-free failure returned by the OpenAI-compatible boundary."""
 
 
@@ -215,14 +213,8 @@ def _explicitly_unsupported_schema(response: _HttpResponse) -> bool:
     if error is None:
         return False
     message, error_type, error_code, error_param = error
-    if any(
-        _is_forbidden_error_discriminator(value)
-        for value in (error_type, error_code, error_param)
-    ):
-        return False
-    if not any(
-        _is_schema_capability_discriminator(value)
-        for value in (error_code, error_param)
+    if not _has_exclusive_schema_capability_details(
+        error_type, error_code, error_param
     ):
         return False
     lowered = message.lower()
@@ -260,11 +252,22 @@ def _optional_error_field(error: dict[object, object], name: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _is_forbidden_error_discriminator(value: str | None) -> bool:
-    if value is None:
+def _has_exclusive_schema_capability_details(
+    error_type: str | None, error_code: str | None, error_param: str | None
+) -> bool:
+    if error_code is not None and not _is_schema_capability_discriminator(error_code):
         return False
-    lowered = value.lower()
-    return any(marker in lowered for marker in _FORBIDDEN_ERROR_DISCRIMINATORS)
+    if error_param is not None and not _is_schema_capability_discriminator(error_param):
+        return False
+    if error_type is not None and not (
+        _is_schema_capability_discriminator(error_type)
+        or error_type.lower() in _GENERIC_REQUEST_ERROR_TYPES
+    ):
+        return False
+    return any(
+        _is_schema_capability_discriminator(value)
+        for value in (error_code, error_param)
+    )
 
 
 def _is_schema_capability_discriminator(value: str | None) -> bool:

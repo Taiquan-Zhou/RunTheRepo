@@ -2,19 +2,21 @@ import asyncio
 import json
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from threading import Event, Lock, Thread
 from types import TracebackType
 from typing import Self
 
 import httpx
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from repotrial.models import openai_compat
 from repotrial.models.openai_compat import (
     ModelAdapterError,
     OpenAICompatibleModelAdapter,
 )
+from repotrial.trial.planner import plan_journeys, propose_recovery
 
 
 class _Answer(BaseModel):
@@ -146,6 +148,30 @@ def test_explicit_json_schema_unsupported_response_uses_one_json_only_fallback()
     assert "response_format" not in server.requests[1][1]
     fallback_system = server.requests[1][1]["messages"][0]["content"]
     assert "valid JSON" in fallback_system
+
+
+@pytest.mark.parametrize(
+    "code", ["invalid_api_key", "invalid_model", "insufficient_quota"]
+)
+def test_explicit_non_capability_codes_veto_json_only_fallback(code: str) -> None:
+    response = {
+        "error": {
+            "code": code,
+            "param": "response_format",
+            "message": "response_format json_schema unsupported",
+        }
+    }
+    with _ResponseServer(
+        [(400, response), (200, _chat_completion('{"answer":"no"}'))]
+    ) as server:
+        adapter = OpenAICompatibleModelAdapter(server.endpoint, "local-model")
+
+        with pytest.raises(ModelAdapterError, match="model request failed"):
+            asyncio.run(
+                adapter.structured(system="system", user="user", schema=_Answer)
+            )
+
+    assert len(server.requests) == 1
 
 
 def test_auth_failure_does_not_trigger_fallback_or_leak_the_api_key() -> None:
@@ -347,6 +373,165 @@ def test_timeout_does_not_trigger_a_fallback(
             )
         release_server.set()
         assert attempts.value == 1
+
+
+def test_adapter_failure_uses_existing_planner_and_recovery_timeout_boundary(
+    tmp_path: Path,
+) -> None:
+    with _ResponseServer([(500, {"error": {"message": "server failure"}})]) as server:
+        adapter = OpenAICompatibleModelAdapter(server.endpoint, "local-model")
+        journeys = asyncio.run(plan_journeys(tmp_path, "", adapter))
+
+    with _ResponseServer([(500, {"error": {"message": "server failure"}})]) as server:
+        adapter = OpenAICompatibleModelAdapter(server.endpoint, "local-model")
+        recovery = asyncio.run(
+            propose_recovery(
+                {"logs": "unrecognized startup failure"}, "", set(), 0, adapter
+            )
+        )
+
+    assert journeys == []
+    assert recovery.action == "stop"
+    assert recovery.reason == "model timeout"
+
+
+def test_oversized_prompts_and_schema_are_rejected_before_network() -> None:
+    class _OversizedSchema(BaseModel):
+        answer: str = Field(description="x" * (openai_compat._MAX_SCHEMA_BYTES + 1))
+
+    with _ResponseServer([]) as server:
+        adapter = OpenAICompatibleModelAdapter(server.endpoint, "local-model")
+
+        with pytest.raises(ValueError, match="prompt exceeds size limit"):
+            asyncio.run(
+                adapter.structured(
+                    system="x" * (openai_compat._MAX_PROMPT_CHARS + 1),
+                    user="user",
+                    schema=_Answer,
+                )
+            )
+        with pytest.raises(ValueError, match="prompt exceeds size limit"):
+            asyncio.run(
+                adapter.structured(
+                    system="system",
+                    user="x" * (openai_compat._MAX_PROMPT_CHARS + 1),
+                    schema=_Answer,
+                )
+            )
+        with pytest.raises(ValueError, match="schema exceeds size limit"):
+            asyncio.run(
+                adapter.structured(
+                    system="system", user="user", schema=_OversizedSchema
+                )
+            )
+
+    assert server.requests == []
+
+
+def test_redirect_response_is_not_followed() -> None:
+    target_attempts = _RequestAttempts()
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            target_attempts.add()
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    with _temporary_server(TargetHandler) as target:
+        source_attempts = _RequestAttempts()
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                source_attempts.add()
+                self.send_response(307)
+                self.send_header("Location", f"{target}/redirect-target")
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                del format, args
+
+        with _temporary_server(RedirectHandler) as source:
+            adapter = OpenAICompatibleModelAdapter(f"{source}/v1", "local-model")
+            with pytest.raises(ModelAdapterError, match="model request failed"):
+                asyncio.run(
+                    adapter.structured(system="system", user="user", schema=_Answer)
+                )
+
+    assert source_attempts.value == 1
+    assert target_attempts.value == 0
+
+
+def test_proxy_environment_is_ignored_when_trust_env_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proxy_attempts = _RequestAttempts()
+
+    class ProxyHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            proxy_attempts.add()
+            self.send_response(502)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    with (
+        _temporary_server(ProxyHandler) as proxy,
+        _ResponseServer([(200, _chat_completion('{"answer":"ok"}'))]) as target,
+    ):
+        monkeypatch.setenv("HTTP_PROXY", proxy)
+        monkeypatch.setenv("http_proxy", proxy)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("no_proxy", raising=False)
+        adapter = OpenAICompatibleModelAdapter(target.endpoint, "local-model")
+        result = asyncio.run(
+            adapter.structured(system="system", user="user", schema=_Answer)
+        )
+
+    assert result == _Answer(answer="ok")
+    assert len(target.requests) == 1
+    assert proxy_attempts.value == 0
+
+
+def test_cancelling_real_adapter_request_propagates_and_stops_after_one_attempt() -> (
+    None
+):
+    attempts = _RequestAttempts()
+    request_started = Event()
+    release_server = Event()
+    request_finished = Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            attempts.add()
+            request_started.set()
+            release_server.wait()
+            request_finished.set()
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    async def cancel_request(endpoint: str) -> None:
+        adapter = OpenAICompatibleModelAdapter(f"{endpoint}/v1", "local-model")
+        task = asyncio.create_task(
+            adapter.structured(system="system", user="user", schema=_Answer)
+        )
+        await asyncio.wait_for(asyncio.to_thread(request_started.wait), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    with _temporary_server(Handler) as server:
+        try:
+            asyncio.run(cancel_request(server))
+        finally:
+            release_server.set()
+            assert request_finished.wait(1)
+
+    assert attempts.value == 1
 
 
 class _RequestAttempts:
