@@ -216,6 +216,7 @@ def create_app(
                 )
             return RunResponse(run_id=run_id, outcome=classified.outcome.value)
         except asyncio.CancelledError:
+            await _complete_safely(selected_registry, run_id, RunLifecycle.INTERRUPTED)
             raise
         except DockerSbxUnsupportedError:
             await _complete_safely(selected_registry, run_id, RunLifecycle.UNSUPPORTED)
@@ -359,22 +360,40 @@ def _lifecycle_for(outcome: TerminalOutcome) -> RunLifecycle:
 def _representation(accept: str | None) -> str | None:
     if accept is None:
         return "trial-report.json"
-    choices: list[tuple[float, int, str]] = []
+    ranges: list[tuple[str, float]] = []
     for item in accept.split(","):
         parts = [part.strip() for part in item.split(";")]
         media_type = parts[0].lower()
         quality = _quality(parts[1:])
-        if not media_type or quality is None or quality == 0:
-            continue
-        if media_type == "application/json":
-            choices.append((quality, 2, "trial-report.json"))
-        if media_type == "text/html":
-            choices.append((quality, 2, "trial-report.html"))
-        if media_type == "*/*":
-            choices.append((quality, 1, "trial-report.json"))
+        if not media_type or quality is None:
+            return None
+        ranges.append((media_type, quality))
+    choices: list[tuple[float, int, str]] = []
+    for name, media_type in (
+        ("trial-report.json", "application/json"),
+        ("trial-report.html", "text/html"),
+    ):
+        quality, specificity = _representation_quality(media_type, ranges)
+        if quality > 0:
+            choices.append((quality, specificity, name))
     if not choices:
         return None
     return max(choices, key=lambda value: (value[0], value[1]))[2]
+
+
+def _representation_quality(
+    representation: str, ranges: list[tuple[str, float]]
+) -> tuple[float, int]:
+    matches: list[tuple[float, int]] = []
+    kind, _slash, _subtype = representation.partition("/")
+    for media_type, quality in ranges:
+        if media_type == representation:
+            matches.append((quality, 2))
+        elif media_type == f"{kind}/*":
+            matches.append((quality, 1))
+        elif media_type == "*/*":
+            matches.append((quality, 0))
+    return max(matches, default=(0.0, -1), key=lambda value: value[1])
 
 
 def _quality(parameters: list[str]) -> float | None:

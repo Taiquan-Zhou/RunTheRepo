@@ -7,7 +7,6 @@ from enum import StrEnum
 from typing import Protocol, cast
 
 from psycopg import AsyncConnection
-from psycopg import Error as PsycopgError
 
 
 class RunLifecycle(StrEnum):
@@ -154,7 +153,7 @@ class PostgresRunRegistry:
                 )
         except asyncio.CancelledError:
             raise
-        except (OSError, PsycopgError, RuntimeError, TypeError, ValueError):
+        except Exception:  # noqa: BLE001 - database adapter boundary
             raise RegistryUnavailableError() from None
 
     async def health(self) -> bool:
@@ -167,7 +166,7 @@ class PostgresRunRegistry:
                 return await cursor.fetchone() is not None
         except asyncio.CancelledError:
             raise
-        except (PsycopgError, RegistryUnavailableError):
+        except Exception:  # noqa: BLE001 - database adapter boundary
             return False
 
     async def interrupt_running(self) -> None:
@@ -203,7 +202,7 @@ class PostgresRunRegistry:
                 row = cast(tuple[object, ...] | None, await cursor.fetchone())
         except asyncio.CancelledError:
             raise
-        except (OSError, PsycopgError, RuntimeError, TypeError, ValueError):
+        except Exception:  # noqa: BLE001 - database adapter boundary
             raise RegistryUnavailableError() from None
         return None if row is None else _record_from_row(row)
 
@@ -236,7 +235,7 @@ class PostgresRunRegistry:
                 await cursor.execute(statement, parameters)
         except asyncio.CancelledError:
             raise
-        except (OSError, PsycopgError, RuntimeError, TypeError, ValueError):
+        except Exception:  # noqa: BLE001 - database adapter boundary
             raise RegistryUnavailableError() from None
 
     async def _fetch_one(
@@ -251,7 +250,7 @@ class PostgresRunRegistry:
                 row = cast(tuple[object, ...] | None, await cursor.fetchone())
         except asyncio.CancelledError:
             raise
-        except (OSError, PsycopgError, RuntimeError, TypeError, ValueError):
+        except Exception:  # noqa: BLE001 - database adapter boundary
             raise RegistryUnavailableError() from None
         if row is None:
             raise RegistryUnavailableError()
