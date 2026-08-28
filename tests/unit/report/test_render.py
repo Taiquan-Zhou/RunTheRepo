@@ -145,10 +145,10 @@ def test_renderer_writes_complete_stable_json_and_html_snapshot(tmp_path: Path) 
     }
     assert report["coverage"]["summary"] == "4/4 journeys"
     assert [item["classification"] for item in report["coverage"]["journeys"]] == [
-        "pass",
-        "pass",
-        "pass",
-        "pass",
+        "PASS",
+        "PASS",
+        "PASS",
+        "PASS",
     ]
     assert report["baseline_risk_findings"][0]["finding_id"] == "privileged-web"
     assert report["baseline_observation"]["inspect"] == {"baseline": "observed"}
@@ -181,9 +181,9 @@ def test_renderer_keeps_untested_and_unsupported_coverage_distinct(
     )
 
     assert [item["classification"] for item in report["coverage"]["journeys"]] == [
-        "pass",
-        "unsupported",
-        "fail",
+        "PASS",
+        "UNSUPPORTED",
+        "FAIL",
         "untested",
     ]
     assert report["coverage"]["summary"] == "3/4 journeys"
@@ -230,6 +230,27 @@ def test_renderer_preserves_collector_provenance_and_artifact_references_without
         "artifacts/first.overlay.yaml",
         "artifacts/second.overlay.yml",
     ]
+
+
+def test_renderer_selects_only_established_overlay_artifact_suffixes(
+    tmp_path: Path,
+) -> None:
+    state = _state()
+    state.compose_path = "artifacts/current.compose.yaml"
+    state.artifacts = [
+        "artifacts/first.overlay.yaml",
+        "artifacts/older-accepted.compose.yaml",
+        "artifacts/second.overlay.yml",
+        "artifacts/current.compose.yaml",
+    ]
+
+    report = json.loads(_render(state, tmp_path).json_path.read_text(encoding="utf-8"))
+
+    assert report["artifacts"]["experiment_overlays"] == [
+        "artifacts/first.overlay.yaml",
+        "artifacts/second.overlay.yml",
+    ]
+    assert report["artifacts"]["references"] == state.artifacts
 
 
 def test_renderer_escapes_hostile_html_and_marks_hardened_overlay_unavailable(

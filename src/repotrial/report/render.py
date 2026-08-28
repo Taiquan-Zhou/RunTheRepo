@@ -86,7 +86,7 @@ def _project(state: RunState) -> dict[str, object]:
                 reference
                 for reference in state.artifacts
                 if reference != state.compose_path
-                and reference.lower().endswith((".yaml", ".yml"))
+                and reference.lower().endswith((".overlay.yaml", ".overlay.yml"))
             ],
             "accepted_configuration": {
                 "compose_reference": state.compose_path,
@@ -111,9 +111,7 @@ def _coverage(state: RunState) -> dict[str, object]:
             {
                 "journey_id": journey.journey_id,
                 "name": journey.name,
-                "classification": "untested"
-                if result is None
-                else result.verdict.value,
+                "classification": "untested" if result is None else result.verdict.name,
             }
         )
     completed = sum(item["classification"] != "untested" for item in journeys)
