@@ -1,4 +1,5 @@
 import asyncio
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Literal
@@ -17,6 +18,7 @@ from repotrial.intake.github import (
     pin_repository,
 )
 from repotrial.models.base import ModelAdapter
+from repotrial.models.openai_compat import OpenAICompatibleModelAdapter
 from repotrial.report.render import render_trial_report
 from repotrial.sandbox.base import SandboxProvider
 from repotrial.sandbox.docker_sbx import (
@@ -58,11 +60,14 @@ def create_app(
         max_experiments: Annotated[
             int, typer.Option("--max-experiments")
         ] = _FROZEN_MAX_EXPERIMENTS,
+        model_endpoint: Annotated[str | None, typer.Option("--model-endpoint")] = None,
+        model_name: Annotated[str | None, typer.Option("--model-name")] = None,
     ) -> None:
         if max_experiments != _FROZEN_MAX_EXPERIMENTS:
             raise typer.BadParameter(
                 f"--max-experiments must be {_FROZEN_MAX_EXPERIMENTS}"
             )
+        configured_model = _configured_model(model, model_endpoint, model_name)
         if dry_run:
             _validate_github_url(url)
             run_id, run_path = create_run_layout(artifacts_root, run_id_generator)
@@ -96,7 +101,7 @@ def create_app(
                         allowed_env_keys=frozenset(),
                         readme_excerpt="",
                         container_port=_DEFAULT_CONTAINER_PORT,
-                        model=model,
+                        model=configured_model,
                         repository_pinner=repository_pinner,
                     ),
                 )
@@ -121,6 +126,24 @@ def _validate_github_url(url: str) -> None:
         raise typer.BadParameter(
             "URL must be a GitHub HTTPS owner/repository URL"
         ) from None
+
+
+def _configured_model(
+    injected_model: ModelAdapter | None,
+    model_endpoint: str | None,
+    model_name: str | None,
+) -> ModelAdapter | None:
+    if model_endpoint is None and model_name is None:
+        return injected_model
+    if model_endpoint is None or model_name is None:
+        raise typer.BadParameter(
+            "--model-endpoint and --model-name must be provided together"
+        )
+    return OpenAICompatibleModelAdapter(
+        model_endpoint,
+        model_name,
+        api_key=os.environ.get("REPOTRIAL_MODEL_API_KEY"),
+    )
 
 
 def _validate_provider(provider: str | None) -> Literal["fake", "docker-sbx"]:
