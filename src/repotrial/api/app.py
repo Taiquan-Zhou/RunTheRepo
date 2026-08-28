@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import stat
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -42,6 +43,12 @@ from .registry import (
 _MAX_REPO_URL_LENGTH = 2_048
 _MAX_MODEL_ENDPOINT_LENGTH = 2_048
 _MAX_MODEL_NAME_LENGTH = 256
+_HTTP_TOKEN = r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+"
+_MEDIA_RANGE = re.compile(rf"({_HTTP_TOKEN})/({_HTTP_TOKEN}|\*)\Z")
+_MEDIA_PARAMETER = re.compile(
+    rf'({_HTTP_TOKEN})=({_HTTP_TOKEN}|"[\x20-\x21\x23-\x7e]*")\Z'
+)
+_QVALUE = re.compile(r"(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)\Z")
 _DEFAULT_POLICY = DockerSbxPolicy(
     cpus=1.5, memory_mb=512, pids_limit=64, disk_mb=2048, total_duration_s=300
 )
@@ -182,6 +189,7 @@ def create_app(
         try:
             await selected_registry.create_running(run_id, request.repo_url)
         except asyncio.CancelledError:
+            await _interrupt_after_cancellation(selected_registry, run_id)
             raise
         except RegistryUnavailableError:
             raise HTTPException(
@@ -216,7 +224,7 @@ def create_app(
                 )
             return RunResponse(run_id=run_id, outcome=classified.outcome.value)
         except asyncio.CancelledError:
-            await _complete_safely(selected_registry, run_id, RunLifecycle.INTERRUPTED)
+            await _interrupt_after_cancellation(selected_registry, run_id)
             raise
         except DockerSbxUnsupportedError:
             await _complete_safely(selected_registry, run_id, RunLifecycle.UNSUPPORTED)
@@ -349,6 +357,19 @@ async def _complete_safely(
         return
 
 
+async def _interrupt_after_cancellation(registry: RunRegistry, run_id: str) -> None:
+    try:
+        await registry.complete(
+            run_id,
+            RunLifecycle.INTERRUPTED,
+            commit_sha=None,
+            report_available=False,
+        )
+    # This one-shot terminalization is best-effort; cleanup cannot replace cancellation.
+    except BaseException:  # noqa: BLE001
+        return
+
+
 def _lifecycle_for(outcome: TerminalOutcome) -> RunLifecycle:
     return {
         TerminalOutcome.COMPLETED: RunLifecycle.COMPLETED,
@@ -364,21 +385,31 @@ def _representation(accept: str | None) -> str | None:
     for item in accept.split(","):
         parts = [part.strip() for part in item.split(";")]
         media_type = parts[0].lower()
+        media_match = _MEDIA_RANGE.fullmatch(media_type)
+        if media_match is None:
+            return None
+        kind, subtype = media_match.groups()
+        if ("*" in kind or "*" in subtype) and (kind, subtype) not in {
+            ("application", "*"),
+            ("text", "*"),
+            ("*", "*"),
+        }:
+            return None
         quality = _quality(parts[1:])
-        if not media_type or quality is None:
+        if quality is None:
             return None
         ranges.append((media_type, quality))
-    choices: list[tuple[float, int, str]] = []
-    for name, media_type in (
-        ("trial-report.json", "application/json"),
-        ("trial-report.html", "text/html"),
+    choices: list[tuple[float, int, int, str]] = []
+    for name, media_type, server_preference in (
+        ("trial-report.json", "application/json", 1),
+        ("trial-report.html", "text/html", 0),
     ):
         quality, specificity = _representation_quality(media_type, ranges)
         if quality > 0:
-            choices.append((quality, specificity, name))
+            choices.append((quality, specificity, server_preference, name))
     if not choices:
         return None
-    return max(choices, key=lambda value: (value[0], value[1]))[2]
+    return max(choices, key=lambda value: (value[0], value[1], value[2]))[3]
 
 
 def _representation_quality(
@@ -393,31 +424,31 @@ def _representation_quality(
             matches.append((quality, 1))
         elif media_type == "*/*":
             matches.append((quality, 0))
-    return max(matches, default=(0.0, -1), key=lambda value: value[1])
+    return max(matches, default=(0.0, -1), key=lambda value: (value[1], value[0]))
 
 
 def _quality(parameters: list[str]) -> float | None:
-    values = [
-        part.split("=", 1)[1].strip()
-        for part in parameters
-        if part.lower().startswith("q=")
-    ]
-    if len(values) > 1:
-        return None
-    if not values:
-        return 1.0
-    try:
-        quality = float(values[0])
-    except ValueError:
-        return None
-    return quality if 0 <= quality <= 1 else None
+    quality: float | None = None
+    for parameter in parameters:
+        match = _MEDIA_PARAMETER.fullmatch(parameter)
+        if match is None:
+            return None
+        name, value = match.groups()
+        if name.lower() != "q":
+            continue
+        if quality is not None or _QVALUE.fullmatch(value) is None:
+            return None
+        quality = float(value)
+    return 1.0 if quality is None else quality
 
 
 def _safe_regular_file(path: Path, artifacts_root: Path) -> bool:
     try:
         root = artifacts_root.resolve(strict=True)
         relative = path.absolute().relative_to(root)
-        if len(relative.parts) != 3:
+        if len(relative.parts) != 3 or any(
+            component in {".", ".."} for component in relative.parts
+        ):
             return False
         current = root
         for component in relative.parts:
