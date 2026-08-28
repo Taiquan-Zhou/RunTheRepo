@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>RepoTrial report {{ report.identity.run_id }}</title>
+</head>
+<body>
+  <h1>RepoTrial trial report</h1>
+  <p>{{ report.disclaimer }}</p>
+
+  <h2>Identity</h2>
+  <dl>
+    {% for key, value in report.identity.items() %}
+    <dt>{{ key }}</dt><dd>{{ value }}</dd>
+    {% endfor %}
+  </dl>
+
+  <h2>Coverage boundary</h2>
+  <p>{{ report.coverage.summary }}</p>
+  <ul>
+    {% for journey in report.coverage.journeys %}
+    <li>{{ journey.journey_id }}: {{ journey.classification }}</li>
+    {% endfor %}
+  </ul>
+
+  <h2>Baseline risk findings</h2>
+  <ul>{% for finding in report.baseline_risk_findings %}<li>{{ finding }}</li>{% endfor %}</ul>
+  <h2>Baseline observation</h2>
+  <p>{{ report.baseline_observation }}</p>
+
+  <h2>Experiment timeline</h2>
+  <ol>
+    {% for experiment in report.experiments %}
+    <li>
+      <strong>{{ experiment.verdict | upper }}</strong>: {{ experiment.experiment_id }}
+      ({{ experiment.reason }})
+      <div>mutation: {{ experiment.mutation }}</div>
+      <div>boot: {{ experiment.boot }}; journeys: {{ experiment.journeys }}</div>
+      <div>before: {{ experiment.before }}; after: {{ experiment.after }}</div>
+    </li>
+    {% endfor %}
+  </ol>
+
+  <h2>Unsupported collectors</h2>
+  <ul>{% for collector in report.unsupported_collectors %}<li>{{ collector }}</li>{% endfor %}</ul>
+
+  <h2>Artifact references</h2>
+  <ul>{% for reference in report.artifacts.references %}<li>{{ reference }}</li>{% endfor %}</ul>
+  <p>Accepted configuration: {{ report.artifacts.accepted_configuration }}</p>
+  <p>Hardened overlay: {{ report.artifacts.hardened_overlay }}</p>
+</body>
+</html>

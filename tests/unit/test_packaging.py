@@ -72,6 +72,7 @@ def test_sdist_excludes_local_state_and_keeps_project_sources(tmp_path: Path) ->
         PurePosixPath("README.md"),
         PurePosixPath("pyproject.toml"),
         PurePosixPath("PKG-INFO"),
+        PurePosixPath("src/repotrial/report/templates/report.html.j2"),
         *(
             PurePosixPath(path.relative_to(project_root).as_posix())
             for source_root in (project_root / "src", project_root / "tests")
