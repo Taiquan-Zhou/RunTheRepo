@@ -6,6 +6,9 @@ from typer.testing import CliRunner
 
 from repotrial.cli import create_app
 from repotrial.config import create_run_layout
+from repotrial.domain.enums import Verdict
+from repotrial.domain.models import JourneyResult, RunState
+from repotrial.run_outcome import TerminalOutcome, classify_terminal_outcome
 
 FIXED_RUN_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -136,3 +139,24 @@ def test_run_layout_rejects_a_colliding_run_id(tmp_path: Path) -> None:
     assert run_path == artifacts_root / FIXED_RUN_ID
     with pytest.raises(FileExistsError):
         create_run_layout(artifacts_root, fixed_run_id)
+
+
+def test_shared_terminal_classifier_preserves_success_exit_semantics() -> None:
+    run = RunState(
+        run_id="run-1",
+        repo_url="https://github.com/a/b",
+        stop_reason="no_more_mutations",
+        baseline_journey_results=[
+            JourneyResult(
+                journey_id="journey-1",
+                verdict=Verdict.PASS,
+                passed_steps=1,
+                total_steps=1,
+            )
+        ],
+    )
+
+    result = classify_terminal_outcome(run)
+
+    assert result.outcome is TerminalOutcome.COMPLETED
+    assert result.exit_code == 0

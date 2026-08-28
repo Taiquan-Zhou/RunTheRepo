@@ -1,0 +1,32 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      REPOTRIAL_DATABASE_URL: postgresql://${REPOTRIAL_POSTGRES_USER}:${REPOTRIAL_POSTGRES_PASSWORD}@postgres:5432/${REPOTRIAL_POSTGRES_DB}
+    ports:
+      - "127.0.0.1:${REPOTRIAL_API_PORT:-8000}:8000"
+    volumes:
+      - repotrial-artifacts:/app/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${REPOTRIAL_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${REPOTRIAL_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${REPOTRIAL_POSTGRES_DB}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - repotrial-postgres:/var/lib/postgresql/data
+
+volumes:
+  repotrial-artifacts:
+  repotrial-postgres:

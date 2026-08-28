@@ -9,7 +9,6 @@ import typer
 from repotrial.agent.graph import ainvoke_run, build_run_graph
 from repotrial.agent.state import GraphContext, RepositoryPinner
 from repotrial.config import create_run_layout, generate_run_id
-from repotrial.domain.enums import ExperimentVerdict, Verdict
 from repotrial.domain.models import PinnedRepo, RepoRef, RunState
 from repotrial.intake.github import (
     RepoIntakeError,
@@ -20,6 +19,7 @@ from repotrial.intake.github import (
 from repotrial.models.base import ModelAdapter
 from repotrial.models.openai_compat import OpenAICompatibleModelAdapter
 from repotrial.report.render import render_trial_report
+from repotrial.run_outcome import classify_terminal_outcome
 from repotrial.sandbox.base import SandboxProvider
 from repotrial.sandbox.docker_sbx import (
     DockerSbxPolicy,
@@ -200,27 +200,7 @@ def _local_repository_pinner(source: Path) -> RepositoryPinner:
 
 
 def _exit_code(run: RunState) -> int:
-    if run.stop_reason == "boot_unsupported" or any(
-        record.boot is Verdict.UNSUPPORTED for record in run.experiments
-    ):
-        return 2
-    if any(
-        result.verdict is Verdict.UNSUPPORTED for result in run.baseline_journey_results
-    ) or any(
-        result.verdict is Verdict.UNSUPPORTED
-        for record in run.experiments
-        for result in record.journeys
-    ):
-        return 2
-    baseline_passed = bool(run.baseline_journey_results) and all(
-        result.verdict is Verdict.PASS for result in run.baseline_journey_results
-    )
-    experiment_stopped = any(
-        record.verdict is ExperimentVerdict.STOP for record in run.experiments
-    )
-    if run.stop_reason is not None and baseline_passed and not experiment_stopped:
-        return 0
-    return 3
+    return classify_terminal_outcome(run).exit_code
 
 
 app = create_app()
