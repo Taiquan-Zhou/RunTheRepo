@@ -223,6 +223,17 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"run_id": run_id, "outcome": "execution_unsupported"},
             ) from None
+        except HTTPException:
+            raise
+        # API boundary: suppress arbitrary untrusted/backend failure details.
+        except Exception:  # noqa: BLE001
+            await _complete_safely(
+                selected_registry, run_id, RunLifecycle.INTERNAL_ERROR
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={"run_id": run_id, "outcome": "internal_error"},
+            ) from None
 
     @app.get("/runs/{run_id}", response_model=RunMetadata)
     async def get_run(run_id: str) -> RunMetadata:
@@ -348,22 +359,45 @@ def _lifecycle_for(outcome: TerminalOutcome) -> RunLifecycle:
 def _representation(accept: str | None) -> str | None:
     if accept is None:
         return "trial-report.json"
+    choices: list[tuple[float, int, str]] = []
     for item in accept.split(","):
         parts = [part.strip() for part in item.split(";")]
         media_type = parts[0].lower()
-        if not media_type or any(part.lower() == "q=0" for part in parts[1:]):
+        quality = _quality(parts[1:])
+        if not media_type or quality is None or quality == 0:
             continue
-        if media_type in {"*/*", "application/json"}:
-            return "trial-report.json"
+        if media_type == "application/json":
+            choices.append((quality, 2, "trial-report.json"))
         if media_type == "text/html":
-            return "trial-report.html"
-    return None
+            choices.append((quality, 2, "trial-report.html"))
+        if media_type == "*/*":
+            choices.append((quality, 1, "trial-report.json"))
+    if not choices:
+        return None
+    return max(choices, key=lambda value: (value[0], value[1]))[2]
+
+
+def _quality(parameters: list[str]) -> float | None:
+    values = [
+        part.split("=", 1)[1].strip()
+        for part in parameters
+        if part.lower().startswith("q=")
+    ]
+    if len(values) > 1:
+        return None
+    if not values:
+        return 1.0
+    try:
+        quality = float(values[0])
+    except ValueError:
+        return None
+    return quality if 0 <= quality <= 1 else None
 
 
 def _safe_regular_file(path: Path, artifacts_root: Path) -> bool:
     try:
         root = artifacts_root.resolve(strict=True)
-        relative = path.relative_to(root)
+        relative = path.absolute().relative_to(root)
         if len(relative.parts) != 3:
             return False
         current = root
@@ -380,5 +414,6 @@ def _safe_regular_file(path: Path, artifacts_root: Path) -> bool:
 
 def _is_reparse_point(metadata: os.stat_result) -> bool:
     return bool(
-        metadata.st_file_attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        getattr(metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     )

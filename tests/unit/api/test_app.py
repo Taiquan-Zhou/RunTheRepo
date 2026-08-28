@@ -143,8 +143,7 @@ def test_unexpected_runner_error_is_recorded_and_sanitized(tmp_path: Path) -> No
             registry=registry,
             run_id_generator=lambda: "run-fixed",
             graph_runner=runner,
-        ),
-        raise_server_exceptions=False,
+        )
     ) as client:
         response = client.post("/runs", json={"repo_url": "https://github.com/a/b"})
 
@@ -207,7 +206,9 @@ def test_report_negotiates_json_html_and_rejects_other_accept_types(
     assert xml_response.status_code == 406
 
 
-@pytest.mark.parametrize("accept", ["application/jsonp", "application/json;q=0"])
+@pytest.mark.parametrize(
+    "accept", ["application/jsonp", "application/json;q=0", "application/json;q=0.0"]
+)
 def test_report_rejects_near_miss_or_unacceptable_json(
     accept: str, tmp_path: Path
 ) -> None:
