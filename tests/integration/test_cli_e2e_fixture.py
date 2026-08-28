@@ -270,6 +270,26 @@ def test_inspect_rejects_unfrozen_experiment_budget_before_artifacts(
     assert provider.calls == []
 
 
+def test_dry_run_rejects_unfrozen_experiment_budget_before_artifacts(
+    tmp_path: Path,
+) -> None:
+    artifacts_root = tmp_path / "artifacts"
+
+    result = CliRunner().invoke(
+        make_app(artifacts_root, FixtureProvider()),
+        [
+            "inspect",
+            "--dry-run",
+            "--max-experiments",
+            "7",
+            "https://github.com/a/b",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert not artifacts_root.exists()
+
+
 def test_inspect_returns_unsupported_for_a_capability_unavailable_trial(
     tmp_path: Path,
 ) -> None:

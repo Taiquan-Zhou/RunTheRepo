@@ -59,16 +59,16 @@ def create_app(
             int, typer.Option("--max-experiments")
         ] = _FROZEN_MAX_EXPERIMENTS,
     ) -> None:
+        if max_experiments != _FROZEN_MAX_EXPERIMENTS:
+            raise typer.BadParameter(
+                f"--max-experiments must be {_FROZEN_MAX_EXPERIMENTS}"
+            )
         if dry_run:
             _validate_github_url(url)
             run_id, run_path = create_run_layout(artifacts_root, run_id_generator)
             typer.echo(f"run_id={run_id}")
             typer.echo(f"artifact_path={run_path}")
             return
-        if max_experiments != _FROZEN_MAX_EXPERIMENTS:
-            raise typer.BadParameter(
-                f"--max-experiments must be {_FROZEN_MAX_EXPERIMENTS}"
-            )
         selected_provider = _validate_provider(provider)
         if selected_provider == "fake" and provider_factory is None:
             typer.echo(
