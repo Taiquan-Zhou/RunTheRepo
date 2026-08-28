@@ -424,6 +424,143 @@ def test_thrown_unsupported_is_recorded_and_sanitized(
     assert "SBXSECRET" not in repr(record)
 
 
+def test_thrown_unsupported_registry_failure_becomes_recorded_internal_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from repotrial.api.app import create_app
+
+    class UnsupportedWriteFailingRegistry(InMemoryRunRegistry):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminal_attempts: list[RunLifecycle] = []
+
+        async def complete(
+            self,
+            run_id: str,
+            lifecycle: RunLifecycle,
+            *,
+            commit_sha: str | None,
+            report_available: bool,
+        ) -> RunRecord:
+            self.terminal_attempts.append(lifecycle)
+            if lifecycle is RunLifecycle.UNSUPPORTED:
+                raise RegistryUnavailableError("DBSECRET")
+            return await super().complete(
+                run_id,
+                lifecycle,
+                commit_sha=commit_sha,
+                report_available=report_available,
+            )
+
+    async def runner(*_args: object) -> GraphState:
+        raise DockerSbxUnsupportedError("missing_capability")
+
+    registry = UnsupportedWriteFailingRegistry()
+    with TestClient(
+        create_app(
+            artifacts_root=tmp_path,
+            registry=registry,
+            run_id_generator=lambda: "run-fixed",
+            graph_runner=runner,
+        )
+    ) as client:
+        response = client.post("/runs", json={"repo_url": "https://github.com/a/b"})
+
+    record = asyncio.run(registry.get("run-fixed"))
+    assert response.status_code == 500
+    assert response.json() == {
+        "detail": {"run_id": "run-fixed", "outcome": "internal_error"}
+    }
+    assert registry.terminal_attempts == [
+        RunLifecycle.UNSUPPORTED,
+        RunLifecycle.INTERNAL_ERROR,
+    ]
+    assert record is not None
+    assert record.lifecycle is RunLifecycle.INTERNAL_ERROR
+    assert record.report_available is False
+    assert "DBSECRET" not in response.text
+    assert "DBSECRET" not in caplog.text
+    assert "DBSECRET" not in repr(record)
+
+
+@pytest.mark.parametrize(
+    "cleanup_failure,expected_lifecycle",
+    [
+        (None, RunLifecycle.INTERRUPTED),
+        (LookupError("CLEANUPSECRET"), RunLifecycle.RUNNING),
+    ],
+)
+def test_thrown_unsupported_terminal_cancellation_preserves_primary_and_interrupts(
+    cleanup_failure: BaseException | None,
+    expected_lifecycle: RunLifecycle,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from repotrial.api.app import create_app
+
+    primary = asyncio.CancelledError("TERMINAL_CANCEL")
+
+    class UnsupportedCancellationRegistry(InMemoryRunRegistry):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminal_attempts: list[RunLifecycle] = []
+
+        async def complete(
+            self,
+            run_id: str,
+            lifecycle: RunLifecycle,
+            *,
+            commit_sha: str | None,
+            report_available: bool,
+        ) -> RunRecord:
+            self.terminal_attempts.append(lifecycle)
+            if lifecycle is RunLifecycle.UNSUPPORTED:
+                raise primary
+            if lifecycle is RunLifecycle.INTERRUPTED and cleanup_failure is not None:
+                raise cleanup_failure
+            return await super().complete(
+                run_id,
+                lifecycle,
+                commit_sha=commit_sha,
+                report_available=report_available,
+            )
+
+    async def runner(*_args: object) -> GraphState:
+        raise DockerSbxUnsupportedError("missing_capability")
+
+    registry = UnsupportedCancellationRegistry()
+
+    async def exercise() -> tuple[BaseException, RunRecord | None]:
+        app = create_app(
+            artifacts_root=tmp_path,
+            registry=registry,
+            run_id_generator=lambda: "run-fixed",
+            graph_runner=runner,
+        )
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client,
+        ):
+            with pytest.raises(asyncio.CancelledError) as raised:
+                await client.post("/runs", json={"repo_url": "https://github.com/a/b"})
+        return raised.value, await registry.get("run-fixed")
+
+    propagated, record = asyncio.run(exercise())
+
+    assert propagated is primary
+    assert propagated.args == ("TERMINAL_CANCEL",)
+    assert registry.terminal_attempts == [
+        RunLifecycle.UNSUPPORTED,
+        RunLifecycle.INTERRUPTED,
+    ]
+    assert record is not None
+    assert record.lifecycle is expected_lifecycle
+    assert "CLEANUPSECRET" not in "".join(traceback.format_exception(propagated))
+    assert "CLEANUPSECRET" not in caplog.text
+
+
 @pytest.mark.parametrize(
     "secondary_kind,expected_lifecycle",
     [
@@ -782,6 +919,69 @@ def test_startup_interrupts_only_preexisting_running_records(tmp_path: Path) -> 
     assert complete.json()["lifecycle"] == "COMPLETED"
     assert complete.json()["commit_sha"] == "b" * 40
     assert complete.json()["report_available"] is True
+
+
+def test_failed_startup_interrupt_sweep_never_publishes_graph_or_retries(
+    tmp_path: Path,
+) -> None:
+    from repotrial.api.app import create_app
+
+    class OnceFailingSweepRegistry(InMemoryRunRegistry):
+        def __init__(self) -> None:
+            super().__init__()
+            self.interrupt_calls = 0
+            self.create_calls = 0
+
+        async def interrupt_running(self) -> None:
+            self.interrupt_calls += 1
+            if self.interrupt_calls == 1:
+                raise RegistryUnavailableError("SWEEPSECRET")
+            await super().interrupt_running()
+
+        async def create_running(self, run_id: str, repo_url: str) -> RunRecord:
+            self.create_calls += 1
+            return await super().create_running(run_id, repo_url)
+
+    registry = OnceFailingSweepRegistry()
+    asyncio.run(registry.create_running("stale-run", "https://github.com/a/stale"))
+    registry.create_calls = 0
+    assert asyncio.run(registry.health()) is True
+    execution_calls: list[str] = []
+
+    def provider_factory() -> FakeSandboxProvider:
+        execution_calls.append("provider")
+        return FakeSandboxProvider()
+
+    async def runner(*_args: object) -> GraphState:
+        execution_calls.append("graph")
+        return GraphState(
+            run=RunState(run_id="new-run", repo_url="https://github.com/a/b")
+        )
+
+    artifacts_root = tmp_path / "artifacts"
+    with TestClient(
+        create_app(
+            artifacts_root=artifacts_root,
+            registry=registry,
+            run_id_generator=lambda: "new-run",
+            provider_factory=provider_factory,
+            graph_runner=runner,
+        )
+    ) as client:
+        first_health = client.get("/healthz")
+        later_health = client.get("/healthz")
+        post = client.post("/runs", json={"repo_url": "https://github.com/a/b"})
+
+    stale = asyncio.run(registry.get("stale-run"))
+    assert first_health.status_code == 503
+    assert later_health.status_code == 503
+    assert post.status_code == 503
+    assert registry.interrupt_calls == 1
+    assert registry.create_calls == 0
+    assert execution_calls == []
+    assert not artifacts_root.exists()
+    assert stale is not None
+    assert stale.lifecycle is RunLifecycle.RUNNING
 
 
 def test_graph_runs_once_with_correlated_thread_state_context_and_renderer(

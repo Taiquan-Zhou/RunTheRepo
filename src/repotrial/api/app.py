@@ -134,10 +134,9 @@ def create_app(
         try:
             await selected_registry.initialize()
             async with build_checkpointer(selected_database_url) as checkpointer:
-                app.state.services = _Services(
-                    build_run_graph(checkpointer=checkpointer)
-                )
+                graph = build_run_graph(checkpointer=checkpointer)
                 await selected_registry.interrupt_running()
+                app.state.services = _Services(graph)
                 yield
         except asyncio.CancelledError:
             raise
@@ -227,7 +226,29 @@ def create_app(
             await _interrupt_after_cancellation(selected_registry, run_id)
             raise
         except DockerSbxUnsupportedError:
-            await _complete_safely(selected_registry, run_id, RunLifecycle.UNSUPPORTED)
+            try:
+                await selected_registry.complete(
+                    run_id,
+                    RunLifecycle.UNSUPPORTED,
+                    commit_sha=None,
+                    report_available=False,
+                )
+            except asyncio.CancelledError:
+                await _interrupt_after_cancellation(selected_registry, run_id)
+                raise
+            # The semantic unsupported response requires a matching registry row.
+            except Exception:  # noqa: BLE001
+                try:
+                    await _complete_safely(
+                        selected_registry, run_id, RunLifecycle.INTERNAL_ERROR
+                    )
+                except asyncio.CancelledError:
+                    await _interrupt_after_cancellation(selected_registry, run_id)
+                    raise
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail={"run_id": run_id, "outcome": "internal_error"},
+                ) from None
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"run_id": run_id, "outcome": "execution_unsupported"},
