@@ -16,16 +16,18 @@ from repotrial.sandbox.fake import FakeSandboxProvider
         (["--model-name", "local-model"], "--model-endpoint"),
     ],
 )
+@pytest.mark.parametrize("dry_run", [False, True])
 def test_model_endpoint_and_name_must_be_supplied_as_a_pair_before_artifacts(
-    tmp_path: Path, options: list[str], missing: str
+    tmp_path: Path, options: list[str], missing: str, dry_run: bool
 ) -> None:
     artifacts_root = tmp_path / "artifacts"
     app = cli.create_app(artifacts_root=artifacts_root)
 
-    result = CliRunner().invoke(
-        app,
-        ["inspect", "--dry-run", *options, "https://github.com/a/b"],
-    )
+    command = ["inspect", *options]
+    if dry_run:
+        command.append("--dry-run")
+    command.append("https://github.com/a/b")
+    result = CliRunner().invoke(app, command)
 
     assert result.exit_code != 0
     assert missing in result.output

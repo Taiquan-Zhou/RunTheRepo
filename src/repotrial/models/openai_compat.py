@@ -12,6 +12,13 @@ _REQUEST_TIMEOUT: Final = httpx.Timeout(10.0, connect=3.0)
 _MAX_PROMPT_CHARS: Final = 16_384
 _MAX_SCHEMA_BYTES: Final = 65_536
 _MAX_RESPONSE_BYTES: Final = 1_048_576
+_FORBIDDEN_ERROR_DISCRIMINATORS: Final = (
+    "authentication",
+    "model_not_found",
+    "model not found",
+    "rate_limit",
+    "rate limit",
+)
 
 
 class ModelAdapterError(RuntimeError):
@@ -204,8 +211,19 @@ def _explicitly_unsupported_schema(response: _HttpResponse) -> bool:
         payload: object = json.loads(response.body)
     except (UnicodeDecodeError, json.JSONDecodeError):
         return False
-    message = _error_message(payload)
-    if message is None:
+    error = _error_details(payload)
+    if error is None:
+        return False
+    message, error_type, error_code, error_param = error
+    if any(
+        _is_forbidden_error_discriminator(value)
+        for value in (error_type, error_code, error_param)
+    ):
+        return False
+    if not any(
+        _is_schema_capability_discriminator(value)
+        for value in (error_code, error_param)
+    ):
         return False
     lowered = message.lower()
     return (
@@ -218,14 +236,42 @@ def _explicitly_unsupported_schema(response: _HttpResponse) -> bool:
     )
 
 
-def _error_message(payload: object) -> str | None:
+def _error_details(
+    payload: object,
+) -> tuple[str, str | None, str | None, str | None] | None:
     if type(payload) is not dict:
         return None
     error = payload.get("error")
     if type(error) is not dict:
         return None
     message = error.get("message")
-    return message if isinstance(message, str) else None
+    if not isinstance(message, str):
+        return None
+    return (
+        message,
+        _optional_error_field(error, "type"),
+        _optional_error_field(error, "code"),
+        _optional_error_field(error, "param"),
+    )
+
+
+def _optional_error_field(error: dict[object, object], name: str) -> str | None:
+    value = error.get(name)
+    return value if isinstance(value, str) else None
+
+
+def _is_forbidden_error_discriminator(value: str | None) -> bool:
+    if value is None:
+        return False
+    lowered = value.lower()
+    return any(marker in lowered for marker in _FORBIDDEN_ERROR_DISCRIMINATORS)
+
+
+def _is_schema_capability_discriminator(value: str | None) -> bool:
+    if value is None:
+        return False
+    lowered = value.lower()
+    return "response_format" in lowered or "json_schema" in lowered
 
 
 def _is_success(status_code: int) -> bool:

@@ -1,13 +1,16 @@
 import asyncio
 import json
+import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Thread
+from threading import Event, Thread
 from types import TracebackType
 from typing import Self
 
+import httpx
 import pytest
 from pydantic import BaseModel
 
+from repotrial.models import openai_compat
 from repotrial.models.openai_compat import (
     ModelAdapterError,
     OpenAICompatibleModelAdapter,
@@ -59,6 +62,9 @@ class _ResponseServer:
         self._server.shutdown()
         self._thread.join()
         self._server.server_close()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self._server.server_port}{path}"
 
 
 def _chat_completion(content: str) -> dict[str, object]:
@@ -118,7 +124,12 @@ def test_explicit_json_schema_unsupported_response_uses_one_json_only_fallback()
         [
             (
                 400,
-                {"error": {"message": "response_format json_schema unsupported"}},
+                {
+                    "error": {
+                        "param": "response_format",
+                        "message": "response_format json_schema unsupported",
+                    }
+                },
             ),
             (200, _chat_completion('{"answer":"fallback"}')),
         ]
@@ -157,3 +168,196 @@ def test_auth_failure_does_not_trigger_fallback_or_leak_the_api_key() -> None:
 def test_endpoint_credentials_are_rejected_before_any_request() -> None:
     with pytest.raises(ValueError, match="endpoint must not include credentials"):
         OpenAICompatibleModelAdapter("http://user:pass@127.0.0.1:8000/v1", "model")
+
+
+@pytest.mark.parametrize(
+    ("status", "error", "label"),
+    [
+        (
+            400,
+            {
+                "type": "authentication_error",
+                "message": "response_format json_schema unsupported",
+            },
+            "authentication",
+        ),
+        (
+            422,
+            {
+                "code": "model_not_found",
+                "message": "response_format json_schema unsupported",
+            },
+            "model",
+        ),
+        (
+            400,
+            {
+                "type": "rate_limit_error",
+                "message": "response_format json_schema unsupported",
+            },
+            "rate limit",
+        ),
+        (
+            500,
+            {"message": "response_format json_schema unsupported"},
+            "server",
+        ),
+    ],
+)
+def test_forbidden_error_classes_never_trigger_json_only_fallback(
+    status: int, error: dict[str, str], label: str
+) -> None:
+    with _ResponseServer([(status, {"error": error})]) as server:
+        adapter = OpenAICompatibleModelAdapter(server.endpoint, "local-model")
+
+        with pytest.raises(ModelAdapterError, match="model request failed"):
+            asyncio.run(
+                adapter.structured(system="system", user="user", schema=_Answer)
+            )
+
+    assert len(server.requests) == 1, label
+
+
+@pytest.mark.parametrize("status", [400, 422])
+def test_non_capability_near_miss_does_not_trigger_fallback(status: int) -> None:
+    response = {
+        "error": {
+            "param": "model",
+            "message": "response_format json_schema unsupported",
+        }
+    }
+    with _ResponseServer([(status, response)]) as server:
+        adapter = OpenAICompatibleModelAdapter(server.endpoint, "local-model")
+
+        with pytest.raises(ModelAdapterError, match="model request failed"):
+            asyncio.run(
+                adapter.structured(system="system", user="user", schema=_Answer)
+            )
+
+    assert len(server.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("endpoint_path", "request_path"),
+    [
+        ("/v1", "/v1/chat/completions"),
+        ("/v1/", "/v1/chat/completions"),
+        ("/local/openai/v1/", "/local/openai/v1/chat/completions"),
+    ],
+)
+def test_endpoint_normalization_preserves_the_base_path(
+    endpoint_path: str, request_path: str
+) -> None:
+    with _ResponseServer([(200, _chat_completion('{"answer":"ok"}'))]) as server:
+        adapter = OpenAICompatibleModelAdapter(server.url(endpoint_path), "local-model")
+
+        result = asyncio.run(
+            adapter.structured(system="system", user="user", schema=_Answer)
+        )
+
+    assert result == _Answer(answer="ok")
+    assert [request[0] for request in server.requests] == [request_path]
+
+
+def test_chunked_response_over_limit_stops_before_the_full_body_is_consumed() -> None:
+    chunk = b"x" * 65_536
+    chunks = (openai_compat._MAX_RESPONSE_BYTES // len(chunk)) + 512
+    sent_chunks = 0
+    request_seen = Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            nonlocal sent_chunks
+            request_seen.set()
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                for _ in range(chunks):
+                    self.wfile.write(f"{len(chunk):X}\r\n".encode("ascii"))
+                    self.wfile.write(chunk + b"\r\n")
+                    self.wfile.flush()
+                    sent_chunks += 1
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                return
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    with _temporary_server(Handler) as server:
+        adapter = OpenAICompatibleModelAdapter(f"{server}/v1", "local-model")
+
+        with pytest.raises(ModelAdapterError, match="response exceeds size limit"):
+            asyncio.run(
+                adapter.structured(system="system", user="user", schema=_Answer)
+            )
+
+    assert request_seen.is_set()
+    assert sent_chunks < chunks
+
+
+def test_transport_failure_completes_zero_requests_without_a_fallback() -> None:
+    reserved = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    reserved.bind(("127.0.0.1", 0))
+    port = reserved.getsockname()[1]
+    reserved.close()
+    adapter = OpenAICompatibleModelAdapter(f"http://127.0.0.1:{port}/v1", "model")
+
+    with pytest.raises(ModelAdapterError, match="model request failed"):
+        asyncio.run(adapter.structured(system="system", user="user", schema=_Answer))
+
+
+def test_timeout_does_not_trigger_a_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_seen = Event()
+    release_server = Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            request_seen.set()
+            release_server.wait(timeout=1)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    monkeypatch.setattr(openai_compat, "_REQUEST_TIMEOUT", httpx.Timeout(0.01))
+    with _temporary_server(Handler) as server:
+        adapter = OpenAICompatibleModelAdapter(f"{server}/v1", "model")
+
+        with pytest.raises(ModelAdapterError, match="model request failed"):
+            asyncio.run(
+                adapter.structured(system="system", user="user", schema=_Answer)
+            )
+
+    release_server.set()
+    assert request_seen.is_set()
+
+
+class _TemporaryServer:
+    def __init__(self, handler: type[BaseHTTPRequestHandler]) -> None:
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self._thread = Thread(target=self._server.serve_forever)
+
+    def __enter__(self) -> str:
+        self._thread.start()
+        return f"http://127.0.0.1:{self._server.server_port}"
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        self._server.shutdown()
+        self._thread.join()
+        self._server.server_close()
+
+
+def _temporary_server(handler: type[BaseHTTPRequestHandler]) -> _TemporaryServer:
+    return _TemporaryServer(handler)
