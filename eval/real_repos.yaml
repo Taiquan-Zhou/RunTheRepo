@@ -1,0 +1,301 @@
+version: 1
+freeze_date: "2026-08-29"
+cohort_policy:
+  status: frozen_before_execution
+  deterministic_order: repositories_list_order
+  replacement_policy: >-
+    Retain all ten repositories and their order. No repository may be removed,
+    replaced, or reordered based on a pilot attempt or result.
+  admission_criteria:
+    - Public and cloneable repository.
+    - Full lowercase 40-character commit SHA pinned from the default branch.
+    - Compose file exists at the pinned commit.
+    - Basic startup documentation exists in the same pinned repository.
+    - >-
+      Basic local startup does not require paid SaaS, private credentials,
+      external OAuth, GPU, or a large database cluster; optional integrations
+      do not disqualify a repository.
+  selection_policy:
+    anti_cherry_picking: >-
+      The cohort and order are frozen before execution. Failures remain in the
+      denominator, and no repository is dropped or replaced after results are
+      observed.
+    diversity:
+      - Root and nested Compose layouts.
+      - Image-pull, source-build, and deployment-repository forms.
+      - Single-service and multi-service stacks.
+      - Relational database, cache, worker, volume, and health-check patterns.
+      - Compose override and environment-template setup patterns.
+      - Outbound-network behavior.
+      - One Docker-socket workload retained to stress isolation policy.
+
+repositories:
+  - id: umami
+    url: https://github.com/umami-software/umami
+    commit_sha: ca661c7057984aa98ed4f7083d84dae2f65bfcb0
+    selection_rationale: >-
+      Adds a root-Compose analytics application with a relational database,
+      health checks, and persistent storage.
+    expected_entry:
+      service: umami
+      container_port: 3000
+      documented_host_port: 3000
+    compose:
+      path: docker-compose.yml
+      evidence: https://github.com/umami-software/umami/blob/ca661c7057984aa98ed4f7083d84dae2f65bfcb0/docker-compose.yml
+    startup_documentation:
+      path: README.md
+      section: Docker Compose, lines 72-86
+      evidence: https://github.com/umami-software/umami/blob/ca661c7057984aa98ed4f7083d84dae2f65bfcb0/README.md#L72-L86
+    workload_shape:
+      - Analytics web application
+      - PostgreSQL
+      - Health checks
+      - Persistent database volume
+    documented_setup:
+      - instruction: Follow the pinned README Docker Compose procedure.
+
+  - id: listmonk
+    url: https://github.com/knadh/listmonk
+    commit_sha: 670c01717d48647093335cc23a6be6f4b79c3b6b
+    selection_rationale: >-
+      Adds a root-Compose Go application with PostgreSQL and a documented
+      initialization and migration flow.
+    expected_entry:
+      service: app
+      container_port: 9000
+      documented_host_port: 9000
+    compose:
+      path: docker-compose.yml
+      evidence: https://github.com/knadh/listmonk/blob/670c01717d48647093335cc23a6be6f4b79c3b6b/docker-compose.yml
+    startup_documentation:
+      path: README.md
+      section: Docker Compose quick start, lines 10-22
+      evidence: https://github.com/knadh/listmonk/blob/670c01717d48647093335cc23a6be6f4b79c3b6b/README.md#L10-L22
+    workload_shape:
+      - Go web application
+      - PostgreSQL
+      - Migration and initialization step
+    documented_setup:
+      - instruction: >-
+          Use the pinned README initialization command before normal startup.
+
+  - id: changedetection
+    url: https://github.com/dgtlmoon/changedetection.io
+    commit_sha: 5d9c7c6da76340597243e8163c4f2439237fa0e8
+    selection_rationale: >-
+      Adds a persistent web workload whose basic function performs outbound
+      fetches, without requiring its optional browser or paid integrations.
+    expected_entry:
+      service: changedetection
+      container_port: 5000
+      documented_host_port: 5000
+    compose:
+      path: docker-compose.yml
+      evidence: https://github.com/dgtlmoon/changedetection.io/blob/5d9c7c6da76340597243e8163c4f2439237fa0e8/docker-compose.yml
+    startup_documentation:
+      path: README.md
+      section: Docker Compose, lines 113-120
+      evidence: https://github.com/dgtlmoon/changedetection.io/blob/5d9c7c6da76340597243e8163c4f2439237fa0e8/README.md#L113-L120
+    workload_shape:
+      - Primary web application
+      - Persistent data
+      - Outbound network fetches
+    documented_setup:
+      - instruction: Follow the pinned README Docker Compose procedure.
+      - instruction: >-
+          Optional browser and paid integrations are excluded from basic startup.
+
+  - id: uptime-kuma
+    url: https://github.com/louislam/uptime-kuma
+    commit_sha: a852e21eba4ecf339624b404518c5bc7fad6d45c
+    selection_rationale: >-
+      Adds a root-Compose single-service monitoring UI with persistent state and
+      a health check.
+    expected_entry:
+      service: uptime-kuma
+      container_port: 3001
+      documented_host_port: 3001
+    compose:
+      path: compose.yaml
+      evidence: https://github.com/louislam/uptime-kuma/blob/a852e21eba4ecf339624b404518c5bc7fad6d45c/compose.yaml
+    startup_documentation:
+      path: README.md
+      section: Docker Compose installation
+      evidence: https://github.com/louislam/uptime-kuma/blob/a852e21eba4ecf339624b404518c5bc7fad6d45c/README.md
+    workload_shape:
+      - Single-service monitoring UI
+      - Persistent volume
+      - Health check
+    documented_setup:
+      - instruction: >-
+          Follow the pinned README Docker Compose installation procedure.
+
+  - id: wakapi
+    url: https://github.com/muety/wakapi
+    commit_sha: 8143ca13ade1c14959be8a79c1d736d9889013e4
+    selection_rationale: >-
+      Adds a root-Compose Go application with local persistent storage and
+      documented local secret inputs.
+    expected_entry:
+      service: wakapi
+      container_port: 3000
+      documented_host_port: 3000
+    compose:
+      path: compose.yml
+      evidence: https://github.com/muety/wakapi/blob/8143ca13ade1c14959be8a79c1d736d9889013e4/compose.yml
+    startup_documentation:
+      path: README.md
+      section: Docker Compose, lines 78-90
+      evidence: https://github.com/muety/wakapi/blob/8143ca13ade1c14959be8a79c1d736d9889013e4/README.md#L78-L90
+    workload_shape:
+      - Go web application
+      - Local persistent storage
+      - Local secret inputs
+    documented_setup:
+      - instruction: >-
+          Supply only documented local, non-production secret values as inputs.
+      - instruction: Follow the pinned README Docker Compose procedure.
+
+  - id: linkding
+    url: https://github.com/sissbruecker/linkding
+    commit_sha: 65813a75404b1319aca8b09700fadc0b15adabaf
+    selection_rationale: >-
+      Adds an environment-template and initial-user setup pattern for a
+      persistent bookmark-manager workload.
+    expected_entry:
+      service: linkding
+      container_port: 9090
+      documented_host_port: 9090
+    compose:
+      path: docker-compose.yml
+      evidence: https://github.com/sissbruecker/linkding/blob/65813a75404b1319aca8b09700fadc0b15adabaf/docker-compose.yml
+    startup_documentation:
+      path: docs/src/content/docs/installation.md
+      section: Docker Compose, lines 67-74
+      evidence: https://github.com/sissbruecker/linkding/blob/65813a75404b1319aca8b09700fadc0b15adabaf/docs/src/content/docs/installation.md#L67-L74
+    workload_shape:
+      - Bookmark-manager web application
+      - Persistent data
+      - Environment template
+      - Initial-user setup
+    documented_setup:
+      - instruction: Copy the documented .env.sample input to .env before startup.
+      - instruction: Apply the documented initial-user setup.
+
+  - id: paperless-ngx
+    url: https://github.com/paperless-ngx/paperless-ngx
+    commit_sha: 6f3945f11f1ff13ab90da76c26de37660ff1d497
+    selection_rationale: >-
+      Adds a nested multi-service Compose template with PostgreSQL, Valkey,
+      workers, and checked-in environment templates.
+    expected_entry:
+      service: webserver
+      container_port: 8000
+      documented_host_port: 8000
+    compose:
+      path: docker/compose/docker-compose.postgres.yml
+      evidence: https://github.com/paperless-ngx/paperless-ngx/blob/6f3945f11f1ff13ab90da76c26de37660ff1d497/docker/compose/docker-compose.postgres.yml
+    startup_documentation:
+      path: docs/setup.md
+      section: Docker Compose setup and referenced instructions
+      evidence: https://github.com/paperless-ngx/paperless-ngx/blob/6f3945f11f1ff13ab90da76c26de37660ff1d497/docs/setup.md
+    workload_shape:
+      - Web application
+      - PostgreSQL
+      - Valkey
+      - Worker services
+      - Nested Compose and environment templates
+    documented_setup:
+      - instruction: Use the pinned PostgreSQL Compose template.
+      - instruction: Use the checked-in Compose environment template.
+        path: docker/compose/docker-compose.env
+        evidence: https://github.com/paperless-ngx/paperless-ngx/blob/6f3945f11f1ff13ab90da76c26de37660ff1d497/docker/compose/docker-compose.env
+      - instruction: Use the checked-in local environment template.
+        path: docker/compose/.env
+        evidence: https://github.com/paperless-ngx/paperless-ngx/blob/6f3945f11f1ff13ab90da76c26de37660ff1d497/docker/compose/.env
+
+  - id: n8n-hosting
+    url: https://github.com/n8n-io/n8n-hosting
+    commit_sha: 6b78193475d84ae190622d8a8e9ba8598e89b7d1
+    selection_rationale: >-
+      Adds a deployment-repository form with nested Compose, PostgreSQL, a task
+      runner, and documented environment input.
+    expected_entry:
+      service: n8n
+      container_port: 5678
+      documented_host_port: 5678
+    compose:
+      path: docker-compose/withPostgres/docker-compose.yml
+      evidence: https://github.com/n8n-io/n8n-hosting/blob/6b78193475d84ae190622d8a8e9ba8598e89b7d1/docker-compose/withPostgres/docker-compose.yml
+    startup_documentation:
+      path: docker-compose/withPostgres/README.md
+      section: PostgreSQL Docker Compose startup
+      evidence: https://github.com/n8n-io/n8n-hosting/blob/6b78193475d84ae190622d8a8e9ba8598e89b7d1/docker-compose/withPostgres/README.md
+    workload_shape:
+      - Deployment repository
+      - Application service
+      - PostgreSQL
+      - Task runner
+      - Environment template
+    documented_setup:
+      - instruction: >-
+          Prepare the documented environment input from the pinned instructions.
+
+  - id: netbox-docker
+    url: https://github.com/netbox-community/netbox-docker
+    commit_sha: 5adc62fe3fa65163c4ef63733bdcbd3e59b5c544
+    selection_rationale: >-
+      Adds a root multi-service deployment with database, cache, worker, and a
+      documented Compose override that publishes the web entry.
+    expected_entry:
+      service: netbox
+      container_port: 8080
+      documented_host_port: 8000
+    compose:
+      path: docker-compose.yml
+      evidence: https://github.com/netbox-community/netbox-docker/blob/5adc62fe3fa65163c4ef63733bdcbd3e59b5c544/docker-compose.yml
+    startup_documentation:
+      path: README.md
+      section: Docker Compose startup and override setup
+      evidence: https://github.com/netbox-community/netbox-docker/blob/5adc62fe3fa65163c4ef63733bdcbd3e59b5c544/README.md
+    workload_shape:
+      - Multi-service web application
+      - PostgreSQL
+      - Valkey
+      - Worker
+      - Compose override
+    documented_setup:
+      - instruction: Copy the documented override example before Compose startup.
+      - instruction: Use the checked-in override example as documented input.
+        path: docker-compose.override.yml.example
+        evidence: https://github.com/netbox-community/netbox-docker/blob/5adc62fe3fa65163c4ef63733bdcbd3e59b5c544/docker-compose.override.yml.example
+
+  - id: dockge
+    url: https://github.com/louislam/dockge
+    commit_sha: f809ae192b571944ad773e9866d3e67064ae8043
+    selection_rationale: >-
+      Retains one realistic Docker-socket and absolute-bind workload to stress
+      admission and sandbox isolation without authorizing weaker policy.
+    expected_entry:
+      service: dockge
+      container_port: 5001
+      documented_host_port: 5001
+    compose:
+      path: compose.yaml
+      evidence: https://github.com/louislam/dockge/blob/f809ae192b571944ad773e9866d3e67064ae8043/compose.yaml
+    startup_documentation:
+      path: README.md
+      section: Docker Compose, lines 25-60
+      evidence: https://github.com/louislam/dockge/blob/f809ae192b571944ad773e9866d3e67064ae8043/README.md#L25-L60
+    workload_shape:
+      - Docker Compose management UI
+      - Root Compose file
+      - Absolute bind path
+      - Guest Docker socket mount
+    documented_setup:
+      - instruction: The absolute stack path is a documented expected input.
+      - instruction: >-
+          The documented Docker socket is evidence for admission testing only;
+          it never authorizes exposing the host socket or weakening sandbox
+          policy.
