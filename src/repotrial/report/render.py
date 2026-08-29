@@ -58,6 +58,7 @@ def _project(state: RunState) -> dict[str, object]:
             "current_compose_reference": state.compose_path,
         },
         "coverage": coverage,
+        "stop_reason": state.stop_reason,
         "baseline_risk_findings": [
             finding.model_dump(mode="json") for finding in state.risk_findings
         ],

@@ -22,6 +22,8 @@ class RepoIntakeError(RuntimeError):
     """A sanitized repository-intake failure."""
 
     def __init__(self, operation: str, returncode: int | None = None) -> None:
+        self.operation = operation
+        self.returncode = returncode
         message = f"repository intake failed: {operation}"
         if returncode is not None:
             message = f"{message} (returncode={returncode})"
@@ -101,16 +103,34 @@ async def clone_and_resolve(
             "clone",
             "--filter=blob:none",
         ]
-        if requested_ref is not None:
+        if (
+            requested_ref is not None
+            and _FULL_COMMIT_SHA.fullmatch(requested_ref) is None
+        ):
             clone_arguments.append(f"--branch={requested_ref}")
         clone_arguments.extend(("--", clone_source, str(destination)))
         await _run_git("clone", *clone_arguments)
+        if requested_ref is not None and _FULL_COMMIT_SHA.fullmatch(requested_ref):
+            await _run_git(
+                "checkout",
+                "-C",
+                str(destination),
+                "checkout",
+                "--detach",
+                requested_ref,
+            )
         sha_output = await _run_git(
             "resolve", "-C", str(destination), "rev-parse", "--verify", "HEAD^{commit}"
         )
         commit_sha = sha_output.decode("ascii", errors="replace").strip().lower()
         if _FULL_COMMIT_SHA.fullmatch(commit_sha) is None:
             raise RepoIntakeError("invalid_commit_sha")
+        if (
+            requested_ref is not None
+            and _FULL_COMMIT_SHA.fullmatch(requested_ref) is not None
+            and commit_sha != requested_ref
+        ):
+            raise RepoIntakeError("commit_sha_mismatch")
         return commit_sha, destination
     except asyncio.CancelledError:
         _remove_owned_destination(claim)

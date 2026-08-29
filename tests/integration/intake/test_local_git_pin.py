@@ -81,6 +81,31 @@ def test_clone_and_resolve_pins_requested_branch_or_tag(
     assert local_path == destination.resolve()
 
 
+def test_clone_and_resolve_checks_out_a_requested_full_sha_detached(
+    local_repository: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    source, first_commit, second_commit = local_repository
+    destination = tmp_path / "historical commit destination"
+
+    commit_sha, local_path = asyncio.run(
+        github.clone_and_resolve(str(source), destination, requested_ref=first_commit)
+    )
+
+    assert second_commit != first_commit
+    assert commit_sha == first_commit
+    assert local_path == destination.resolve()
+    assert _git(local_path, "rev-parse", "HEAD^{commit}") == first_commit
+    detached = subprocess.run(
+        ["git", "symbolic-ref", "-q", "HEAD"],
+        cwd=local_path,
+        check=False,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    assert detached.returncode == 1
+
+
 def test_clone_and_resolve_removes_owned_destination_after_missing_ref(
     local_repository: tuple[Path, str, str], tmp_path: Path
 ) -> None:

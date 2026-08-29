@@ -4,11 +4,13 @@ import pytest
 from typer import Typer
 from typer.testing import CliRunner
 
+from repotrial import cli
 from repotrial.cli import create_app
 from repotrial.config import create_run_layout
 from repotrial.domain.enums import Verdict
 from repotrial.domain.models import JourneyResult, RunState
 from repotrial.run_outcome import TerminalOutcome, classify_terminal_outcome
+from repotrial.sandbox.base import SandboxProvider
 
 FIXED_RUN_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -124,6 +126,75 @@ def test_inspect_without_dry_run_creates_no_artifacts(tmp_path: Path) -> None:
 
     result = CliRunner().invoke(
         make_app(artifacts_root), ["inspect", "https://github.com/a/b"]
+    )
+
+    assert result.exit_code != 0
+    assert not artifacts_root.exists()
+
+
+def test_docker_sbx_inspect_requires_a_full_lowercase_commit_sha_before_artifacts(
+    tmp_path: Path,
+) -> None:
+    artifacts_root = tmp_path / "artifacts"
+
+    result = CliRunner().invoke(
+        make_app(artifacts_root),
+        ["inspect", "--provider", "docker-sbx", "https://github.com/a/b"],
+    )
+
+    assert result.exit_code != 0
+    assert "--commit-sha" in result.output
+    assert not artifacts_root.exists()
+
+
+def test_cli_docker_sbx_default_keeps_a_1024_mb_memory_bound() -> None:
+    assert cli._DEFAULT_DOCKER_SBX_POLICY.memory_mb == 1024
+
+
+@pytest.mark.parametrize("commit_sha", ["A" * 40, "a" * 39, "g" * 40])
+def test_dry_run_rejects_invalid_supplied_commit_sha_before_artifacts(
+    tmp_path: Path, commit_sha: str
+) -> None:
+    artifacts_root = tmp_path / "artifacts"
+
+    result = CliRunner().invoke(
+        make_app(artifacts_root),
+        [
+            "inspect",
+            "--dry-run",
+            "--commit-sha",
+            commit_sha,
+            "https://github.com/a/b",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert not artifacts_root.exists()
+
+
+def test_invalid_container_port_fails_before_provider_or_artifact_use(
+    tmp_path: Path,
+) -> None:
+    artifacts_root = tmp_path / "artifacts"
+
+    def unexpected_provider(_name: str) -> SandboxProvider:
+        raise AssertionError("invalid port reached provider construction")
+
+    app = create_app(
+        artifacts_root=artifacts_root,
+        run_id_generator=fixed_run_id,
+        provider_factory=unexpected_provider,
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "inspect",
+            "--provider",
+            "fake",
+            "--container-port",
+            "0",
+            "https://github.com/a/b",
+        ],
     )
 
     assert result.exit_code != 0

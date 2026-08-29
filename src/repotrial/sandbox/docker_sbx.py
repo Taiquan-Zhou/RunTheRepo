@@ -41,8 +41,8 @@ _CREATE_FLAGS = (
     "--cpus",
     "--memory",
     "--deny-network",
-    "--pids-limit",
 )
+PID_HARD_BOUND_LIMITATION = "pid_hard_bound_unsupported"
 _PORT_KEYS = {"host_ip", "host_port", "sandbox_port", "protocol"}
 _NETWORK_EVENT_KEYS = {
     "sandbox",
@@ -228,7 +228,6 @@ class DockerSbxProvider(SandboxProvider):
         deadline = time.monotonic() + self._policy.total_duration_s
         allocation = calculate_disk_allocation(self._policy.disk_mb)
         network_log_supported = await self._probe(deadline)
-        self._require_runtime_policy_enforcement()
         sandbox_id = _new_sandbox_id(name)
         self._sandbox_states[sandbox_id] = _SandboxState.PENDING
         arguments = [
@@ -240,8 +239,6 @@ class DockerSbxProvider(SandboxProvider):
             _format_cpus(self._policy.cpus),
             "--memory",
             f"{self._policy.memory_mb}m",
-            "--pids-limit",
-            str(self._policy.pids_limit),
         ]
         for resource in sorted(self._policy.deny_network):
             arguments.extend(("--deny-network", resource))
@@ -266,9 +263,6 @@ class DockerSbxProvider(SandboxProvider):
         if network_log_supported:
             self._network_log_sandboxes.add(sandbox_id)
         return sandbox_id
-
-    def _require_runtime_policy_enforcement(self) -> None:
-        raise DockerSbxUnsupportedError("runtime_policy_enforcement_unproven:pids")
 
     def _disk_environment(self, allocation: DiskAllocation) -> dict[str, str]:
         environment = self._subprocess_environment.copy()
@@ -470,7 +464,7 @@ class DockerSbxProvider(SandboxProvider):
         required_help = (
             ("create", ["create", "--help"], _CREATE_FLAGS),
             ("create_shell", ["create", "shell", "--help"], ("PATH",)),
-            ("exec", ["exec", "--help"], ("--",)),
+            ("exec", ["exec", "--help"], ()),
             ("ports", ["ports", "--help"], ("--publish", "--json")),
             ("cp", ["cp", "--help"], ()),
             ("rm", ["rm", "--help"], ("--force",)),

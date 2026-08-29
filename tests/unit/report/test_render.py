@@ -119,6 +119,7 @@ def _state(*, hostile: bool = False, untested: bool = False) -> RunState:
             "artifacts/nonexistent-sentinel.json",
             "artifacts/accepted-compose.yaml",
         ],
+        stop_reason="no_remaining_mutations",
     )
 
 
@@ -144,6 +145,7 @@ def test_renderer_writes_complete_stable_json_and_html_snapshot(tmp_path: Path) 
         "run_id": "run-001",
     }
     assert report["coverage"]["summary"] == "4/4 journeys"
+    assert report["stop_reason"] == "no_remaining_mutations"
     assert [item["classification"] for item in report["coverage"]["journeys"]] == [
         "PASS",
         "PASS",

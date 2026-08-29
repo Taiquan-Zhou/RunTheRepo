@@ -31,7 +31,6 @@ CREATE_FLAGS = (
     "--cpus",
     "--memory",
     "--deny-network",
-    "--pids-limit",
 )
 HELP_OUTPUTS = {
     ("sbx", "create", "--help"): "Usage: sbx create [flags] AGENT PATH\n"
@@ -225,7 +224,6 @@ def _provider(
         ),
         command_timeout_s=command_timeout_s,
     )
-    monkeypatch.setattr(provider, "_require_runtime_policy_enforcement", lambda: None)
     return provider
 
 
@@ -483,21 +481,29 @@ def test_missing_required_operation_flag_prevents_create(
     assert _non_help_create_calls(spawner) == []
 
 
-def test_complete_help_tokens_cannot_attest_runtime_policy_enforcement(
+def test_current_exec_help_shape_allows_create_with_argv_delimiter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     spawner = _SbxSpawner()
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawner)
-    provider = DockerSbxProvider(_policy())
-
-    with pytest.raises(DockerSbxUnsupportedError) as raised:
-        _create(provider, tmp_path)
-
-    assert raised.value.reason == "runtime_policy_enforcement_unproven:pids"
-    assert _non_help_create_calls(spawner) == []
-    assert not any(
-        call[:2] == ("sbx", "exec") and call[-1] != "--help" for call in spawner.calls
+    spawner.overrides[("sbx", "exec", "--help")] = _Outcome(
+        stdout=b"Usage: sbx exec [flags] SANDBOX COMMAND [ARG...]"
     )
+    provider = _provider(monkeypatch, spawner)
+
+    _create(provider, tmp_path)
+
+    assert len(_non_help_create_calls(spawner)) == 1
+
+
+def test_supported_capabilities_allow_create_without_pid_hard_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+
+    _create(provider, tmp_path)
+
+    assert len(_non_help_create_calls(spawner)) == 1
 
 
 def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
@@ -527,13 +533,12 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
         "1.5",
         "--memory",
         "512m",
-        "--pids-limit",
-        "64",
     ]
     for resource in sorted(MANDATORY_DENY_NETWORK | {"example.internal"}):
         expected.extend(("--deny-network", resource))
     expected.extend(("shell", str(tmp_path)))
     assert _actual_create_call(spawner) == tuple(expected)
+    assert "--pids-limit" not in _actual_create_call(spawner)
     assert sandbox_id.startswith("repotrial-trial-")
     assert all("shell" not in kwargs for kwargs in spawner.kwargs)
     create_index = next(

@@ -60,26 +60,27 @@ Execution is prohibited until every gate below is independently verified as
 
 | Gate | Required proof before any target workload | Preparation status |
 |---|---|---|
-| PID hard bound | Effective sandbox PID limit is a verified hard bound, including failure behavior. | UNVERIFIED — gate closed |
+| PID hard bound | SBX v0.39.0 cannot prove a PID hard bound; `pid_hard_bound_unsupported` is retained in every attempt result. | OWNER-ACCEPTED KNOWN UNSUPPORTED LIMITATION — not a Pilot blocker |
 | Sandbox health | Current provider health and required isolation capabilities pass immediately before execution. | UNVERIFIED — gate closed |
-| Immutable repository identity | An official, generic route accepts/enforces the manifest SHA, and actual `HEAD^{commit}` equality is proven before target workload execution. | BLOCKED — current CLI has no immutable-ref input |
-| Exact failure reason | Every failed attempt exposes and preserves the exact `RunState.stop_reason` in collected evidence. | BLOCKED — current report/CLI projection is insufficient |
-| Resource bounds | Effective CPU, memory, PID, disk, and whole-duration limits are all verified. | UNVERIFIED — gate closed |
+| Immutable repository identity | `--commit-sha` accepts only a lowercase full SHA, generic intake checks it out detached, verifies `HEAD^{commit}`, and persists expected/actual SHA in `attempt-result.json`. | IMPLEMENTED — verify against every exact Pilot attempt |
+| Exact failure reason | Deterministic report JSON includes `RunState.stop_reason`; terminal `attempt-result.json` retains it for graph terminal results and a sanitized reason for exceptions. | IMPLEMENTED — verify against every exact Pilot attempt |
+| Resource bounds | Effective CPU, memory, disk, and whole-duration limits are all verified; PID is the separately disclosed unsupported limitation. | UNVERIFIED — gate closed |
 | Forced cleanup | Cancellation, timeout, normal completion, and partial-create paths prove forced cleanup and auditable lifecycle evidence. | UNVERIFIED — gate closed |
 | No host fallback | Provider/tool routing proves that no target command or Compose workload can fall back to the host. | UNVERIFIED — gate closed |
 
 ### Current preparation findings (execution gates, not Pilot outcomes)
 
-1. `repotrial inspect` currently accepts a repository URL but exposes no
-   immutable-ref input. Repository intake can pin a `requested_ref` internally,
-   but that does not provide an operator-visible, verified manifest-SHA route.
-   Execution must not start until an official, generic route proves the exact
-   manifest SHA before any target workload. This protocol invents no CLI flag.
-2. `RunState.stop_reason` exists, but the current report projection omits it and
-   the CLI does not provide the complete exact failure evidence required here.
-   Execution must not start until exact stop-reason capture is proven.
-
-Neither finding is fixed or bypassed by this preparation task.
+1. SBX v0.39.0 PID hard-bound enforcement is an Owner-accepted known unsupported
+   limitation. It is disclosed as `pid_hard_bound_unsupported`; this Pilot does
+   not claim fork-bomb protection and PID is not an execution blocker.
+2. `repotrial inspect --commit-sha <lowercase-full-sha>` is the generic immutable
+   repository route. Generic intake performs a detached checkout and verifies
+   `HEAD^{commit}` before baseline/workload; `attempt-result.json` records both
+   expected and actual SHA. Each Pilot attempt must independently verify it.
+3. `trial-report.json` projects the exact graph-terminal `RunState.stop_reason`.
+   `attempt-result.json` is persisted for each non-dry-run terminal attempt and
+   retains the raw graph stop reason or a deterministic sanitized exception reason.
+   Each Pilot attempt must independently verify the evidence.
 
 ## 3. Execution protocol
 
@@ -88,7 +89,8 @@ For each manifest entry, in order:
 1. Confirm all pre-execution gates are `PASS` and archive their evidence.
 2. Allocate an attempt ID, assign its `primary`/`replacement`/`diagnostic` role,
    start an external monotonic timer, and record UTC start time before invocation.
-   Record the exact command verbatim; do not add an invented immutable-ref option.
+   Record the exact command verbatim, including the approved generic
+   `--commit-sha`, `--container-port`, and optional `--compose-path` inputs.
 3. Through the approved generic intake route, verify the checked-out
    `HEAD^{commit}` equals the manifest SHA before any target workload executes.
    A mismatch terminates the attempt and is classified as `intake`.
@@ -108,8 +110,8 @@ For each manifest entry, in order:
 9. Stop the attempt timer only after required cleanup has reached a terminal state.
    Apply the frozen attribution rules without a free-form effect-on-metrics decision.
 
-The exact Pilot command is `TBD` until the immutable-identity gate has an approved
-generic route. This preparation document does not authorize execution.
+The exact Pilot command remains `TBD`. This preparation document does not
+authorize execution.
 
 ## 4. Outcome definitions
 

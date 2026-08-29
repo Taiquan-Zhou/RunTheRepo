@@ -1,10 +1,13 @@
+import asyncio
 import json
 import subprocess
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TypeVar
 
 import pytest
@@ -15,9 +18,17 @@ from repotrial import cli
 from repotrial.agent.state import GraphState
 from repotrial.cli import create_app
 from repotrial.domain.enums import ExperimentVerdict, MutationType, Verdict
-from repotrial.domain.models import ExperimentRecord, JourneyResult, Mutation, RunState
+from repotrial.domain.models import (
+    ExperimentRecord,
+    JourneyResult,
+    Mutation,
+    PinnedRepo,
+    RepoRef,
+    RunState,
+)
 from repotrial.models.base import RecoveryAction
 from repotrial.sandbox.base import ExecResult
+from repotrial.sandbox.docker_sbx import DockerSbxUnsupportedError
 from repotrial.sandbox.fake import FakeSandboxProvider
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -40,11 +51,12 @@ class FixtureProvider(FakeSandboxProvider):
         self,
         *,
         host_port: int | None = None,
+        container_port: int = 8080,
         baseline_healthy: bool = True,
         candidate_boot_unavailable: bool = False,
         create_error: BaseException | None = None,
     ) -> None:
-        super().__init__(ports={} if host_port is None else {8080: host_port})
+        super().__init__(ports={} if host_port is None else {container_port: host_port})
         self.baseline_healthy = baseline_healthy
         self.candidate_boot_unavailable = candidate_boot_unavailable
         self.create_error = create_error
@@ -209,24 +221,75 @@ def make_app(artifacts_root: Path, provider: FixtureProvider):
     )
 
 
+def _patch_attempt_clocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    utc_values = iter(
+        (
+            datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+            datetime(2026, 8, 29, 12, 1, tzinfo=UTC),
+        )
+    )
+    monotonic_values = iter((100.0, 102.5))
+    monkeypatch.setattr(cli, "_utc_now", lambda: next(utc_values), raising=False)
+    monkeypatch.setattr(
+        cli,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+        raising=False,
+    )
+
+
+def _attempt_result(artifacts_root: Path) -> dict[str, object]:
+    return json.loads(
+        (artifacts_root / FIXED_RUN_ID / "attempt-result.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+def _assert_attempt_timing(attempt: dict[str, object]) -> None:
+    assert attempt["started_at_utc"] == "2026-08-29T12:00:00+00:00"
+    assert attempt["ended_at_utc"] == "2026-08-29T12:01:00+00:00"
+    assert attempt["monotonic_duration_s"] == 2.5
+
+
+def _assert_timing_error(attempt: dict[str, object]) -> None:
+    assert attempt["timing_status"] == "evidence_timing_error"
+    assert attempt["started_at_utc"] is None
+    assert attempt["ended_at_utc"] is None
+    assert attempt["monotonic_duration_s"] is None
+
+
 def test_inspect_runs_local_git_fixture_to_a_report_and_cleans_up(
     tmp_path: Path,
 ) -> None:
     source = create_fixture_repo(tmp_path)
     artifacts_root = tmp_path / "artifacts"
     with healthy_server() as port:
-        provider = FixtureProvider(host_port=port)
+        provider = FixtureProvider(host_port=port, container_port=3000)
+        source_head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=source, text=True
+        ).strip()
         result = CliRunner().invoke(
             make_app(artifacts_root, provider),
-            ["inspect", str(source), "--provider", "fake", "--max-experiments", "8"],
+            [
+                "inspect",
+                str(source),
+                "--provider",
+                "fake",
+                "--max-experiments",
+                "8",
+                "--commit-sha",
+                source_head,
+                "--container-port",
+                "3000",
+                "--compose-path",
+                "compose.yaml",
+            ],
         )
 
     run_path = artifacts_root / FIXED_RUN_ID
     report_path = run_path / "report" / "trial-report.json"
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    source_head = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=source, text=True
-    ).strip()
     workspace = run_path / "workspace"
     assert result.exit_code == 0, result.output
     assert (workspace / ".git").is_dir()
@@ -237,6 +300,14 @@ def test_inspect_runs_local_git_fixture_to_a_report_and_cleans_up(
         == source_head
     )
     assert report["identity"]["commit_sha"] == source_head
+    attempt = json.loads((run_path / "attempt-result.json").read_text(encoding="utf-8"))
+    assert attempt["actual_verified_sha"] == source_head
+    assert attempt["expected_sha"] == source_head
+    assert attempt["container_port"] == 3000
+    assert attempt["compose_path"] == "compose.yaml"
+    assert attempt["stop_reason"] == "no_remaining_mutations"
+    assert attempt["known_limitations"] == ["pid_hard_bound_unsupported"]
+    assert f"attempt_evidence={run_path / 'attempt-result.json'}" in result.output
     assert (workspace / "compose.yaml").is_file()
     overlays = report["artifacts"]["experiment_overlays"]
     assert overlays
@@ -247,10 +318,326 @@ def test_inspect_runs_local_git_fixture_to_a_report_and_cleans_up(
     assert (run_path / "report" / "trial-report.html").is_file()
     assert list((run_path / "evidence").rglob("*.json"))
     assert any(call[0] == "create" for call in provider.calls)
+    assert any(call[0] == "publish_port" and call[2] == 3000 for call in provider.calls)
     assert len([call for call in provider.calls if call[0] == "create"]) == len(
         [call for call in provider.calls if call[0] == "destroy"]
     )
     assert provider.active_sandboxes == set()
+
+
+def test_graph_terminal_evidence_records_utc_and_monotonic_attempt_timing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = create_fixture_repo(tmp_path)
+    artifacts_root = tmp_path / "artifacts"
+    _patch_attempt_clocks(monkeypatch)
+
+    async def terminal_run(
+        graph: object, state: RunState, *, context: object
+    ) -> GraphState:
+        del graph, context
+        return GraphState(run=state.model_copy(update={"stop_reason": "completed"}))
+
+    monkeypatch.setattr(cli, "ainvoke_run", terminal_run)
+    result = CliRunner().invoke(
+        make_app(artifacts_root, FixtureProvider()),
+        ["inspect", str(source), "--provider", "fake", "--max-experiments", "8"],
+    )
+
+    assert result.exit_code == 3, result.output
+    _assert_attempt_timing(_attempt_result(artifacts_root))
+
+
+def test_start_timing_failure_persists_sanitized_evidence_without_running_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = create_fixture_repo(tmp_path)
+    artifacts_root = tmp_path / "artifacts"
+    graph_started = False
+
+    def fail_start_clock() -> datetime:
+        raise RuntimeError("clock secret=do-not-persist")
+
+    async def unexpected_graph(
+        graph: object, state: RunState, *, context: object
+    ) -> GraphState:
+        nonlocal graph_started
+        del graph, state, context
+        graph_started = True
+        raise AssertionError("timing failure reached graph execution")
+
+    monkeypatch.setattr(cli, "_utc_now", fail_start_clock)
+    monkeypatch.setattr(cli, "ainvoke_run", unexpected_graph)
+    result = CliRunner().invoke(
+        make_app(artifacts_root, FixtureProvider()),
+        ["inspect", str(source), "--provider", "fake", "--max-experiments", "8"],
+    )
+
+    attempt = _attempt_result(artifacts_root)
+    assert result.exit_code == 4, result.output
+    assert not graph_started
+    assert attempt["exception_type"] == "EvidenceTimingError"
+    assert attempt["stop_reason"] == "internal:evidence_timing_error"
+    _assert_timing_error(attempt)
+    assert "do-not-persist" not in json.dumps(attempt)
+
+
+@pytest.mark.parametrize("failure", ["end_utc", "end_monotonic"])
+def test_terminal_timing_completion_failure_fails_closed_with_evidence(
+    failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = create_fixture_repo(tmp_path)
+    artifacts_root = tmp_path / "artifacts"
+    timestamps = iter(
+        (
+            datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+            datetime(2026, 8, 29, 12, 1, tzinfo=UTC),
+        )
+    )
+    monotonic_values = iter((100.0, 102.5))
+
+    def utc_now() -> datetime:
+        if failure == "end_utc" and len(calls) == 0:
+            calls.append("start")
+            return next(timestamps)
+        if failure == "end_utc":
+            raise RuntimeError("end UTC secret=do-not-persist")
+        return next(timestamps)
+
+    def monotonic() -> float:
+        if failure == "end_monotonic" and len(calls) == 0:
+            calls.append("start")
+            return next(monotonic_values)
+        if failure == "end_monotonic":
+            raise RuntimeError("end monotonic secret=do-not-persist")
+        return next(monotonic_values)
+
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "_utc_now", utc_now)
+    monkeypatch.setattr(cli, "time", SimpleNamespace(monotonic=monotonic))
+
+    async def terminal_run(
+        graph: object, state: RunState, *, context: object
+    ) -> GraphState:
+        del graph, context
+        return GraphState(run=state.model_copy(update={"stop_reason": "completed"}))
+
+    monkeypatch.setattr(cli, "ainvoke_run", terminal_run)
+    result = CliRunner().invoke(
+        make_app(artifacts_root, FixtureProvider()),
+        ["inspect", str(source), "--provider", "fake", "--max-experiments", "8"],
+    )
+
+    attempt = _attempt_result(artifacts_root)
+    assert result.exit_code == 4, result.output
+    assert attempt["exception_type"] == "EvidenceTimingError"
+    assert attempt["stop_reason"] == "internal:evidence_timing_error"
+    assert attempt["report_paths"]["json"] == str(
+        artifacts_root / FIXED_RUN_ID / "report" / "trial-report.json"
+    )
+    assert attempt["report_paths"]["html"] == str(
+        artifacts_root / FIXED_RUN_ID / "report" / "trial-report.html"
+    )
+    _assert_timing_error(attempt)
+    assert "do-not-persist" not in json.dumps(attempt)
+
+
+def test_missing_graph_terminal_stop_reason_fails_closed_with_sanitized_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = create_fixture_repo(tmp_path)
+    artifacts_root = tmp_path / "artifacts"
+    _patch_attempt_clocks(monkeypatch)
+
+    async def missing_stop_reason(
+        graph: object, state: RunState, *, context: object
+    ) -> GraphState:
+        del graph, context
+        return GraphState(run=state)
+
+    monkeypatch.setattr(cli, "ainvoke_run", missing_stop_reason)
+    result = CliRunner().invoke(
+        make_app(artifacts_root, FixtureProvider()),
+        ["inspect", str(source), "--provider", "fake", "--max-experiments", "8"],
+    )
+
+    attempt = _attempt_result(artifacts_root)
+    assert result.exit_code == 4, result.output
+    assert attempt["stop_reason"] == "internal:valueerror"
+    assert attempt["terminal_outcome"] == "exception"
+    _assert_attempt_timing(attempt)
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected_exit", "expected_stop_reason"),
+    [
+        (
+            DockerSbxUnsupportedError("capability_missing"),
+            2,
+            "sandbox_unsupported:capability_missing",
+        ),
+        (RuntimeError("secret=never-persist"), 4, "internal:runtimeerror"),
+    ],
+)
+def test_exception_attempt_evidence_records_timing_without_error_text(
+    raised: Exception,
+    expected_exit: int,
+    expected_stop_reason: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = create_fixture_repo(tmp_path)
+    artifacts_root = tmp_path / "artifacts"
+    _patch_attempt_clocks(monkeypatch)
+
+    async def failing_run(
+        graph: object, state: RunState, *, context: object
+    ) -> GraphState:
+        del graph, state, context
+        raise raised
+
+    monkeypatch.setattr(cli, "ainvoke_run", failing_run)
+    result = CliRunner().invoke(
+        make_app(artifacts_root, FixtureProvider()),
+        ["inspect", str(source), "--provider", "fake", "--max-experiments", "8"],
+    )
+
+    attempt = _attempt_result(artifacts_root)
+    assert result.exit_code == expected_exit, result.output
+    assert attempt["stop_reason"] == expected_stop_reason
+    assert "never-persist" not in json.dumps(attempt)
+    _assert_attempt_timing(attempt)
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected_stop_reason", "expected_cli_exit"),
+    [
+        (asyncio.CancelledError(), "control:cancelled", None),
+        (KeyboardInterrupt(), "control:keyboard_interrupt", 130),
+        (SystemExit(17), "control:system_exit", 17),
+        (SystemExit(), "control:system_exit", 0),
+        (SystemExit("secret=do-not-persist"), "control:system_exit", 1),
+        (SystemExit(True), "control:system_exit", 1),
+        (SystemExit(False), "control:system_exit", 0),
+    ],
+)
+def test_control_flow_exit_persists_sanitized_attempt_evidence_before_propagating(
+    raised: BaseException,
+    expected_stop_reason: str,
+    expected_cli_exit: int | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = create_fixture_repo(tmp_path)
+    artifacts_root = tmp_path / "artifacts"
+    _patch_attempt_clocks(monkeypatch)
+
+    async def interrupted_run(
+        graph: object, state: RunState, *, context: object
+    ) -> GraphState:
+        del graph, state, context
+        raise raised
+
+    monkeypatch.setattr(cli, "ainvoke_run", interrupted_run)
+    if expected_cli_exit is None:
+        with pytest.raises(asyncio.CancelledError) as propagated:
+            CliRunner().invoke(
+                make_app(artifacts_root, FixtureProvider()),
+                [
+                    "inspect",
+                    str(source),
+                    "--provider",
+                    "fake",
+                    "--max-experiments",
+                    "8",
+                ],
+            )
+        assert propagated.value is raised
+    else:
+        result = CliRunner().invoke(
+            make_app(artifacts_root, FixtureProvider()),
+            ["inspect", str(source), "--provider", "fake", "--max-experiments", "8"],
+        )
+        assert result.exit_code == expected_cli_exit
+
+    attempt = _attempt_result(artifacts_root)
+    assert attempt["exception_type"] == type(raised).__name__
+    assert attempt["stop_reason"] == expected_stop_reason
+    assert attempt["known_limitations"] == ["pid_hard_bound_unsupported"]
+    if isinstance(raised, SystemExit):
+        assert attempt["exit_code"] == expected_cli_exit
+        assert type(attempt["exit_code"]) is int
+        assert "do-not-persist" not in json.dumps(attempt)
+    _assert_attempt_timing(attempt)
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected_stop_reason", "expected_cli_exit"),
+    [
+        (asyncio.CancelledError(), "control:cancelled", None),
+        (KeyboardInterrupt(), "control:keyboard_interrupt", 130),
+        (SystemExit(17), "control:system_exit", 17),
+    ],
+)
+def test_control_flow_timing_failure_persists_evidence_without_replacing_control_flow(
+    raised: BaseException,
+    expected_stop_reason: str,
+    expected_cli_exit: int | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = create_fixture_repo(tmp_path)
+    artifacts_root = tmp_path / "artifacts"
+    start = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
+    monotonic_values = iter((100.0,))
+
+    def utc_now() -> datetime:
+        if len(calls) == 0:
+            calls.append("start")
+            return start
+        raise RuntimeError("end UTC secret=do-not-persist")
+
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "_utc_now", utc_now)
+    monkeypatch.setattr(
+        cli,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+
+    async def interrupted_run(
+        graph: object, state: RunState, *, context: object
+    ) -> GraphState:
+        del graph, state, context
+        raise raised
+
+    monkeypatch.setattr(cli, "ainvoke_run", interrupted_run)
+    if expected_cli_exit is None:
+        with pytest.raises(asyncio.CancelledError) as propagated:
+            CliRunner().invoke(
+                make_app(artifacts_root, FixtureProvider()),
+                [
+                    "inspect",
+                    str(source),
+                    "--provider",
+                    "fake",
+                    "--max-experiments",
+                    "8",
+                ],
+            )
+        assert propagated.value is raised
+    else:
+        result = CliRunner().invoke(
+            make_app(artifacts_root, FixtureProvider()),
+            ["inspect", str(source), "--provider", "fake", "--max-experiments", "8"],
+        )
+        assert result.exit_code == expected_cli_exit
+
+    attempt = _attempt_result(artifacts_root)
+    assert attempt["exception_type"] == type(raised).__name__
+    assert attempt["stop_reason"] == expected_stop_reason
+    _assert_timing_error(attempt)
+    assert "do-not-persist" not in json.dumps(attempt)
 
 
 def test_inspect_rejects_unfrozen_experiment_budget_before_artifacts(
@@ -325,7 +712,9 @@ def test_inspect_returns_internal_error_for_an_unexpected_provider_failure(
 ) -> None:
     source = create_fixture_repo(tmp_path)
     artifacts_root = tmp_path / "artifacts"
-    provider = FixtureProvider(create_error=RuntimeError("unexpected fixture failure"))
+    provider = FixtureProvider(
+        create_error=RuntimeError("unexpected fixture failure secret=do-not-persist")
+    )
 
     result = CliRunner().invoke(
         make_app(artifacts_root, provider),
@@ -333,6 +722,63 @@ def test_inspect_returns_internal_error_for_an_unexpected_provider_failure(
     )
 
     assert result.exit_code == 4, result.output
+    attempt = json.loads(
+        (artifacts_root / FIXED_RUN_ID / "attempt-result.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert attempt["exception_type"] == "RuntimeError"
+    assert attempt["stop_reason"] == "internal:runtimeerror"
+    assert "unexpected fixture failure" not in json.dumps(attempt)
+    assert "do-not-persist" not in json.dumps(attempt)
+
+
+def test_inspect_rejects_pinner_sha_mismatch_before_provider_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts_root = tmp_path / "artifacts"
+    expected_sha = "a" * 40
+    actual_sha = "b" * 40
+    provider = FixtureProvider()
+
+    async def mismatched_pinner(
+        url: str, destination: Path, requested_ref: str | None = None
+    ) -> PinnedRepo:
+        assert requested_ref == expected_sha
+        destination.mkdir()
+        return PinnedRepo(
+            repo=RepoRef(
+                url=url,
+                owner="owner",
+                repo="repo",
+                requested_ref=requested_ref,
+            ),
+            commit_sha=actual_sha,
+            local_path=destination,
+        )
+
+    monkeypatch.setattr(cli, "pin_repository", mismatched_pinner)
+    result = CliRunner().invoke(
+        make_app(artifacts_root, provider),
+        [
+            "inspect",
+            "--provider",
+            "fake",
+            "--commit-sha",
+            expected_sha,
+            "https://github.com/owner/repo",
+        ],
+    )
+
+    attempt = json.loads(
+        (artifacts_root / FIXED_RUN_ID / "attempt-result.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert result.exit_code == 4, result.output
+    assert provider.calls == []
+    assert attempt["actual_verified_sha"] == actual_sha
+    assert attempt["stop_reason"] == "intake:commit_sha_mismatch"
 
 
 def test_inspect_returns_internal_error_when_report_rendering_fails(

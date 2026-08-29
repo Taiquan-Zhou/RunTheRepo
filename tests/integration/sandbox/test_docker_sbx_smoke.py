@@ -36,7 +36,7 @@ def test_real_sbx_disposable_lifecycle(tmp_path: Path) -> None:
     provider = DockerSbxProvider(
         DockerSbxPolicy(
             cpus=1,
-            memory_mb=512,
+            memory_mb=1024,
             pids_limit=64,
             disk_mb=2048,
             total_duration_s=120,
