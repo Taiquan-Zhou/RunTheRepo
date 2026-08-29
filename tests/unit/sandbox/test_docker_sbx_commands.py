@@ -40,6 +40,10 @@ HELP_OUTPUTS = {
     ("sbx", "ports", "--help"): "Usage: sbx ports SANDBOX [--publish PORT] [--json]",
     ("sbx", "cp", "--help"): "Usage: sbx cp SRC DST",
     ("sbx", "rm", "--help"): "Usage: sbx rm --force SANDBOX",
+    ("sbx", "policy", "allow", "network", "--help"): (
+        "Usage: sbx policy allow network [--sandbox SANDBOX] RESOURCES\n"
+        'Use "**" to allow all hosts.'
+    ),
     ("sbx", "policy", "log", "--help"): (
         "Usage: sbx policy log SANDBOX --type network --json"
     ),
@@ -52,6 +56,7 @@ PROBE_CALLS = [
     ("sbx", "ports", "--help"),
     ("sbx", "cp", "--help"),
     ("sbx", "rm", "--help"),
+    ("sbx", "policy", "allow", "network", "--help"),
     ("sbx", "policy", "log", "--help"),
 ]
 
@@ -397,6 +402,7 @@ def test_nonzero_probe_preserves_bounded_stderr_on_unsupported_error(
         ("sbx", "ports", "--help"),
         ("sbx", "cp", "--help"),
         ("sbx", "rm", "--help"),
+        ("sbx", "policy", "allow", "network", "--help"),
     ],
 )
 def test_nonzero_required_probe_fails_closed_before_create(
@@ -493,6 +499,25 @@ def test_missing_required_operation_flag_prevents_create(
     assert _non_help_create_calls(spawner) == []
 
 
+@pytest.mark.parametrize("missing_token", ["--sandbox", '"**"'])
+def test_missing_policy_allow_network_capability_prevents_create(
+    missing_token: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    help_call = ("sbx", "policy", "allow", "network", "--help")
+    spawner = _SbxSpawner()
+    help_text = HELP_OUTPUTS[help_call].replace(missing_token, "")
+    spawner.overrides[help_call] = _Outcome(stdout=help_text.encode())
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxUnsupportedError) as raised:
+        _create(provider, tmp_path)
+
+    assert raised.value.reason == (
+        f"policy_allow_network_missing_capability:{missing_token}"
+    )
+    assert _non_help_create_calls(spawner) == []
+
+
 def test_current_exec_help_shape_allows_create_with_argv_delimiter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -550,14 +575,19 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
         expected.extend(("--deny-network", resource))
     expected.extend(("shell", str(tmp_path)))
     assert _actual_create_call(spawner) == tuple(expected)
+    create_index = spawner.calls.index(tuple(expected))
+    assert spawner.calls[create_index + 1] == (
+        "sbx",
+        "policy",
+        "allow",
+        "network",
+        "--sandbox",
+        sandbox_id,
+        "**",
+    )
     assert "--pids-limit" not in _actual_create_call(spawner)
     assert sandbox_id.startswith("repotrial-trial-")
     assert all("shell" not in kwargs for kwargs in spawner.kwargs)
-    create_index = next(
-        index
-        for index, call in enumerate(spawner.calls)
-        if call[:2] == ("sbx", "create") and call[-1] != "--help"
-    )
     create_env = cast(dict[str, str], spawner.kwargs[create_index].get("env"))
     assert create_env["DOCKER_SANDBOXES_ROOT_SIZE"] == "1m"
     assert create_env["DOCKER_SANDBOXES_DOCKER_SIZE"] == "2042m"
@@ -574,6 +604,93 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
         and any("df -B1 -P" in argument for argument in call)
         for call in spawner.calls
     )
+
+
+@pytest.mark.parametrize(
+    ("failure", "outcome", "expected_reason"),
+    [
+        ("nonzero", _Outcome(returncode=7, stderr=b"allow failed"), "nonzero_exit"),
+        ("timeout", _Outcome(hang=True), "timeout"),
+        ("io", OSError("allow io"), "io_error"),
+    ],
+)
+def test_policy_allow_failure_force_removes_pending_sandbox_without_deadline(
+    failure: str,
+    outcome: _Outcome | BaseException,
+    expected_reason: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+
+    def handle(command: tuple[str, ...]) -> _Outcome | BaseException:
+        if command[:5] == ("sbx", "policy", "allow", "network", "--sandbox"):
+            return outcome
+        return _Outcome()
+
+    spawner.handler = handle
+    provider = _provider(
+        monkeypatch,
+        spawner,
+        command_timeout_s=0.05 if failure == "timeout" else 5,
+    )
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    create_call = _actual_create_call(spawner)
+    sandbox_id = create_call[create_call.index("--name") + 1]
+    allow_call = (
+        "sbx",
+        "policy",
+        "allow",
+        "network",
+        "--sandbox",
+        sandbox_id,
+        "**",
+    )
+    assert (raised.value.operation, raised.value.reason) == (
+        "allow_network",
+        expected_reason,
+    )
+    assert spawner.calls[-3:] == [
+        create_call,
+        allow_call,
+        ("sbx", "rm", "--force", sandbox_id),
+    ]
+    assert provider._sandbox_deadlines == {}
+
+
+def test_cancelled_policy_allow_force_removes_pending_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    spawner.handler = lambda command: (
+        _Outcome(hang=True)
+        if command[:5] == ("sbx", "policy", "allow", "network", "--sandbox")
+        else _Outcome()
+    )
+    provider = _provider(monkeypatch, spawner)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(provider.create(tmp_path, "trial"))
+        while not any(
+            call[:5] == ("sbx", "policy", "allow", "network", "--sandbox")
+            for call in spawner.calls
+        ):
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+
+    create_call = _actual_create_call(spawner)
+    sandbox_id = create_call[create_call.index("--name") + 1]
+    assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
+    assert spawner.processes[-2].killed is True
+    assert spawner.processes[-2].waited is True
+    assert provider._sandbox_deadlines == {}
 
 
 def test_optional_network_log_probe_does_not_weaken_create_gate(
@@ -1318,7 +1435,7 @@ def test_cancellation_kills_and_reaps_child(
 
     async def exercise() -> None:
         task = asyncio.create_task(provider.exec(sandbox_id, ["wait"]))
-        while len(spawner.processes) < len(PROBE_CALLS) + 2:
+        while len(spawner.processes) < len(PROBE_CALLS) + 3:
             await asyncio.sleep(0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -1370,7 +1487,7 @@ def test_process_cleanup_resists_second_cancellation_and_reaps_before_raising(
 
     async def exercise() -> None:
         task = asyncio.create_task(provider.exec(sandbox_id, ["wait"]))
-        while len(spawner.processes) < len(PROBE_CALLS) + 2:
+        while len(spawner.processes) < len(PROBE_CALLS) + 3:
             await asyncio.sleep(0)
         process = spawner.processes[-1]
         task.cancel()
@@ -1399,7 +1516,7 @@ def test_cancelled_process_cleanup_failure_is_visible_after_second_cancellation(
 
     async def exercise() -> None:
         task = asyncio.create_task(provider.exec(sandbox_id, ["wait"]))
-        while len(spawner.processes) < len(PROBE_CALLS) + 2:
+        while len(spawner.processes) < len(PROBE_CALLS) + 3:
             await asyncio.sleep(0)
         process = spawner.processes[-1]
         task.cancel()
@@ -1691,19 +1808,58 @@ def test_create_deadline_starts_before_probes_and_limits_create_subprocess(
         monkeypatch,
         spawner,
         command_timeout_s=30,
-        total_duration_s=10,
+        total_duration_s=20,
     )
 
     sandbox_id = _create(provider, tmp_path)
 
     assert _timeouts_by_command(spawner, recorder)[: len(PROBE_CALLS)] == list(
-        zip(PROBE_CALLS, (10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0), strict=True)
+        zip(
+            PROBE_CALLS,
+            (20.0, 19.0, 18.0, 17.0, 16.0, 15.0, 14.0, 13.0, 12.0),
+            strict=True,
+        )
     )
-    assert _timeouts_by_command(spawner, recorder)[-1] == (
-        _actual_create_call(spawner),
-        2.0,
-    )
-    assert provider._sandbox_deadlines == {sandbox_id: 10.0}
+    create_call = _actual_create_call(spawner)
+    assert _timeouts_by_command(spawner, recorder)[-2:] == [
+        (create_call, 11.0),
+        (
+            (
+                "sbx",
+                "policy",
+                "allow",
+                "network",
+                "--sandbox",
+                sandbox_id,
+                "**",
+            ),
+            10.0,
+        ),
+    ]
+    assert provider._sandbox_deadlines == {sandbox_id: 20.0}
+
+
+def test_policy_allow_runs_before_active_state_and_deadline_are_saved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+
+    def assert_pending(command: tuple[str, ...]) -> None:
+        if command[:5] == ("sbx", "policy", "allow", "network", "--sandbox"):
+            sandbox_id = command[-2]
+            assert provider._sandbox_deadlines == {}
+            with pytest.raises(RuntimeError, match="not active"):
+                provider._require_active(sandbox_id)
+
+    spawner.before_spawn = assert_pending
+
+    sandbox_id = _create(provider, tmp_path)
+
+    assert provider._sandbox_deadlines == {sandbox_id: 300.0}
+    provider._require_active(sandbox_id)
 
 
 def test_trial_exhaustion_before_first_probe_prevents_subprocess(

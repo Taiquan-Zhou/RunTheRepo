@@ -251,6 +251,21 @@ class DockerSbxProvider(SandboxProvider):
                 deadline=deadline,
             )
             _require_success("create", result)
+            allow_network = await self._run(
+                "allow_network",
+                [
+                    "policy",
+                    "allow",
+                    "network",
+                    "--sandbox",
+                    sandbox_id,
+                    "**",
+                ],
+                self._command_timeout_s,
+                deadline=deadline,
+                sandbox_id=sandbox_id,
+            )
+            _require_success("allow_network", allow_network)
         except (DockerSbxError, asyncio.CancelledError) as error:
             await self._cleanup_after_uncertain_failure(
                 sandbox_id,
@@ -467,6 +482,11 @@ class DockerSbxProvider(SandboxProvider):
             ("ports", ["ports", "--help"], ("--publish", "--json")),
             ("cp", ["cp", "--help"], ()),
             ("rm", ["rm", "--help"], ("--force",)),
+            (
+                "policy_allow_network",
+                ["policy", "allow", "network", "--help"],
+                ("--sandbox", '"**"'),
+            ),
         )
         for capability, arguments, tokens in required_help:
             result = await self._probe_call(capability, arguments, deadline)
