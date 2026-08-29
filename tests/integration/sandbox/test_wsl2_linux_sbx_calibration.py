@@ -1,13 +1,16 @@
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.request import urlopen
+from typing import BinaryIO, Protocol
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import pytest
 
@@ -33,6 +36,9 @@ _EXPECTED_FILES = {
 }
 _MARKER = b"repotrial-wsl2-sbx-ok\n"
 _MIB = 1024 * 1024
+_MAX_HOST_OUTPUT_BYTES = 65_536
+_CANONICAL_EMPTY_SBX_INVENTORY = b"No sandboxes found.\n"
+_MAJOR_MINOR_PATTERN = re.compile(r"[0-9]+:[0-9]+")
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +52,42 @@ class _TrustedFixtureRepository:
 class _Mount:
     source: str
     filesystem: str
+    major_minor: str
+    uuid: str
     target: str
+
+    @property
+    def identity(self) -> tuple[str, str]:
+        return (self.major_minor, self.uuid)
+
+
+@dataclass(frozen=True, slots=True)
+class _HostCommandResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+class _LoopbackResponse(Protocol):
+    def geturl(self) -> str: ...
+
+    def read(self, size: int = -1) -> bytes: ...
+
+
+class _RejectLoopbackRedirect(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        request: Request,
+        fp: object,
+        code: int,
+        message: str,
+        headers: object,
+        new_url: str,
+    ) -> Request:
+        raise AssertionError("loopback marker request redirected")
+
+
+_LOOPBACK_OPENER = build_opener(_RejectLoopbackRedirect())
 
 
 def _run_host(
@@ -54,15 +95,58 @@ def _run_host(
     *,
     cwd: Path | None = None,
     timeout_s: int = 15,
-) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
+) -> _HostCommandResult:
+    process = subprocess.Popen(
         argv,
-        check=False,
         cwd=cwd,
         stdin=subprocess.DEVNULL,
-        capture_output=True,
-        timeout=timeout_s,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
+    assert process.stdout is not None and process.stderr is not None
+    outputs: dict[str, bytes] = {}
+    failures: list[Exception] = []
+
+    def read_stream(name: str, stream: BinaryIO) -> None:
+        try:
+            outputs[name] = _read_bounded_host_stream(stream)
+        except (AssertionError, OSError, ValueError) as error:
+            failures.append(error)
+
+    readers = [
+        threading.Thread(target=read_stream, args=("stdout", process.stdout)),
+        threading.Thread(target=read_stream, args=("stderr", process.stderr)),
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        returncode = process.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired as error:
+        process.kill()
+        process.wait()
+        raise AssertionError(f"trusted host command timed out: {argv[0]}") from error
+    finally:
+        for reader in readers:
+            reader.join()
+    assert not failures, str(failures[0])
+    return _HostCommandResult(
+        returncode=returncode,
+        stdout=outputs["stdout"],
+        stderr=outputs["stderr"],
+    )
+
+
+def _read_bounded_host_stream(stream: BinaryIO) -> bytes:
+    collected = bytearray()
+    exceeded = False
+    while chunk := stream.read(8192):
+        remaining = _MAX_HOST_OUTPUT_BYTES + 1 - len(collected)
+        if remaining > 0:
+            collected.extend(chunk[:remaining])
+        if len(chunk) > remaining or len(collected) > _MAX_HOST_OUTPUT_BYTES:
+            exceeded = True
+    assert not exceeded, "trusted host command output exceeded bounded limit"
+    return bytes(collected)
 
 
 def _require_supported_host(tmp_path: Path) -> None:
@@ -155,14 +239,21 @@ async def _exec(
     return result.stdout
 
 
-def _parse_mount(output: str) -> _Mount:
+def _parse_mount(output: str, requested_path: str) -> _Mount:
     lines = [line for line in output.splitlines() if line]
     assert len(lines) == 1
-    fields = lines[0].split(maxsplit=2)
-    assert len(fields) == 3
-    source, filesystem, target = fields
-    assert source and filesystem and target
-    return _Mount(source=source, filesystem=filesystem, target=target)
+    fields = lines[0].split(maxsplit=4)
+    assert len(fields) == 5
+    source, filesystem, major_minor, filesystem_uuid, target = fields
+    assert source and filesystem and _MAJOR_MINOR_PATTERN.fullmatch(major_minor)
+    assert filesystem_uuid and target == requested_path
+    return _Mount(
+        source=source,
+        filesystem=filesystem,
+        major_minor=major_minor,
+        uuid=filesystem_uuid,
+        target=target,
+    )
 
 
 def _parse_df_total(output: str) -> int:
@@ -209,13 +300,11 @@ async def _assert_guest_clone_contract(
     assert (
         await _exec(provider, sandbox_id, ["git", "status", "--porcelain"])
     ).strip() == ""
-    assert (
-        await _exec(
-            provider,
-            sandbox_id,
-            ["find", ".", "-xdev", "-name", fixture.parent_sentinel, "-print"],
-        )
-    ).strip() == ""
+    await _exec(
+        provider,
+        sandbox_id,
+        ["test", "!", "-e", f"../{fixture.parent_sentinel}"],
+    )
     return guest_workspace
 
 
@@ -246,15 +335,23 @@ async def _assert_resources(
                 await _exec(
                     provider,
                     sandbox_id,
-                    ["findmnt", "-n", "-o", "SOURCE,FSTYPE,TARGET", "--target", path],
-                )
+                    [
+                        "findmnt",
+                        "-n",
+                        "-o",
+                        "SOURCE,FSTYPE,MAJ:MIN,UUID,TARGET",
+                        "--target",
+                        path,
+                    ],
+                ),
+                path,
             )
         )
         total_bytes = _parse_df_total(
             await _exec(provider, sandbox_id, ["df", "-B1", "-P", path])
         )
         assert total_bytes <= size_mb * _MIB
-    assert len({mount.source for mount in mounts}) == len(mounts)
+    assert len({mount.identity for mount in mounts}) == len(mounts)
 
 
 async def _assert_network_policy(provider: DockerSbxProvider, sandbox_id: str) -> None:
@@ -275,28 +372,80 @@ async def _assert_network_policy(provider: DockerSbxProvider, sandbox_id: str) -
         "http://10.255.255.1:81/": {"10.255.255.1", "10.0.0.0/8"},
         "http://host.docker.internal:80/": {"host.docker.internal"},
     }
-    for probe in probes:
+    for probe, expected_evidence in probes.items():
+        before = await _observed_network_events(provider, sandbox_id)
         result = await provider.exec(
             sandbox_id,
             ["wget", "-q", "-O", "-", probe],
             timeout_s=10,
         )
         assert result.exit_code != 0, (probe, result.stdout, result.stderr)
+        after = await _observed_network_events(provider, sandbox_id)
+        assert _has_fresh_blocked_evidence(before, after, expected_evidence), probe
 
+
+async def _observed_network_events(
+    provider: DockerSbxProvider, sandbox_id: str
+) -> list[dict[str, object]]:
     network_log = await provider.network_log(sandbox_id)
     if not network_log.supported:
         pytest.skip(
             f"UNSUPPORTED: network_log is unavailable: {network_log.unsupported_reason}"
         )
-    for probe, expected_evidence in probes.items():
-        assert any(
-            event["decision"] == "blocked"
-            and any(
-                token in " ".join((event["host"], event["rule"], event["reason"]))
-                for token in expected_evidence
-            )
-            for event in network_log.events
-        ), probe
+    return [dict(event) for event in network_log.events]
+
+
+def _has_fresh_blocked_evidence(
+    before: list[dict[str, object]],
+    after: list[dict[str, object]],
+    expected_evidence: set[str],
+) -> bool:
+    before_events = {
+        key: (count, last_seen)
+        for event in before
+        if (observed := _blocked_evidence_observation(event, expected_evidence))
+        is not None
+        for key, count, last_seen in (observed,)
+    }
+    for event in after:
+        observed = _blocked_evidence_observation(event, expected_evidence)
+        if observed is None:
+            continue
+        key, count, last_seen = observed
+        prior = before_events.get(key)
+        if prior is None or count > prior[0] or last_seen != prior[1]:
+            return True
+    return False
+
+
+def _blocked_evidence_observation(
+    event: dict[str, object], expected_evidence: set[str]
+) -> tuple[tuple[str, str, str, str], int, str] | None:
+    if event.get("decision") != "blocked":
+        return None
+    host = event.get("host")
+    rule = event.get("rule")
+    reason = event.get("reason")
+    proxy = event.get("proxy")
+    last_seen = event.get("last_seen")
+    count = event.get("count")
+    if (
+        not all(
+            isinstance(value, str) for value in (host, rule, reason, proxy, last_seen)
+        )
+        or type(count) is not int
+        or count < 1
+    ):
+        return None
+    assert isinstance(host, str)
+    assert isinstance(rule, str)
+    assert isinstance(reason, str)
+    assert isinstance(proxy, str)
+    assert isinstance(last_seen, str)
+    assert isinstance(count, int)
+    if not any(token in f"{host} {rule} {reason}" for token in expected_evidence):
+        return None
+    return ((host, rule, reason, proxy), count, last_seen)
 
 
 async def _assert_published_marker(
@@ -318,15 +467,38 @@ async def _assert_published_marker(
 
 
 def _read_loopback_marker(host_port: int) -> bytes:
-    with urlopen(f"http://127.0.0.1:{host_port}", timeout=10) as response:
-        return response.read()
+    url = f"http://127.0.0.1:{host_port}"
+    with _LOOPBACK_OPENER.open(url, timeout=10) as response:
+        return _read_exact_loopback_response(response, url)
+
+
+def _read_exact_loopback_response(
+    response: _LoopbackResponse, expected_url: str
+) -> bytes:
+    assert response.geturl() == expected_url
+    body = response.read(len(_MARKER) + 1)
+    assert body == _MARKER
+    return body
 
 
 def _assert_empty_sbx_inventory() -> None:
     result = _run_host(["sbx", "list"], timeout_s=15)
-    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
-    inventory = result.stdout.decode("utf-8").strip()
-    assert inventory in {"", "No sandboxes found", "No sandboxes found."}, inventory
+    assert result.returncode == 0
+    _parse_empty_sbx_inventory(result.stdout, result.stderr)
+
+
+def _parse_empty_sbx_inventory(stdout: bytes, stderr: bytes) -> None:
+    assert stderr == b""
+    assert stdout == _CANONICAL_EMPTY_SBX_INVENTORY
+
+
+def _matches_workload_spawn(
+    arguments: tuple[object, ...],
+    *,
+    sandbox_id: str,
+    workload: tuple[str, ...],
+) -> bool:
+    return arguments == ("sbx", "exec", sandbox_id, "--", *workload)
 
 
 async def _warm_image_cache(
@@ -393,11 +565,32 @@ def test_wsl2_linux_sbx_primary_calibration(tmp_path: Path) -> None:
         _assert_empty_sbx_inventory()
 
 
-def test_wsl2_linux_sbx_timeout_calibration(tmp_path: Path) -> None:
+def test_wsl2_linux_sbx_timeout_calibration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _require_supported_host(tmp_path)
     fixture = _create_trusted_fixture_repository(tmp_path)
+    original_create_subprocess_exec = docker_sbx.asyncio.create_subprocess_exec
+    second_workload_spawns = 0
+    guarded_arguments: tuple[object, ...] | None = None
+
+    async def reject_expired_workload_spawn(
+        *args: object, **kwargs: object
+    ) -> asyncio.subprocess.Process:
+        nonlocal second_workload_spawns
+        if guarded_arguments is not None and tuple(args) == guarded_arguments:
+            second_workload_spawns += 1
+            raise AssertionError("expired workload reached sbx exec spawn")
+        return await original_create_subprocess_exec(*args, **kwargs)
+
+    monkeypatch.setattr(
+        docker_sbx.asyncio,
+        "create_subprocess_exec",
+        reject_expired_workload_spawn,
+    )
 
     async def exercise() -> None:
+        nonlocal guarded_arguments
         await _warm_image_cache(fixture, tmp_path)
         provider = DockerSbxProvider(_policy(total_duration_s=45), command_timeout_s=30)
         async with managed_sandbox(
@@ -410,10 +603,13 @@ def test_wsl2_linux_sbx_timeout_calibration(tmp_path: Path) -> None:
                 await provider.exec(sandbox_id, ["sleep", "120"], timeout_s=120)
             assert timed_out.value.operation == "exec"
             assert timed_out.value.reason == "total_duration_exhausted"
+            guarded_arguments = ("sbx", "exec", sandbox_id, "--", "true")
+            spawn_count_before = second_workload_spawns
             with pytest.raises(DockerSbxError) as expired:
                 await provider.exec(sandbox_id, ["true"], timeout_s=1)
             assert expired.value.operation == "exec"
             assert expired.value.reason == "total_duration_exhausted"
+            assert second_workload_spawns == spawn_count_before
 
     try:
         asyncio.run(exercise())
@@ -428,13 +624,19 @@ def test_wsl2_linux_sbx_cancellation_calibration(
     fixture = _create_trusted_fixture_repository(tmp_path)
     exec_spawned = asyncio.Event()
     original_create_subprocess_exec = docker_sbx.asyncio.create_subprocess_exec
+    owned_sandbox_id: str | None = None
 
     async def record_real_sbx_exec(
         *args: object, **kwargs: object
     ) -> asyncio.subprocess.Process:
-        if args[:2] == ("sbx", "exec"):
+        process = await original_create_subprocess_exec(*args, **kwargs)
+        if owned_sandbox_id is not None and _matches_workload_spawn(
+            tuple(args),
+            sandbox_id=owned_sandbox_id,
+            workload=("sleep", "120"),
+        ):
             exec_spawned.set()
-        return await original_create_subprocess_exec(*args, **kwargs)
+        return process
 
     monkeypatch.setattr(
         docker_sbx.asyncio,
@@ -443,6 +645,7 @@ def test_wsl2_linux_sbx_cancellation_calibration(
     )
 
     async def exercise() -> None:
+        nonlocal owned_sandbox_id
         provider = DockerSbxProvider(
             _policy(total_duration_s=120), command_timeout_s=30
         )
@@ -452,6 +655,7 @@ def test_wsl2_linux_sbx_cancellation_calibration(
             "wsl2-cancellation",
             lifecycle_artifact=tmp_path / "cancellation-lifecycle.jsonl",
         ) as sandbox_id:
+            owned_sandbox_id = sandbox_id
             workload = asyncio.create_task(
                 provider.exec(sandbox_id, ["sleep", "120"], timeout_s=120)
             )
