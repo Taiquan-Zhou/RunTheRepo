@@ -1,10 +1,18 @@
 # M7.5 real-repository Pilot protocol and report
 
-> **EXECUTION COMPLETE — release threshold and cleanup safety gate not met**
+> **POST-FIX UNIFIED COHORT COMPLETE — MVP limitations identified**
 
 This document freezes the M7.5 execution protocol and records the append-only Pilot
 evidence. Infrastructure-invalidated attempts are retained below; no repository
 metric is claimed until the target-workload boundary is actually crossed.
+
+Sections 5–11 retain the first cohort as the append-only **pre-fix baseline**.
+They were superseded after the generic network-policy fix
+`d4c2a629b602fbd7128fc3ab6a4c2d5c81eb5d2d` and must not be used as the final
+M7.5 metric set. The root-cause proof, fix verification, and complete final cohort
+from that single unified HEAD are recorded in
+[`pilot-evidence/m7.5-boot-root-cause.md`](pilot-evidence/m7.5-boot-root-cause.md).
+The frozen manifest, repository order, and pinned SHAs were not changed.
 
 ## 1. Immutable cohort
 
