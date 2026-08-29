@@ -704,6 +704,7 @@ def test_policy_allow_failure_force_removes_pending_sandbox_without_deadline(
         allow_call,
         ("sbx", "rm", "--force", sandbox_id),
     ]
+    assert provider._trial_deadline is None
     assert provider._sandbox_deadlines == {}
 
 
@@ -736,6 +737,7 @@ def test_cancelled_policy_allow_force_removes_pending_sandbox(
     assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
     assert spawner.processes[-2].killed is True
     assert spawner.processes[-2].waited is True
+    assert provider._trial_deadline is None
     assert provider._sandbox_deadlines == {}
 
 
