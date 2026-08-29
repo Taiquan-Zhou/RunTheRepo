@@ -55,6 +55,22 @@ def test_evidence_schema_is_bounded_deterministic_and_redacts_all_runtime_values
     assert evidence_path.read_bytes().endswith(b"\n")
 
 
+def test_evidence_redacts_env_values_from_compose_path_metadata(tmp_path: Path) -> None:
+    evidence_path = tmp_path / "baseline-boot-attempt.json"
+    env_value = "compose.yml"
+    session = _session(
+        evidence_path,
+        {"NON_SENSITIVE_VALUE": env_value},
+        compose_path="deploy/compose.yml",
+    )
+    session.finalize(Verdict.FAIL, {})
+
+    persisted = evidence_path.read_text(encoding="utf-8")
+    payload = json.loads(persisted)
+    assert env_value not in persisted
+    assert payload["compose_path"] == "deploy/[REDACTED]"
+
+
 def test_evidence_redacts_four_byte_values_before_crossing_head_boundary(
     tmp_path: Path,
 ) -> None:

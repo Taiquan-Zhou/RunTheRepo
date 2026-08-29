@@ -98,7 +98,7 @@ class _BootEvidenceSession:
         )
         self._document = _EvidenceDocument(
             attempt=attempt,
-            compose_path=compose_path,
+            compose_path=_redact_text(compose_path, self._redactions),
         )
         self._created = False
 
@@ -186,9 +186,7 @@ def record_recovery_evidence(
 
 
 def _stream_evidence(text: str, redactions: tuple[str, ...]) -> _StreamEvidence:
-    redacted = text
-    for value in redactions:
-        redacted = redacted.replace(value, _REDACTION)
+    redacted = _redact_text(text, redactions)
     encoded = redacted.encode("utf-8")
     if len(encoded) <= _MAX_STREAM_BYTES:
         return _StreamEvidence(text=redacted, truncated=False)
@@ -201,6 +199,13 @@ def _stream_evidence(text: str, redactions: tuple[str, ...]) -> _StreamEvidence:
         text=_decode_head(head) + _TRUNCATION_MARKER + _decode_tail(tail),
         truncated=True,
     )
+
+
+def _redact_text(text: str, redactions: tuple[str, ...]) -> str:
+    redacted = text
+    for value in redactions:
+        redacted = redacted.replace(value, _REDACTION)
+    return redacted
 
 
 def _decode_head(value: bytes) -> str:
