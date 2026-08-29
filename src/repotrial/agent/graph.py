@@ -43,7 +43,9 @@ from repotrial.journey.http_runner import run_http_journey
 from repotrial.journey.playwright_runner import run_playwright_journey
 from repotrial.models.base import RecoveryAction
 from repotrial.sandbox.lifecycle import managed_sandbox
-from repotrial.trial.boot import boot_compose
+from repotrial.trial import boot as boot_module
+from repotrial.trial.boot import _boot_compose_with_evidence, boot_compose
+from repotrial.trial.boot_evidence import record_recovery_evidence
 from repotrial.trial.observer import collect_observation
 from repotrial.trial.planner import plan_journeys, propose_recovery
 
@@ -219,6 +221,8 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
     )
     lifecycle_artifact = attempt_dir / "baseline-lifecycle.jsonl"
     observation_artifact = attempt_dir / "baseline-observation.json"
+    evidence_artifact = attempt_dir / "baseline-boot-attempt.json"
+    evidence_enabled = boot_compose is boot_module.boot_compose
     async with managed_sandbox(
         context.provider,
         context.workspace,
@@ -228,13 +232,19 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
         ),
         lifecycle_artifact=lifecycle_artifact,
     ) as sandbox_id:
-        result = await boot_compose(
-            context.provider,
-            sandbox_id,
-            compose_path,
-            env,
-            attempt,
-        )
+        if evidence_enabled:
+            result = await _boot_compose_with_evidence(
+                context.provider,
+                sandbox_id,
+                compose_path,
+                env,
+                attempt,
+                evidence_path=evidence_artifact,
+            )
+        else:
+            result = await boot_compose(
+                context.provider, sandbox_id, compose_path, env, attempt
+            )
         journey_results: list[JourneyResult] | None = None
         observation = None
         if result.verdict is Verdict.PASS:
@@ -277,6 +287,22 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
     update["boot_error_hash"] = fingerprint
     update["repeated_error_count"] = repeated
     await _apply_recovery(state, update, recovery, runtime.context)
+    updated_run = update.get("run")
+    stop_reason = updated_run.stop_reason if isinstance(updated_run, RunState) else None
+    recovery_reason = recovery.reason
+    for value in sorted(
+        {value for value in env.values() if value},
+        key=lambda value: (-len(value), value),
+    ):
+        recovery_reason = recovery_reason.replace(value, "[REDACTED]")
+    evidence_recovery = recovery.model_copy(update={"reason": recovery_reason})
+    if evidence_enabled:
+        record_recovery_evidence(
+            evidence_artifact,
+            evidence_recovery,
+            disposition="stopped" if recovery.action == "stop" else "applied",
+            stop_reason=stop_reason,
+        )
     return update
 
 

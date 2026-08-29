@@ -1,10 +1,12 @@
 import json
 import re
+from pathlib import Path
 
 from pydantic import BaseModel
 
 from repotrial.domain.enums import Verdict
 from repotrial.sandbox.base import ExecResult, SandboxProvider
+from repotrial.trial.boot_evidence import _BootEvidenceSession
 
 _ENV_KEY_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _CONTROL_ENV_KEYS = {
@@ -46,27 +48,88 @@ async def boot_compose(
     *,
     overlay_path: str | None = None,
 ) -> BootResult:
+    return await _boot_compose_with_evidence(
+        provider,
+        sandbox_id,
+        compose_path,
+        env,
+        attempt,
+        overlay_path=overlay_path,
+    )
+
+
+async def _boot_compose_with_evidence(
+    provider: SandboxProvider,
+    sandbox_id: str,
+    compose_path: str,
+    env: dict[str, str],
+    attempt: int,
+    *,
+    evidence_path: Path | None = None,
+    overlay_path: str | None = None,
+) -> BootResult:
     prefix = _validated_env_prefix(compose_path, env)
     docker_compose = ["docker", "compose", "-f", compose_path]
     if overlay_path is not None:
         _validate_compose_path(overlay_path, "overlay_path")
         docker_compose.extend(["-f", overlay_path])
+    evidence = (
+        None if evidence_path is None else _BootEvidenceSession(evidence_path, env)
+    )
 
-    up = await provider.exec(
-        sandbox_id,
-        [*prefix, *docker_compose, "up", "-d"],
-        timeout_s=120,
-    )
-    ps = await provider.exec(
-        sandbox_id,
-        [*prefix, *docker_compose, "ps", "--all", "--format", "json"],
-        timeout_s=30,
-    )
-    logs = await provider.exec(
-        sandbox_id,
-        [*prefix, *docker_compose, "logs", "--no-color", "--tail", "200"],
-        timeout_s=30,
-    )
+    try:
+        up = await provider.exec(
+            sandbox_id,
+            [*prefix, *docker_compose, "up", "-d"],
+            timeout_s=120,
+        )
+    except BaseException as error:
+        if evidence is not None:
+            evidence.record_exception("up", error)
+        raise
+    if not isinstance(up, ExecResult):
+        error = TypeError("boot command returned a malformed result")
+        if evidence is not None:
+            evidence.record_exception("up", error)
+        raise error
+    if evidence is not None:
+        evidence.record_command("up", up)
+
+    try:
+        ps = await provider.exec(
+            sandbox_id,
+            [*prefix, *docker_compose, "ps", "--all", "--format", "json"],
+            timeout_s=30,
+        )
+    except BaseException as error:
+        if evidence is not None:
+            evidence.record_exception("ps", error)
+        raise
+    if not isinstance(ps, ExecResult):
+        error = TypeError("boot command returned a malformed result")
+        if evidence is not None:
+            evidence.record_exception("ps", error)
+        raise error
+    if evidence is not None:
+        evidence.record_command("ps", ps)
+
+    try:
+        logs = await provider.exec(
+            sandbox_id,
+            [*prefix, *docker_compose, "logs", "--no-color", "--tail", "200"],
+            timeout_s=30,
+        )
+    except BaseException as error:
+        if evidence is not None:
+            evidence.record_exception("logs", error)
+        raise
+    if not isinstance(logs, ExecResult):
+        error = TypeError("boot command returned a malformed result")
+        if evidence is not None:
+            evidence.record_exception("logs", error)
+        raise error
+    if evidence is not None:
+        evidence.record_command("logs", logs)
 
     service_states, all_services_ready = _parse_service_states(ps.stdout)
     workload_commands_succeeded = up.exit_code == 0 and ps.exit_code == 0
@@ -76,6 +139,8 @@ async def boot_compose(
         else Verdict.FAIL
     )
     sensitive_values = _sensitive_env_values(env)
+    if evidence is not None:
+        evidence.finalize(verdict, service_states)
 
     return BootResult(
         verdict=verdict,
@@ -225,10 +290,7 @@ def _is_sensitive_env_key(key: str) -> bool:
 
 
 def _sanitize_result(result: ExecResult, sensitive_values: tuple[str, ...]) -> str:
-    combined = _combine_output(
-        _bound_raw_evidence(result.stdout),
-        _bound_raw_evidence(result.stderr),
-    )
+    combined = _combine_output(result.stdout, result.stderr)
     for value in sensitive_values:
         combined = combined.replace(value, _REDACTION)
     if combined.count(_TRUNCATION_MARKER) > 2:
@@ -237,10 +299,7 @@ def _sanitize_result(result: ExecResult, sensitive_values: tuple[str, ...]) -> s
     combined = _BEARER_PATTERN.sub(lambda match: f"Bearer {_REDACTION}", combined)
     combined = _redact_pem_private_keys(combined)
     combined = _redact_sensitive_assignments(combined)
-    if len(combined) <= _LOG_LIMIT:
-        return combined
-    retained = _LOG_LIMIT - len(_TRUNCATION_MARKER)
-    return f"{combined[:retained]}{_TRUNCATION_MARKER}"
+    return _bound_raw_evidence(combined)
 
 
 def _sanitize_logs_result(result: ExecResult, sensitive_values: tuple[str, ...]) -> str:
@@ -251,17 +310,17 @@ def _sanitize_logs_result(result: ExecResult, sensitive_values: tuple[str, ...])
     if not sanitized:
         return context
     evidence_limit = _LOG_LIMIT - len(context) - 1
-    if len(sanitized) > evidence_limit:
-        retained = evidence_limit - len(_TRUNCATION_MARKER)
-        sanitized = f"{sanitized[:retained]}{_TRUNCATION_MARKER}"
+    sanitized = _bound_raw_evidence(sanitized, evidence_limit)
     return f"{context}\n{sanitized}"
 
 
-def _bound_raw_evidence(text: str) -> str:
-    if len(text) <= _LOG_LIMIT:
+def _bound_raw_evidence(text: str, limit: int = _LOG_LIMIT) -> str:
+    if len(text) <= limit:
         return text
-    retained = _LOG_LIMIT - len(_TRUNCATION_MARKER)
-    return f"{text[:retained]}{_TRUNCATION_MARKER}"
+    payload_limit = limit - len(_TRUNCATION_MARKER)
+    head_limit = payload_limit // 2
+    tail_limit = payload_limit - head_limit
+    return f"{text[:head_limit]}{_TRUNCATION_MARKER}{text[-tail_limit:]}"
 
 
 def _redact_sensitive_assignments(text: str) -> str:

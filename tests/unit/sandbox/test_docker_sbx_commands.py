@@ -89,6 +89,18 @@ class _FakeStream:
         return chunk
 
 
+class _ScriptedStream:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+        self.read_count = 0
+
+    async def read(self, _: int = -1) -> bytes:
+        self.read_count += 1
+        if not self._chunks:
+            return b""
+        return self._chunks.pop(0)
+
+
 class _FakeProcess:
     def __init__(self, outcome: _Outcome) -> None:
         self._outcome = outcome
@@ -388,7 +400,8 @@ def test_nonzero_probe_preserves_bounded_stderr_on_unsupported_error(
         _create(provider, tmp_path)
 
     assert raised.value.reason == "version_probe_failed"
-    assert raised.value.stderr.endswith("\n...[truncated]")
+    assert raised.value.stderr.count("\n...[truncated]") == 1
+    assert raised.value.stderr.endswith("x" * 64)
     assert len(raised.value.stderr.encode()) <= 65_536
 
 
@@ -1113,10 +1126,51 @@ def test_exec_returns_nonzero_result_and_bounds_both_output_streams(
     result = asyncio.run(provider.exec(sandbox_id, ["failing-command"]))
 
     assert result.exit_code == 23
-    assert result.stdout.endswith("\n...[truncated]")
-    assert result.stderr.endswith("\n...[truncated]")
+    assert result.stdout.count("\n...[truncated]") == 1
+    assert result.stderr.count("\n...[truncated]") == 1
+    assert result.stdout.endswith("o" * 64)
+    assert result.stderr.endswith("e" * 64)
     assert len(result.stdout.encode()) <= 65_536
     assert len(result.stderr.encode()) <= 65_536
+
+
+@pytest.mark.parametrize("stream_name", ["stdout", "stderr"])
+def test_read_bounded_retains_literal_head_and_tail_after_truncation(
+    stream_name: str,
+) -> None:
+    stream = _ScriptedStream(
+        [
+            b"literal-head-" + (b"x" * 65_536),
+            (b"y" * 65_536) + b"-literal-tail",
+        ]
+    )
+
+    result = asyncio.run(docker_sbx._read_bounded(cast(asyncio.StreamReader, stream)))
+
+    assert result.startswith(b"literal-head-")
+    assert result.count(b"\n...[truncated]") == 1
+    assert result.endswith(b"-literal-tail")
+    assert len(result) <= docker_sbx.MAX_OUTPUT_BYTES
+    assert stream.read_count == 3
+
+
+def test_read_bounded_preserves_split_four_byte_utf8_at_head_and_tail() -> None:
+    stream = _ScriptedStream(
+        [
+            b"head-\xf0\x9f",
+            b"\x92\xa9" + (b"x" * 65_536),
+            (b"y" * 65_536) + b"-tail-\xf0\x9f",
+            b"\x92\xa9",
+        ]
+    )
+
+    result = asyncio.run(docker_sbx._read_bounded(cast(asyncio.StreamReader, stream)))
+
+    assert result.startswith("head-💩".encode())
+    assert result.count(b"\n...[truncated]") == 1
+    assert result.endswith("-tail-💩".encode())
+    assert result.decode("utf-8")
+    assert stream.read_count == 5
 
 
 def test_exec_lossy_utf8_output_is_bounded_after_encoding(
@@ -1133,8 +1187,10 @@ def test_exec_lossy_utf8_output_is_bounded_after_encoding(
 
     result = asyncio.run(provider.exec(sandbox_id, ["bad-bytes"]))
 
-    assert result.stdout.endswith("\n...[truncated]")
-    assert result.stderr.endswith("\n...[truncated]")
+    assert result.stdout.count("\n...[truncated]") == 1
+    assert result.stderr.count("\n...[truncated]") == 1
+    assert result.stdout.endswith("\ufffd" * 64)
+    assert result.stderr.endswith("\ufffd" * 64)
     assert len(result.stdout.encode("utf-8")) <= 65_536
     assert len(result.stderr.encode("utf-8")) <= 65_536
 
@@ -1402,7 +1458,8 @@ def test_nonzero_command_error_has_deterministically_truncated_stderr(
 
     assert raised.value.reason == "nonzero_exit"
     assert raised.value.returncode == 9
-    assert raised.value.stderr.endswith("\n...[truncated]")
+    assert raised.value.stderr.count("\n...[truncated]") == 1
+    assert raised.value.stderr.endswith("x" * 64)
     assert len(raised.value.stderr.encode()) <= 65_536
 
 

@@ -325,6 +325,17 @@ def test_boot_failure_uses_bounded_recovery_then_returns_to_boot(
     )
     assert result.stage_history[:4] == ["intake", "baseline", "boot", "boot"]
     assert result.run.stop_reason == "insufficient_coverage"
+    evidence_paths = sorted(
+        context.artifact_dir.glob("baseline-*/baseline-boot-attempt.json")
+    )
+    assert len(evidence_paths) == 2
+    first_payload = json.loads(evidence_paths[0].read_text(encoding="utf-8"))
+    assert first_payload["recovery"] == {
+        "action": "set_env",
+        "disposition": "applied",
+        "reason": "missing allowlisted environment variable",
+        "stop_reason": None,
+    }
 
 
 def test_repeated_boot_error_stops_after_four_attempts_without_retry_storm(
@@ -360,6 +371,25 @@ def test_unsafe_model_recovery_cannot_bypass_propose_recovery_policy(
     assert model.calls == 1
     assert len([call for call in provider.calls if call[0] == "create"]) == 1
     assert result.run.stop_reason == "boot_recovery_stopped"
+
+
+def test_recovery_evidence_redacts_every_runtime_env_value_before_persistence(
+    tmp_path: Path,
+) -> None:
+    secret = "postgresql://alice:recovery-secret@db.invalid/app"
+    provider = GraphProvider(baseline_boots=[(False, "unclassified failure")])
+    model = FakeModelAdapter(
+        RecoveryAction(action="stop", params={}, reason=f"stop with {secret}")
+    )
+    context, source = _context(tmp_path, provider, journeys=[], model=model)
+    context = replace(context, env={"PUBLIC_DSN": secret})
+
+    _run(_state(source.parent), context)
+
+    evidence_path = next(
+        context.artifact_dir.glob("baseline-*/baseline-boot-attempt.json")
+    )
+    assert secret not in evidence_path.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(

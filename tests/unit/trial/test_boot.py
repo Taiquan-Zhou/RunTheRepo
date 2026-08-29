@@ -8,7 +8,7 @@ import pytest
 from repotrial.domain.enums import Verdict
 from repotrial.sandbox.base import ExecResult
 from repotrial.sandbox.fake import FakeSandboxProvider
-from repotrial.trial.boot import BootResult, boot_compose
+from repotrial.trial.boot import BootResult, _boot_compose_with_evidence, boot_compose
 
 COMPOSE_PATH = "/workspace/compose.yml"
 UP_ARGV = ("docker", "compose", "-f", COMPOSE_PATH, "up", "-d")
@@ -96,6 +96,98 @@ def _run_with_active_sandbox(
         )
 
     return asyncio.run(exercise())
+
+
+def test_private_boot_evidence_checkpoints_commands_final_readiness_and_redacts_env(
+    tmp_path: Path,
+) -> None:
+    secret = "runtime-secret-value"
+    prefix = ("env", f"PUBLIC_DSN={secret}")
+    provider = FakeSandboxProvider(
+        scripts={
+            (*prefix, *UP_ARGV): _result(exit_code=1, stdout="up", stderr=secret),
+            (*prefix, *PS_ARGV): _result(stdout=_healthy_ps()),
+            (*prefix, *LOGS_ARGV): _result(stdout="logs"),
+        }
+    )
+    evidence_path = tmp_path / "baseline-boot-attempt.json"
+
+    async def exercise() -> BootResult:
+        sandbox_id = await provider.create(Path("missing-workspace"), "trial")
+        return await _boot_compose_with_evidence(
+            provider,
+            sandbox_id,
+            COMPOSE_PATH,
+            {"PUBLIC_DSN": secret},
+            attempt=1,
+            evidence_path=evidence_path,
+        )
+
+    result = asyncio.run(exercise())
+
+    payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert result.verdict is Verdict.FAIL
+    assert [item["name"] for item in payload["commands"]] == ["up", "ps", "logs"]
+    assert payload["final"] == {
+        "service_states": {"web": "running/healthy"},
+        "verdict": "fail",
+    }
+    assert secret not in evidence_path.read_text(encoding="utf-8")
+    assert '"env"' not in evidence_path.read_text(encoding="utf-8")
+
+
+def test_private_boot_evidence_records_exception_class_before_reraising_provider_error(
+    tmp_path: Path,
+) -> None:
+    provider = FakeSandboxProvider()
+    evidence_path = tmp_path / "baseline-boot-attempt.json"
+
+    async def exercise() -> None:
+        sandbox_id = await provider.create(Path("missing-workspace"), "trial")
+        with pytest.raises(KeyError):
+            await _boot_compose_with_evidence(
+                provider,
+                sandbox_id,
+                COMPOSE_PATH,
+                {"APP_VALUE": "never-persist-this"},
+                attempt=1,
+                evidence_path=evidence_path,
+            )
+
+    asyncio.run(exercise())
+
+    payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert payload["commands"] == [{"exception_type": "KeyError", "name": "up"}]
+    assert "never-persist-this" not in evidence_path.read_text(encoding="utf-8")
+
+
+def test_private_boot_logs_retain_stderr_error_after_saturated_stdout(
+    tmp_path: Path,
+) -> None:
+    error = "literal-stderr-error-at-tail"
+    provider = FakeSandboxProvider(
+        scripts={
+            UP_ARGV: _result(),
+            PS_ARGV: _result(stdout=_healthy_ps()),
+            LOGS_ARGV: _result(stdout="x" * 70_000, stderr=error),
+        }
+    )
+    evidence_path = tmp_path / "baseline-boot-attempt.json"
+
+    async def exercise() -> BootResult:
+        sandbox_id = await provider.create(Path("missing-workspace"), "trial")
+        return await _boot_compose_with_evidence(
+            provider,
+            sandbox_id,
+            COMPOSE_PATH,
+            {},
+            attempt=1,
+            evidence_path=evidence_path,
+        )
+
+    result = asyncio.run(exercise())
+
+    assert error in result.logs["logs"]
 
 
 def test_empty_env_uses_direct_fixed_commands_and_returns_healthy_pass() -> None:
@@ -547,7 +639,8 @@ def test_sensitive_evidence_is_redacted_before_every_source_is_truncated() -> No
         assert "[REDACTED]" in value
         assert "APP_REQUIRED_TOKEN is required" in value
         assert len(value) <= 65_536
-        assert value.endswith("\n...[truncated]")
+        assert value.count("\n...[truncated]") == 1
+        assert value.endswith("x" * 64)
 
 
 def test_provider_truncated_sensitive_env_prefixes_are_redacted_at_markers() -> None:

@@ -646,21 +646,34 @@ class DockerSbxProvider(SandboxProvider):
 
 
 async def _read_bounded(stream: asyncio.StreamReader) -> bytes:
-    retained = bytearray()
-    truncated = False
     payload_limit = MAX_OUTPUT_BYTES - len(_TRUNCATION_MARKER)
+    head_limit = payload_limit // 2
+    tail_limit = payload_limit - head_limit
+    head = bytearray()
+    tail = bytearray()
+    truncated = False
     while True:
         chunk = await stream.read(8192)
         if not chunk:
             break
-        remaining = payload_limit - len(retained)
-        if remaining > 0:
-            retained.extend(chunk[:remaining])
-        if len(chunk) > max(remaining, 0):
+        head_remaining = head_limit - len(head)
+        if head_remaining > 0:
+            head.extend(chunk[:head_remaining])
+        tail_chunk = memoryview(chunk)[min(len(chunk), head_remaining) :]
+        if not tail_chunk:
+            continue
+        if len(tail_chunk) >= tail_limit:
+            tail[:] = tail_chunk[-tail_limit:]
             truncated = True
+            continue
+        excess = len(tail) + len(tail_chunk) - tail_limit
+        if excess > 0:
+            del tail[:excess]
+            truncated = True
+        tail.extend(tail_chunk)
     if truncated:
-        retained.extend(_TRUNCATION_MARKER)
-    return bytes(retained)
+        return bytes(head) + _TRUNCATION_MARKER + bytes(tail)
+    return bytes(head) + bytes(tail)
 
 
 async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
@@ -724,12 +737,24 @@ def _decode_human_output(output: bytes) -> str:
     encoded = decoded.encode("utf-8")
     if len(encoded) <= MAX_OUTPUT_BYTES:
         return decoded
-    prefix = encoded[: MAX_OUTPUT_BYTES - len(_TRUNCATION_MARKER)]
+    payload_limit = MAX_OUTPUT_BYTES - len(_TRUNCATION_MARKER)
+    head_limit = payload_limit // 2
+    tail_limit = payload_limit - head_limit
+    head = encoded[:head_limit]
+    tail = encoded[-tail_limit:]
     while True:
         try:
-            return prefix.decode("utf-8") + _TRUNCATION_MARKER.decode("ascii")
+            decoded_head = head.decode("utf-8")
+            break
         except UnicodeDecodeError:
-            prefix = prefix[:-1]
+            head = head[:-1]
+    while True:
+        try:
+            decoded_tail = tail.decode("utf-8")
+            break
+        except UnicodeDecodeError:
+            tail = tail[1:]
+    return decoded_head + _TRUNCATION_MARKER.decode("ascii") + decoded_tail
 
 
 def _require_success(operation: str, result: _CommandResult) -> None:
