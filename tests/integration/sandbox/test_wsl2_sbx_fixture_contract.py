@@ -442,6 +442,56 @@ print("bounded-reap")
     assert completed.stdout.strip() == b"bounded-reap"
 
 
+def test_calibration_host_reaper_baseexception_propagates_exact_object(
+    calibration_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReaperFailure(BaseException):
+        pass
+
+    expected = ReaperFailure("reaper failed")
+
+    class Pipe:
+        def read(self, size: int) -> bytes:
+            return b""
+
+        def close(self) -> None:
+            return None
+
+    class Process:
+        def __init__(self) -> None:
+            self.stdout = Pipe()
+            self.stderr = Pipe()
+            self.wait_calls = 0
+            self.killed = False
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise subprocess.TimeoutExpired(["fake"], timeout)
+            raise expected
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = Process()
+    monkeypatch.setattr(
+        calibration_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: process,
+    )
+
+    try:
+        calibration_module._run_host(["fake"], timeout_s=0.01)
+    except ReaperFailure as error:
+        assert error is expected
+    else:
+        raise AssertionError("_run_host returned success after reaper failure")
+
+    assert process.killed
+    assert process.wait_calls == 2
+
+
 @pytest.mark.parametrize("failure_site", ["reader", "killer", "closer"])
 def test_calibration_host_helper_baseexceptions_propagate(failure_site: str) -> None:
     script = f"""
