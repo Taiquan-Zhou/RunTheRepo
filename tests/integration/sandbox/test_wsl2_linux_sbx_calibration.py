@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -44,6 +45,7 @@ _MAJOR_MINOR_PATTERN = re.compile(r"[0-9]+:[0-9]+")
 _HOST_CLEANUP_TIMEOUT_S = 5.0
 _HOST_READER_NAME_PREFIX = "repotrial-host-reader-"
 _HOST_CLOSER_NAME_PREFIX = "repotrial-host-closer-"
+_HOST_KILLER_NAME_PREFIX = "repotrial-host-killer-"
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,35 +140,39 @@ def _run_host(
     ]
     for reader in readers:
         reader.start()
-    timeout_error: subprocess.TimeoutExpired | None = None
-    cleanup_failures: list[str] = []
-    cleanup_deadline: float | None = None
     try:
         returncode = process.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired as error:
-        timeout_error = error
-        returncode = None
         cleanup_deadline = time.monotonic() + _HOST_CLEANUP_TIMEOUT_S
-        cleanup_failures.extend(_kill_and_reap_host_process(process, cleanup_deadline))
-    finally:
-        if cleanup_deadline is None:
-            cleanup_deadline = time.monotonic() + _HOST_CLEANUP_TIMEOUT_S
+        cleanup_failures = _kill_and_reap_host_process(process, cleanup_deadline)
         closing_streams.set()
         cleanup_failures.extend(
             _close_host_streams((process.stdout, process.stderr), cleanup_deadline)
         )
         cleanup_failures.extend(_join_host_threads(readers, cleanup_deadline))
-    if timeout_error is not None:
         if cleanup_failures:
             raise AssertionError(
                 f"trusted host timeout cleanup unconfirmed: {'; '.join(cleanup_failures)}"
-            ) from timeout_error
+            ) from error
+        raise AssertionError(f"trusted host command timed out: {argv[0]}") from error
+
+    cleanup_deadline = time.monotonic() + _HOST_CLEANUP_TIMEOUT_S
+    reader_cleanup_failures = _join_host_threads(readers, cleanup_deadline)
+    if reader_cleanup_failures:
+        closing_streams.set()
+        reader_cleanup_failures.extend(
+            _close_host_streams((process.stdout, process.stderr), cleanup_deadline)
+        )
+        reader_cleanup_failures.extend(_join_host_threads(readers, cleanup_deadline))
         raise AssertionError(
-            f"trusted host command timed out: {argv[0]}"
-        ) from timeout_error
-    assert not cleanup_failures, "; ".join(cleanup_failures)
+            "trusted host reader cleanup unconfirmed: "
+            f"{'; '.join(reader_cleanup_failures)}"
+        )
     assert not failures, str(failures[0])
-    assert returncode is not None
+    missing_outputs = {"stdout", "stderr"}.difference(outputs)
+    assert not missing_outputs, "trusted host output missing: " + ", ".join(
+        sorted(missing_outputs)
+    )
     return _HostCommandResult(
         returncode=returncode,
         stdout=outputs["stdout"],
@@ -190,11 +196,7 @@ def _read_bounded_host_stream(stream: BinaryIO) -> bytes:
 def _kill_and_reap_host_process(
     process: subprocess.Popen[bytes], deadline: float
 ) -> list[str]:
-    failures: list[str] = []
-    try:
-        process.kill()
-    except OSError as error:
-        failures.append(f"kill_failed:{type(error).__name__}")
+    failures = _run_bounded_host_operation("kill", process.kill, deadline)
     remaining = _remaining_cleanup_time(deadline)
     if remaining <= 0:
         failures.append("reap_deadline_exhausted")
@@ -205,6 +207,27 @@ def _kill_and_reap_host_process(
         failures.append("reap_timeout")
     except OSError as error:
         failures.append(f"reap_failed:{type(error).__name__}")
+    return failures
+
+
+def _run_bounded_host_operation(
+    operation_name: str, operation: Callable[[], None], deadline: float
+) -> list[str]:
+    failures: list[str] = []
+
+    def run_operation() -> None:
+        try:
+            operation()
+        except (OSError, RuntimeError, ValueError) as error:
+            failures.append(f"{operation_name}_failed:{type(error).__name__}")
+
+    worker = threading.Thread(
+        target=run_operation,
+        name=f"{_HOST_KILLER_NAME_PREFIX}{operation_name}",
+        daemon=True,
+    )
+    worker.start()
+    failures.extend(_join_host_threads([worker], deadline))
     return failures
 
 
@@ -497,63 +520,108 @@ def _has_fresh_blocked_evidence(
     after: list[dict[str, object]],
     expected_evidence: set[str],
 ) -> bool:
-    before_events = _aggregate_blocked_evidence(before, expected_evidence)
-    after_events = _aggregate_blocked_evidence(after, expected_evidence)
+    before_events, before_poisoned, before_globally_poisoned = (
+        _aggregate_blocked_evidence(before, expected_evidence)
+    )
+    after_events, after_poisoned, after_globally_poisoned = _aggregate_blocked_evidence(
+        after, expected_evidence
+    )
+    if before_globally_poisoned or after_globally_poisoned:
+        return False
     for key, (count, last_seen) in after_events.items():
+        if key in before_poisoned or key in after_poisoned:
+            continue
         prior = before_events.get(key)
-        if prior is None or count > prior[0] or last_seen > prior[1]:
+        if prior is None:
+            return True
+        prior_count, prior_last_seen = prior
+        if (
+            count >= prior_count
+            and last_seen >= prior_last_seen
+            and (count > prior_count or last_seen > prior_last_seen)
+        ):
             return True
     return False
 
 
 def _aggregate_blocked_evidence(
     events: list[dict[str, object]], expected_evidence: set[str]
-) -> dict[tuple[str, str, str, str], tuple[int, datetime]]:
+) -> tuple[
+    dict[tuple[str, str, str, str], tuple[int, datetime]],
+    set[tuple[str, str, str, str]],
+    bool,
+]:
     aggregated: dict[tuple[str, str, str, str], tuple[int, datetime]] = {}
+    poisoned: set[tuple[str, str, str, str]] = set()
+    globally_poisoned = False
     for event in events:
+        key = _blocked_evidence_key(event, expected_evidence)
         observed = _blocked_evidence_observation(event, expected_evidence)
         if observed is None:
+            if key is None:
+                globally_poisoned = (
+                    globally_poisoned
+                    or _is_malformed_expected_evidence(event, expected_evidence)
+                )
+            else:
+                poisoned.add(key)
             continue
-        key, count, last_seen = observed
+        _, count, last_seen = observed
         prior = aggregated.get(key)
         if prior is None:
             aggregated[key] = (count, last_seen)
         else:
             aggregated[key] = (max(prior[0], count), max(prior[1], last_seen))
-    return aggregated
+    return aggregated, poisoned, globally_poisoned
 
 
 def _blocked_evidence_observation(
     event: dict[str, object], expected_evidence: set[str]
 ) -> tuple[tuple[str, str, str, str], int, datetime] | None:
+    key = _blocked_evidence_key(event, expected_evidence)
+    if key is None:
+        return None
+    last_seen = event.get("last_seen")
+    count = event.get("count")
+    if not isinstance(last_seen, str) or type(count) is not int or count < 1:
+        return None
+    timestamp = _parse_network_timestamp(last_seen)
+    if timestamp is None:
+        return None
+    return (key, count, timestamp)
+
+
+def _blocked_evidence_key(
+    event: dict[str, object], expected_evidence: set[str]
+) -> tuple[str, str, str, str] | None:
     if event.get("decision") != "blocked":
         return None
     host = event.get("host")
     rule = event.get("rule")
     reason = event.get("reason")
     proxy = event.get("proxy")
-    last_seen = event.get("last_seen")
-    count = event.get("count")
-    if (
-        not all(
-            isinstance(value, str) for value in (host, rule, reason, proxy, last_seen)
-        )
-        or type(count) is not int
-        or count < 1
-    ):
+    if not all(isinstance(value, str) for value in (host, rule, reason, proxy)):
         return None
     assert isinstance(host, str)
     assert isinstance(rule, str)
     assert isinstance(reason, str)
     assert isinstance(proxy, str)
-    assert isinstance(last_seen, str)
-    assert isinstance(count, int)
-    timestamp = _parse_network_timestamp(last_seen)
-    if timestamp is None:
-        return None
     if not any(token in f"{host} {rule} {reason}" for token in expected_evidence):
         return None
-    return ((host, rule, reason, proxy), count, timestamp)
+    return (host, rule, reason, proxy)
+
+
+def _is_malformed_expected_evidence(
+    event: dict[str, object], expected_evidence: set[str]
+) -> bool:
+    if event.get("decision") != "blocked":
+        return False
+    evidence_fields = (event.get("host"), event.get("rule"), event.get("reason"))
+    return any(
+        isinstance(field, str) and token in field
+        for field in evidence_fields
+        for token in expected_evidence
+    )
 
 
 def _parse_network_timestamp(value: str) -> datetime | None:
