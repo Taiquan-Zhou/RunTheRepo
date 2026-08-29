@@ -15,11 +15,42 @@ candidate repository has been started, and no pass, failure, or metric is claime
   replaced, or reordered after any attempt or result is observed.
 - Repo-specific workarounds are prohibited. A later generic product change must be
   reviewed and tested outside this preparation task before a new Pilot is frozen.
-- Each repository receives one primary run. An attempt invalidated by infrastructure
-  is retained as evidence and linked to any authorized replacement attempt; it is
-  never erased or silently reclassified.
+- Each repository receives exactly one primary attempt. Every command and attempt
+  is retained in an append-only attempt ledger and is never erased or silently
+  reclassified.
 
 README remains unchanged until real Pilot metrics exist.
+
+### Frozen attempt attribution
+
+Attempt attribution is decided by observed execution boundaries, not by a later
+interpretation of results:
+
+1. Before invocation, label the first attempt `primary`. A retry authorized after
+   a pre-workload infrastructure invalidation is `replacement`. Any attempt after
+   a metric-bearing attempt exists is `diagnostic`.
+2. An attempt invalidated by infrastructure before any target workload starts is
+   `audit-only`. Retain all terminal evidence, but exclude it from repository
+   outcome, convergence, experiment-count, failure-class, and timing attribution.
+   It still contributes every failed terminal state to the exact-stop-reason gate
+   and every owned sandbox obligation to the aggregate cleanup gate. A replacement
+   requires explicit invalidation evidence and authorization.
+3. The first attempt that starts any target workload is irrevocably the
+   repository's sole metric-bearing attempt, whether its role is `primary` or
+   `replacement`. Once assigned, the metric-bearing attempt ID never changes.
+4. Every later attempt is `diagnostic-only`; retain its complete evidence. It
+   cannot alter repository outcome, convergence, experiment-count, failure-class,
+   or timing attribution, but its failed terminal state and owned sandbox cleanup
+   obligations remain in the all-attempt safety gates.
+5. A pre-workload terminal attempt without verified infrastructure invalidation is
+   not replaceable under this protocol. If no metric-bearing attempt exists, the
+   repository is an autonomous failure, its experiment count is `0`, it has no
+   meaningful convergence, and its repository duration is missing. That missing
+   duration makes P50 and P95 `UNKNOWN`.
+6. Repository-level outcome, convergence, experiment, failure-class, and timing
+   rows and aggregates derive mechanically from the sole metric-bearing attempt,
+   or from the fixed no-metric-bearing defaults above. Exact-stop-reason coverage
+   and aggregate cleanup instead derive from every retained attempt.
 
 ## 2. Fail-closed pre-execution gates
 
@@ -55,23 +86,27 @@ Neither finding is fixed or bypassed by this preparation task.
 For each manifest entry, in order:
 
 1. Confirm all pre-execution gates are `PASS` and archive their evidence.
-2. Start an external monotonic timer and record UTC start time before the approved
-   command is invoked. Record the exact command verbatim; do not add an invented
-   immutable-ref option.
+2. Allocate an attempt ID, assign its `primary`/`replacement`/`diagnostic` role,
+   start an external monotonic timer, and record UTC start time before invocation.
+   Record the exact command verbatim; do not add an invented immutable-ref option.
 3. Through the approved generic intake route, verify the checked-out
    `HEAD^{commit}` equals the manifest SHA before any target workload executes.
    A mismatch terminates the attempt and is classified as `intake`.
-4. Run exactly one primary trial through `SandboxProvider`; never execute target
-   Compose on the host and never fall back to a host command path.
-5. Persist report paths, artifact references, deterministic baseline journey
+4. Record `target_workload_started=false` until the controlled provider boundary
+   first starts target workload execution. At that boundary, set it to `true` and,
+   if no metric-bearing attempt exists, bind this attempt ID irrevocably as the
+   repository's sole metric-bearing attempt.
+5. Run only through `SandboxProvider`; never execute target Compose on the host and
+   never fall back to a host command path.
+6. Persist report paths, artifact references, deterministic baseline journey
    definitions/results, every experiment/mutation, and every lifecycle JSONL file.
-6. Record terminal outcome, process exit code, exact raw `stop_reason`, UTC end
-   time, and external monotonic duration for every terminal path.
-7. Derive cleanup only from lifecycle JSONL under the rules in section 6. Preserve
+7. For every attempt, record actual SHA, UTC end, external monotonic duration,
+   exact command, exit code, terminal outcome, exact raw `stop_reason`, failure
+   class, lifecycle/cleanup evidence, and any invalidation evidence/authorization.
+8. Derive cleanup only from lifecycle JSONL under the rules in section 6. Preserve
    raw unsupported/not-observed evidence; never convert it to success.
-8. Stop the external timer only after required cleanup has reached a terminal
-   state. Retain infrastructure-invalidated attempts and explain any authorized
-   rerun in the deviations table.
+9. Stop the attempt timer only after required cleanup has reached a terminal state.
+   Apply the frozen attribution rules without a free-form effect-on-metrics decision.
 
 The exact Pilot command is `TBD` until the immutable-identity gate has an approved
 generic route. This preparation document does not authorize execution.
@@ -80,6 +115,8 @@ generic route. This preparation document does not authorize execution.
 
 ### Autonomous success
 
+Evaluate autonomous success only from the repository's sole metric-bearing
+attempt. With no metric-bearing attempt, the repository is an autonomous failure.
 A repository is an autonomous success only when all of the following are true:
 
 - terminal outcome is `completed` and the captured process exit code is `0`;
@@ -87,17 +124,20 @@ A repository is an autonomous success only when all of the following are true:
 - report/intake identity SHA exactly equals the manifest SHA;
 - a non-empty deterministic baseline journey set exists and every required
   baseline journey passes;
-- every cleanup obligation derived from lifecycle JSONL succeeds.
+- every cleanup obligation of the metric-bearing attempt derived from lifecycle
+  JSONL succeeds.
 
 Any missing, `UNKNOWN`, `UNSUPPORTED`, or failed condition means the repository is
 not counted as an autonomous success.
 
 ### Meaningful regression-passing convergence
 
-A repository meaningfully converges only when at least one `KEEP` mutation is
-backed by replay of the complete passing baseline journey set and evidence shows
-that it removes or reduces privilege. The classification and evidence reference
-must be recorded per mutation. `add_tmpfs` by itself is not meaningful.
+Evaluate convergence only from the repository's sole metric-bearing attempt. With
+no metric-bearing attempt, the repository has no convergence. A repository
+meaningfully converges only when at least one `KEEP` mutation is backed by replay
+of the complete passing baseline journey set and evidence shows that it removes or
+reduces privilege. The classification and evidence reference must be recorded per
+mutation. `add_tmpfs` by itself is not meaningful.
 
 `ROLLBACK`, `STOP`, unsupported collectors, and not-observed behavior remain raw
 evidence and cannot be converted into a meaningful convergence or success.
@@ -105,9 +145,12 @@ evidence and cannot be converted into a meaningful convergence or success.
 ## 5. Per-repository capture
 
 `TBD` means no run evidence exists. URLs and manifest SHAs below are frozen input,
-not observed results.
+not observed results. Each row is populated only from its sole metric-bearing
+attempt. If none exists, use `MISSING — no metric-bearing attempt` for attempt
+identity and duration, apply the fixed failure/zero/no-convergence defaults, and
+keep attempt facts exclusively in section 10.
 
-| # | Repository | Manifest SHA | Actual SHA | Run ID | UTC start | UTC end | Monotonic duration | Exact command | Exit | Terminal outcome | Exact raw `stop_reason` | Failure class |
+| # | Repository | Manifest SHA | Actual SHA | Metric-bearing attempt ID | UTC start | UTC end | Repository monotonic duration | Exact command | Exit | Terminal outcome | Exact raw `stop_reason` | Failure class |
 |---:|---|---|---|---|---|---|---|---|---:|---|---|---|
 | 1 | `https://github.com/umami-software/umami` | `ca661c7057984aa98ed4f7083d84dae2f65bfcb0` | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
 | 2 | `https://github.com/knadh/listmonk` | `670c01717d48647093335cc23a6be6f4b79c3b6b` | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
@@ -122,7 +165,14 @@ not observed results.
 
 ### Report, journey, experiment, and cleanup evidence
 
-| # | Report/artifact references | Baseline journey definitions/results | Experiment count | Meaningful convergence | Lifecycle JSONL references | Cleanup result |
+These fields also come only from the sole metric-bearing attempt. No
+metric-bearing attempt means no report/baseline evidence, experiment count `0`,
+meaningful convergence `NO`, and metric-bearing cleanup `N/A`; audit evidence
+remains available in section 10. The cleanup value in this repository-level table
+supports autonomous-success derivation only and is not the aggregate cleanup
+denominator.
+
+| # | Report/artifact references | Baseline journey definitions/results | Experiment count | Meaningful convergence | Lifecycle JSONL references | Metric-bearing cleanup result |
 |---:|---|---|---:|---|---|---|
 | 1 | TBD | TBD | TBD | TBD | TBD | TBD |
 | 2 | TBD | TBD | TBD | TBD | TBD | TBD |
@@ -137,16 +187,20 @@ not observed results.
 
 ### Mutation evidence
 
-Add one row per attempted experiment; do not summarize away `ROLLBACK` or `STOP`.
+Retain one row for every attempted experiment; do not summarize away `ROLLBACK` or
+`STOP`. Only mutation rows whose `Attempt ID` equals the repository's sole
+metric-bearing attempt ID participate in experiment count and meaningful
+convergence. All other mutation rows are audit evidence only and cannot alter
+either aggregate.
 
-| Repo # | Experiment ID | Mutation type/service/params | Parent hash | Candidate hash | Boot | Regression journeys | Verdict (`KEEP`/`ROLLBACK`/`STOP`) | Exact reason | Meaningful? | Evidence references |
-|---:|---|---|---|---|---|---|---|---|---|---|
-| TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| Repo # | Attempt ID | Experiment ID | Mutation type/service/params | Parent hash | Candidate hash | Boot | Regression journeys | Verdict (`KEEP`/`ROLLBACK`/`STOP`) | Exact reason | Meaningful? | Evidence references |
+|---:|---|---|---|---|---|---|---|---|---|---|---|
+| TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
 
 ## 6. Cleanup derivation
 
-Derive each sandbox lifecycle from its JSONL events; do not infer cleanup from a
-process exit or report file.
+Derive each attempt's sandbox lifecycle from its JSONL events; do not infer cleanup
+from a process exit or report file.
 
 - `create_success` requires a later `destroy_success` for the same owned sandbox
   ID and no `destroy_failure`; otherwise cleanup is `FAIL` or `UNKNOWN`.
@@ -154,21 +208,32 @@ process exit or report file.
   `cleanup_retry_failure` is `FAIL`.
 - `create_failure` before any owned sandbox ID is `N/A`.
 - Missing, malformed, or incomplete lifecycle evidence is `UNKNOWN`.
-- A repository cleanup result is `FAIL` if any required lifecycle fails,
-  `UNKNOWN` if none fails but required evidence is unknown, `PASS` only if all
-  required cleanups succeed, and `N/A` only when no sandbox ID was ever owned.
+- An attempt cleanup result is `FAIL` if any required lifecycle fails, `UNKNOWN`
+  if none fails but required evidence is unknown, `PASS` only if all required
+  cleanups succeed, and `N/A` only when no sandbox ID was ever owned.
 
-Cleanup percentage is successful required cleanups divided by all terminal
-cleanup obligations; `N/A` has no obligation. Any `UNKNOWN` makes the aggregate
-cleanup metric `UNKNOWN`. The M7.5 cleanup target is `100%`.
+The repository-level cleanup value is the cleanup result of its sole
+metric-bearing attempt. With no metric-bearing attempt it is `N/A`; this value is
+used for autonomous-success derivation but not as the aggregate cleanup
+denominator.
 
-| Repo # | Lifecycle reference | Create state / owned ID | Required terminal event | Observed terminal event | Derived cleanup | Notes |
-|---:|---|---|---|---|---|---|
-| TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+Aggregate cleanup is successful cleanup obligations across all retained attempts
+divided by all cleanup obligations across all retained attempts. Audit-only,
+metric-bearing, and diagnostic-only attempts all contribute every owned sandbox
+obligation. `N/A` has no obligation. Any `UNKNOWN` obligation makes aggregate
+cleanup `UNKNOWN`. The M7.5 aggregate cleanup target is `100%`.
+
+| Repo # | Attempt ID | Lifecycle reference | Create state / owned ID | Required terminal event | Observed terminal event | Derived attempt cleanup | Notes |
+|---:|---|---|---|---|---|---|---|
+| TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
 
 ## 7. Failure taxonomy
 
-Always preserve exact raw `stop_reason` separately from the normalized class.
+Always preserve exact raw `stop_reason` separately from the normalized class for
+every attempt. Attempt-level classes use the taxonomy below. Repository rows and
+aggregate failure-class counts use only the sole metric-bearing attempt; a
+repository with none has the derived state `no metric-bearing attempt` and is not
+post-hoc assigned one of these attempt failure classes.
 
 | Failure class | Classification boundary | Count | Run/attempt references |
 |---|---|---:|---|
@@ -185,19 +250,27 @@ Always preserve exact raw `stop_reason` separately from the normalized class.
 
 ## 8. Aggregate metrics and thresholds
 
-All aggregate denominators use the ten frozen repositories. Failed runs and runs
-with no experiments contribute `0` experiments to the average; survivor-only
-averages are prohibited.
+Repository outcome, convergence, experiment, failure-class, and timing aggregates
+use the ten frozen repositories and derive from each sole metric-bearing attempt or
+the frozen no-metric-bearing defaults. Failed metric-bearing attempts and
+repositories with no metric-bearing attempt contribute `0` experiments;
+survivor-only averages are prohibited. Exact-stop-reason coverage and aggregate
+cleanup are all-attempt safety gates and use every retained attempt instead.
 
 | Metric | Exact calculation | Result | M7.5 threshold/status |
 |---|---|---|---|
-| Autonomous successes | Count satisfying every autonomous-success condition, denominator 10 | TBD | At least `7/10` |
-| Meaningful convergences | Count with at least one meaningful regression-passing `KEEP`, denominator 10 | TBD | At least `5/10` |
-| Exact stop-reason coverage | Failed attempts with exact raw `stop_reason` / all failed attempts | TBD | `100%` |
-| Average experiments | Sum of experiment counts for all ten repositories / `10`; failed/no-experiment runs add zero | TBD | Report only |
-| Cleanup | Section 6 derivation across all cleanup obligations | TBD | `100%` |
-| P50 monotonic duration | Nearest-rank, section 9 | TBD | Report only |
-| P95 monotonic duration | Nearest-rank, section 9 | TBD | Report only |
+| Autonomous successes | Count whose metric-bearing attempt satisfies every autonomous-success condition; none means failure; denominator 10 | TBD | At least `7/10` |
+| Meaningful convergences | Count whose metric-bearing attempt has at least one meaningful regression-passing `KEEP`; none means no convergence; denominator 10 | TBD | At least `5/10` |
+| Exact stop-reason coverage | All retained failed attempts with exact raw `stop_reason` / all retained failed attempts | TBD | `100%` |
+| Average experiments | Sum of metric-bearing experiment counts for all ten repositories / `10`; no metric-bearing/no-experiment adds zero | TBD | Report only |
+| Aggregate cleanup | Successful cleanup obligations across all retained attempts / all cleanup obligations across all retained attempts; `N/A` has no obligation and any `UNKNOWN` makes the result `UNKNOWN` | TBD | `100%` |
+| P50 repository duration | Nearest-rank over metric-bearing repository durations, section 9 | TBD | Report only |
+| P95 repository duration | Nearest-rank over metric-bearing repository durations, section 9 | TBD | Report only |
+
+The exact-stop-reason and aggregate-cleanup rows are safety gates, not repository
+outcome metrics. They include primary, replacement, audit-only, metric-bearing,
+and diagnostic-only attempts according to their retained terminal and lifecycle
+evidence.
 
 The release-style Before/After demo threshold is met only if autonomous successes
 are at least `7/10`, meaningful convergences are at least `5/10`, every failure has
@@ -211,34 +284,48 @@ condition.
 
 ## 9. Timing
 
-Use external monotonic whole-attempt durations for all ten repositories, including
-failed attempts and cleanup. Sort all ten durations ascending. With `n = 10`,
-nearest-rank P50 is rank `ceil(0.50 * 10) = 5`, and P95 is rank
-`ceil(0.95 * 10) = 10`. If any duration is missing, both timing aggregates are
-`UNKNOWN`; do not silently exclude that repository.
+The repository duration is the external monotonic whole-attempt duration of its
+sole metric-bearing attempt, including cleanup. Audit-only and diagnostic-only
+attempt durations remain in section 10 but are excluded here. If no metric-bearing
+attempt exists, the repository duration is missing. Sort all ten repository
+durations ascending only when all are present. With `n = 10`, nearest-rank P50 is
+rank `ceil(0.50 * 10) = 5`, and P95 is rank `ceil(0.95 * 10) = 10`. If any
+repository duration is missing, both timing aggregates are `UNKNOWN`; do not
+silently substitute another attempt or exclude that repository.
 
-| Repo # | External monotonic duration | Included in all-ten ordering? | Evidence |
-|---:|---|---|---|
-| 1 | TBD | TBD | TBD |
-| 2 | TBD | TBD | TBD |
-| 3 | TBD | TBD | TBD |
-| 4 | TBD | TBD | TBD |
-| 5 | TBD | TBD | TBD |
-| 6 | TBD | TBD | TBD |
-| 7 | TBD | TBD | TBD |
-| 8 | TBD | TBD | TBD |
-| 9 | TBD | TBD | TBD |
-| 10 | TBD | TBD | TBD |
+| Repo # | Metric-bearing attempt ID | Repository monotonic duration | Included in all-ten ordering? | Evidence |
+|---:|---|---|---|---|
+| 1 | TBD | TBD | TBD | TBD |
+| 2 | TBD | TBD | TBD | TBD |
+| 3 | TBD | TBD | TBD | TBD |
+| 4 | TBD | TBD | TBD | TBD |
+| 5 | TBD | TBD | TBD | TBD |
+| 6 | TBD | TBD | TBD | TBD |
+| 7 | TBD | TBD | TBD | TBD |
+| 8 | TBD | TBD | TBD | TBD |
+| 9 | TBD | TBD | TBD | TBD |
+| 10 | TBD | TBD | TBD | TBD |
 
-## 10. Deviations and infrastructure-invalidated attempts
+## 10. Attempt ledger and infrastructure invalidation
 
-Every attempted command remains in the audit trail. A replacement attempt requires
-explicit authorization and a reason; it does not overwrite the primary record or
-change the frozen cohort denominator.
+Every attempted command remains in the audit trail. Populate one row in each table
+per attempt using the same attempt ID. Attempt role and metric attribution are
+derived by the frozen rules in section 1; there is no free-form post-hoc field that
+can change metric inclusion.
 
-| Repo # | Attempt/run ID | Primary or replacement | Infrastructure invalidation evidence | Authorization/reason | Effect on metrics |
-|---:|---|---|---|---|---|
-| TBD | TBD | TBD | TBD | TBD | TBD |
+| Repo # | Attempt ID | Attempt role (`primary`/`replacement`/`diagnostic`) | Metric attribution | Target workload started? | Actual SHA | UTC start | UTC end | Monotonic duration | Exact command | Exit | Terminal outcome | Exact raw `stop_reason` | Failure class |
+|---:|---|---|---|---|---|---|---|---|---|---:|---|---|---|
+| TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+
+Allowed terminal metric-attribution values are `audit-only` for a verified
+pre-workload infrastructure invalidation, `metric-bearing` for the first attempt
+that starts target workload, `diagnostic-only` after that binding, and
+`no-metric pre-workload terminal` for a non-replaceable attempt that ends before
+target workload starts.
+
+| Repo # | Attempt ID | Report/artifact references | Lifecycle JSONL references | Derived attempt cleanup | Invalidation evidence and authorization | Notes |
+|---:|---|---|---|---|---|---|
+| TBD | TBD | TBD | TBD | TBD | TBD | TBD |
 
 ## 11. Pilot decision
 

@@ -78,7 +78,8 @@ repositories:
       - Migration and initialization step
     documented_setup:
       - instruction: >-
-          Use the pinned README initialization command before normal startup.
+          The checked-in Compose service runs its documented internal
+          initialization/upgrade command as part of startup.
 
   - id: changedetection
     url: https://github.com/dgtlmoon/changedetection.io
