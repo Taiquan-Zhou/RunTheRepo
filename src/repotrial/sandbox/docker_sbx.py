@@ -221,10 +221,14 @@ class DockerSbxProvider(SandboxProvider):
         self._subprocess_environment = _sanitized_environment()
         self._sandbox_states: dict[str, _SandboxState] = {}
         self._sandbox_deadlines: dict[str, float] = {}
+        self._trial_deadline: float | None = None
         self._network_log_sandboxes: set[str] = set()
 
     async def create(self, workspace: Path, name: str) -> str:
-        deadline = time.monotonic() + self._policy.total_duration_s
+        deadline = self._trial_deadline
+        first_successful_create = deadline is None
+        if deadline is None:
+            deadline = time.monotonic() + self._policy.total_duration_s
         allocation = calculate_disk_allocation(self._policy.disk_mb)
         network_log_supported = await self._probe(deadline)
         sandbox_id = _new_sandbox_id(name)
@@ -273,6 +277,8 @@ class DockerSbxProvider(SandboxProvider):
                 partial_create=True,
             )
         self._sandbox_states[sandbox_id] = _SandboxState.ACTIVE
+        if first_successful_create:
+            self._trial_deadline = deadline
         self._sandbox_deadlines[sandbox_id] = deadline
         if network_log_supported:
             self._network_log_sandboxes.add(sandbox_id)

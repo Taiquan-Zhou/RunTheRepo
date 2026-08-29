@@ -193,6 +193,39 @@ class _TimeoutRecorder:
         return _RecordedTimeout()
 
 
+class _TimeoutAfterProcessCreation:
+    def __init__(self, process_created: asyncio.Event) -> None:
+        self._process_created = process_created
+        self._canceller: asyncio.Task[None] | None = None
+        self._task: asyncio.Task[object] | None = None
+        self._timed_out = False
+
+    async def __aenter__(self) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        self._task = cast(asyncio.Task[object], task)
+        self._canceller = asyncio.create_task(self._cancel_after_process_creation())
+
+    async def __aexit__(self, *args: object) -> bool:
+        if self._canceller is not None and not self._canceller.done():
+            self._canceller.cancel()
+            try:
+                await self._canceller
+            except asyncio.CancelledError:
+                pass
+        if self._timed_out and args[0] is asyncio.CancelledError:
+            assert self._task is not None
+            self._task.uncancel()
+            raise TimeoutError
+        return False
+
+    async def _cancel_after_process_creation(self) -> None:
+        await self._process_created.wait()
+        assert self._task is not None
+        self._timed_out = True
+        self._task.cancel()
+
+
 def _install_deterministic_clock(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock
 ) -> _TimeoutRecorder:
@@ -1778,6 +1811,8 @@ def test_network_log_confirmed_timeout_remains_unsupported(
 def test_network_log_in_flight_trial_deadline_timeout_propagates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
     spawner = _SbxSpawner()
     provider = _provider(monkeypatch, spawner, command_timeout_s=5)
     sandbox_id = _create(provider, tmp_path)
@@ -1791,7 +1826,19 @@ def test_network_log_in_flight_trial_deadline_timeout_propagates(
         "--json",
     )
     spawner.overrides[command] = _Outcome(hang=True)
-    provider._sandbox_deadlines[sandbox_id] = time.monotonic() + 0.01
+    provider._sandbox_deadlines[sandbox_id] = 1.0
+    process_created = asyncio.Event()
+
+    def signal_network_log_spawn(spawned_command: tuple[str, ...]) -> None:
+        if spawned_command == command:
+            process_created.set()
+
+    spawner.before_spawn = signal_network_log_spawn
+    monkeypatch.setattr(
+        docker_sbx.asyncio,
+        "timeout",
+        lambda _: _TimeoutAfterProcessCreation(process_created),
+    )
 
     with pytest.raises(DockerSbxError) as raised:
         asyncio.run(provider.network_log(sandbox_id))
@@ -1799,6 +1846,7 @@ def test_network_log_in_flight_trial_deadline_timeout_propagates(
     assert raised.value.operation == "network_log"
     assert raised.value.reason == "total_duration_exhausted"
     assert raised.value.sandbox_id == sandbox_id
+    assert process_created.is_set()
     assert spawner.processes[-1].killed is True
     assert spawner.processes[-1].waited is True
 
@@ -2010,7 +2058,7 @@ def test_expired_trial_prevents_new_workload_subprocess_and_network_log_propagat
     assert spawner.calls == calls_before_workloads
 
 
-def test_direct_destroy_bypasses_expired_trial_deadline(
+def test_destroy_after_shared_deadline_expiry_still_forces_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clock = _Clock()
@@ -2055,49 +2103,48 @@ def test_managed_sandbox_cleans_up_after_in_flight_trial_deadline_timeout(
     assert managed_id not in provider._sandbox_deadlines
 
 
-def test_multiple_sandbox_deadlines_are_independent_and_owned_cleanup_is_scoped(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    clock = _Clock()
-    recorder = _install_deterministic_clock(monkeypatch, clock)
-    spawner = _SbxSpawner()
-    provider = _provider(
-        monkeypatch,
-        spawner,
-        command_timeout_s=30,
-        total_duration_s=10,
-    )
-    first_id = _create(provider, tmp_path)
-    clock.value = 2
-    second_id = _create(provider, tmp_path)
-
-    assert provider._sandbox_deadlines == {first_id: 10.0, second_id: 12.0}
-
-    clock.value = 3
-    asyncio.run(provider.exec(first_id, ["first"]))
-    asyncio.run(provider.exec(second_id, ["second"]))
-    assert _timeouts_by_command(spawner, recorder)[-2:] == [
-        (("sbx", "exec", first_id, "--", "first"), 7.0),
-        (("sbx", "exec", second_id, "--", "second"), 9.0),
-    ]
-
-    asyncio.run(provider.destroy(first_id))
-
-    assert first_id not in provider._sandbox_deadlines
-    assert provider._sandbox_deadlines[second_id] == 12.0
-    asyncio.run(provider.destroy(second_id))
-
-
-def test_failed_create_keeps_no_deadline_and_failure_cleanup_bypasses_deadline(
+def test_sequential_sandboxes_share_first_successful_trial_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clock = _Clock()
     _install_deterministic_clock(monkeypatch, clock)
     spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner, total_duration_s=10)
+    first_id = _create(provider, tmp_path)
+    asyncio.run(provider.destroy(first_id))
+    clock.value = 2
+    second_id = _create(provider, tmp_path)
+
+    assert provider._trial_deadline == 10.0
+    assert provider._sandbox_deadlines[second_id] == 10.0
+
+
+def test_expired_trial_prevents_second_create_before_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner, total_duration_s=10)
+    first_id = _create(provider, tmp_path)
+    asyncio.run(provider.destroy(first_id))
+    clock.value = 10
+    calls_before_second_create = list(spawner.calls)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert raised.value.reason == "total_duration_exhausted"
+    assert spawner.calls == calls_before_second_create
+
+
+def test_failed_first_create_leaves_no_trial_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
 
     def outcome(command: tuple[str, ...]) -> _Outcome:
         if command[:2] == ("sbx", "create") and command[-1] != "--help":
-            clock.value = 10
             return _Outcome(returncode=7, stderr=b"create failed")
         return _Outcome()
 
@@ -2107,8 +2154,53 @@ def test_failed_create_keeps_no_deadline_and_failure_cleanup_bypasses_deadline(
     with pytest.raises(DockerSbxError, match="create failed"):
         _create(provider, tmp_path)
 
+    create_call = _actual_create_call(spawner)
+    sandbox_id = create_call[create_call.index("--name") + 1]
+    assert provider._trial_deadline is None
     assert provider._sandbox_deadlines == {}
-    assert spawner.calls[-1][:3] == ("sbx", "rm", "--force")
+    assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
+
+
+def test_failed_later_create_does_not_reset_trial_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    create_attempts = 0
+
+    def outcome(command: tuple[str, ...]) -> _Outcome:
+        nonlocal create_attempts
+        if command[:2] == ("sbx", "create") and command[-1] != "--help":
+            create_attempts += 1
+            if create_attempts == 2:
+                return _Outcome(returncode=7, stderr=b"create failed")
+        return _Outcome()
+
+    spawner.handler = outcome
+    provider = _provider(monkeypatch, spawner, total_duration_s=10)
+    _create(provider, tmp_path)
+    clock.value = 2
+
+    with pytest.raises(DockerSbxError, match="create failed"):
+        _create(provider, tmp_path)
+
+    assert provider._trial_deadline == 10.0
+
+
+def test_separate_provider_instances_have_independent_trial_deadlines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    provider_a = _provider(monkeypatch, _SbxSpawner(), total_duration_s=10)
+    _create(provider_a, tmp_path)
+    clock.value = 2
+    provider_b = _provider(monkeypatch, _SbxSpawner(), total_duration_s=10)
+    _create(provider_b, tmp_path)
+
+    assert provider_a._trial_deadline == 10.0
+    assert provider_b._trial_deadline == 12.0
 
 
 def test_publish_recomputes_timeout_for_each_subprocess_from_one_deadline(
