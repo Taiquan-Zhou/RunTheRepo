@@ -1,10 +1,10 @@
 # M7.5 real-repository Pilot protocol and report
 
-> **NOT RUN — cohort and protocol frozen; no pilot result exists yet**
+> **EXECUTION IN PROGRESS — cohort and protocol remain frozen**
 
-This document freezes the M7.5 execution protocol and empty report structure. It
-contains preparation findings and fail-closed gates, not Pilot outcomes. No
-candidate repository has been started, and no pass, failure, or metric is claimed.
+This document freezes the M7.5 execution protocol and records the append-only Pilot
+evidence. Infrastructure-invalidated attempts are retained below; no repository
+metric is claimed until the target-workload boundary is actually crossed.
 
 ## 1. Immutable cohort
 
@@ -318,6 +318,7 @@ can change metric inclusion.
 | Repo # | Attempt ID | Attempt role (`primary`/`replacement`/`diagnostic`) | Metric attribution | Target workload started? | Actual SHA | UTC start | UTC end | Monotonic duration | Exact command | Exit | Terminal outcome | Exact raw `stop_reason` | Failure class |
 |---:|---|---|---|---|---|---|---|---|---|---:|---|---|---|
 | 1 | `4d487d62-e775-47f1-ac3d-2720309c3f6f` | `primary` | `audit-only` — verified pre-workload infrastructure invalidation | `false` | `ca661c7057984aa98ed4f7083d84dae2f65bfcb0` | `2026-08-29T09:05:56.262880+00:00` | `2026-08-29T09:06:50.320499+00:00` | `54.04700000000594` | `uv run repotrial inspect https://github.com/umami-software/umami --provider docker-sbx --commit-sha ca661c7057984aa98ed4f7083d84dae2f65bfcb0 --container-port 3000 --compose-path docker-compose.yml` | `1` outer command; `4` logical evidence | `exception` | `internal:valueerror` | `internal` |
+| 1 | `53bd0dda-93c2-493b-bed1-43c37a585dbf` | `replacement` | `audit-only` — verified pre-workload infrastructure invalidation | `false` | `ca661c7057984aa98ed4f7083d84dae2f65bfcb0` | `2026-08-29T09:23:55.105099+00:00` | `2026-08-29T09:24:56.031849+00:00` | `60.921999999991385` | `uv run repotrial inspect https://github.com/umami-software/umami --provider docker-sbx --commit-sha ca661c7057984aa98ed4f7083d84dae2f65bfcb0 --container-port 3000 --compose-path docker-compose.yml` | `1` outer command; `4` logical evidence | `exception` | `internal:cleanuperror` | `cleanup` |
 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
 
 Allowed terminal metric-attribution values are `audit-only` for a verified
@@ -328,7 +329,8 @@ target workload starts.
 
 | Repo # | Attempt ID | Report/artifact references | Lifecycle JSONL references | Derived attempt cleanup | Invalidation evidence and authorization | Notes |
 |---:|---|---|---|---|---|---|
-| 1 | `4d487d62-e775-47f1-ac3d-2720309c3f6f` | `artifacts/4d487d62-e775-47f1-ac3d-2720309c3f6f/attempt-result.json` | None — no lifecycle JSONL | `N/A` | Verified pre-workload infrastructure invalidation: relative artifact root produced mixed relative/absolute GraphContext paths; no sandbox/lifecycle was reached and `sbx list` was empty. Replacement is **NOT authorized**. | No retry occurred; `target_workload_started=false`; retain as audit-only and do not fill metric-bearing repository outcomes. The command runner observed process exit `1`; retained RepoTrial evidence records logical exit `4`, so both are preserved rather than silently reconciled. |
+| 1 | `4d487d62-e775-47f1-ac3d-2720309c3f6f` | `artifacts/4d487d62-e775-47f1-ac3d-2720309c3f6f/attempt-result.json` | None — no lifecycle JSONL | `N/A` | Verified pre-workload infrastructure invalidation: relative artifact root produced mixed relative/absolute GraphContext paths; no sandbox/lifecycle was reached and `sbx list` was empty. Owner later authorized one replacement attempt. | `target_workload_started=false`; retain as audit-only and do not fill metric-bearing repository outcomes. The command runner observed process exit `1`; retained RepoTrial evidence records logical exit `4`, so both are preserved rather than silently reconciled. |
+| 1 | `53bd0dda-93c2-493b-bed1-43c37a585dbf` | `artifacts/53bd0dda-93c2-493b-bed1-43c37a585dbf/attempt-result.json` | `artifacts/53bd0dda-93c2-493b-bed1-43c37a585dbf/evidence/baseline-d780b5f62220835d-0001-attempt-01/baseline-lifecycle.jsonl` | `FAIL` — `create_cleanup_unsafe` followed by `cleanup_retry_failure`; post-attempt `sbx list` was empty but does not override lifecycle evidence | Verified generic pre-workload compatibility invalidation: installed `sbx create --help` specifies `--cpus int`; the attempt passed `1.5` and failed before any daemon create request. A controlled provider reproduction retained exact stderr `invalid argument \"1.5\" for \"--cpus\" ... ParseInt`; integer CPU then passed `create -> exec echo ok -> destroy` against the same pinned workspace with no residue. Owner authorized generic TDD repair and continuation. | `target_workload_started=false`; retain as audit-only. Generic fix `cbc6eea0cb570f46929693a1f38cf7904cb2bf21` rejects fractional CPU policy and uses an integer default; scoped reviewer accepted it. The raw attempt stop reason remains exactly as originally captured. |
 | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
 
 ## 11. Pilot decision
