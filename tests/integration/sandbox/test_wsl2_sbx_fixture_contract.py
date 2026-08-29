@@ -330,12 +330,14 @@ module._HOST_CLEANUP_TIMEOUT_S = 0.05
 class Pipe:
     def __init__(self):
         self.release = threading.Event()
+        self.close_called = False
 
     def read(self, size):
         self.release.wait()
         return b""
 
     def close(self):
+        self.close_called = True
         self.release.set()
 
 class Process:
@@ -360,6 +362,7 @@ except AssertionError as error:
 else:
     raise AssertionError("expected bounded blocking-kill failure")
 assert process.kill_entered.is_set()
+assert not process.stdout.close_called and not process.stderr.close_called
 helpers = [thread for thread in threading.enumerate() if thread.name.startswith("repotrial-host-")]
 assert helpers and all(thread.daemon for thread in helpers)
 print("bounded-kill")
@@ -372,6 +375,244 @@ print("bounded-kill")
     )
     assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
     assert completed.stdout.strip() == b"bounded-kill"
+
+
+def test_calibration_host_timeout_bounds_blocking_reap() -> None:
+    script = f"""
+import importlib.util
+import subprocess
+import sys
+import threading
+
+specification = importlib.util.spec_from_file_location("calibration", {str(_CALIBRATION_TEST_PATH)!r})
+assert specification is not None and specification.loader is not None
+module = importlib.util.module_from_spec(specification)
+sys.modules["calibration"] = module
+specification.loader.exec_module(module)
+module._HOST_CLEANUP_TIMEOUT_S = 0.05
+
+class Pipe:
+    def __init__(self):
+        self.close_called = False
+
+    def read(self, size):
+        threading.Event().wait()
+        return b""
+
+    def close(self):
+        self.close_called = True
+
+class Process:
+    def __init__(self):
+        self.stdout = Pipe()
+        self.stderr = Pipe()
+        self.killed = False
+        self.reap_entered = threading.Event()
+
+    def wait(self, timeout=None):
+        if not self.killed:
+            raise subprocess.TimeoutExpired(["fake"], timeout)
+        self.reap_entered.set()
+        threading.Event().wait()
+
+    def kill(self):
+        self.killed = True
+
+process = Process()
+module.subprocess.Popen = lambda *args, **kwargs: process
+try:
+    module._run_host(["fake"], timeout_s=0.01)
+except AssertionError as error:
+    assert "cleanup unconfirmed" in str(error)
+else:
+    raise AssertionError("expected bounded blocking-reap failure")
+assert process.killed and process.reap_entered.is_set()
+assert not process.stdout.close_called and not process.stderr.close_called
+helpers = [thread for thread in threading.enumerate() if thread.name.startswith("repotrial-host-")]
+assert helpers and all(thread.daemon for thread in helpers)
+print("bounded-reap")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        timeout=2,
+    )
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
+    assert completed.stdout.strip() == b"bounded-reap"
+
+
+@pytest.mark.parametrize("failure_site", ["reader", "killer", "closer"])
+def test_calibration_host_helper_baseexceptions_propagate(failure_site: str) -> None:
+    script = f"""
+import importlib.util
+import subprocess
+import sys
+import threading
+
+specification = importlib.util.spec_from_file_location("calibration", {str(_CALIBRATION_TEST_PATH)!r})
+assert specification is not None and specification.loader is not None
+module = importlib.util.module_from_spec(specification)
+sys.modules["calibration"] = module
+specification.loader.exec_module(module)
+module._HOST_CLEANUP_TIMEOUT_S = 0.05
+
+failure_site = {failure_site!r}
+
+class HelperFailure(BaseException):
+    pass
+
+expected = HelperFailure(failure_site)
+
+class EmptyPipe:
+    def read(self, size):
+        return b""
+
+    def close(self):
+        return None
+
+class FailingReaderPipe(EmptyPipe):
+    def read(self, size):
+        raise expected
+
+class BlockingPipe:
+    def __init__(self, fail_close=False):
+        self.release = threading.Event()
+        self.fail_close = fail_close
+
+    def read(self, size):
+        self.release.wait()
+        return b""
+
+    def close(self):
+        self.release.set()
+        if self.fail_close:
+            raise expected
+
+class Process:
+    def __init__(self):
+        self.killed = False
+        if failure_site == "reader":
+            self.stdout = FailingReaderPipe()
+            self.stderr = EmptyPipe()
+        elif failure_site == "closer":
+            self.stdout = BlockingPipe(fail_close=True)
+            self.stderr = BlockingPipe()
+        else:
+            self.stdout = EmptyPipe()
+            self.stderr = EmptyPipe()
+
+    def wait(self, timeout=None):
+        if failure_site == "reader":
+            return 23
+        if failure_site == "killer" or not self.killed:
+            raise subprocess.TimeoutExpired(["fake"], timeout)
+        return 137
+
+    def kill(self):
+        if failure_site == "killer":
+            raise expected
+        self.killed = True
+
+process = Process()
+module.subprocess.Popen = lambda *args, **kwargs: process
+try:
+    module._run_host(["fake"], timeout_s=0.01)
+except HelperFailure as error:
+    assert error is expected
+else:
+    raise AssertionError(f"expected {{failure_site}} BaseException propagation")
+assert not [
+    thread
+    for thread in threading.enumerate()
+    if thread.name.startswith("repotrial-host-") and not thread.daemon
+]
+print(f"propagated-{{failure_site}}")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        timeout=2,
+    )
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
+    assert completed.stdout.strip() == f"propagated-{failure_site}".encode()
+
+
+def test_calibration_host_non_timeout_wait_error_runs_bounded_cleanup() -> None:
+    script = f"""
+import importlib.util
+import sys
+import threading
+
+specification = importlib.util.spec_from_file_location("calibration", {str(_CALIBRATION_TEST_PATH)!r})
+assert specification is not None and specification.loader is not None
+module = importlib.util.module_from_spec(specification)
+sys.modules["calibration"] = module
+specification.loader.exec_module(module)
+module._HOST_CLEANUP_TIMEOUT_S = 0.05
+
+class WaitFailure(BaseException):
+    pass
+
+expected = WaitFailure("wait failed")
+
+class Pipe:
+    def __init__(self):
+        self.release = threading.Event()
+        self.close_called = False
+
+    def read(self, size):
+        self.release.wait()
+        return b""
+
+    def close(self):
+        self.close_called = True
+        self.release.set()
+
+class Process:
+    def __init__(self):
+        self.stdout = Pipe()
+        self.stderr = Pipe()
+        self.wait_calls = 0
+        self.killed = False
+        self.reaped = False
+
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        if self.wait_calls == 1:
+            raise expected
+        self.reaped = True
+        return 137
+
+    def kill(self):
+        self.killed = True
+
+process = Process()
+module.subprocess.Popen = lambda *args, **kwargs: process
+try:
+    module._run_host(["fake"], timeout_s=0.01)
+except WaitFailure as error:
+    assert error is expected
+else:
+    raise AssertionError("expected original wait BaseException")
+assert process.killed and process.reaped
+assert process.stdout.close_called and process.stderr.close_called
+assert not [
+    thread
+    for thread in threading.enumerate()
+    if thread.name.startswith("repotrial-host-") and not thread.daemon
+]
+print("wait-error-cleaned")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        timeout=2,
+    )
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
+    assert completed.stdout.strip() == b"wait-error-cleaned"
 
 
 def test_calibration_host_timeout_bounds_blocking_pipe_close() -> None:

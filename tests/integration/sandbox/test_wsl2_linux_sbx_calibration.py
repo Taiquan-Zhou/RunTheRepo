@@ -46,6 +46,7 @@ _HOST_CLEANUP_TIMEOUT_S = 5.0
 _HOST_READER_NAME_PREFIX = "repotrial-host-reader-"
 _HOST_CLOSER_NAME_PREFIX = "repotrial-host-closer-"
 _HOST_KILLER_NAME_PREFIX = "repotrial-host-killer-"
+_HOST_REAPER_NAME_PREFIX = "repotrial-host-reaper-"
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +74,18 @@ class _HostCommandResult:
     returncode: int
     stdout: bytes
     stderr: bytes
+
+
+@dataclass(slots=True)
+class _HostWorker:
+    thread: threading.Thread
+    failures: list[BaseException]
+
+
+@dataclass(slots=True)
+class _HostCleanupResult:
+    unconfirmed: list[str]
+    worker_failures: list[tuple[str, BaseException]]
 
 
 class _LoopbackResponse(Protocol):
@@ -112,63 +125,60 @@ def _run_host(
     )
     assert process.stdout is not None and process.stderr is not None
     outputs: dict[str, bytes] = {}
-    failures: list[Exception] = []
     closing_streams = threading.Event()
 
     def read_stream(name: str, stream: BinaryIO) -> None:
         try:
             outputs[name] = _read_bounded_host_stream(stream)
-        except AssertionError as error:
-            failures.append(error)
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError):
             if not closing_streams.is_set():
-                failures.append(error)
+                raise
+
+    def start_reader(name: str, stream: BinaryIO) -> _HostWorker:
+        return _start_host_worker(
+            f"{_HOST_READER_NAME_PREFIX}{name}",
+            lambda: read_stream(name, stream),
+        )
 
     readers = [
-        threading.Thread(
-            target=read_stream,
-            args=("stdout", process.stdout),
-            name=f"{_HOST_READER_NAME_PREFIX}stdout",
-            daemon=True,
-        ),
-        threading.Thread(
-            target=read_stream,
-            args=("stderr", process.stderr),
-            name=f"{_HOST_READER_NAME_PREFIX}stderr",
-            daemon=True,
-        ),
+        start_reader("stdout", process.stdout),
+        start_reader("stderr", process.stderr),
     ]
-    for reader in readers:
-        reader.start()
     try:
         returncode = process.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired as error:
-        cleanup_deadline = time.monotonic() + _HOST_CLEANUP_TIMEOUT_S
-        cleanup_failures = _kill_and_reap_host_process(process, cleanup_deadline)
-        closing_streams.set()
-        cleanup_failures.extend(
-            _close_host_streams((process.stdout, process.stderr), cleanup_deadline)
+    except subprocess.TimeoutExpired as timeout_error:
+        _ensure_host_cleanup(
+            process,
+            (process.stdout, process.stderr),
+            readers,
+            closing_streams,
+            cause=timeout_error,
         )
-        cleanup_failures.extend(_join_host_threads(readers, cleanup_deadline))
-        if cleanup_failures:
-            raise AssertionError(
-                f"trusted host timeout cleanup unconfirmed: {'; '.join(cleanup_failures)}"
-            ) from error
-        raise AssertionError(f"trusted host command timed out: {argv[0]}") from error
+        raise AssertionError(
+            f"trusted host command timed out: {argv[0]}"
+        ) from timeout_error
+    except BaseException as wait_error:
+        _ensure_host_cleanup(
+            process,
+            (process.stdout, process.stderr),
+            readers,
+            closing_streams,
+            cause=wait_error,
+        )
+        raise
 
     cleanup_deadline = time.monotonic() + _HOST_CLEANUP_TIMEOUT_S
-    reader_cleanup_failures = _join_host_threads(readers, cleanup_deadline)
+    reader_cleanup_failures = _join_host_workers(readers, cleanup_deadline)
+    worker_failures = _host_worker_failures(readers)
+    _raise_host_worker_failures(
+        worker_failures,
+        context="trusted host stream reader failed",
+    )
     if reader_cleanup_failures:
-        closing_streams.set()
-        reader_cleanup_failures.extend(
-            _close_host_streams((process.stdout, process.stderr), cleanup_deadline)
-        )
-        reader_cleanup_failures.extend(_join_host_threads(readers, cleanup_deadline))
         raise AssertionError(
             "trusted host reader cleanup unconfirmed: "
             f"{'; '.join(reader_cleanup_failures)}"
         )
-    assert not failures, str(failures[0])
     missing_outputs = {"stdout", "stderr"}.difference(outputs)
     assert not missing_outputs, "trusted host output missing: " + ", ".join(
         sorted(missing_outputs)
@@ -193,76 +203,145 @@ def _read_bounded_host_stream(stream: BinaryIO) -> bytes:
     return bytes(collected)
 
 
-def _kill_and_reap_host_process(
-    process: subprocess.Popen[bytes], deadline: float
-) -> list[str]:
-    failures = _run_bounded_host_operation("kill", process.kill, deadline)
+def _ensure_host_cleanup(
+    process: subprocess.Popen[bytes],
+    streams: tuple[BinaryIO, ...],
+    readers: list[_HostWorker],
+    closing_streams: threading.Event,
+    *,
+    cause: BaseException,
+) -> None:
+    cleanup_deadline = time.monotonic() + _HOST_CLEANUP_TIMEOUT_S
+    cleanup = _cleanup_host_process(
+        process,
+        streams,
+        readers,
+        closing_streams,
+        cleanup_deadline,
+    )
+    _raise_host_worker_failures(
+        cleanup.worker_failures,
+        context="trusted host cleanup unconfirmed",
+        cause=cause,
+    )
+    if cleanup.unconfirmed:
+        raise AssertionError(
+            f"trusted host cleanup unconfirmed: {'; '.join(cleanup.unconfirmed)}"
+        ) from cause
+
+
+def _cleanup_host_process(
+    process: subprocess.Popen[bytes],
+    streams: tuple[BinaryIO, ...],
+    readers: list[_HostWorker],
+    closing_streams: threading.Event,
+    deadline: float,
+) -> _HostCleanupResult:
+    result = _HostCleanupResult(unconfirmed=[], worker_failures=[])
+    killer = _start_host_worker(
+        f"{_HOST_KILLER_NAME_PREFIX}kill",
+        process.kill,
+    )
+    result.unconfirmed.extend(_join_host_workers([killer], deadline))
+    result.worker_failures.extend(_host_worker_failures([killer]))
+    if result.unconfirmed or result.worker_failures:
+        return result
+
     remaining = _remaining_cleanup_time(deadline)
     if remaining <= 0:
-        failures.append("reap_deadline_exhausted")
-        return failures
-    try:
-        process.wait(timeout=remaining)
-    except subprocess.TimeoutExpired:
-        failures.append("reap_timeout")
-    except OSError as error:
-        failures.append(f"reap_failed:{type(error).__name__}")
-    return failures
+        result.unconfirmed.append("reap_deadline_exhausted")
+        return result
 
-
-def _run_bounded_host_operation(
-    operation_name: str, operation: Callable[[], None], deadline: float
-) -> list[str]:
-    failures: list[str] = []
-
-    def run_operation() -> None:
-        try:
-            operation()
-        except (OSError, RuntimeError, ValueError) as error:
-            failures.append(f"{operation_name}_failed:{type(error).__name__}")
-
-    worker = threading.Thread(
-        target=run_operation,
-        name=f"{_HOST_KILLER_NAME_PREFIX}{operation_name}",
-        daemon=True,
+    reaper = _start_host_worker(
+        f"{_HOST_REAPER_NAME_PREFIX}wait",
+        lambda: process.wait(timeout=remaining),
     )
-    worker.start()
-    failures.extend(_join_host_threads([worker], deadline))
-    return failures
+    result.unconfirmed.extend(_join_host_workers([reaper], deadline))
+    if result.unconfirmed:
+        return result
+    for _, error in _host_worker_failures([reaper]):
+        if isinstance(error, subprocess.TimeoutExpired):
+            result.unconfirmed.append("reap_timeout")
+        else:
+            result.worker_failures.append((reaper.thread.name, error))
 
+    if _remaining_cleanup_time(deadline) <= 0:
+        result.unconfirmed.append("pipe_close_deadline_exhausted")
+        result.unconfirmed.extend(_alive_host_workers(readers))
+        return result
 
-def _close_host_streams(streams: tuple[BinaryIO, ...], deadline: float) -> list[str]:
-    failures: list[str] = []
-
-    def close_stream(stream: BinaryIO) -> None:
-        try:
-            stream.close()
-        except (OSError, ValueError) as error:
-            failures.append(f"pipe_close_failed:{type(error).__name__}")
-
+    closing_streams.set()
     closers = [
-        threading.Thread(
-            target=close_stream,
-            args=(stream,),
-            name=f"{_HOST_CLOSER_NAME_PREFIX}{index}",
-            daemon=True,
+        _start_host_worker(
+            f"{_HOST_CLOSER_NAME_PREFIX}{index}",
+            stream.close,
         )
         for index, stream in enumerate(streams)
     ]
-    for closer in closers:
-        closer.start()
-    failures.extend(_join_host_threads(closers, deadline))
-    return failures
+    result.unconfirmed.extend(_join_host_workers(closers, deadline))
+    result.worker_failures.extend(_host_worker_failures(closers))
+    result.unconfirmed.extend(_join_host_workers(readers, deadline))
+    result.worker_failures.extend(_host_worker_failures(readers))
+    return result
 
 
-def _join_host_threads(threads: list[threading.Thread], deadline: float) -> list[str]:
-    for thread in threads:
-        thread.join(timeout=_remaining_cleanup_time(deadline))
+def _start_host_worker(name: str, operation: Callable[[], object]) -> _HostWorker:
+    failures: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            operation()
+        # This thread boundary must relay every BaseException to its caller.
+        except BaseException as error:  # noqa: BLE001
+            failures.append(error)
+
+    thread = threading.Thread(
+        target=run,
+        name=name,
+        daemon=True,
+    )
+    worker = _HostWorker(thread=thread, failures=failures)
+    thread.start()
+    return worker
+
+
+def _host_worker_failures(
+    workers: list[_HostWorker],
+) -> list[tuple[str, BaseException]]:
     return [
-        f"thread_not_terminated:{thread.name}"
-        for thread in threads
-        if thread.is_alive()
+        (worker.thread.name, failure)
+        for worker in workers
+        for failure in worker.failures
     ]
+
+
+def _join_host_workers(workers: list[_HostWorker], deadline: float) -> list[str]:
+    for worker in workers:
+        worker.thread.join(timeout=_remaining_cleanup_time(deadline))
+    return _alive_host_workers(workers)
+
+
+def _alive_host_workers(workers: list[_HostWorker]) -> list[str]:
+    return [
+        f"thread_not_terminated:{worker.thread.name}"
+        for worker in workers
+        if worker.thread.is_alive()
+    ]
+
+
+def _raise_host_worker_failures(
+    failures: list[tuple[str, BaseException]],
+    *,
+    context: str,
+    cause: BaseException | None = None,
+) -> None:
+    if not failures:
+        return
+    first_name, first_error = failures[0]
+    first_error.add_note(f"{context}: {first_name}")
+    for worker_name, error in failures[1:]:
+        first_error.add_note(f"additional helper failure: {worker_name}: {error!r}")
+    raise first_error from cause
 
 
 def _remaining_cleanup_time(deadline: float) -> float:
