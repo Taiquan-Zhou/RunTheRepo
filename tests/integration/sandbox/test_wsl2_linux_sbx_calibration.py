@@ -6,8 +6,10 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, Protocol
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -39,6 +41,9 @@ _MIB = 1024 * 1024
 _MAX_HOST_OUTPUT_BYTES = 65_536
 _CANONICAL_EMPTY_SBX_INVENTORY = b"No sandboxes found.\n"
 _MAJOR_MINOR_PATTERN = re.compile(r"[0-9]+:[0-9]+")
+_HOST_CLEANUP_TIMEOUT_S = 5.0
+_HOST_READER_NAME_PREFIX = "repotrial-host-reader-"
+_HOST_CLOSER_NAME_PREFIX = "repotrial-host-closer-"
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,29 +111,62 @@ def _run_host(
     assert process.stdout is not None and process.stderr is not None
     outputs: dict[str, bytes] = {}
     failures: list[Exception] = []
+    closing_streams = threading.Event()
 
     def read_stream(name: str, stream: BinaryIO) -> None:
         try:
             outputs[name] = _read_bounded_host_stream(stream)
-        except (AssertionError, OSError, ValueError) as error:
+        except AssertionError as error:
             failures.append(error)
+        except (OSError, ValueError) as error:
+            if not closing_streams.is_set():
+                failures.append(error)
 
     readers = [
-        threading.Thread(target=read_stream, args=("stdout", process.stdout)),
-        threading.Thread(target=read_stream, args=("stderr", process.stderr)),
+        threading.Thread(
+            target=read_stream,
+            args=("stdout", process.stdout),
+            name=f"{_HOST_READER_NAME_PREFIX}stdout",
+            daemon=True,
+        ),
+        threading.Thread(
+            target=read_stream,
+            args=("stderr", process.stderr),
+            name=f"{_HOST_READER_NAME_PREFIX}stderr",
+            daemon=True,
+        ),
     ]
     for reader in readers:
         reader.start()
+    timeout_error: subprocess.TimeoutExpired | None = None
+    cleanup_failures: list[str] = []
+    cleanup_deadline: float | None = None
     try:
         returncode = process.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired as error:
-        process.kill()
-        process.wait()
-        raise AssertionError(f"trusted host command timed out: {argv[0]}") from error
+        timeout_error = error
+        returncode = None
+        cleanup_deadline = time.monotonic() + _HOST_CLEANUP_TIMEOUT_S
+        cleanup_failures.extend(_kill_and_reap_host_process(process, cleanup_deadline))
     finally:
-        for reader in readers:
-            reader.join()
+        if cleanup_deadline is None:
+            cleanup_deadline = time.monotonic() + _HOST_CLEANUP_TIMEOUT_S
+        closing_streams.set()
+        cleanup_failures.extend(
+            _close_host_streams((process.stdout, process.stderr), cleanup_deadline)
+        )
+        cleanup_failures.extend(_join_host_threads(readers, cleanup_deadline))
+    if timeout_error is not None:
+        if cleanup_failures:
+            raise AssertionError(
+                f"trusted host timeout cleanup unconfirmed: {'; '.join(cleanup_failures)}"
+            ) from timeout_error
+        raise AssertionError(
+            f"trusted host command timed out: {argv[0]}"
+        ) from timeout_error
+    assert not cleanup_failures, "; ".join(cleanup_failures)
     assert not failures, str(failures[0])
+    assert returncode is not None
     return _HostCommandResult(
         returncode=returncode,
         stdout=outputs["stdout"],
@@ -147,6 +185,65 @@ def _read_bounded_host_stream(stream: BinaryIO) -> bytes:
             exceeded = True
     assert not exceeded, "trusted host command output exceeded bounded limit"
     return bytes(collected)
+
+
+def _kill_and_reap_host_process(
+    process: subprocess.Popen[bytes], deadline: float
+) -> list[str]:
+    failures: list[str] = []
+    try:
+        process.kill()
+    except OSError as error:
+        failures.append(f"kill_failed:{type(error).__name__}")
+    remaining = _remaining_cleanup_time(deadline)
+    if remaining <= 0:
+        failures.append("reap_deadline_exhausted")
+        return failures
+    try:
+        process.wait(timeout=remaining)
+    except subprocess.TimeoutExpired:
+        failures.append("reap_timeout")
+    except OSError as error:
+        failures.append(f"reap_failed:{type(error).__name__}")
+    return failures
+
+
+def _close_host_streams(streams: tuple[BinaryIO, ...], deadline: float) -> list[str]:
+    failures: list[str] = []
+
+    def close_stream(stream: BinaryIO) -> None:
+        try:
+            stream.close()
+        except (OSError, ValueError) as error:
+            failures.append(f"pipe_close_failed:{type(error).__name__}")
+
+    closers = [
+        threading.Thread(
+            target=close_stream,
+            args=(stream,),
+            name=f"{_HOST_CLOSER_NAME_PREFIX}{index}",
+            daemon=True,
+        )
+        for index, stream in enumerate(streams)
+    ]
+    for closer in closers:
+        closer.start()
+    failures.extend(_join_host_threads(closers, deadline))
+    return failures
+
+
+def _join_host_threads(threads: list[threading.Thread], deadline: float) -> list[str]:
+    for thread in threads:
+        thread.join(timeout=_remaining_cleanup_time(deadline))
+    return [
+        f"thread_not_terminated:{thread.name}"
+        for thread in threads
+        if thread.is_alive()
+    ]
+
+
+def _remaining_cleanup_time(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
 
 
 def _require_supported_host(tmp_path: Path) -> None:
@@ -400,27 +497,35 @@ def _has_fresh_blocked_evidence(
     after: list[dict[str, object]],
     expected_evidence: set[str],
 ) -> bool:
-    before_events = {
-        key: (count, last_seen)
-        for event in before
-        if (observed := _blocked_evidence_observation(event, expected_evidence))
-        is not None
-        for key, count, last_seen in (observed,)
-    }
-    for event in after:
-        observed = _blocked_evidence_observation(event, expected_evidence)
-        if observed is None:
-            continue
-        key, count, last_seen = observed
+    before_events = _aggregate_blocked_evidence(before, expected_evidence)
+    after_events = _aggregate_blocked_evidence(after, expected_evidence)
+    for key, (count, last_seen) in after_events.items():
         prior = before_events.get(key)
-        if prior is None or count > prior[0] or last_seen != prior[1]:
+        if prior is None or count > prior[0] or last_seen > prior[1]:
             return True
     return False
 
 
+def _aggregate_blocked_evidence(
+    events: list[dict[str, object]], expected_evidence: set[str]
+) -> dict[tuple[str, str, str, str], tuple[int, datetime]]:
+    aggregated: dict[tuple[str, str, str, str], tuple[int, datetime]] = {}
+    for event in events:
+        observed = _blocked_evidence_observation(event, expected_evidence)
+        if observed is None:
+            continue
+        key, count, last_seen = observed
+        prior = aggregated.get(key)
+        if prior is None:
+            aggregated[key] = (count, last_seen)
+        else:
+            aggregated[key] = (max(prior[0], count), max(prior[1], last_seen))
+    return aggregated
+
+
 def _blocked_evidence_observation(
     event: dict[str, object], expected_evidence: set[str]
-) -> tuple[tuple[str, str, str, str], int, str] | None:
+) -> tuple[tuple[str, str, str, str], int, datetime] | None:
     if event.get("decision") != "blocked":
         return None
     host = event.get("host")
@@ -443,9 +548,23 @@ def _blocked_evidence_observation(
     assert isinstance(proxy, str)
     assert isinstance(last_seen, str)
     assert isinstance(count, int)
+    timestamp = _parse_network_timestamp(last_seen)
+    if timestamp is None:
+        return None
     if not any(token in f"{host} {rule} {reason}" for token in expected_evidence):
         return None
-    return ((host, rule, reason, proxy), count, last_seen)
+    return ((host, rule, reason, proxy), count, timestamp)
+
+
+def _parse_network_timestamp(value: str) -> datetime | None:
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        timestamp = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        return None
+    return timestamp
 
 
 async def _assert_published_marker(

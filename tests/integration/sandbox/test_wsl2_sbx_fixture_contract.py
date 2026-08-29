@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -114,6 +115,48 @@ def test_calibration_network_evidence_requires_a_new_or_advanced_event(
     )
 
 
+def test_calibration_network_evidence_aggregates_duplicates_and_rejects_regression(
+    calibration_module: ModuleType,
+) -> None:
+    def event(count: int, last_seen: str) -> dict[str, object]:
+        return {
+            "sandbox": "owned",
+            "decision": "blocked",
+            "host": "169.254.169.254",
+            "proxy": "network",
+            "rule": "169.254.169.254/32",
+            "reason": "deny",
+            "last_seen": last_seen,
+            "count": count,
+        }
+
+    expected_evidence = {"169.254.169.254", "169.254.169.254/32"}
+    highest = event(10, "2026-08-30T10:00:00Z")
+    lowest = event(1, "2026-08-30T01:00:00Z")
+    stale_after = event(2, "2026-08-30T02:00:00Z")
+    assert not calibration_module._has_fresh_blocked_evidence(
+        [highest, lowest], [stale_after], expected_evidence
+    )
+    assert not calibration_module._has_fresh_blocked_evidence(
+        [lowest, highest], [stale_after], expected_evidence
+    )
+    assert not calibration_module._has_fresh_blocked_evidence(
+        [event(1, "2026-08-30T10:00:00Z")],
+        [event(1, "2026-08-30T09:00:00Z")],
+        expected_evidence,
+    )
+    assert calibration_module._has_fresh_blocked_evidence(
+        [event(1, "2026-08-30T10:00:00Z")],
+        [event(2, "2026-08-30T10:00:00Z")],
+        expected_evidence,
+    )
+    assert not calibration_module._has_fresh_blocked_evidence(
+        [event(1, "2026-08-30T10:00:00Z")],
+        [event(2, "not-a-timestamp")],
+        expected_evidence,
+    )
+
+
 def test_calibration_inventory_parser_only_accepts_canonical_empty_output(
     calibration_module: ModuleType,
 ) -> None:
@@ -138,6 +181,72 @@ def test_calibration_host_stream_reader_rejects_unbounded_output(
         calibration_module._read_bounded_host_stream(
             io.BytesIO(b"x" * (calibration_module._MAX_HOST_OUTPUT_BYTES + 1))
         )
+
+
+def test_calibration_host_timeout_is_bounded_when_reader_pipe_never_closes() -> None:
+    script = f"""
+import importlib.util
+import subprocess
+import sys
+import threading
+
+specification = importlib.util.spec_from_file_location("calibration", {str(_CALIBRATION_TEST_PATH)!r})
+assert specification is not None and specification.loader is not None
+module = importlib.util.module_from_spec(specification)
+sys.modules["calibration"] = module
+specification.loader.exec_module(module)
+module._HOST_CLEANUP_TIMEOUT_S = 0.05
+
+class InheritedPipe:
+    def __init__(self):
+        self.release = threading.Event()
+        self.close_called = False
+
+    def read(self, size):
+        self.release.wait()
+        return b""
+
+    def close(self):
+        self.close_called = True
+
+class Process:
+    def __init__(self):
+        self.stdout = InheritedPipe()
+        self.stderr = InheritedPipe()
+        self.killed = False
+        self.reaped = False
+
+    def wait(self, timeout=None):
+        if not self.killed:
+            raise subprocess.TimeoutExpired(["fake"], timeout)
+        self.reaped = True
+        return 137
+
+    def kill(self):
+        self.killed = True
+
+process = Process()
+module.subprocess.Popen = lambda *args, **kwargs: process
+try:
+    module._run_host(["fake"], timeout_s=0.01)
+except AssertionError as error:
+    assert "cleanup unconfirmed" in str(error)
+else:
+    raise AssertionError("expected bounded timeout cleanup failure")
+assert process.killed and process.reaped
+assert process.stdout.close_called and process.stderr.close_called
+readers = [thread for thread in threading.enumerate() if thread.name.startswith("repotrial-host-reader")]
+assert readers and all(thread.daemon for thread in readers)
+print("bounded-timeout")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        timeout=2,
+    )
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
+    assert completed.stdout.strip() == b"bounded-timeout"
 
 
 def test_calibration_loopback_reader_reads_only_marker_plus_one_byte(
