@@ -1,6 +1,6 @@
 # M7.5 real-repository Pilot protocol and report
 
-> **EXECUTION IN PROGRESS — cohort and protocol remain frozen**
+> **EXECUTION COMPLETE — release threshold and cleanup safety gate not met**
 
 This document freezes the M7.5 execution protocol and records the append-only Pilot
 evidence. Infrastructure-invalidated attempts are retained below; no repository
@@ -61,12 +61,12 @@ Execution is prohibited until every gate below is independently verified as
 | Gate | Required proof before any target workload | Preparation status |
 |---|---|---|
 | PID hard bound | SBX v0.39.0 cannot prove a PID hard bound; `pid_hard_bound_unsupported` is retained in every attempt result. | OWNER-ACCEPTED KNOWN UNSUPPORTED LIMITATION — not a Pilot blocker |
-| Sandbox health | Current provider health and required isolation capabilities pass immediately before execution. | UNVERIFIED — gate closed |
+| Sandbox health | Current provider health and required isolation capabilities pass immediately before execution. | PASS — `sbx diagnose` reported `12/12` immediately before metric execution; daemon was not restarted/reset |
 | Immutable repository identity | `--commit-sha` accepts only a lowercase full SHA, generic intake checks it out detached, verifies `HEAD^{commit}`, and persists expected/actual SHA in `attempt-result.json`. | IMPLEMENTED — verify against every exact Pilot attempt |
 | Exact failure reason | Deterministic report JSON includes `RunState.stop_reason`; terminal `attempt-result.json` retains it for graph terminal results and a sanitized reason for exceptions. | IMPLEMENTED — verify against every exact Pilot attempt |
-| Resource bounds | Effective CPU, memory, disk, and whole-duration limits are all verified; PID is the separately disclosed unsupported limitation. | UNVERIFIED — gate closed |
-| Forced cleanup | Cancellation, timeout, normal completion, and partial-create paths prove forced cleanup and auditable lifecycle evidence. | UNVERIFIED — gate closed |
-| No host fallback | Provider/tool routing proves that no target command or Compose workload can fall back to the host. | UNVERIFIED — gate closed |
+| Resource bounds | Effective CPU, memory, disk, and whole-duration limits are all verified; PID is the separately disclosed unsupported limitation. | PASS before execution — integer CPU compatibility, memory, official disk env allocation, and host monotonic deadline were verified; PID limitation remained disclosed |
+| Forced cleanup | Cancellation, timeout, normal completion, and partial-create paths prove forced cleanup and auditable lifecycle evidence. | PASS before execution; observed all-attempt aggregate later finished at `90%`, below the Pilot safety target |
+| No host fallback | Provider/tool routing proves that no target command or Compose workload can fall back to the host. | PASS — execution used only `DockerSbxProvider`; no host fallback route was enabled |
 
 ### Current preparation findings (execution gates, not Pilot outcomes)
 
@@ -110,8 +110,10 @@ For each manifest entry, in order:
 9. Stop the attempt timer only after required cleanup has reached a terminal state.
    Apply the frozen attribution rules without a free-form effect-on-metrics decision.
 
-The exact Pilot command remains `TBD`. This preparation document does not
-authorize execution.
+The exact command for every retained attempt is recorded in sections 5 and 10.
+Metric-bearing execution used RepoTrial HEAD
+`8766f818fe2d4920b7e3cdc95247fe903b6d0a83`; the manifest and pinned SHAs were
+unchanged throughout the cohort.
 
 ## 4. Outcome definitions
 
@@ -146,24 +148,25 @@ evidence and cannot be converted into a meaningful convergence or success.
 
 ## 5. Per-repository capture
 
-`TBD` means no run evidence exists. URLs and manifest SHAs below are frozen input,
-not observed results. Each row is populated only from its sole metric-bearing
+`MISSING` marks a field that the retained evidence could not produce. URLs and
+manifest SHAs below are frozen input, not observed results. Each row is populated
+only from its sole metric-bearing
 attempt. If none exists, use `MISSING — no metric-bearing attempt` for attempt
 identity and duration, apply the fixed failure/zero/no-convergence defaults, and
 keep attempt facts exclusively in section 10.
 
 | # | Repository | Manifest SHA | Actual SHA | Metric-bearing attempt ID | UTC start | UTC end | Repository monotonic duration | Exact command | Exit | Terminal outcome | Exact raw `stop_reason` | Failure class |
 |---:|---|---|---|---|---|---|---|---|---:|---|---|---|
-| 1 | `https://github.com/umami-software/umami` | `ca661c7057984aa98ed4f7083d84dae2f65bfcb0` | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 2 | `https://github.com/knadh/listmonk` | `670c01717d48647093335cc23a6be6f4b79c3b6b` | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 3 | `https://github.com/dgtlmoon/changedetection.io` | `5d9c7c6da76340597243e8163c4f2439237fa0e8` | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 4 | `https://github.com/louislam/uptime-kuma` | `a852e21eba4ecf339624b404518c5bc7fad6d45c` | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 5 | `https://github.com/muety/wakapi` | `8143ca13ade1c14959be8a79c1d736d9889013e4` | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 6 | `https://github.com/sissbruecker/linkding` | `65813a75404b1319aca8b09700fadc0b15adabaf` | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 7 | `https://github.com/paperless-ngx/paperless-ngx` | `6f3945f11f1ff13ab90da76c26de37660ff1d497` | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 8 | `https://github.com/n8n-io/n8n-hosting` | `6b78193475d84ae190622d8a8e9ba8598e89b7d1` | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 9 | `https://github.com/netbox-community/netbox-docker` | `5adc62fe3fa65163c4ef63733bdcbd3e59b5c544` | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 10 | `https://github.com/louislam/dockge` | `f809ae192b571944ad773e9866d3e67064ae8043` | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| 1 | `https://github.com/umami-software/umami` | `ca661c7057984aa98ed4f7083d84dae2f65bfcb0` | `ca661c7057984aa98ed4f7083d84dae2f65bfcb0` | `70313f8c-9ea6-458a-aad0-89c133fc5ec4` | `2026-08-29T09:45:18.795779+00:00` | `2026-08-29T09:46:31.265957+00:00` | `72.46799999999348` | `uv run repotrial inspect https://github.com/umami-software/umami --provider docker-sbx --commit-sha ca661c7057984aa98ed4f7083d84dae2f65bfcb0 --container-port 3000 --compose-path docker-compose.yml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
+| 2 | `https://github.com/knadh/listmonk` | `670c01717d48647093335cc23a6be6f4b79c3b6b` | `670c01717d48647093335cc23a6be6f4b79c3b6b` | `4ea7097c-2228-4318-84a1-7c6a5e9b2327` | `2026-08-29T09:47:04.831788+00:00` | `2026-08-29T09:48:04.239354+00:00` | `59.40600000000268` | `uv run repotrial inspect https://github.com/knadh/listmonk --provider docker-sbx --commit-sha 670c01717d48647093335cc23a6be6f4b79c3b6b --container-port 9000 --compose-path docker-compose.yml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
+| 3 | `https://github.com/dgtlmoon/changedetection.io` | `5d9c7c6da76340597243e8163c4f2439237fa0e8` | `5d9c7c6da76340597243e8163c4f2439237fa0e8` | `04263916-9d1f-4f7c-81cc-4655bc20bb32` | `2026-08-29T09:48:17.682290+00:00` | `2026-08-29T09:49:32.985026+00:00` | `75.31200000000536` | `uv run repotrial inspect https://github.com/dgtlmoon/changedetection.io --provider docker-sbx --commit-sha 5d9c7c6da76340597243e8163c4f2439237fa0e8 --container-port 5000 --compose-path docker-compose.yml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
+| 4 | `https://github.com/louislam/uptime-kuma` | `a852e21eba4ecf339624b404518c5bc7fad6d45c` | `a852e21eba4ecf339624b404518c5bc7fad6d45c` | `3f00fc2d-48ed-4222-a184-657b8bace6f0` | `2026-08-29T09:49:47.939558+00:00` | `2026-08-29T09:51:00.853151+00:00` | `72.90600000000268` | `uv run repotrial inspect https://github.com/louislam/uptime-kuma --provider docker-sbx --commit-sha a852e21eba4ecf339624b404518c5bc7fad6d45c --container-port 3001 --compose-path compose.yaml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
+| 5 | `https://github.com/muety/wakapi` | `8143ca13ade1c14959be8a79c1d736d9889013e4` | `8143ca13ade1c14959be8a79c1d736d9889013e4` | `061e3097-62f2-42cc-9dec-b8c7948738f2` | `2026-08-29T09:51:22.588789+00:00` | `2026-08-29T09:52:24.962992+00:00` | `62.36000000000058` | `uv run repotrial inspect https://github.com/muety/wakapi --provider docker-sbx --commit-sha 8143ca13ade1c14959be8a79c1d736d9889013e4 --container-port 3000 --compose-path compose.yml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
+| 6 | `https://github.com/sissbruecker/linkding` | `65813a75404b1319aca8b09700fadc0b15adabaf` | `65813a75404b1319aca8b09700fadc0b15adabaf` | `8d508779-0002-417f-98da-8b51be739f9a` | `2026-08-29T09:52:40.803754+00:00` | `2026-08-29T09:53:40.374799+00:00` | `59.57799999999406` | `uv run repotrial inspect https://github.com/sissbruecker/linkding --provider docker-sbx --commit-sha 65813a75404b1319aca8b09700fadc0b15adabaf --container-port 9090 --compose-path docker-compose.yml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
+| 7 | `https://github.com/paperless-ngx/paperless-ngx` | `6f3945f11f1ff13ab90da76c26de37660ff1d497` | MISSING — clone failed before verification | MISSING — no metric-bearing attempt | MISSING | MISSING | MISSING | MISSING — retained in section 10 | N/A | Autonomous failure (derived) | MISSING — no metric-bearing attempt | `no metric-bearing attempt` (derived) |
+| 8 | `https://github.com/n8n-io/n8n-hosting` | `6b78193475d84ae190622d8a8e9ba8598e89b7d1` | `6b78193475d84ae190622d8a8e9ba8598e89b7d1` | `01b0ed6c-6eeb-4fca-a428-128c8aff4339` | `2026-08-29T09:55:57.571272+00:00` | `2026-08-29T09:56:35.257852+00:00` | `37.687999999994645` | `uv run repotrial inspect https://github.com/n8n-io/n8n-hosting --provider docker-sbx --commit-sha 6b78193475d84ae190622d8a8e9ba8598e89b7d1 --container-port 5678 --compose-path docker-compose/withPostgres/docker-compose.yml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
+| 9 | `https://github.com/netbox-community/netbox-docker` | `5adc62fe3fa65163c4ef63733bdcbd3e59b5c544` | `5adc62fe3fa65163c4ef63733bdcbd3e59b5c544` | `155e28e2-877d-4d20-b5ab-cfb335ee2de5` | `2026-08-29T09:56:48.893949+00:00` | `2026-08-29T09:57:36.463230+00:00` | `47.5630000000092` | `uv run repotrial inspect https://github.com/netbox-community/netbox-docker --provider docker-sbx --commit-sha 5adc62fe3fa65163c4ef63733bdcbd3e59b5c544 --container-port 8080 --compose-path docker-compose.yml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
+| 10 | `https://github.com/louislam/dockge` | `f809ae192b571944ad773e9866d3e67064ae8043` | `f809ae192b571944ad773e9866d3e67064ae8043` | `b0e72a15-fa10-4863-9440-e98533407f09` | `2026-08-29T09:57:50.215862+00:00` | `2026-08-29T09:58:23.540343+00:00` | `33.312999999994645` | `uv run repotrial inspect https://github.com/louislam/dockge --provider docker-sbx --commit-sha f809ae192b571944ad773e9866d3e67064ae8043 --container-port 5001 --compose-path compose.yaml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
 
 ### Report, journey, experiment, and cleanup evidence
 
@@ -176,16 +179,16 @@ denominator.
 
 | # | Report/artifact references | Baseline journey definitions/results | Experiment count | Meaningful convergence | Lifecycle JSONL references | Metric-bearing cleanup result |
 |---:|---|---|---:|---|---|---|
-| 1 | TBD | TBD | TBD | TBD | TBD | TBD |
-| 2 | TBD | TBD | TBD | TBD | TBD | TBD |
-| 3 | TBD | TBD | TBD | TBD | TBD | TBD |
-| 4 | TBD | TBD | TBD | TBD | TBD | TBD |
-| 5 | TBD | TBD | TBD | TBD | TBD | TBD |
-| 6 | TBD | TBD | TBD | TBD | TBD | TBD |
-| 7 | TBD | TBD | TBD | TBD | TBD | TBD |
-| 8 | TBD | TBD | TBD | TBD | TBD | TBD |
-| 9 | TBD | TBD | TBD | TBD | TBD | TBD |
-| 10 | TBD | TBD | TBD | TBD | TBD | TBD |
+| 1 | `artifacts/70313f8c-9ea6-458a-aad0-89c133fc5ec4/{attempt-result.json,report/}` | `0/0`; `baseline_observation=null` | `0` | NO | `artifacts/70313f8c-9ea6-458a-aad0-89c133fc5ec4/evidence/baseline-5eb18a4c1f9b1ce0-0001-attempt-01/baseline-lifecycle.jsonl` | PASS |
+| 2 | `artifacts/4ea7097c-2228-4318-84a1-7c6a5e9b2327/{attempt-result.json,report/}` | `0/0`; `baseline_observation=null` | `0` | NO | `artifacts/4ea7097c-2228-4318-84a1-7c6a5e9b2327/evidence/baseline-ef9a1d8f87acec76-0001-attempt-01/baseline-lifecycle.jsonl` | PASS |
+| 3 | `artifacts/04263916-9d1f-4f7c-81cc-4655bc20bb32/{attempt-result.json,report/}` | `0/0`; `baseline_observation=null` | `0` | NO | `artifacts/04263916-9d1f-4f7c-81cc-4655bc20bb32/evidence/baseline-672819d073160390-0001-attempt-01/baseline-lifecycle.jsonl` | PASS |
+| 4 | `artifacts/3f00fc2d-48ed-4222-a184-657b8bace6f0/{attempt-result.json,report/}` | `0/0`; `baseline_observation=null` | `0` | NO | `artifacts/3f00fc2d-48ed-4222-a184-657b8bace6f0/evidence/baseline-ed49c0ce2915c984-0001-attempt-01/baseline-lifecycle.jsonl` | PASS |
+| 5 | `artifacts/061e3097-62f2-42cc-9dec-b8c7948738f2/{attempt-result.json,report/}` | `0/0`; `baseline_observation=null` | `0` | NO | `artifacts/061e3097-62f2-42cc-9dec-b8c7948738f2/evidence/baseline-d083a8d7052efce2-0001-attempt-01/baseline-lifecycle.jsonl` | PASS |
+| 6 | `artifacts/8d508779-0002-417f-98da-8b51be739f9a/{attempt-result.json,report/}` | `0/0`; `baseline_observation=null` | `0` | NO | `artifacts/8d508779-0002-417f-98da-8b51be739f9a/evidence/baseline-f5bb9d8de959f92e-0001-attempt-01/baseline-lifecycle.jsonl` | PASS |
+| 7 | None — no report | None — no metric-bearing attempt | `0` | NO | None — no sandbox created | N/A |
+| 8 | `artifacts/01b0ed6c-6eeb-4fca-a428-128c8aff4339/{attempt-result.json,report/}` | `0/0`; `baseline_observation=null` | `0` | NO | `artifacts/01b0ed6c-6eeb-4fca-a428-128c8aff4339/evidence/baseline-cdd798ab4674a725-0001-attempt-01/baseline-lifecycle.jsonl` | PASS |
+| 9 | `artifacts/155e28e2-877d-4d20-b5ab-cfb335ee2de5/{attempt-result.json,report/}` | `0/0`; `baseline_observation=null` | `0` | NO | `artifacts/155e28e2-877d-4d20-b5ab-cfb335ee2de5/evidence/baseline-d3d5db9191d73068-0001-attempt-01/baseline-lifecycle.jsonl` | PASS |
+| 10 | `artifacts/b0e72a15-fa10-4863-9440-e98533407f09/{attempt-result.json,report/}` | `0/0`; `baseline_observation=null` | `0` | NO | `artifacts/b0e72a15-fa10-4863-9440-e98533407f09/evidence/baseline-e3379201f8f0ff62-0001-attempt-01/baseline-lifecycle.jsonl` | PASS |
 
 ### Mutation evidence
 
@@ -197,7 +200,7 @@ either aggregate.
 
 | Repo # | Attempt ID | Experiment ID | Mutation type/service/params | Parent hash | Candidate hash | Boot | Regression journeys | Verdict (`KEEP`/`ROLLBACK`/`STOP`) | Exact reason | Meaningful? | Evidence references |
 |---:|---|---|---|---|---|---|---|---|---|---|---|
-| TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| N/A | N/A | N/A | None — all metric-bearing attempts stopped before experiments | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
 
 ## 6. Cleanup derivation
 
@@ -227,7 +230,18 @@ cleanup `UNKNOWN`. The M7.5 aggregate cleanup target is `100%`.
 
 | Repo # | Attempt ID | Lifecycle reference | Create state / owned ID | Required terminal event | Observed terminal event | Derived attempt cleanup | Notes |
 |---:|---|---|---|---|---|---|---|
-| TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| 1 | `4d487d62-e775-47f1-ac3d-2720309c3f6f` | None | No owned sandbox ID | None | None | `N/A` | Failed before lifecycle boundary |
+| 1 | `53bd0dda-93c2-493b-bed1-43c37a585dbf` | `artifacts/53bd0dda-93c2-493b-bed1-43c37a585dbf/evidence/baseline-d780b5f62220835d-0001-attempt-01/baseline-lifecycle.jsonl` | `create_cleanup_unsafe`; `repotrial-repotrial-baseline-d780b-797742fcf4c2` | `cleanup_retry_success` | `cleanup_retry_failure` | `FAIL` | Later `sbx list` empty does not override the frozen lifecycle rule |
+| 1 | `70313f8c-9ea6-458a-aad0-89c133fc5ec4` | `artifacts/70313f8c-9ea6-458a-aad0-89c133fc5ec4/evidence/baseline-5eb18a4c1f9b1ce0-0001-attempt-01/baseline-lifecycle.jsonl` | `create_success`; `repotrial-repotrial-baseline-5eb18-f19c462fedb8` | `destroy_success` | `destroy_success` | `PASS` | Metric-bearing |
+| 2 | `4ea7097c-2228-4318-84a1-7c6a5e9b2327` | `artifacts/4ea7097c-2228-4318-84a1-7c6a5e9b2327/evidence/baseline-ef9a1d8f87acec76-0001-attempt-01/baseline-lifecycle.jsonl` | `create_success`; `repotrial-repotrial-baseline-ef9a1-c610e20cd671` | `destroy_success` | `destroy_success` | `PASS` | Metric-bearing |
+| 3 | `04263916-9d1f-4f7c-81cc-4655bc20bb32` | `artifacts/04263916-9d1f-4f7c-81cc-4655bc20bb32/evidence/baseline-672819d073160390-0001-attempt-01/baseline-lifecycle.jsonl` | `create_success`; `repotrial-repotrial-baseline-67281-f0f72b765017` | `destroy_success` | `destroy_success` | `PASS` | Metric-bearing |
+| 4 | `3f00fc2d-48ed-4222-a184-657b8bace6f0` | `artifacts/3f00fc2d-48ed-4222-a184-657b8bace6f0/evidence/baseline-ed49c0ce2915c984-0001-attempt-01/baseline-lifecycle.jsonl` | `create_success`; `repotrial-repotrial-baseline-ed49c-c988dc996f24` | `destroy_success` | `destroy_success` | `PASS` | Metric-bearing |
+| 5 | `061e3097-62f2-42cc-9dec-b8c7948738f2` | `artifacts/061e3097-62f2-42cc-9dec-b8c7948738f2/evidence/baseline-d083a8d7052efce2-0001-attempt-01/baseline-lifecycle.jsonl` | `create_success`; `repotrial-repotrial-baseline-d083a-b400050bdff6` | `destroy_success` | `destroy_success` | `PASS` | Metric-bearing |
+| 6 | `8d508779-0002-417f-98da-8b51be739f9a` | `artifacts/8d508779-0002-417f-98da-8b51be739f9a/evidence/baseline-f5bb9d8de959f92e-0001-attempt-01/baseline-lifecycle.jsonl` | `create_success`; `repotrial-repotrial-baseline-f5bb9-e2c0c90d3b6f` | `destroy_success` | `destroy_success` | `PASS` | Metric-bearing |
+| 7 | `b8907b7d-d983-4e54-874a-f81cc538f9f5` | None | No owned sandbox ID | None | None | `N/A` | Clone failed before sandbox lifecycle |
+| 8 | `01b0ed6c-6eeb-4fca-a428-128c8aff4339` | `artifacts/01b0ed6c-6eeb-4fca-a428-128c8aff4339/evidence/baseline-cdd798ab4674a725-0001-attempt-01/baseline-lifecycle.jsonl` | `create_success`; `repotrial-repotrial-baseline-cdd79-737a3f265064` | `destroy_success` | `destroy_success` | `PASS` | Metric-bearing |
+| 9 | `155e28e2-877d-4d20-b5ab-cfb335ee2de5` | `artifacts/155e28e2-877d-4d20-b5ab-cfb335ee2de5/evidence/baseline-d3d5db9191d73068-0001-attempt-01/baseline-lifecycle.jsonl` | `create_success`; `repotrial-repotrial-baseline-d3d5d-1e9084865c26` | `destroy_success` | `destroy_success` | `PASS` | Metric-bearing |
+| 10 | `b0e72a15-fa10-4863-9440-e98533407f09` | `artifacts/b0e72a15-fa10-4863-9440-e98533407f09/evidence/baseline-e3379201f8f0ff62-0001-attempt-01/baseline-lifecycle.jsonl` | `create_success`; `repotrial-repotrial-baseline-e3379-b8e827e55112` | `destroy_success` | `destroy_success` | `PASS` | Metric-bearing |
 
 ## 7. Failure taxonomy
 
@@ -239,16 +253,16 @@ post-hoc assigned one of these attempt failure classes.
 
 | Failure class | Classification boundary | Count | Run/attempt references |
 |---|---|---:|---|
-| intake | URL/ref/clone/pin/manifest-SHA identity failure before workload execution | TBD | TBD |
-| Compose discovery/parse | Compose path discovery, loading, or validation failure | TBD | TBD |
-| sandbox unsupported | Required provider or observability capability is unsupported | TBD | TBD |
-| create/boot | Sandbox creation or workload boot failure | TBD | TBD |
-| baseline journey | Non-empty deterministic baseline journey execution/verification failure | TBD | TBD |
-| experiment | Mutation application, candidate boot, replay, or decision failure | TBD | TBD |
-| whole-trial timeout | Whole-duration deadline terminates the attempt | TBD | TBD |
-| cleanup | Required destroy/retry cleanup fails | TBD | TBD |
-| internal | RepoTrial internal failure not classified above | TBD | TBD |
-| unknown | Evidence cannot support a more specific class | TBD | TBD |
+| intake | URL/ref/clone/pin/manifest-SHA identity failure before workload execution | `0` metric-bearing; one no-metric pre-workload terminal | `b8907b7d-d983-4e54-874a-f81cc538f9f5` is retained only in the all-attempt ledger |
+| Compose discovery/parse | Compose path discovery, loading, or validation failure | `0` | None |
+| sandbox unsupported | Required provider or observability capability is unsupported | `0` | None; PID remains a disclosed Owner-accepted known limitation |
+| create/boot | Sandbox creation or workload boot failure | `9` | `70313f8c-...`, `4ea7097c-...`, `04263916-...`, `3f00fc2d-...`, `061e3097-...`, `8d508779-...`, `01b0ed6c-...`, `155e28e2-...`, `b0e72a15-...` |
+| baseline journey | Non-empty deterministic baseline journey execution/verification failure | `0` | None; all metric attempts stopped before a baseline observation |
+| experiment | Mutation application, candidate boot, replay, or decision failure | `0` | None |
+| whole-trial timeout | Whole-duration deadline terminates the attempt | `0` | None |
+| cleanup | Required destroy/retry cleanup fails | `0` metric-bearing | Audit-only attempt `53bd0dda-...` has a failed cleanup obligation and is counted in aggregate cleanup, not repository failure classes |
+| internal | RepoTrial internal failure not classified above | `0` metric-bearing | Audit-only attempt `4d487d62-...` is retained in section 10 |
+| unknown | Evidence cannot support a more specific class | `0` | None |
 
 ## 8. Aggregate metrics and thresholds
 
@@ -261,13 +275,13 @@ cleanup are all-attempt safety gates and use every retained attempt instead.
 
 | Metric | Exact calculation | Result | M7.5 threshold/status |
 |---|---|---|---|
-| Autonomous successes | Count whose metric-bearing attempt satisfies every autonomous-success condition; none means failure; denominator 10 | TBD | At least `7/10` |
-| Meaningful convergences | Count whose metric-bearing attempt has at least one meaningful regression-passing `KEEP`; none means no convergence; denominator 10 | TBD | At least `5/10` |
-| Exact stop-reason coverage | All retained failed attempts with exact raw `stop_reason` / all retained failed attempts | TBD | `100%` |
-| Average experiments | Sum of metric-bearing experiment counts for all ten repositories / `10`; no metric-bearing/no-experiment adds zero | TBD | Report only |
-| Aggregate cleanup | Successful cleanup obligations across all retained attempts / all cleanup obligations across all retained attempts; `N/A` has no obligation and any `UNKNOWN` makes the result `UNKNOWN` | TBD | `100%` |
-| P50 repository duration | Nearest-rank over metric-bearing repository durations, section 9 | TBD | Report only |
-| P95 repository duration | Nearest-rank over metric-bearing repository durations, section 9 | TBD | Report only |
+| Autonomous successes | Count whose metric-bearing attempt satisfies every autonomous-success condition; none means failure; denominator 10 | `0/10` | **FAIL** — requires at least `7/10` |
+| Meaningful convergences | Count whose metric-bearing attempt has at least one meaningful regression-passing `KEEP`; none means no convergence; denominator 10 | `0/10` | **FAIL** — requires at least `5/10` |
+| Exact stop-reason coverage | All retained failed attempts with exact raw `stop_reason` / all retained failed attempts | `12/12 = 100%` | PASS |
+| Average experiments | Sum of metric-bearing experiment counts for all ten repositories / `10`; no metric-bearing/no-experiment adds zero | `0 / 10 = 0.0` | Report only |
+| Aggregate cleanup | Successful cleanup obligations across all retained attempts / all cleanup obligations across all retained attempts; `N/A` has no obligation and any `UNKNOWN` makes the result `UNKNOWN` | `9/10 = 90%` | **FAIL** — requires `100%` |
+| P50 repository duration | Nearest-rank over metric-bearing repository durations, section 9 | `UNKNOWN` | Paperless-ngx has no metric-bearing duration |
+| P95 repository duration | Nearest-rank over metric-bearing repository durations, section 9 | `UNKNOWN` | Paperless-ngx has no metric-bearing duration |
 
 The exact-stop-reason and aggregate-cleanup rows are safety gates, not repository
 outcome metrics. They include primary, replacement, audit-only, metric-bearing,
@@ -297,29 +311,41 @@ silently substitute another attempt or exclude that repository.
 
 | Repo # | Metric-bearing attempt ID | Repository monotonic duration | Included in all-ten ordering? | Evidence |
 |---:|---|---|---|---|
-| 1 | TBD | TBD | TBD | TBD |
-| 2 | TBD | TBD | TBD | TBD |
-| 3 | TBD | TBD | TBD | TBD |
-| 4 | TBD | TBD | TBD | TBD |
-| 5 | TBD | TBD | TBD | TBD |
-| 6 | TBD | TBD | TBD | TBD |
-| 7 | TBD | TBD | TBD | TBD |
-| 8 | TBD | TBD | TBD | TBD |
-| 9 | TBD | TBD | TBD | TBD |
-| 10 | TBD | TBD | TBD | TBD |
+| 1 | `70313f8c-9ea6-458a-aad0-89c133fc5ec4` | `72.46799999999348` | NO — all-ten ordering is incomplete | `artifacts/70313f8c-9ea6-458a-aad0-89c133fc5ec4/attempt-result.json` |
+| 2 | `4ea7097c-2228-4318-84a1-7c6a5e9b2327` | `59.40600000000268` | NO — all-ten ordering is incomplete | `artifacts/4ea7097c-2228-4318-84a1-7c6a5e9b2327/attempt-result.json` |
+| 3 | `04263916-9d1f-4f7c-81cc-4655bc20bb32` | `75.31200000000536` | NO — all-ten ordering is incomplete | `artifacts/04263916-9d1f-4f7c-81cc-4655bc20bb32/attempt-result.json` |
+| 4 | `3f00fc2d-48ed-4222-a184-657b8bace6f0` | `72.90600000000268` | NO — all-ten ordering is incomplete | `artifacts/3f00fc2d-48ed-4222-a184-657b8bace6f0/attempt-result.json` |
+| 5 | `061e3097-62f2-42cc-9dec-b8c7948738f2` | `62.36000000000058` | NO — all-ten ordering is incomplete | `artifacts/061e3097-62f2-42cc-9dec-b8c7948738f2/attempt-result.json` |
+| 6 | `8d508779-0002-417f-98da-8b51be739f9a` | `59.57799999999406` | NO — all-ten ordering is incomplete | `artifacts/8d508779-0002-417f-98da-8b51be739f9a/attempt-result.json` |
+| 7 | MISSING — no metric-bearing attempt | MISSING | NO | `artifacts/b8907b7d-d983-4e54-874a-f81cc538f9f5/attempt-result.json` (audit-only timing, excluded) |
+| 8 | `01b0ed6c-6eeb-4fca-a428-128c8aff4339` | `37.687999999994645` | NO — all-ten ordering is incomplete | `artifacts/01b0ed6c-6eeb-4fca-a428-128c8aff4339/attempt-result.json` |
+| 9 | `155e28e2-877d-4d20-b5ab-cfb335ee2de5` | `47.5630000000092` | NO — all-ten ordering is incomplete | `artifacts/155e28e2-877d-4d20-b5ab-cfb335ee2de5/attempt-result.json` |
+| 10 | `b0e72a15-fa10-4863-9440-e98533407f09` | `33.312999999994645` | NO — all-ten ordering is incomplete | `artifacts/b0e72a15-fa10-4863-9440-e98533407f09/attempt-result.json` |
 
 ## 10. Attempt ledger and infrastructure invalidation
 
 Every attempted command remains in the audit trail. Populate one row in each table
 per attempt using the same attempt ID. Attempt role and metric attribution are
 derived by the frozen rules in section 1; there is no free-form post-hoc field that
-can change metric inclusion.
+can change metric inclusion. The independently reviewable root-cause, reproduction,
+fix-commit, inventory, and Owner-authorization chain for the two Umami
+invalidations is retained in
+[`pilot-evidence/umami-replacement-gate.md`](pilot-evidence/umami-replacement-gate.md).
 
 | Repo # | Attempt ID | Attempt role (`primary`/`replacement`/`diagnostic`) | Metric attribution | Target workload started? | Actual SHA | UTC start | UTC end | Monotonic duration | Exact command | Exit | Terminal outcome | Exact raw `stop_reason` | Failure class |
 |---:|---|---|---|---|---|---|---|---|---|---:|---|---|---|
 | 1 | `4d487d62-e775-47f1-ac3d-2720309c3f6f` | `primary` | `audit-only` — verified pre-workload infrastructure invalidation | `false` | `ca661c7057984aa98ed4f7083d84dae2f65bfcb0` | `2026-08-29T09:05:56.262880+00:00` | `2026-08-29T09:06:50.320499+00:00` | `54.04700000000594` | `uv run repotrial inspect https://github.com/umami-software/umami --provider docker-sbx --commit-sha ca661c7057984aa98ed4f7083d84dae2f65bfcb0 --container-port 3000 --compose-path docker-compose.yml` | `1` outer command; `4` logical evidence | `exception` | `internal:valueerror` | `internal` |
 | 1 | `53bd0dda-93c2-493b-bed1-43c37a585dbf` | `replacement` | `audit-only` — verified pre-workload infrastructure invalidation | `false` | `ca661c7057984aa98ed4f7083d84dae2f65bfcb0` | `2026-08-29T09:23:55.105099+00:00` | `2026-08-29T09:24:56.031849+00:00` | `60.921999999991385` | `uv run repotrial inspect https://github.com/umami-software/umami --provider docker-sbx --commit-sha ca661c7057984aa98ed4f7083d84dae2f65bfcb0 --container-port 3000 --compose-path docker-compose.yml` | `1` outer command; `4` logical evidence | `exception` | `internal:cleanuperror` | `cleanup` |
-| TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| 1 | `70313f8c-9ea6-458a-aad0-89c133fc5ec4` | `replacement` | `metric-bearing` | `true` | `ca661c7057984aa98ed4f7083d84dae2f65bfcb0` | `2026-08-29T09:45:18.795779+00:00` | `2026-08-29T09:46:31.265957+00:00` | `72.46799999999348` | `uv run repotrial inspect https://github.com/umami-software/umami --provider docker-sbx --commit-sha ca661c7057984aa98ed4f7083d84dae2f65bfcb0 --container-port 3000 --compose-path docker-compose.yml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
+| 2 | `4ea7097c-2228-4318-84a1-7c6a5e9b2327` | `primary` | `metric-bearing` | `true` | `670c01717d48647093335cc23a6be6f4b79c3b6b` | `2026-08-29T09:47:04.831788+00:00` | `2026-08-29T09:48:04.239354+00:00` | `59.40600000000268` | `uv run repotrial inspect https://github.com/knadh/listmonk --provider docker-sbx --commit-sha 670c01717d48647093335cc23a6be6f4b79c3b6b --container-port 9000 --compose-path docker-compose.yml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
+| 3 | `04263916-9d1f-4f7c-81cc-4655bc20bb32` | `primary` | `metric-bearing` | `true` | `5d9c7c6da76340597243e8163c4f2439237fa0e8` | `2026-08-29T09:48:17.682290+00:00` | `2026-08-29T09:49:32.985026+00:00` | `75.31200000000536` | `uv run repotrial inspect https://github.com/dgtlmoon/changedetection.io --provider docker-sbx --commit-sha 5d9c7c6da76340597243e8163c4f2439237fa0e8 --container-port 5000 --compose-path docker-compose.yml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
+| 4 | `3f00fc2d-48ed-4222-a184-657b8bace6f0` | `primary` | `metric-bearing` | `true` | `a852e21eba4ecf339624b404518c5bc7fad6d45c` | `2026-08-29T09:49:47.939558+00:00` | `2026-08-29T09:51:00.853151+00:00` | `72.90600000000268` | `uv run repotrial inspect https://github.com/louislam/uptime-kuma --provider docker-sbx --commit-sha a852e21eba4ecf339624b404518c5bc7fad6d45c --container-port 3001 --compose-path compose.yaml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
+| 5 | `061e3097-62f2-42cc-9dec-b8c7948738f2` | `primary` | `metric-bearing` | `true` | `8143ca13ade1c14959be8a79c1d736d9889013e4` | `2026-08-29T09:51:22.588789+00:00` | `2026-08-29T09:52:24.962992+00:00` | `62.36000000000058` | `uv run repotrial inspect https://github.com/muety/wakapi --provider docker-sbx --commit-sha 8143ca13ade1c14959be8a79c1d736d9889013e4 --container-port 3000 --compose-path compose.yml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
+| 6 | `8d508779-0002-417f-98da-8b51be739f9a` | `primary` | `metric-bearing` | `true` | `65813a75404b1319aca8b09700fadc0b15adabaf` | `2026-08-29T09:52:40.803754+00:00` | `2026-08-29T09:53:40.374799+00:00` | `59.57799999999406` | `uv run repotrial inspect https://github.com/sissbruecker/linkding --provider docker-sbx --commit-sha 65813a75404b1319aca8b09700fadc0b15adabaf --container-port 9090 --compose-path docker-compose.yml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
+| 7 | `b8907b7d-d983-4e54-874a-f81cc538f9f5` | `primary` | `no-metric pre-workload terminal` | `false` | MISSING — clone failed before verification | `2026-08-29T09:54:03.498649+00:00` | `2026-08-29T09:54:16.100172+00:00` | `12.593000000008033` (audit-only timing) | `uv run repotrial inspect https://github.com/paperless-ngx/paperless-ngx --provider docker-sbx --commit-sha 6f3945f11f1ff13ab90da76c26de37660ff1d497 --container-port 8000 --compose-path docker/compose/docker-compose.postgres.yml` | `1` outer; `4` evidence | `exception` | `intake:clone` | `intake` |
+| 8 | `01b0ed6c-6eeb-4fca-a428-128c8aff4339` | `primary` | `metric-bearing` | `true` | `6b78193475d84ae190622d8a8e9ba8598e89b7d1` | `2026-08-29T09:55:57.571272+00:00` | `2026-08-29T09:56:35.257852+00:00` | `37.687999999994645` | `uv run repotrial inspect https://github.com/n8n-io/n8n-hosting --provider docker-sbx --commit-sha 6b78193475d84ae190622d8a8e9ba8598e89b7d1 --container-port 5678 --compose-path docker-compose/withPostgres/docker-compose.yml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
+| 9 | `155e28e2-877d-4d20-b5ab-cfb335ee2de5` | `primary` | `metric-bearing` | `true` | `5adc62fe3fa65163c4ef63733bdcbd3e59b5c544` | `2026-08-29T09:56:48.893949+00:00` | `2026-08-29T09:57:36.463230+00:00` | `47.5630000000092` | `uv run repotrial inspect https://github.com/netbox-community/netbox-docker --provider docker-sbx --commit-sha 5adc62fe3fa65163c4ef63733bdcbd3e59b5c544 --container-port 8080 --compose-path docker-compose.yml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
+| 10 | `b0e72a15-fa10-4863-9440-e98533407f09` | `primary` | `metric-bearing` | `true` | `f809ae192b571944ad773e9866d3e67064ae8043` | `2026-08-29T09:57:50.215862+00:00` | `2026-08-29T09:58:23.540343+00:00` | `33.312999999994645` | `uv run repotrial inspect https://github.com/louislam/dockge --provider docker-sbx --commit-sha f809ae192b571944ad773e9866d3e67064ae8043 --container-port 5001 --compose-path compose.yaml` | `1` outer; `3` evidence | `trial_failed` | `boot_recovery_stopped` | `create/boot` |
 
 Allowed terminal metric-attribution values are `audit-only` for a verified
 pre-workload infrastructure invalidation, `metric-bearing` for the first attempt
@@ -331,10 +357,35 @@ target workload starts.
 |---:|---|---|---|---|---|---|
 | 1 | `4d487d62-e775-47f1-ac3d-2720309c3f6f` | `artifacts/4d487d62-e775-47f1-ac3d-2720309c3f6f/attempt-result.json` | None — no lifecycle JSONL | `N/A` | Verified pre-workload infrastructure invalidation: relative artifact root produced mixed relative/absolute GraphContext paths; no sandbox/lifecycle was reached and `sbx list` was empty. Owner later authorized one replacement attempt. | `target_workload_started=false`; retain as audit-only and do not fill metric-bearing repository outcomes. The command runner observed process exit `1`; retained RepoTrial evidence records logical exit `4`, so both are preserved rather than silently reconciled. |
 | 1 | `53bd0dda-93c2-493b-bed1-43c37a585dbf` | `artifacts/53bd0dda-93c2-493b-bed1-43c37a585dbf/attempt-result.json` | `artifacts/53bd0dda-93c2-493b-bed1-43c37a585dbf/evidence/baseline-d780b5f62220835d-0001-attempt-01/baseline-lifecycle.jsonl` | `FAIL` — `create_cleanup_unsafe` followed by `cleanup_retry_failure`; post-attempt `sbx list` was empty but does not override lifecycle evidence | Verified generic pre-workload compatibility invalidation: installed `sbx create --help` specifies `--cpus int`; the attempt passed `1.5` and failed before any daemon create request. A controlled provider reproduction retained exact stderr `invalid argument \"1.5\" for \"--cpus\" ... ParseInt`; integer CPU then passed `create -> exec echo ok -> destroy` against the same pinned workspace with no residue. Owner authorized generic TDD repair and continuation. | `target_workload_started=false`; retain as audit-only. Generic fix `cbc6eea0cb570f46929693a1f38cf7904cb2bf21` rejects fractional CPU policy and uses an integer default; scoped reviewer accepted it. The raw attempt stop reason remains exactly as originally captured. |
-| TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| 1 | `70313f8c-9ea6-458a-aad0-89c133fc5ec4` | `artifacts/70313f8c-9ea6-458a-aad0-89c133fc5ec4/{attempt-result.json,report/}` | `artifacts/70313f8c-9ea6-458a-aad0-89c133fc5ec4/evidence/baseline-5eb18a4c1f9b1ce0-0001-attempt-01/baseline-lifecycle.jsonl` | `PASS` | Owner-authorized continuation after generic fix | First Umami attempt to cross workload boundary; irrevocably metric-bearing |
+| 2 | `4ea7097c-2228-4318-84a1-7c6a5e9b2327` | `artifacts/4ea7097c-2228-4318-84a1-7c6a5e9b2327/{attempt-result.json,report/}` | `artifacts/4ea7097c-2228-4318-84a1-7c6a5e9b2327/evidence/baseline-ef9a1d8f87acec76-0001-attempt-01/baseline-lifecycle.jsonl` | `PASS` | N/A | Primary metric-bearing attempt |
+| 3 | `04263916-9d1f-4f7c-81cc-4655bc20bb32` | `artifacts/04263916-9d1f-4f7c-81cc-4655bc20bb32/{attempt-result.json,report/}` | `artifacts/04263916-9d1f-4f7c-81cc-4655bc20bb32/evidence/baseline-672819d073160390-0001-attempt-01/baseline-lifecycle.jsonl` | `PASS` | N/A | Primary metric-bearing attempt |
+| 4 | `3f00fc2d-48ed-4222-a184-657b8bace6f0` | `artifacts/3f00fc2d-48ed-4222-a184-657b8bace6f0/{attempt-result.json,report/}` | `artifacts/3f00fc2d-48ed-4222-a184-657b8bace6f0/evidence/baseline-ed49c0ce2915c984-0001-attempt-01/baseline-lifecycle.jsonl` | `PASS` | N/A | Primary metric-bearing attempt |
+| 5 | `061e3097-62f2-42cc-9dec-b8c7948738f2` | `artifacts/061e3097-62f2-42cc-9dec-b8c7948738f2/{attempt-result.json,report/}` | `artifacts/061e3097-62f2-42cc-9dec-b8c7948738f2/evidence/baseline-d083a8d7052efce2-0001-attempt-01/baseline-lifecycle.jsonl` | `PASS` | N/A | Primary metric-bearing attempt |
+| 6 | `8d508779-0002-417f-98da-8b51be739f9a` | `artifacts/8d508779-0002-417f-98da-8b51be739f9a/{attempt-result.json,report/}` | `artifacts/8d508779-0002-417f-98da-8b51be739f9a/evidence/baseline-f5bb9d8de959f92e-0001-attempt-01/baseline-lifecycle.jsonl` | `PASS` | N/A | Primary metric-bearing attempt |
+| 7 | `b8907b7d-d983-4e54-874a-f81cc538f9f5` | `artifacts/b8907b7d-d983-4e54-874a-f81cc538f9f5/attempt-result.json` | None | `N/A` | No verified infrastructure invalidation: a later diagnostic clone succeeded, but the retained exception does not preserve enough detail to prove the original transient cause | Frozen no-metric pre-workload autonomous failure; no replacement |
+| 8 | `01b0ed6c-6eeb-4fca-a428-128c8aff4339` | `artifacts/01b0ed6c-6eeb-4fca-a428-128c8aff4339/{attempt-result.json,report/}` | `artifacts/01b0ed6c-6eeb-4fca-a428-128c8aff4339/evidence/baseline-cdd798ab4674a725-0001-attempt-01/baseline-lifecycle.jsonl` | `PASS` | N/A | Primary metric-bearing attempt |
+| 9 | `155e28e2-877d-4d20-b5ab-cfb335ee2de5` | `artifacts/155e28e2-877d-4d20-b5ab-cfb335ee2de5/{attempt-result.json,report/}` | `artifacts/155e28e2-877d-4d20-b5ab-cfb335ee2de5/evidence/baseline-d3d5db9191d73068-0001-attempt-01/baseline-lifecycle.jsonl` | `PASS` | N/A | Primary metric-bearing attempt |
+| 10 | `b0e72a15-fa10-4863-9440-e98533407f09` | `artifacts/b0e72a15-fa10-4863-9440-e98533407f09/{attempt-result.json,report/}` | `artifacts/b0e72a15-fa10-4863-9440-e98533407f09/evidence/baseline-e3379201f8f0ff62-0001-attempt-01/baseline-lifecycle.jsonl` | `PASS` | N/A | Primary metric-bearing attempt |
 
 ## 11. Pilot decision
 
-**TBD — NOT RUN.** No release, continuation, or Kill Criteria conclusion exists.
-Populate this section only from the complete retained evidence and calculations
-defined above.
+**M7.5 RELEASE GATE — FAIL.** Autonomous success is `0/10` (required `>=7/10`),
+meaningful convergence is `0/10` (required `>=5/10`), and aggregate cleanup is
+`9/10 = 90%` (required `100%`). Exact stop-reason coverage is `12/12 = 100%`,
+all nine verified repository SHAs match their manifest pins, and the final SBX
+inventory is empty. No release-style Before/After Demo is authorized.
+
+Autonomous success below `5/10` triggers Kill Criteria analysis. The dominant
+observed metric-bearing failure class is create/boot: all nine metric-bearing
+attempts ended with the exact graph stop reason `boot_recovery_stopped` before a
+baseline observation or experiment. The retained evidence does not include the
+underlying boot-command failure detail, so it cannot prove that project
+heterogeneity, rather than a common generic boot path, is the main cause. It would
+be unsound to add repository-specific setup scripts or to claim the product thesis
+is disproven from this evidence alone.
+
+Owner decision is required between a bounded, generic boot-evidence/root-cause
+task and stopping the MVP line. Any future production change after these
+metric-bearing results requires marking them superseded and rerunning the complete
+frozen cohort on one final unified HEAD. No repository may be replaced.
