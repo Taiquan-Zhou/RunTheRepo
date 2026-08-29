@@ -68,6 +68,8 @@ class _EvidenceDocument(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     schema_version: Literal[1] = 1
+    attempt: int = Field(ge=1)
+    compose_path: str
     commands: list[_CommandEvidence | _CommandExceptionEvidence] = Field(
         default_factory=list, max_length=_MAX_COMMANDS
     )
@@ -76,8 +78,17 @@ class _EvidenceDocument(BaseModel):
 
 
 class _BootEvidenceSession:
-    def __init__(self, path: Path, env: dict[str, str]) -> None:
+    def __init__(
+        self,
+        path: Path,
+        env: dict[str, str],
+        *,
+        attempt: int,
+        compose_path: str,
+    ) -> None:
         _validate_new_target(path)
+        _validate_attempt(attempt)
+        _validate_compose_path(compose_path)
         self._path = path
         self._redactions = tuple(
             sorted(
@@ -85,7 +96,10 @@ class _BootEvidenceSession:
                 key=lambda value: (-len(value), value),
             )
         )
-        self._document = _EvidenceDocument()
+        self._document = _EvidenceDocument(
+            attempt=attempt,
+            compose_path=compose_path,
+        )
         self._created = False
 
     def record_command(
@@ -309,6 +323,20 @@ def _verify_bytes(path: Path, expected: bytes) -> None:
 def _validate_command_name(name: str) -> None:
     if name not in {"up", "ps", "logs"}:
         raise ValueError("invalid boot command name")
+
+
+def _validate_attempt(attempt: object) -> None:
+    if type(attempt) is not int:
+        raise TypeError("attempt must be an integer")
+    if attempt < 1:
+        raise ValueError("attempt must be positive")
+
+
+def _validate_compose_path(compose_path: object) -> None:
+    if not isinstance(compose_path, str):
+        raise TypeError("compose_path must be a string")
+    if "\0" in compose_path:
+        raise ValueError("compose_path must not contain NUL")
 
 
 def _is_link(path: Path) -> bool:

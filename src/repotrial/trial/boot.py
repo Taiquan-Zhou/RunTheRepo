@@ -74,7 +74,14 @@ async def _boot_compose_with_evidence(
         _validate_compose_path(overlay_path, "overlay_path")
         docker_compose.extend(["-f", overlay_path])
     evidence = (
-        None if evidence_path is None else _BootEvidenceSession(evidence_path, env)
+        None
+        if evidence_path is None
+        else _BootEvidenceSession(
+            evidence_path,
+            env,
+            attempt=attempt,
+            compose_path=compose_path,
+        )
     )
 
     try:

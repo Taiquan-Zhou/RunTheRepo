@@ -9,8 +9,19 @@ from repotrial.sandbox.base import ExecResult
 from repotrial.trial import boot_evidence
 
 
-def _session(path: Path, env: dict[str, str]) -> boot_evidence._BootEvidenceSession:
-    return boot_evidence._BootEvidenceSession(path, env)
+def _session(
+    path: Path,
+    env: dict[str, str],
+    *,
+    attempt: int = 7,
+    compose_path: str = "workspace/compose.yaml",
+) -> boot_evidence._BootEvidenceSession:
+    return boot_evidence._BootEvidenceSession(
+        path,
+        env,
+        attempt=attempt,
+        compose_path=compose_path,
+    )
 
 
 def _write_complete_evidence(path: Path, env: dict[str, str]) -> None:
@@ -33,6 +44,8 @@ def test_evidence_schema_is_bounded_deterministic_and_redacts_all_runtime_values
 
     payload = json.loads(evidence_path.read_text(encoding="utf-8"))
     assert payload["schema_version"] == 1
+    assert payload["attempt"] == 7
+    assert payload["compose_path"] == "workspace/compose.yaml"
     assert [item["name"] for item in payload["commands"]] == ["up", "ps", "logs"]
     assert payload["commands"][0]["exit_code"] == 1
     assert payload["commands"][0]["stderr"]["truncated"] is True
@@ -42,26 +55,56 @@ def test_evidence_schema_is_bounded_deterministic_and_redacts_all_runtime_values
     assert evidence_path.read_bytes().endswith(b"\n")
 
 
-def test_evidence_redacts_four_byte_values_that_cross_head_tail_boundary(
+def test_evidence_redacts_four_byte_values_before_crossing_head_boundary(
     tmp_path: Path,
 ) -> None:
     evidence_path = tmp_path / "baseline-boot-attempt.json"
-    secret = "left-💩-right"
+    secret = "boundary-💩-secret"
+    secret_prefix = "boundary-"
+    payload_limit = 32_000 - len("\n...[truncated]".encode("ascii"))
+    head_limit = payload_limit // 2
+    secret_start = head_limit - len(secret_prefix.encode("utf-8")) - 2
+    stdout = ("a" * secret_start) + secret + ("b" * 40_000)
+    encoded_stdout = stdout.encode("utf-8")
+    emoji_start = encoded_stdout.index("💩".encode())
+    assert emoji_start == head_limit - 2
+    assert encoded_stdout[emoji_start : emoji_start + 4] == "💩".encode()
+
+    truncated_before_redaction = boot_evidence._stream_evidence(stdout, ())
+    assert secret_prefix in truncated_before_redaction.text
+    assert secret not in truncated_before_redaction.text
+
     session = _session(evidence_path, {"UNRELATED_VALUE": secret})
     session.record_command(
         "up",
-        ExecResult(
-            exit_code=1,
-            stdout=("a" * 40_000) + secret + ("b" * 40_000),
-            stderr="",
-        ),
+        ExecResult(exit_code=1, stdout=stdout, stderr=""),
     )
     session.finalize(Verdict.FAIL, {})
 
     persisted = evidence_path.read_text(encoding="utf-8")
     assert secret not in persisted
-    assert "left-" not in persisted
-    assert "-right" not in persisted
+    assert secret_prefix not in persisted
+    assert "-secret" not in persisted
+
+
+def test_evidence_session_rejects_invalid_attempt_identity(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="attempt"):
+        boot_evidence._BootEvidenceSession(
+            tmp_path / "baseline-boot-attempt.json",
+            {},
+            attempt=0,
+            compose_path="workspace/compose.yaml",
+        )
+
+
+def test_evidence_session_rejects_nul_compose_path_identity(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="compose_path"):
+        boot_evidence._BootEvidenceSession(
+            tmp_path / "baseline-boot-attempt.json",
+            {},
+            attempt=1,
+            compose_path="workspace/compose\0.yaml",
+        )
 
 
 def test_evidence_records_malformed_results_and_exception_class_without_raw_exception(

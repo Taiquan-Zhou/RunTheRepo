@@ -127,6 +127,8 @@ def test_private_boot_evidence_checkpoints_commands_final_readiness_and_redacts_
 
     payload = json.loads(evidence_path.read_text(encoding="utf-8"))
     assert result.verdict is Verdict.FAIL
+    assert payload["attempt"] == 1
+    assert payload["compose_path"] == COMPOSE_PATH
     assert [item["name"] for item in payload["commands"]] == ["up", "ps", "logs"]
     assert payload["final"] == {
         "service_states": {"web": "running/healthy"},
