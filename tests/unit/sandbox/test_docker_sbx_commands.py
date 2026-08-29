@@ -1,12 +1,15 @@
 import asyncio
 import json
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
+from repotrial.sandbox import docker_sbx
 from repotrial.sandbox.base import ExecResult, NetworkLogResult
 from repotrial.sandbox.docker_sbx import (
     DOCKER_FLOOR_MB,
@@ -29,7 +32,6 @@ CREATE_FLAGS = (
     "--memory",
     "--deny-network",
     "--pids-limit",
-    "--total-duration",
 )
 HELP_OUTPUTS = {
     ("sbx", "create", "--help"): "Usage: sbx create [flags] AGENT PATH\n"
@@ -124,9 +126,12 @@ class _SbxSpawner:
         self.handler: Callable[[tuple[str, ...]], _Outcome | BaseException] | None = (
             None
         )
+        self.before_spawn: Callable[[tuple[str, ...]], None] | None = None
 
     async def __call__(self, *argv: str, **kwargs: object) -> _FakeProcess:
         command = tuple(argv)
+        if self.before_spawn is not None:
+            self.before_spawn(command)
         self.calls.append(command)
         self.kwargs.append(kwargs)
         outcome: _Outcome | BaseException
@@ -147,13 +152,60 @@ class _SbxSpawner:
         return process
 
 
-def _policy(*, deny_network: frozenset[str] = frozenset()) -> DockerSbxPolicy:
+class _Clock:
+    def __init__(self, value: float = 0) -> None:
+        self.value = value
+
+    def monotonic(self) -> float:
+        return self.value
+
+
+class _RecordedTimeout:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *args: object) -> bool:
+        return False
+
+
+class _TimeoutRecorder:
+    def __init__(self) -> None:
+        self.values: list[float] = []
+
+    def __call__(self, value: float) -> _RecordedTimeout:
+        self.values.append(value)
+        return _RecordedTimeout()
+
+
+def _install_deterministic_clock(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock
+) -> _TimeoutRecorder:
+    monkeypatch.setattr(
+        docker_sbx,
+        "time",
+        SimpleNamespace(monotonic=clock.monotonic),
+        raising=False,
+    )
+    recorder = _TimeoutRecorder()
+    monkeypatch.setattr(docker_sbx.asyncio, "timeout", recorder)
+    return recorder
+
+
+def _timeouts_by_command(
+    spawner: _SbxSpawner, recorder: _TimeoutRecorder
+) -> list[tuple[tuple[str, ...], float]]:
+    return list(zip(spawner.calls, recorder.values, strict=True))
+
+
+def _policy(
+    *, deny_network: frozenset[str] = frozenset(), total_duration_s: int = 300
+) -> DockerSbxPolicy:
     return DockerSbxPolicy(
         cpus=1.5,
         memory_mb=512,
         pids_limit=64,
         disk_mb=2048,
-        total_duration_s=300,
+        total_duration_s=total_duration_s,
         deny_network=deny_network,
     )
 
@@ -163,10 +215,14 @@ def _provider(
     spawner: _SbxSpawner,
     *,
     command_timeout_s: float = 5,
+    total_duration_s: int = 300,
 ) -> DockerSbxProvider:
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawner)
     provider = DockerSbxProvider(
-        _policy(deny_network=frozenset({"example.internal"})),
+        _policy(
+            deny_network=frozenset({"example.internal"}),
+            total_duration_s=total_duration_s,
+        ),
         command_timeout_s=command_timeout_s,
     )
     monkeypatch.setattr(provider, "_require_runtime_policy_enforcement", lambda: None)
@@ -437,10 +493,7 @@ def test_complete_help_tokens_cannot_attest_runtime_policy_enforcement(
     with pytest.raises(DockerSbxUnsupportedError) as raised:
         _create(provider, tmp_path)
 
-    assert (
-        raised.value.reason
-        == "runtime_policy_enforcement_unproven:pids,disk,total_duration"
-    )
+    assert raised.value.reason == "runtime_policy_enforcement_unproven:pids"
     assert _non_help_create_calls(spawner) == []
     assert not any(
         call[:2] == ("sbx", "exec") and call[-1] != "--help" for call in spawner.calls
@@ -476,8 +529,6 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
         "512m",
         "--pids-limit",
         "64",
-        "--total-duration",
-        "300s",
     ]
     for resource in sorted(MANDATORY_DENY_NETWORK | {"example.internal"}):
         expected.extend(("--deny-network", resource))
@@ -1482,12 +1533,12 @@ def test_network_log_command_failure_is_unsupported_not_observed_empty(
     )
 
 
-def test_network_log_propagates_unconfirmed_process_cleanup(
+def test_network_log_deadline_timeout_propagates_unconfirmed_process_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("repotrial.sandbox.docker_sbx.REAP_TIMEOUT_SECONDS", 0.01)
     spawner = _SbxSpawner()
-    provider = _provider(monkeypatch, spawner, command_timeout_s=0.05)
+    provider = _provider(monkeypatch, spawner, command_timeout_s=5)
     sandbox_id = _create(provider, tmp_path)
     command = (
         "sbx",
@@ -1499,6 +1550,7 @@ def test_network_log_propagates_unconfirmed_process_cleanup(
         "--json",
     )
     spawner.overrides[command] = _Outcome(hang=True, kill_error=OSError("kill denied"))
+    provider._sandbox_deadlines[sandbox_id] = time.monotonic() + 0.01
 
     with pytest.raises(DockerSbxError) as raised:
         asyncio.run(provider.network_log(sandbox_id))
@@ -1532,9 +1584,335 @@ def test_network_log_confirmed_timeout_remains_unsupported(
     assert any(process.killed and process.waited for process in spawner.processes)
 
 
+def test_network_log_in_flight_trial_deadline_timeout_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner, command_timeout_s=5)
+    sandbox_id = _create(provider, tmp_path)
+    command = (
+        "sbx",
+        "policy",
+        "log",
+        sandbox_id,
+        "--type",
+        "network",
+        "--json",
+    )
+    spawner.overrides[command] = _Outcome(hang=True)
+    provider._sandbox_deadlines[sandbox_id] = time.monotonic() + 0.01
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(provider.network_log(sandbox_id))
+
+    assert raised.value.operation == "network_log"
+    assert raised.value.reason == "total_duration_exhausted"
+    assert raised.value.sandbox_id == sandbox_id
+    assert spawner.processes[-1].killed is True
+    assert spawner.processes[-1].waited is True
+
+
+def test_network_log_equal_trial_and_command_timeout_is_trial_exhaustion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    command_timeout_s = 0.0625
+    spawner = _SbxSpawner()
+    provider = _provider(
+        monkeypatch,
+        spawner,
+        command_timeout_s=command_timeout_s,
+    )
+    sandbox_id = _create(provider, tmp_path)
+    command = (
+        "sbx",
+        "policy",
+        "log",
+        sandbox_id,
+        "--type",
+        "network",
+        "--json",
+    )
+    spawner.overrides[command] = _Outcome(hang=True)
+    monkeypatch.setattr(
+        docker_sbx,
+        "time",
+        SimpleNamespace(monotonic=lambda: 10.0),
+    )
+    provider._sandbox_deadlines[sandbox_id] = 10.0625
+    assert provider._sandbox_deadlines[sandbox_id] - 10.0 == command_timeout_s
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(provider.network_log(sandbox_id))
+
+    assert raised.value.operation == "network_log"
+    assert raised.value.reason == "total_duration_exhausted"
+    assert raised.value.sandbox_id == sandbox_id
+    assert spawner.processes[-1].killed is True
+    assert spawner.processes[-1].waited is True
+
+
 def _non_help_create_calls(spawner: _SbxSpawner) -> list[tuple[str, ...]]:
     return [
         call
         for call in spawner.calls
         if call[:2] == ("sbx", "create") and call[-1] != "--help"
+    ]
+
+
+def test_create_deadline_starts_before_probes_and_limits_create_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    recorder = _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+
+    def advance_after_timeout_calculation(command: tuple[str, ...]) -> None:
+        clock.value += 1
+
+    spawner.before_spawn = advance_after_timeout_calculation
+    provider = _provider(
+        monkeypatch,
+        spawner,
+        command_timeout_s=30,
+        total_duration_s=10,
+    )
+
+    sandbox_id = _create(provider, tmp_path)
+
+    assert _timeouts_by_command(spawner, recorder)[: len(PROBE_CALLS)] == list(
+        zip(PROBE_CALLS, (10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0), strict=True)
+    )
+    assert _timeouts_by_command(spawner, recorder)[-1] == (
+        _actual_create_call(spawner),
+        2.0,
+    )
+    assert provider._sandbox_deadlines == {sandbox_id: 10.0}
+
+
+def test_trial_exhaustion_before_first_probe_prevents_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    readings = iter((0.0, 10.0))
+    monkeypatch.setattr(
+        docker_sbx,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(readings)),
+    )
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner, total_duration_s=10)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert raised.value.operation == "probe_version"
+    assert raised.value.reason == "total_duration_exhausted"
+    assert spawner.calls == []
+
+
+def test_workload_operations_share_one_deadline_and_elapsed_time_reduces_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    recorder = _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider = _provider(
+        monkeypatch,
+        spawner,
+        command_timeout_s=30,
+        total_duration_s=10,
+    )
+    sandbox_id = _create(provider, tmp_path)
+
+    clock.value = 2
+    asyncio.run(provider.exec(sandbox_id, ["first"]))
+    clock.value = 7
+    asyncio.run(provider.copy(sandbox_id, "/result", tmp_path / "result"))
+
+    workload_timeouts = _timeouts_by_command(spawner, recorder)[-2:]
+    assert workload_timeouts == [
+        (("sbx", "exec", sandbox_id, "--", "first"), 8.0),
+        (("sbx", "cp", f"{sandbox_id}:/result", str(tmp_path / "result")), 3.0),
+    ]
+
+
+def test_exec_keeps_smaller_per_command_timeout_than_trial_remaining_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    recorder = _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner, total_duration_s=10)
+    sandbox_id = _create(provider, tmp_path)
+
+    clock.value = 1
+    asyncio.run(provider.exec(sandbox_id, ["short"], timeout_s=3))
+
+    assert _timeouts_by_command(spawner, recorder)[-1] == (
+        ("sbx", "exec", sandbox_id, "--", "short"),
+        3.0,
+    )
+
+
+def test_expired_trial_prevents_new_workload_subprocess_and_network_log_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner, total_duration_s=10)
+    sandbox_id = _create(provider, tmp_path)
+    clock.value = 10
+    calls_before_workloads = list(spawner.calls)
+
+    with pytest.raises(DockerSbxError) as exec_error:
+        asyncio.run(provider.exec(sandbox_id, ["must-not-spawn"]))
+    with pytest.raises(DockerSbxError) as network_error:
+        asyncio.run(provider.network_log(sandbox_id))
+
+    assert (exec_error.value.operation, exec_error.value.reason) == (
+        "exec",
+        "total_duration_exhausted",
+    )
+    assert (network_error.value.operation, network_error.value.reason) == (
+        "network_log",
+        "total_duration_exhausted",
+    )
+    assert spawner.calls == calls_before_workloads
+
+
+def test_direct_destroy_bypasses_expired_trial_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner, total_duration_s=10)
+    sandbox_id = _create(provider, tmp_path)
+
+    clock.value = 10
+    asyncio.run(provider.destroy(sandbox_id))
+    assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
+    assert sandbox_id not in provider._sandbox_deadlines
+
+
+def test_managed_sandbox_cleans_up_after_in_flight_trial_deadline_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner, command_timeout_s=5)
+    artifact = tmp_path.parent / "deadline-timeout-managed-sandbox.jsonl"
+
+    async def manage() -> None:
+        async with managed_sandbox(
+            provider,
+            tmp_path,
+            "managed",
+            lifecycle_artifact=artifact,
+        ) as managed_id:
+            command = ("sbx", "exec", managed_id, "--", "hang")
+            spawner.overrides[command] = _Outcome(hang=True)
+            provider._sandbox_deadlines[managed_id] = time.monotonic() + 0.01
+            await provider.exec(managed_id, ["hang"])
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(manage())
+
+    create_call = _actual_create_call(spawner)
+    managed_id = create_call[create_call.index("--name") + 1]
+    assert raised.value.reason == "total_duration_exhausted"
+    assert raised.value.sandbox_id == managed_id
+    assert spawner.calls[-1] == ("sbx", "rm", "--force", managed_id)
+    assert managed_id not in provider._sandbox_deadlines
+
+
+def test_multiple_sandbox_deadlines_are_independent_and_owned_cleanup_is_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    recorder = _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider = _provider(
+        monkeypatch,
+        spawner,
+        command_timeout_s=30,
+        total_duration_s=10,
+    )
+    first_id = _create(provider, tmp_path)
+    clock.value = 2
+    second_id = _create(provider, tmp_path)
+
+    assert provider._sandbox_deadlines == {first_id: 10.0, second_id: 12.0}
+
+    clock.value = 3
+    asyncio.run(provider.exec(first_id, ["first"]))
+    asyncio.run(provider.exec(second_id, ["second"]))
+    assert _timeouts_by_command(spawner, recorder)[-2:] == [
+        (("sbx", "exec", first_id, "--", "first"), 7.0),
+        (("sbx", "exec", second_id, "--", "second"), 9.0),
+    ]
+
+    asyncio.run(provider.destroy(first_id))
+
+    assert first_id not in provider._sandbox_deadlines
+    assert provider._sandbox_deadlines[second_id] == 12.0
+    asyncio.run(provider.destroy(second_id))
+
+
+def test_failed_create_keeps_no_deadline_and_failure_cleanup_bypasses_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+
+    def outcome(command: tuple[str, ...]) -> _Outcome:
+        if command[:2] == ("sbx", "create") and command[-1] != "--help":
+            clock.value = 10
+            return _Outcome(returncode=7, stderr=b"create failed")
+        return _Outcome()
+
+    spawner.handler = outcome
+    provider = _provider(monkeypatch, spawner, total_duration_s=10)
+
+    with pytest.raises(DockerSbxError, match="create failed"):
+        _create(provider, tmp_path)
+
+    assert provider._sandbox_deadlines == {}
+    assert spawner.calls[-1][:3] == ("sbx", "rm", "--force")
+
+
+def test_publish_recomputes_timeout_for_each_subprocess_from_one_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    recorder = _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+
+    def outcome(command: tuple[str, ...]) -> _Outcome:
+        if command[:2] != ("sbx", "ports"):
+            return _Outcome()
+        if command[-1:] == ("--json",):
+            return _Outcome(
+                stdout=(
+                    b'[{"host_ip":"127.0.0.1","host_port":49152,'
+                    b'"sandbox_port":8080,"protocol":"tcp4"}]'
+                )
+            )
+        clock.value = 2
+        return _Outcome()
+
+    spawner.handler = outcome
+    provider = _provider(
+        monkeypatch,
+        spawner,
+        command_timeout_s=30,
+        total_duration_s=10,
+    )
+    sandbox_id = _create(provider, tmp_path)
+
+    assert asyncio.run(provider.publish_port(sandbox_id, 8080)) == 49152
+
+    assert _timeouts_by_command(spawner, recorder)[-2:] == [
+        (("sbx", "ports", sandbox_id, "--publish", "8080/tcp4"), 10.0),
+        (("sbx", "ports", sandbox_id, "--json"), 8.0),
     ]

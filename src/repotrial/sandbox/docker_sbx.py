@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
@@ -41,7 +42,6 @@ _CREATE_FLAGS = (
     "--memory",
     "--deny-network",
     "--pids-limit",
-    "--total-duration",
 )
 _PORT_KEYS = {"host_ip", "host_port", "sandbox_port", "protocol"}
 _NETWORK_EVENT_KEYS = {
@@ -221,11 +221,13 @@ class DockerSbxProvider(SandboxProvider):
         self._command_timeout_s = float(command_timeout_s)
         self._subprocess_environment = _sanitized_environment()
         self._sandbox_states: dict[str, _SandboxState] = {}
+        self._sandbox_deadlines: dict[str, float] = {}
         self._network_log_sandboxes: set[str] = set()
 
     async def create(self, workspace: Path, name: str) -> str:
+        deadline = time.monotonic() + self._policy.total_duration_s
         allocation = calculate_disk_allocation(self._policy.disk_mb)
-        network_log_supported = await self._probe()
+        network_log_supported = await self._probe(deadline)
         self._require_runtime_policy_enforcement()
         sandbox_id = _new_sandbox_id(name)
         self._sandbox_states[sandbox_id] = _SandboxState.PENDING
@@ -240,8 +242,6 @@ class DockerSbxProvider(SandboxProvider):
             f"{self._policy.memory_mb}m",
             "--pids-limit",
             str(self._policy.pids_limit),
-            "--total-duration",
-            f"{self._policy.total_duration_s}s",
         ]
         for resource in sorted(self._policy.deny_network):
             arguments.extend(("--deny-network", resource))
@@ -252,6 +252,7 @@ class DockerSbxProvider(SandboxProvider):
                 arguments,
                 self._command_timeout_s,
                 env=self._disk_environment(allocation),
+                deadline=deadline,
             )
             _require_success("create", result)
         except (DockerSbxError, asyncio.CancelledError) as error:
@@ -261,14 +262,13 @@ class DockerSbxProvider(SandboxProvider):
                 partial_create=True,
             )
         self._sandbox_states[sandbox_id] = _SandboxState.ACTIVE
+        self._sandbox_deadlines[sandbox_id] = deadline
         if network_log_supported:
             self._network_log_sandboxes.add(sandbox_id)
         return sandbox_id
 
     def _require_runtime_policy_enforcement(self) -> None:
-        raise DockerSbxUnsupportedError(
-            "runtime_policy_enforcement_unproven:pids,disk,total_duration"
-        )
+        raise DockerSbxUnsupportedError("runtime_policy_enforcement_unproven:pids")
 
     def _disk_environment(self, allocation: DiskAllocation) -> dict[str, str]:
         environment = self._subprocess_environment.copy()
@@ -300,7 +300,11 @@ class DockerSbxProvider(SandboxProvider):
             raise ValueError("timeout_s must be a positive integer")
         self._require_active(sandbox_id)
         result = await self._run(
-            "exec", ["exec", sandbox_id, "--", *argv], float(timeout_s)
+            "exec",
+            ["exec", sandbox_id, "--", *argv],
+            float(timeout_s),
+            deadline=self._require_deadline(sandbox_id),
+            sandbox_id=sandbox_id,
         )
         return ExecResult(
             exit_code=result.returncode,
@@ -321,12 +325,16 @@ class DockerSbxProvider(SandboxProvider):
                 "publish_port",
                 ["ports", sandbox_id, "--publish", f"{container_port}/tcp4"],
                 self._command_timeout_s,
+                deadline=self._require_deadline(sandbox_id),
+                sandbox_id=sandbox_id,
             )
             _require_success("publish_port", published)
             listed = await self._run(
                 "publish_port",
                 ["ports", sandbox_id, "--json"],
                 self._command_timeout_s,
+                deadline=self._require_deadline(sandbox_id),
+                sandbox_id=sandbox_id,
             )
             _require_success("publish_port", listed)
             return _parse_published_port(listed.stdout, container_port)
@@ -341,6 +349,8 @@ class DockerSbxProvider(SandboxProvider):
             "copy",
             ["cp", f"{sandbox_id}:{remote_path}", str(local_path)],
             self._command_timeout_s,
+            deadline=self._require_deadline(sandbox_id),
+            sandbox_id=sandbox_id,
         )
         _require_success("copy", result)
 
@@ -360,9 +370,14 @@ class DockerSbxProvider(SandboxProvider):
                     "--json",
                 ],
                 self._command_timeout_s,
+                deadline=self._require_deadline(sandbox_id),
+                sandbox_id=sandbox_id,
             )
         except DockerSbxError as error:
-            if error.reason == "process_cleanup_unconfirmed":
+            if error.reason in {
+                "process_cleanup_unconfirmed",
+                "total_duration_exhausted",
+            }:
                 raise
             return _unsupported_network_log("network_log_command_failed")
         if result.returncode != 0:
@@ -392,6 +407,7 @@ class DockerSbxProvider(SandboxProvider):
         )
         _require_success(operation, result)
         self._sandbox_states[sandbox_id] = _SandboxState.CLEANED
+        self._sandbox_deadlines.pop(sandbox_id, None)
         self._network_log_sandboxes.discard(sandbox_id)
 
     async def _cleanup_after_uncertain_failure(
@@ -444,8 +460,8 @@ class DockerSbxProvider(SandboxProvider):
             raise cancellation
         raise primary_error
 
-    async def _probe(self) -> bool:
-        version = await self._probe_call("version", ["version"])
+    async def _probe(self, deadline: float) -> bool:
+        version = await self._probe_call("version", ["version"], deadline)
         if version.returncode != 0:
             raise DockerSbxUnsupportedError(
                 "version_probe_failed", stderr=_decode_human_output(version.stderr)
@@ -460,7 +476,7 @@ class DockerSbxProvider(SandboxProvider):
             ("rm", ["rm", "--help"], ("--force",)),
         )
         for capability, arguments, tokens in required_help:
-            result = await self._probe_call(capability, arguments)
+            result = await self._probe_call(capability, arguments, deadline)
             if result.returncode != 0:
                 raise DockerSbxUnsupportedError(
                     f"{capability}_probe_failed",
@@ -477,9 +493,13 @@ class DockerSbxProvider(SandboxProvider):
                 "probe_network_log",
                 ["policy", "log", "--help"],
                 self._command_timeout_s,
+                deadline=deadline,
             )
         except DockerSbxError as error:
-            if error.reason == "process_cleanup_unconfirmed":
+            if error.reason in {
+                "process_cleanup_unconfirmed",
+                "total_duration_exhausted",
+            }:
                 raise
             return False
         return log_help.returncode == 0 and all(
@@ -487,14 +507,20 @@ class DockerSbxProvider(SandboxProvider):
         )
 
     async def _probe_call(
-        self, capability: str, arguments: list[str]
+        self, capability: str, arguments: list[str], deadline: float
     ) -> _CommandResult:
         try:
             return await self._run(
-                f"probe_{capability}", arguments, self._command_timeout_s
+                f"probe_{capability}",
+                arguments,
+                self._command_timeout_s,
+                deadline=deadline,
             )
         except DockerSbxError as error:
-            if error.reason == "process_cleanup_unconfirmed":
+            if error.reason in {
+                "process_cleanup_unconfirmed",
+                "total_duration_exhausted",
+            }:
                 raise
             if capability == "version" and error.reason == "executable_unavailable":
                 raise DockerSbxUnsupportedError(
@@ -511,10 +537,18 @@ class DockerSbxProvider(SandboxProvider):
         timeout_s: float,
         *,
         env: dict[str, str] | None = None,
+        deadline: float | None = None,
+        sandbox_id: str | None = None,
     ) -> _CommandResult:
         process: asyncio.subprocess.Process | None = None
         try:
-            async with asyncio.timeout(timeout_s):
+            effective_timeout_s, deadline_limited = self._effective_timeout(
+                operation,
+                timeout_s,
+                deadline=deadline,
+                sandbox_id=sandbox_id,
+            )
+            async with asyncio.timeout(effective_timeout_s):
                 spawn_kwargs: dict[str, Any] = {
                     "stdin": asyncio.subprocess.DEVNULL,
                     "stdout": asyncio.subprocess.PIPE,
@@ -534,9 +568,22 @@ class DockerSbxProvider(SandboxProvider):
                     process.wait(),
                 )
         except TimeoutError as error:
+            timeout_reason = (
+                "total_duration_exhausted" if deadline_limited else "timeout"
+            )
             if process is not None:
-                await _raise_after_process_cleanup(operation, "timeout", process, error)
-            raise DockerSbxError(operation, "timeout") from error
+                await _raise_after_process_cleanup(
+                    operation,
+                    timeout_reason,
+                    process,
+                    error,
+                    sandbox_id=sandbox_id if deadline_limited else None,
+                )
+            raise DockerSbxError(
+                operation,
+                timeout_reason,
+                sandbox_id=sandbox_id if deadline_limited else None,
+            ) from error
         except asyncio.CancelledError as error:
             if process is not None:
                 await _raise_after_process_cleanup(
@@ -559,6 +606,30 @@ class DockerSbxProvider(SandboxProvider):
     def _require_active(self, sandbox_id: str) -> None:
         if self._sandbox_states.get(sandbox_id) is not _SandboxState.ACTIVE:
             raise RuntimeError(f"sandbox is not active: {sandbox_id}")
+
+    def _require_deadline(self, sandbox_id: str) -> float:
+        return self._sandbox_deadlines[sandbox_id]
+
+    def _effective_timeout(
+        self,
+        operation: str,
+        timeout_s: float,
+        *,
+        deadline: float | None,
+        sandbox_id: str | None,
+    ) -> tuple[float, bool]:
+        if deadline is None:
+            return timeout_s, False
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            raise DockerSbxError(
+                operation,
+                "total_duration_exhausted",
+                sandbox_id=sandbox_id,
+            )
+        if remaining_s <= timeout_s:
+            return remaining_s, True
+        return timeout_s, False
 
 
 async def _read_bounded(stream: asyncio.StreamReader) -> bytes:
@@ -601,6 +672,8 @@ async def _raise_after_process_cleanup(
     reason: str,
     process: asyncio.subprocess.Process,
     primary_error: BaseException,
+    *,
+    sandbox_id: str | None = None,
 ) -> NoReturn:
     cleanup_task = asyncio.create_task(_kill_and_reap(process))
     cancellation = (
@@ -630,7 +703,7 @@ async def _raise_after_process_cleanup(
             "process_cleanup_unconfirmed",
             cleanup_error=str(cleanup_error),
         ) from primary_error
-    raise DockerSbxError(operation, reason) from primary_error
+    raise DockerSbxError(operation, reason, sandbox_id=sandbox_id) from primary_error
 
 
 def _decode_human_output(output: bytes) -> str:
