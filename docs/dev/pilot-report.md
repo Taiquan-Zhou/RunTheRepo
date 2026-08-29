@@ -317,6 +317,7 @@ can change metric inclusion.
 
 | Repo # | Attempt ID | Attempt role (`primary`/`replacement`/`diagnostic`) | Metric attribution | Target workload started? | Actual SHA | UTC start | UTC end | Monotonic duration | Exact command | Exit | Terminal outcome | Exact raw `stop_reason` | Failure class |
 |---:|---|---|---|---|---|---|---|---|---|---:|---|---|---|
+| 1 | `4d487d62-e775-47f1-ac3d-2720309c3f6f` | `primary` | `audit-only` — verified pre-workload infrastructure invalidation | `false` | `ca661c7057984aa98ed4f7083d84dae2f65bfcb0` | `2026-08-29T09:05:56.262880+00:00` | `2026-08-29T09:06:50.320499+00:00` | `54.04700000000594` | `uv run repotrial inspect https://github.com/umami-software/umami --provider docker-sbx --commit-sha ca661c7057984aa98ed4f7083d84dae2f65bfcb0 --container-port 3000 --compose-path docker-compose.yml` | `1` outer command; `4` logical evidence | `exception` | `internal:valueerror` | `internal` |
 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
 
 Allowed terminal metric-attribution values are `audit-only` for a verified
@@ -327,6 +328,7 @@ target workload starts.
 
 | Repo # | Attempt ID | Report/artifact references | Lifecycle JSONL references | Derived attempt cleanup | Invalidation evidence and authorization | Notes |
 |---:|---|---|---|---|---|---|
+| 1 | `4d487d62-e775-47f1-ac3d-2720309c3f6f` | `artifacts/4d487d62-e775-47f1-ac3d-2720309c3f6f/attempt-result.json` | None — no lifecycle JSONL | `N/A` | Verified pre-workload infrastructure invalidation: relative artifact root produced mixed relative/absolute GraphContext paths; no sandbox/lifecycle was reached and `sbx list` was empty. Replacement is **NOT authorized**. | No retry occurred; `target_workload_started=false`; retain as audit-only and do not fill metric-bearing repository outcomes. The command runner observed process exit `1`; retained RepoTrial evidence records logical exit `4`, so both are preserved rather than silently reconciled. |
 | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
 
 ## 11. Pilot decision

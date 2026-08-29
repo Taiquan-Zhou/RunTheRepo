@@ -138,7 +138,8 @@ def create_app(
                     ),
                     4,
                 )
-            workspace = run_path / "workspace"
+            context_run_path = run_path.resolve(strict=True)
+            workspace = context_run_path / "workspace"
             typer.echo(f"run_id={run_id}")
             typer.echo(f"artifact_path={run_path}")
             result = asyncio.run(
@@ -152,7 +153,7 @@ def create_app(
                     context=GraphContext(
                         provider=_make_provider(selected_provider, provider_factory),
                         workspace=workspace,
-                        artifact_dir=run_path / "evidence",
+                        artifact_dir=context_run_path / "evidence",
                         overlay_dir=workspace / ".repotrial-overlays",
                         accepted_compose_dir=workspace / ".repotrial-accepted",
                         env={},

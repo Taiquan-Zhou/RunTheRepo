@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from typer.testing import CliRunner
 
 from repotrial import cli
-from repotrial.agent.state import GraphState
+from repotrial.agent.state import GraphContext, GraphState
 from repotrial.cli import create_app
 from repotrial.domain.enums import ExperimentVerdict, MutationType, Verdict
 from repotrial.domain.models import (
@@ -322,6 +322,57 @@ def test_inspect_runs_local_git_fixture_to_a_report_and_cleans_up(
     assert len([call for call in provider.calls if call[0] == "create"]) == len(
         [call for call in provider.calls if call[0] == "destroy"]
     )
+    assert provider.active_sandboxes == set()
+
+
+def test_relative_artifacts_root_uses_absolute_graph_context_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = create_fixture_repo(tmp_path)
+    invocation_cwd = tmp_path / "invocation-cwd"
+    invocation_cwd.mkdir()
+    monkeypatch.chdir(invocation_cwd)
+    artifacts_root = Path("artifacts")
+    contexts: list[GraphContext] = []
+    original_ainvoke_run = cli.ainvoke_run
+
+    async def capture_context(
+        graph: object, state: RunState, *, context: GraphContext
+    ) -> GraphState:
+        contexts.append(context)
+        return await original_ainvoke_run(graph, state, context=context)
+
+    monkeypatch.setattr(cli, "ainvoke_run", capture_context)
+    with healthy_server() as port:
+        provider = FixtureProvider(host_port=port)
+        result = CliRunner().invoke(
+            make_app(artifacts_root, provider),
+            ["inspect", str(source), "--provider", "fake", "--max-experiments", "8"],
+        )
+
+    relative_run_path = artifacts_root / FIXED_RUN_ID
+    absolute_run_path = (invocation_cwd / relative_run_path).resolve(strict=True)
+    assert result.exit_code == 0, result.output
+    assert f"artifact_path={relative_run_path}" in result.output
+    assert len(contexts) == 1
+    context = contexts[0]
+    assert context.workspace == absolute_run_path / "workspace"
+    assert context.overlay_dir == context.workspace / ".repotrial-overlays"
+    assert context.accepted_compose_dir == context.workspace / ".repotrial-accepted"
+    assert context.artifact_dir == absolute_run_path / "evidence"
+    assert all(
+        path.is_absolute()
+        for path in (
+            context.workspace,
+            context.overlay_dir,
+            context.accepted_compose_dir,
+            context.artifact_dir,
+        )
+    )
+    assert context.overlay_dir.is_relative_to(context.workspace)
+    assert context.accepted_compose_dir.is_relative_to(context.workspace)
+    assert not context.artifact_dir.is_relative_to(context.workspace)
+    assert (absolute_run_path / "report" / "trial-report.json").is_file()
     assert provider.active_sandboxes == set()
 
 
