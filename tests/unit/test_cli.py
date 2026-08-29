@@ -147,7 +147,9 @@ def test_docker_sbx_inspect_requires_a_full_lowercase_commit_sha_before_artifact
     assert not artifacts_root.exists()
 
 
-def test_cli_docker_sbx_default_keeps_a_1024_mb_memory_bound() -> None:
+def test_cli_docker_sbx_default_uses_supported_cpu_and_keeps_memory_bound() -> None:
+    assert cli._DEFAULT_DOCKER_SBX_POLICY.cpus == 1
+    assert isinstance(cli._DEFAULT_DOCKER_SBX_POLICY.cpus, int)
     assert cli._DEFAULT_DOCKER_SBX_POLICY.memory_mb == 1024
 
 

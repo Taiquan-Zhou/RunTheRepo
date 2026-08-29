@@ -200,7 +200,7 @@ def _policy(
     *, deny_network: frozenset[str] = frozenset(), total_duration_s: int = 300
 ) -> DockerSbxPolicy:
     return DockerSbxPolicy(
-        cpus=1.5,
+        cpus=1,
         memory_mb=512,
         pids_limit=64,
         disk_mb=2048,
@@ -254,7 +254,7 @@ def test_policy_rejects_non_positive_or_non_finite_limits(
     field: str, value: object
 ) -> None:
     values: dict[str, object] = {
-        "cpus": 1.0,
+        "cpus": 1,
         "memory_mb": 512,
         "pids_limit": 64,
         "disk_mb": 2048,
@@ -264,6 +264,18 @@ def test_policy_rejects_non_positive_or_non_finite_limits(
 
     with pytest.raises((TypeError, ValueError), match=field):
         DockerSbxPolicy(**values)
+
+
+@pytest.mark.parametrize("cpus", [1.0, 1.5])
+def test_policy_rejects_non_integer_cpu_values(cpus: float) -> None:
+    with pytest.raises(ValueError, match="cpus must be a positive integer"):
+        DockerSbxPolicy(
+            cpus=cpus,
+            memory_mb=512,
+            pids_limit=64,
+            disk_mb=2048,
+            total_duration_s=300,
+        )
 
 
 def test_policy_is_immutable_and_mandatory_denies_cannot_be_removed() -> None:
@@ -530,7 +542,7 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
         sandbox_id,
         "--clone",
         "--cpus",
-        "1.5",
+        "1",
         "--memory",
         "512m",
     ]

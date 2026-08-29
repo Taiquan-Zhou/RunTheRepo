@@ -18,7 +18,8 @@ from repotrial.api.registry import (
 from repotrial.domain.enums import Verdict
 from repotrial.domain.models import JourneyResult, RunState
 from repotrial.report.render import render_trial_report
-from repotrial.sandbox.docker_sbx import DockerSbxUnsupportedError
+from repotrial.sandbox.base import SandboxProvider
+from repotrial.sandbox.docker_sbx import DockerSbxPolicy, DockerSbxUnsupportedError
 from repotrial.sandbox.fake import FakeSandboxProvider
 
 
@@ -114,6 +115,26 @@ def test_healthz_reports_ready_without_probing_sandbox() -> None:
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
     assert provider_calls == []
+
+
+def test_api_default_provider_uses_a_supported_integer_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import repotrial.api.app as app_module
+
+    captured_policies: list[DockerSbxPolicy] = []
+    provider = FakeSandboxProvider()
+
+    def recording_provider(policy: DockerSbxPolicy) -> SandboxProvider:
+        captured_policies.append(policy)
+        return provider
+
+    monkeypatch.setattr(app_module, "DockerSbxProvider", recording_provider)
+
+    assert app_module._default_provider() is provider
+    assert len(captured_policies) == 1
+    assert captured_policies[0].cpus == 1
+    assert isinstance(captured_policies[0].cpus, int)
 
 
 def test_healthz_is_unavailable_without_ready_registry() -> None:

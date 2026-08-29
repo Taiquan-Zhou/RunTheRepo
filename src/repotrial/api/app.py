@@ -50,7 +50,7 @@ _MEDIA_PARAMETER = re.compile(
 )
 _QVALUE = re.compile(r"(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)\Z")
 _DEFAULT_POLICY = DockerSbxPolicy(
-    cpus=1.5, memory_mb=512, pids_limit=64, disk_mb=2048, total_duration_s=300
+    cpus=1, memory_mb=512, pids_limit=64, disk_mb=2048, total_duration_s=300
 )
 
 type ProviderFactory = Callable[[], SandboxProvider]

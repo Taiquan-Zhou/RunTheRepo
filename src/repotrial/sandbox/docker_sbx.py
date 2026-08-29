@@ -151,7 +151,7 @@ def calculate_disk_allocation(disk_mb: int) -> DiskAllocation:
 class DockerSbxPolicy:
     """Immutable resource and network limits applied to every new sandbox."""
 
-    cpus: float
+    cpus: int
     memory_mb: int
     pids_limit: int
     disk_mb: int
@@ -161,11 +161,10 @@ class DockerSbxPolicy:
     def __post_init__(self) -> None:
         if (
             isinstance(self.cpus, bool)
-            or not isinstance(self.cpus, (int, float))
-            or not math.isfinite(self.cpus)
+            or not isinstance(self.cpus, int)
             or self.cpus <= 0
         ):
-            raise ValueError("cpus must be positive and finite")
+            raise ValueError("cpus must be a positive integer")
         for field_name in (
             "memory_mb",
             "pids_limit",
@@ -236,7 +235,7 @@ class DockerSbxProvider(SandboxProvider):
             sandbox_id,
             "--clone",
             "--cpus",
-            _format_cpus(self._policy.cpus),
+            str(self._policy.cpus),
             "--memory",
             f"{self._policy.memory_mb}m",
         ]
@@ -729,10 +728,6 @@ def _has_token(output: bytes, token: str) -> bool:
     except UnicodeDecodeError:
         return False
     return re.search(rf"(?<![\w-]){re.escape(token)}(?![\w-])", decoded) is not None
-
-
-def _format_cpus(cpus: float) -> str:
-    return str(int(cpus)) if float(cpus).is_integer() else str(cpus)
 
 
 def _sanitized_environment() -> dict[str, str]:
