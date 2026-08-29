@@ -1,6 +1,6 @@
 # RepoTrial WSL2 Linux SBX Execution Design
 
-**Status:** Independently reviewed; pending Owner review
+**Status:** Independently reviewed and Owner approved
 
 **Date:** 2026-08-29
 
