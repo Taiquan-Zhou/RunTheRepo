@@ -937,6 +937,23 @@ def test_graph_rejects_tampered_baseline_journeys_before_candidate_replay(
     assert _candidate_create_calls(provider) == []
 
 
+def test_same_run_baseline_reentry_verifies_identical_canonical_journeys(
+    tmp_path: Path,
+) -> None:
+    provider = GraphProvider()
+    context, source = _context(tmp_path, provider)
+    state = _state(source.parent, run_id="same-run-reentry")
+
+    for _ in range(2):
+        graph = build_run_graph(interrupt_after=("baseline",))
+        result = asyncio.run(ainvoke_run(graph, state, context=context))
+        assert result.stage_history == ["intake", "baseline"]
+
+    artifact = graph_module._baseline_journey_artifact(state, context)
+    assert artifact.is_file()
+    assert [call for call in provider.calls if call[0] == "create"] == []
+
+
 def test_missing_commit_uses_narrow_repository_pinner_then_real_baseline(
     tmp_path: Path,
 ) -> None:

@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import stat
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -17,23 +18,24 @@ class JourneyArtifactError(RuntimeError):
 
 
 def write_baseline_journeys(path: Path, journeys: Sequence[Journey]) -> str:
-    """Persist the exact baseline Journey payload once and return its SHA-256."""
-    payload = _canonical_payload(journeys)
-    payload_hash = _sha256(payload)
-    document = (
-        _canonical_json_bytes(
-            {
-                "journeys": json.loads(payload),
-                "payload_sha256": payload_hash,
-                "schema_version": _SCHEMA_VERSION,
-            }
-        )
-        + b"\n"
-    )
-    if len(document) > _MAX_ARTIFACT_BYTES:
-        raise JourneyArtifactError("baseline journey artifact exceeds byte budget")
+    """Atomically persist the exact baseline Journey payload once."""
+    document, payload_hash = _document_for(journeys)
     _create_new_file(path, document)
     return payload_hash
+
+
+def write_or_verify_baseline_journeys(path: Path, journeys: Sequence[Journey]) -> str:
+    """Persist once, or accept an identical complete canonical reentry."""
+    if not isinstance(path, Path):
+        raise TypeError("baseline journey artifact path must be a Path")
+    if path.exists() or path.is_symlink():
+        return verify_baseline_journeys(path, journeys)
+    try:
+        return write_baseline_journeys(path, journeys)
+    except JourneyArtifactError as error:
+        if "already in use" not in str(error):
+            raise
+    return verify_baseline_journeys(path, journeys)
 
 
 def verify_baseline_journeys(path: Path, journeys: Sequence[Journey]) -> str:
@@ -49,6 +51,24 @@ def verify_baseline_journeys(path: Path, journeys: Sequence[Journey]) -> str:
     return expected_hash
 
 
+def _document_for(journeys: Sequence[Journey]) -> tuple[bytes, str]:
+    payload = _canonical_payload(journeys)
+    payload_hash = _sha256(payload)
+    document = (
+        _canonical_json_bytes(
+            {
+                "journeys": json.loads(payload),
+                "payload_sha256": payload_hash,
+                "schema_version": _SCHEMA_VERSION,
+            }
+        )
+        + b"\n"
+    )
+    if len(document) > _MAX_ARTIFACT_BYTES:
+        raise JourneyArtifactError("baseline journey artifact exceeds byte budget")
+    return document, payload_hash
+
+
 def _canonical_payload(journeys: Sequence[Journey]) -> bytes:
     if isinstance(journeys, (str, bytes)):
         raise TypeError("journeys must be a Journey sequence")
@@ -61,13 +81,24 @@ def _canonical_payload(journeys: Sequence[Journey]) -> bytes:
 
 
 def _read_document(path: Path) -> dict[str, object]:
-    _validate_existing_file(path)
+    initial = _validate_existing_file(path)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
     try:
-        payload = path.read_bytes()
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or not _same_identity(initial, opened):
+            raise JourneyArtifactError("baseline journey artifact target changed")
+        payload = os.read(descriptor, _MAX_ARTIFACT_BYTES + 1)
+    except JourneyArtifactError:
+        raise
     except OSError as error:
         raise JourneyArtifactError(
             "could not read baseline journey artifact"
         ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     if len(payload) > _MAX_ARTIFACT_BYTES:
         raise JourneyArtifactError("baseline journey artifact exceeds byte budget")
     try:
@@ -107,19 +138,70 @@ def _create_new_file(path: Path, payload: bytes) -> None:
     _validate_parent(path.parent)
     if path.exists() or path.is_symlink():
         raise JourneyArtifactError("baseline journey artifact is already in use")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor: int | None = None
     try:
-        descriptor = os.open(path, flags, 0o600)
-        with os.fdopen(descriptor, "wb", closefd=True) as output:
-            output.write(payload)
-    except OSError as error:
+        descriptor = os.open(temporary, flags, 0o600)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise JourneyArtifactError(
+                "baseline journey temporary is not a regular file"
+            )
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.link(temporary, path, follow_symlinks=False)
+    except FileExistsError as error:
         raise JourneyArtifactError(
             "baseline journey artifact is already in use"
         ) from error
+    except JourneyArtifactError:
+        raise
+    except OSError as error:
+        if path.exists() or path.is_symlink():
+            raise JourneyArtifactError(
+                "baseline journey artifact is already in use"
+            ) from error
+        raise JourneyArtifactError(
+            "could not publish baseline journey artifact"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise JourneyArtifactError(
+                "could not remove baseline journey temporary"
+            ) from error
     _validate_existing_file(path)
 
 
-def _validate_existing_file(path: Path) -> None:
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    try:
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("short write made no progress")
+            offset += written
+    except OSError as error:
+        raise JourneyArtifactError(
+            "could not write baseline journey artifact"
+        ) from error
+
+
+def _validate_existing_file(path: Path) -> os.stat_result:
     if not isinstance(path, Path):
         raise TypeError("baseline journey artifact path must be a Path")
     _validate_parent(path.parent)
@@ -133,6 +215,7 @@ def _validate_existing_file(path: Path) -> None:
         raise JourneyArtifactError(
             "baseline journey artifact is not a real regular file"
         )
+    return path_stat
 
 
 def _validate_parent(path: Path) -> None:
@@ -147,6 +230,10 @@ def _validate_parent(path: Path) -> None:
         raise JourneyArtifactError(
             "baseline journey artifact parent is not a real directory"
         )
+
+
+def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
 
 
 def _is_link(path: Path) -> bool:

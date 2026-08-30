@@ -22,7 +22,23 @@ type ModelAttemptOutcome = Literal[
 type ModelAttemptPurpose = Literal["journey", "recovery"]
 
 _SCHEMA_VERSION = 1
+_MAX_ATTEMPT_SLOTS = 9_999
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+_PURPOSE_PREFIXES: dict[ModelAttemptPurpose, str] = {
+    "journey": "baseline-model-attempt",
+    "recovery": "recovery-model-attempt",
+}
+_FAILURE_OUTCOMES: frozenset[str] = frozenset(
+    {
+        "planner_timeout",
+        "transport_error",
+        "http_error",
+        "response_too_large",
+        "structured_response_invalid",
+        "policy_rejected",
+        "adapter_error",
+    }
+)
 
 
 class ModelAttemptEvidenceError(RuntimeError):
@@ -34,23 +50,24 @@ class ModelAttemptRecorder:
 
     def __init__(
         self,
-        path: Path,
+        evidence_dir: Path,
         *,
         purpose: ModelAttemptPurpose,
         system: str,
         user: str,
         schema: type[BaseModel],
     ) -> None:
-        if purpose not in {"journey", "recovery"}:
+        if purpose not in _PURPOSE_PREFIXES:
             raise ValueError("invalid model attempt purpose")
         if not isinstance(system, str) or not isinstance(user, str):
             raise TypeError("model inputs must be strings")
         schema_bytes = _canonical_schema_bytes(schema)
-        self._path = path
         self._started_at = time.monotonic()
         self._finished = False
-        self._identity = _create_new_file(
-            path,
+        self._purpose = purpose
+        self._path, self._identity = _claim_attempt_slot(
+            evidence_dir,
+            _PURPOSE_PREFIXES[purpose],
             _serialize(
                 {
                     "elapsed_s": 0.0,
@@ -67,7 +84,10 @@ class ModelAttemptRecorder:
                 }
             ),
         )
-        self._purpose = purpose
+
+    @property
+    def path(self) -> Path:
+        return self._path
 
     def finish_success(
         self, accepted_output: object, *, journey_count: int | None
@@ -84,8 +104,8 @@ class ModelAttemptRecorder:
         )
 
     def finish_failure(self, outcome: ModelAttemptOutcome) -> None:
-        if outcome == "success":
-            raise ValueError("success must include accepted output")
+        if outcome not in _FAILURE_OUTCOMES:
+            raise ValueError("invalid model attempt outcome")
         self._finish(outcome, accepted_output_sha256=None, journey_count=None)
 
     def _finish(
@@ -145,45 +165,99 @@ def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def _create_new_file(path: Path, payload: bytes) -> tuple[int, int]:
-    _validate_new_path(path)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+def _claim_attempt_slot(
+    evidence_dir: Path, prefix: str, payload: bytes
+) -> tuple[Path, tuple[int, int]]:
+    if not isinstance(evidence_dir, Path):
+        raise TypeError("model evidence directory must be a Path")
+    _validate_parent(evidence_dir)
+    for slot in range(1, _MAX_ATTEMPT_SLOTS + 1):
+        path = evidence_dir / f"{prefix}-{slot:04d}.jsonl"
+        claimed = _try_create_new_file(path, payload)
+        if claimed is not None:
+            return path, claimed
+    raise ModelAttemptEvidenceError("model evidence attempt slots are exhausted")
+
+
+def _try_create_new_file(path: Path, payload: bytes) -> tuple[int, int] | None:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor: int | None = None
     try:
         descriptor = os.open(path, flags, 0o600)
-        with os.fdopen(descriptor, "wb", closefd=True) as output:
-            output.write(payload)
+    except FileExistsError:
+        return None
     except OSError as error:
-        raise ModelAttemptEvidenceError(
-            "model evidence target is already in use"
-        ) from error
-    return _file_identity(path)
+        raise ModelAttemptEvidenceError("could not create model evidence") from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ModelAttemptEvidenceError(
+                "model evidence target is not a real regular file"
+            )
+        _write_all(descriptor, payload, "create")
+        os.fsync(descriptor)
+        return opened.st_dev, opened.st_ino
+    except ModelAttemptEvidenceError:
+        raise
+    except OSError as error:
+        raise ModelAttemptEvidenceError("could not create model evidence") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _append_existing_file(
     path: Path, expected_identity: tuple[int, int], payload: bytes
 ) -> None:
     _validate_parent(path.parent)
-    if _file_identity(path) != expected_identity:
-        raise ModelAttemptEvidenceError("model evidence target changed")
-    flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_WRONLY
+        | os.O_APPEND
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor: int | None = None
     try:
         descriptor = os.open(path, flags)
-        with os.fdopen(descriptor, "ab", closefd=True) as output:
-            if _file_identity(path) != expected_identity:
-                raise ModelAttemptEvidenceError("model evidence target changed")
-            output.write(payload)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (
+                opened.st_dev,
+                opened.st_ino,
+            )
+            != expected_identity
+        ):
+            raise ModelAttemptEvidenceError("model evidence target changed")
+        _write_all(descriptor, payload, "append")
+        os.fsync(descriptor)
     except ModelAttemptEvidenceError:
         raise
     except OSError as error:
         raise ModelAttemptEvidenceError("could not append model evidence") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
-def _validate_new_path(path: Path) -> None:
-    if not isinstance(path, Path):
-        raise TypeError("model evidence path must be a Path")
-    _validate_parent(path.parent)
-    if path.exists() or path.is_symlink():
-        raise ModelAttemptEvidenceError("model evidence target is already in use")
+def _write_all(descriptor: int, payload: bytes, operation: str) -> None:
+    offset = 0
+    try:
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("short write made no progress")
+            offset += written
+    except OSError as error:
+        raise ModelAttemptEvidenceError(
+            f"could not {operation} model evidence"
+        ) from error
 
 
 def _validate_parent(path: Path) -> None:
@@ -196,20 +270,6 @@ def _validate_parent(path: Path) -> None:
         ) from error
     if _is_link(path) or not stat.S_ISDIR(path_stat.st_mode) or resolved != path:
         raise ModelAttemptEvidenceError("model evidence parent is not a real directory")
-
-
-def _file_identity(path: Path) -> tuple[int, int]:
-    try:
-        path_stat = path.lstat()
-    except OSError as error:
-        raise ModelAttemptEvidenceError(
-            "model evidence target is unavailable"
-        ) from error
-    if _is_link(path) or not stat.S_ISREG(path_stat.st_mode):
-        raise ModelAttemptEvidenceError(
-            "model evidence target is not a real regular file"
-        )
-    return path_stat.st_dev, path_stat.st_ino
 
 
 def _is_link(path: Path) -> bool:

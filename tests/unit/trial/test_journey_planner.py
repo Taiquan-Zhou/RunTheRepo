@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 from pathlib import Path
 
@@ -241,18 +242,20 @@ def test_model_journey_failure_records_the_adapter_reason_without_changing_fail_
                 "model request failed", reason_code="transport_error"
             )
 
-    evidence_path = tmp_path / "baseline-model-attempt.jsonl"
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
 
     journeys = asyncio.run(
-        plan_journeys(
+        planner_module._plan_journeys_with_evidence(
             tmp_path,
             "no safe markdown links",
             FailingAdapter(),
-            evidence_path=evidence_path,
+            evidence_dir=evidence_dir,
         )
     )
 
     assert journeys == []
+    evidence_path = next(evidence_dir.glob("baseline-model-attempt-*.jsonl"))
     rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
     assert rows[-1]["outcome"] == "transport_error"
 
@@ -260,7 +263,8 @@ def test_model_journey_failure_records_the_adapter_reason_without_changing_fail_
 def test_model_journey_policy_rejection_is_recorded_without_raw_model_output(
     tmp_path: Path,
 ) -> None:
-    evidence_path = tmp_path / "baseline-model-attempt.jsonl"
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
     model = FakeModelAdapter(
         [
             {
@@ -280,18 +284,86 @@ def test_model_journey_policy_rejection_is_recorded_without_raw_model_output(
     )
 
     journeys = asyncio.run(
-        plan_journeys(
+        planner_module._plan_journeys_with_evidence(
             tmp_path,
             "no safe markdown links",
             model,
-            evidence_path=evidence_path,
+            evidence_dir=evidence_dir,
         )
     )
 
     assert journeys == []
+    evidence_path = next(evidence_dir.glob("baseline-model-attempt-*.jsonl"))
     content = evidence_path.read_text(encoding="utf-8")
     assert json.loads(content.splitlines()[-1])["outcome"] == "policy_rejected"
     assert "secret-value" not in content
+
+
+@pytest.mark.parametrize("error", [RuntimeError("boom"), ValueError("bad adapter")])
+def test_unknown_adapter_exception_records_terminal_adapter_error_and_fails_closed(
+    tmp_path: Path, error: Exception
+) -> None:
+    class UnknownFailingAdapter:
+        async def structured(
+            self, *, system: str, user: str, schema: type[BaseModel]
+        ) -> BaseModel:
+            del system, user, schema
+            raise error
+
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+
+    journeys = asyncio.run(
+        planner_module._plan_journeys_with_evidence(
+            tmp_path,
+            "no safe markdown links",
+            UnknownFailingAdapter(),
+            evidence_dir=evidence_dir,
+        )
+    )
+
+    path = next(evidence_dir.glob("baseline-model-attempt-*.jsonl"))
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert journeys == []
+    assert rows[-1]["phase"] == "terminal"
+    assert rows[-1]["outcome"] == "adapter_error"
+
+
+def test_public_planner_signature_and_unknown_adapter_fail_closed_are_preserved(
+    tmp_path: Path,
+) -> None:
+    class UnknownFailingAdapter:
+        async def structured(
+            self, *, system: str, user: str, schema: type[BaseModel]
+        ) -> BaseModel:
+            del system, user, schema
+            raise RuntimeError("boom")
+
+    assert "evidence_path" not in inspect.signature(plan_journeys).parameters
+    assert asyncio.run(plan_journeys(tmp_path, "", UnknownFailingAdapter())) == []
+
+
+def test_model_journey_reentry_uses_distinct_auditable_attempt_slots(
+    tmp_path: Path,
+) -> None:
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+
+    for _ in range(2):
+        journeys = asyncio.run(
+            planner_module._plan_journeys_with_evidence(
+                tmp_path,
+                "no safe markdown links",
+                FakeModelAdapter([_http_journey()]),
+                evidence_dir=evidence_dir,
+            )
+        )
+        assert journeys
+
+    assert [path.name for path in sorted(evidence_dir.iterdir())] == [
+        "baseline-model-attempt-0001.jsonl",
+        "baseline-model-attempt-0002.jsonl",
+    ]
 
 
 def test_mixed_tool_declared_journey_fails_closed_without_model_fallback(

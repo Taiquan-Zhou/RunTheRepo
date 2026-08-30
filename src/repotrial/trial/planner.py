@@ -104,6 +104,10 @@ class _ModelDeadlineExpired:
     pass
 
 
+class _UnknownAdapterError(RuntimeError):
+    pass
+
+
 _MODEL_DEADLINE_EXPIRED = _ModelDeadlineExpired()
 
 
@@ -113,8 +117,44 @@ async def propose_recovery(
     allowed_env_keys: set[str],
     repeated_error_count: int,
     model: ModelAdapter | None = None,
+) -> RecoveryAction:
+    return await _propose_recovery(
+        logs,
+        readme_excerpt,
+        allowed_env_keys,
+        repeated_error_count,
+        model,
+        evidence_dir=None,
+    )
+
+
+async def _propose_recovery_with_evidence(
+    logs: dict[str, str],
+    readme_excerpt: str,
+    allowed_env_keys: set[str],
+    repeated_error_count: int,
+    model: ModelAdapter,
     *,
-    evidence_path: Path | None = None,
+    evidence_dir: Path,
+) -> RecoveryAction:
+    return await _propose_recovery(
+        logs,
+        readme_excerpt,
+        allowed_env_keys,
+        repeated_error_count,
+        model,
+        evidence_dir=evidence_dir,
+    )
+
+
+async def _propose_recovery(
+    logs: dict[str, str],
+    readme_excerpt: str,
+    allowed_env_keys: set[str],
+    repeated_error_count: int,
+    model: ModelAdapter | None,
+    *,
+    evidence_dir: Path | None,
 ) -> RecoveryAction:
     if type(repeated_error_count) is not int or repeated_error_count < 0:
         raise ValueError("repeated_error_count must be a non-negative integer")
@@ -138,7 +178,7 @@ async def propose_recovery(
         return _stop("no recovery action")
 
     recorder = _model_attempt_recorder(
-        evidence_path,
+        evidence_dir,
         purpose="recovery",
         system=_recovery_system_prompt(),
         user=_model_input(evidence, readme_excerpt, authority),
@@ -157,6 +197,9 @@ async def propose_recovery(
     except TimeoutError:
         _record_model_failure(recorder, "planner_timeout")
         return _stop("model timeout")
+    except _UnknownAdapterError:
+        _record_model_failure(recorder, "adapter_error")
+        return _stop("model adapter error")
     except ValidationError:
         _record_model_failure(recorder, "policy_rejected")
         return _stop("unsafe proposal")
@@ -175,10 +218,30 @@ async def plan_journeys(
     repo_root: Path,
     readme_excerpt: str,
     model: ModelAdapter | None = None,
-    *,
-    evidence_path: Path | None = None,
 ) -> list[Journey]:
     """Plan bounded Journey data without executing any target workload."""
+    return await _plan_journeys(repo_root, readme_excerpt, model, evidence_dir=None)
+
+
+async def _plan_journeys_with_evidence(
+    repo_root: Path,
+    readme_excerpt: str,
+    model: ModelAdapter,
+    *,
+    evidence_dir: Path,
+) -> list[Journey]:
+    return await _plan_journeys(
+        repo_root, readme_excerpt, model, evidence_dir=evidence_dir
+    )
+
+
+async def _plan_journeys(
+    repo_root: Path,
+    readme_excerpt: str,
+    model: ModelAdapter | None,
+    *,
+    evidence_dir: Path | None,
+) -> list[Journey]:
     declared = _read_declared_journeys(repo_root)
     if declared is not None:
         return declared
@@ -195,7 +258,7 @@ async def plan_journeys(
         return []
 
     recorder = _model_attempt_recorder(
-        evidence_path,
+        evidence_dir,
         purpose="journey",
         system=_journey_system_prompt(),
         user=_journey_user_prompt(readme_excerpt),
@@ -208,6 +271,9 @@ async def plan_journeys(
         return []
     except TimeoutError:
         _record_model_failure(recorder, "planner_timeout")
+        return []
+    except _UnknownAdapterError:
+        _record_model_failure(recorder, "adapter_error")
         return []
     except (ValidationError, TypeError, ValueError):
         _record_model_failure(recorder, "policy_rejected")
@@ -348,7 +414,17 @@ async def _journey_proposal_before_deadline(
     if deadline in completed:
         _cancel_and_observe_journey_model_task(model_task)
         return _MODEL_DEADLINE_EXPIRED
-    proposal = model_task.result()
+    try:
+        proposal = model_task.result()
+    except (
+        ModelAdapterError,
+        TimeoutError,
+        ValidationError,
+        asyncio.CancelledError,
+    ):
+        raise
+    except Exception as error:
+        raise _UnknownAdapterError("unknown model adapter failure") from error
     if type(proposal) is not _JourneyProposal:
         raise ValueError("invalid journey proposal type")
     transport = _preflight_transport_structure(proposal)
@@ -825,7 +901,17 @@ async def _model_proposal_before_deadline(
     if deadline in completed:
         _cancel_and_observe_model_task(model_task)
         return _MODEL_DEADLINE_EXPIRED
-    return model_task.result()
+    try:
+        return model_task.result()
+    except (
+        ModelAdapterError,
+        TimeoutError,
+        ValidationError,
+        asyncio.CancelledError,
+    ):
+        raise
+    except Exception as error:
+        raise _UnknownAdapterError("unknown model adapter failure") from error
 
 
 def _cancel_and_observe_model_task(task: asyncio.Task[RecoveryAction]) -> None:
@@ -944,17 +1030,17 @@ def _recovery_system_prompt() -> str:
 
 
 def _model_attempt_recorder(
-    evidence_path: Path | None,
+    evidence_dir: Path | None,
     *,
     purpose: ModelAttemptPurpose,
     system: str,
     user: str,
     schema: type[BaseModel],
 ) -> ModelAttemptRecorder | None:
-    if evidence_path is None:
+    if evidence_dir is None:
         return None
     return ModelAttemptRecorder(
-        evidence_path,
+        evidence_dir,
         purpose=purpose,
         system=system,
         user=user,

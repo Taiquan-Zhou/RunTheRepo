@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 from pathlib import Path
 from typing import cast
@@ -6,6 +7,7 @@ from typing import cast
 import pytest
 
 from repotrial.models.base import ModelAdapter, RecoveryAction
+from repotrial.trial import planner as planner_module
 from repotrial.trial.planner import propose_recovery
 from repotrial.trial.recovery_context import project_recovery_evidence
 
@@ -169,24 +171,87 @@ def test_missing_allowlisted_env_proposes_fixed_synthetic_value() -> None:
 def test_model_recovery_evidence_is_written_to_the_claimed_attempt_directory(
     tmp_path: Path,
 ) -> None:
-    evidence_path = tmp_path / "baseline-model-attempt.jsonl"
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
     model = FakeModelAdapter(RecoveryAction(action="retry", params={}, reason="retry"))
 
+    action = asyncio.run(
+        planner_module._propose_recovery_with_evidence(
+            {"logs": "unrecognized startup failure"},
+            "",
+            set(),
+            0,
+            model,
+            evidence_dir=evidence_dir,
+        )
+    )
+
+    evidence_path = next(evidence_dir.glob("recovery-model-attempt-*.jsonl"))
+    rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    assert action.action == "retry"
+    assert rows[0]["purpose"] == "recovery"
+    assert rows[-1]["outcome"] == "success"
+
+
+def test_unknown_recovery_adapter_exception_records_terminal_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    class UnknownFailingAdapter:
+        async def structured(
+            self,
+            *,
+            system: str,
+            user: str,
+            schema: type[RecoveryAction],
+        ) -> RecoveryAction:
+            del system, user, schema
+            raise RuntimeError("boom")
+
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+
+    action = asyncio.run(
+        planner_module._propose_recovery_with_evidence(
+            {"logs": "unrecognized startup failure"},
+            "",
+            set(),
+            0,
+            UnknownFailingAdapter(),
+            evidence_dir=evidence_dir,
+        )
+    )
+
+    path = next(evidence_dir.glob("recovery-model-attempt-*.jsonl"))
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert action.action == "stop"
+    assert rows[-1]["outcome"] == "adapter_error"
+
+
+def test_public_recovery_signature_and_unknown_adapter_fail_closed_are_preserved() -> (
+    None
+):
+    class UnknownFailingAdapter:
+        async def structured(
+            self,
+            *,
+            system: str,
+            user: str,
+            schema: type[RecoveryAction],
+        ) -> RecoveryAction:
+            del system, user, schema
+            raise RuntimeError("boom")
+
+    assert "evidence_path" not in inspect.signature(propose_recovery).parameters
     action = asyncio.run(
         propose_recovery(
             {"logs": "unrecognized startup failure"},
             "",
             set(),
             0,
-            model,
-            evidence_path=evidence_path,
+            UnknownFailingAdapter(),
         )
     )
-
-    rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
-    assert action.action == "retry"
-    assert rows[0]["purpose"] == "recovery"
-    assert rows[-1]["outcome"] == "success"
+    assert action.action == "stop"
 
 
 def test_projected_boot_evidence_avoids_invalid_recovery_evidence() -> None:
