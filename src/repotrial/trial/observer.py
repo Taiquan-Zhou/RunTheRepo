@@ -129,6 +129,20 @@ class _CollectionBudget:
         raise ObservationParseError("unsupported JSON value")
 
 
+@dataclass(slots=True)
+class _ServiceAuditInput:
+    container_id: str
+    inspect_argv: list[str]
+    inspect_stdout: str
+    inspect_parsed: object
+    diff_argv: list[str]
+    diff_stdout: str
+    diff_parsed: object
+    top_argv: list[str]
+    top_stdout: str
+    top_parsed: object
+
+
 async def collect_observation(
     provider: SandboxProvider,
     sandbox_id: str,
@@ -222,7 +236,7 @@ async def _collect_observation(
     inspect_by_service: dict[str, list[dict[str, object]]] = {}
     file_changes: list[dict[str, object]] = []
     process_events: list[dict[str, object]] = []
-    audit_services: dict[str, list[dict[str, object]]] = {}
+    audit_service_inputs: dict[str, list[_ServiceAuditInput]] = {}
 
     for service, container_id in containers:
         inspect_argv = ["docker", "inspect", container_id]
@@ -285,15 +299,19 @@ async def _collect_observation(
             }
             for row in parsed_top
         )
-        audit_services.setdefault(service, []).append(
-            {
-                "container_id": container_id,
-                "inspect": _command_audit(
-                    inspect_argv, inspect_result.stdout, inspect_data
-                ),
-                "diff": _command_audit(diff_argv, diff_result.stdout, parsed_diff),
-                "top": _command_audit(top_argv, top_result.stdout, parsed_top),
-            }
+        audit_service_inputs.setdefault(service, []).append(
+            _ServiceAuditInput(
+                container_id=container_id,
+                inspect_argv=inspect_argv,
+                inspect_stdout=inspect_result.stdout,
+                inspect_parsed=inspect_data,
+                diff_argv=diff_argv,
+                diff_stdout=diff_result.stdout,
+                diff_parsed=parsed_diff,
+                top_argv=top_argv,
+                top_stdout=top_result.stdout,
+                top_parsed=parsed_top,
+            )
         )
 
     (
@@ -313,24 +331,6 @@ async def _collect_observation(
         network_events=network_events,
         unsupported_collectors=unsupported_collectors,
     )
-    audit = {
-        "schema_version": 1,
-        "discovery": _command_audit(
-            discovery_argv,
-            discovery_result.stdout,
-            [
-                {"service": service, "container_id": container_id}
-                for service, container_id in containers
-            ],
-        ),
-        "services": audit_services,
-        "network_runtime": {
-            "supported": network_result.supported,
-            "unsupported_reason": network_result.unsupported_reason,
-            "parsed": network_events,
-        },
-        "snapshot": snapshot.model_dump(mode="json"),
-    }
     audit_argv: list[str] = []
     if recorder is not None:
         recorder.record_start(
@@ -340,6 +340,48 @@ async def _collect_observation(
             reason="audit_started",
         )
     try:
+        audit_services = {
+            service: [
+                {
+                    "container_id": item.container_id,
+                    "inspect": _command_audit(
+                        item.inspect_argv,
+                        item.inspect_stdout,
+                        item.inspect_parsed,
+                    ),
+                    "diff": _command_audit(
+                        item.diff_argv,
+                        item.diff_stdout,
+                        item.diff_parsed,
+                    ),
+                    "top": _command_audit(
+                        item.top_argv,
+                        item.top_stdout,
+                        item.top_parsed,
+                    ),
+                }
+                for item in items
+            ]
+            for service, items in audit_service_inputs.items()
+        }
+        audit = {
+            "schema_version": 1,
+            "discovery": _command_audit(
+                discovery_argv,
+                discovery_result.stdout,
+                [
+                    {"service": service, "container_id": container_id}
+                    for service, container_id in containers
+                ],
+            ),
+            "services": audit_services,
+            "network_runtime": {
+                "supported": network_result.supported,
+                "unsupported_reason": network_result.unsupported_reason,
+                "parsed": network_events,
+            },
+            "snapshot": snapshot.model_dump(mode="json"),
+        }
         serialized_audit = _serialize_artifact(audit)
     except BaseException as error:
         if recorder is not None:

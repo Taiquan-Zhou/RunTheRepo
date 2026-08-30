@@ -277,6 +277,69 @@ def test_audit_serialization_failures_receive_audit_terminal(
     assert rows[-1]["reason"] == reason
 
 
+def test_unencodable_stdout_records_one_audit_assembly_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scripts = _scripts()
+    scripts[("docker", "inspect", CONTAINER_ID)] = _result(
+        '[{"Config":{"Env":[]},"raw":"\ud800"}]'
+    )
+    artifact = tmp_path / "observation.json"
+    evidence = tmp_path / "observer-boundary.jsonl"
+    recorded_primaries: list[BaseException] = []
+    real_record_terminal = (
+        ObservationEvidenceRecorder.record_terminal_preserving_primary
+    )
+
+    def record_primary(
+        recorder: ObservationEvidenceRecorder, *args: object, **kwargs: object
+    ) -> None:
+        primary = kwargs["primary"]
+        assert isinstance(primary, BaseException)
+        recorded_primaries.append(primary)
+        real_record_terminal(recorder, *args, **kwargs)
+
+    monkeypatch.setattr(
+        ObservationEvidenceRecorder,
+        "record_terminal_preserving_primary",
+        record_primary,
+    )
+
+    with pytest.raises(ObservationParseError) as raised:
+        _collect(_Provider(scripts), artifact, evidence)
+
+    assert type(raised.value) is ObservationParseError
+    assert str(raised.value) == "collector stdout is not valid UTF-8 text"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert len(recorded_primaries) == 1
+    assert recorded_primaries[0] is raised.value
+    rows = _rows(evidence)
+    collector_terminals = [
+        row for row in rows if row["operation"] != "audit" and row["outcome"] != "start"
+    ]
+    assert collector_terminals
+    assert {row["outcome"] for row in collector_terminals} == {"success"}
+    assert [
+        (row["operation"], row["outcome"])
+        for row in rows
+        if row["operation"] == "audit"
+    ] == [
+        ("audit", "start"),
+        ("audit", "failure"),
+    ]
+    assert [row["operation"] for row in collector_terminals] == [
+        "discovery",
+        "inspect",
+        "diff",
+        "top",
+        "network",
+    ]
+    assert rows[-1]["phase"] == "serialization"
+    assert rows[-1]["reason"] == "audit_serialization_failed"
+    assert not artifact.exists()
+
+
 class _ArtifactCollisionProvider(_Provider):
     def __init__(
         self, scripts: Mapping[tuple[str, ...], object], artifact: Path
