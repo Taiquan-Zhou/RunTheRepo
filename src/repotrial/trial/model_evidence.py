@@ -88,7 +88,6 @@ class ModelAttemptRecorder:
             ),
         )
         self._descriptor: int | None = descriptor
-        self._last_close_error: ModelAttemptEvidenceError | None = None
 
     @property
     def path(self) -> Path:
@@ -117,20 +116,15 @@ class ModelAttemptRecorder:
         descriptor = self._descriptor
         if descriptor is None:
             return
+        self._descriptor = None
         try:
             os.close(descriptor)
         except OSError as error:
             close_error = ModelAttemptEvidenceError("could not close model evidence")
-            self._last_close_error = close_error
             raise close_error from error
-        self._descriptor = None
-        self._last_close_error = None
 
     def _close_preserving_primary(self, primary: BaseException) -> None:
-        if self._descriptor is None or primary is self._last_close_error:
-            return
-        if self._last_close_error is not None:
-            _add_close_failure_note(primary)
+        if self._descriptor is None:
             return
         try:
             self.close()

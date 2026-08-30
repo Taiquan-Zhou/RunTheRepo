@@ -218,6 +218,7 @@ def test_model_attempt_start_primary_failure_survives_secondary_close_failure(
 
     def fail_close(descriptor: int) -> None:
         close_attempts.append(descriptor)
+        real_close(descriptor)
         raise OSError("secondary close")
 
     monkeypatch.setattr("repotrial.trial.model_evidence.os.open", record_open)
@@ -283,6 +284,7 @@ def test_model_attempt_terminal_primary_failure_survives_secondary_close_failure
 
     def fail_close(descriptor: int) -> None:
         close_attempts.append(descriptor)
+        real_close(descriptor)
         raise OSError("secondary close")
 
     if primary_phase == "write":
@@ -298,7 +300,6 @@ def test_model_attempt_terminal_primary_failure_survives_secondary_close_failure
             recorder.finish_failure("adapter_error")
     finally:
         monkeypatch.setattr("repotrial.trial.model_evidence.os.close", real_close)
-        recorder.close()
         _close_if_open(claimed, real_close)
 
     assert isinstance(caught.value.__cause__, OSError)
@@ -307,7 +308,7 @@ def test_model_attempt_terminal_primary_failure_survives_secondary_close_failure
     assert close_attempts == [claimed]
 
 
-def test_model_attempt_close_only_failure_retains_ownership_for_explicit_close(
+def test_model_attempt_close_only_failure_drops_uncertain_ownership_without_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     real_open = os.open
@@ -320,9 +321,10 @@ def test_model_attempt_close_only_failure_retains_ownership_for_explicit_close(
         opened.append(descriptor)
         return descriptor
 
-    def fail_close(descriptor: int) -> None:
+    def uncertain_close(descriptor: int) -> None:
         close_attempts.append(descriptor)
-        raise OSError("close-only failure")
+        real_close(descriptor)
+        raise OSError("raw close secret")
 
     monkeypatch.setattr("repotrial.trial.model_evidence.os.open", record_open)
     recorder = ModelAttemptRecorder(
@@ -333,25 +335,30 @@ def test_model_attempt_close_only_failure_retains_ownership_for_explicit_close(
         schema=_Proposal,
     )
     claimed = opened[0]
-    monkeypatch.setattr("repotrial.trial.model_evidence.os.close", fail_close)
+    monkeypatch.setattr("repotrial.trial.model_evidence.os.close", uncertain_close)
 
     with pytest.raises(ModelAttemptEvidenceError, match="could not close") as caught:
         recorder.close()
 
     assert isinstance(caught.value.__cause__, OSError)
-    assert str(caught.value.__cause__) == "close-only failure"
+    assert str(caught.value) == "could not close model evidence"
+    assert str(caught.value.__cause__) == "raw close secret"
     assert close_attempts == [claimed]
-    os.fstat(claimed)
     assert "__del__" not in ModelAttemptRecorder.__dict__
 
-    monkeypatch.setattr("repotrial.trial.model_evidence.os.close", real_close)
+    victim = tmp_path / "victim.txt"
+    victim_descriptor = real_open(victim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
+        assert victim_descriptor == claimed
         recorder.close()
         recorder.close()
-        with pytest.raises(OSError):
-            os.fstat(claimed)
+        assert close_attempts == [claimed]
+        assert os.write(victim_descriptor, b"victim remains usable") == 21
+        os.fsync(victim_descriptor)
     finally:
-        _close_if_open(claimed, real_close)
+        _close_if_open(victim_descriptor, real_close)
+
+    assert victim.read_bytes() == b"victim remains usable"
 
 
 def test_model_attempt_short_writes_are_completed_and_fsynced(
