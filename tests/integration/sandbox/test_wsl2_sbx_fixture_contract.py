@@ -6,6 +6,7 @@ import sys
 import threading
 from pathlib import Path
 from types import ModuleType
+from urllib.request import ProxyHandler, build_opener
 
 import pytest
 from ruamel.yaml import YAML
@@ -25,6 +26,43 @@ def calibration_module() -> ModuleType:
     sys.modules[module_name] = module
     specification.loader.exec_module(module)
     return module
+
+
+def test_calibration_loopback_opener_disables_environment_proxies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("http_proxy", "http://proxy.example.invalid:3128")
+    monkeypatch.setenv("https_proxy", "http://proxy.example.invalid:3129")
+    configured_handlers: tuple[object, ...] | None = None
+
+    def record_build_opener(*handlers: object) -> object:
+        nonlocal configured_handlers
+        configured_handlers = handlers
+        return build_opener(*handlers)
+
+    monkeypatch.setattr("urllib.request.build_opener", record_build_opener)
+    module_name = "_repotrial_wsl2_sbx_calibration_proxy_contract"
+    specification = importlib.util.spec_from_file_location(
+        module_name, _CALIBRATION_TEST_PATH
+    )
+    assert specification is not None and specification.loader is not None
+    module = importlib.util.module_from_spec(specification)
+    sys.modules[module_name] = module
+    try:
+        specification.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    assert configured_handlers is not None
+    configured_proxy_handlers = [
+        handler for handler in configured_handlers if isinstance(handler, ProxyHandler)
+    ]
+    assert len(configured_proxy_handlers) == 1
+    assert configured_proxy_handlers[0].proxies == {}
+    assert not any(
+        isinstance(handler, ProxyHandler)
+        for handler in module._LOOPBACK_OPENER.handlers
+    )
 
 
 def test_wsl2_compose_fixture_has_pinned_minimal_web_service() -> None:

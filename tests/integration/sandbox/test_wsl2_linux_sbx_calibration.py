@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, Protocol
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 import pytest
 
@@ -107,7 +107,7 @@ class _RejectLoopbackRedirect(HTTPRedirectHandler):
         raise AssertionError("loopback marker request redirected")
 
 
-_LOOPBACK_OPENER = build_opener(_RejectLoopbackRedirect())
+_LOOPBACK_OPENER = build_opener(ProxyHandler({}), _RejectLoopbackRedirect())
 
 
 def _run_host(
