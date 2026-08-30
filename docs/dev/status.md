@@ -213,3 +213,28 @@
 - Environment recovery now hands execution to existing Task 2 of the M7.5
   compatibility-recovery plan. The frozen manifest, repository order, SHAs,
   thresholds, and Boot/Recovery/Journey/experiment semantics are unchanged.
+
+## M7.5 final compatibility canary — FAILED
+
+- Frozen execution HEAD:
+  `bf62cc72ca3b77e305312f4cc54ff88d49e2bbff`; manifest SHA-256:
+  `4a963f0ee730ddf4be7243ad31cc2899ce19cdbfed3c4570498ff7d1c617551a`.
+- Final pre-canary gates: full pytest `1256 passed, 5 skipped`; branch coverage
+  `88.61%`; Ruff lint/format, mypy, pre-commit, and diff-check PASS; real SBX
+  basic/primary/timeout/cancellation `4 passed`; independent review APPROVED.
+- Umami `b08a3643-4390-4378-b378-a78686ba2ac2`: exact SHA; PostgreSQL disk
+  exhaustion evidence; terminal
+  `sandbox:clone_verification:total_duration_exhausted`; no completed report or
+  passing required Journey set; cleanup PASS and final inventory empty.
+- Listmonk `cc0cab03-8ca6-41ce-b359-9d5000bc15b5`: exact SHA; completed report
+  with `journeys=[]` (`0/0`); terminal `boot_recovery_stopped`; cleanup PASS and
+  final inventory empty.
+- changedetection.io `655948c0-d46f-473a-b232-b400768954d5`: exact SHA; Boot
+  PASS followed by `ObservationCollectionError`; terminal
+  `internal:observationcollectionerror`; no completed report or passing
+  required Journey set; cleanup PASS and final inventory empty.
+- Canary result: `0/3` passed against the required `2/3`. Repositories #4-#10
+  were not run. README, manifest, production code, frozen contracts, and the
+  known `pid_hard_bound_unsupported` limitation were not changed.
+
+**M7.5 COMPATIBILITY CANARY FAILED**

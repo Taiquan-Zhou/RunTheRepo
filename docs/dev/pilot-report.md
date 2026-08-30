@@ -555,3 +555,27 @@ before evidence; changedetection passed Boot directly.
 
 **Task 4 — NOT APPLICABLE (ENTRY GATE NOT MET)**. No readiness implementation
 or calibration is authorized.
+
+## 17. Final metric-bearing compatibility canary
+
+The canary ran at frozen execution HEAD
+`bf62cc72ca3b77e305312f4cc54ff88d49e2bbff` with the unchanged frozen
+manifest. Pre-execution repository gates passed: `1256 passed, 5 skipped`,
+branch coverage `88.61%`, Ruff lint/format, mypy, pre-commit, and diff-check.
+The trusted SBX basic/primary/timeout/cancellation suite passed `4` tests in
+`230.03 s`; SBX diagnose passed `12/12`. Independent scoped review returned
+APPROVED with no Critical or Important finding.
+
+| Repo | Run ID | Exact SHA | Report/Journeys | Terminal result | Cleanup |
+|---|---|---|---|---|---|
+| Umami | `b08a3643-4390-4378-b378-a78686ba2ac2` | PASS | no completed report / no passing required Journey set | `sandbox:clone_verification:total_duration_exhausted`; retained PostgreSQL `No space left on device` evidence | PASS; final inventory empty |
+| Listmonk | `cc0cab03-8ca6-41ce-b359-9d5000bc15b5` | PASS | completed JSON/HTML / `0/0` Journeys | `boot_recovery_stopped` | PASS; final inventory empty |
+| changedetection.io | `655948c0-d46f-473a-b232-b400768954d5` | PASS | no completed report / no passing required Journey set | `internal:observationcollectionerror` after Boot PASS | PASS; final inventory empty |
+
+The frozen pass criterion was met by `0/3` repositories; at least `2/3` was
+required. All attempts remain metric-bearing audit evidence. This failure does
+not invalidate the verified isolation, exact-SHA, total-duration, or cleanup
+evidence, and it does not claim PID hard-bound support. Repositories #4-#10
+were not run and README was not changed.
+
+**M7.5 COMPATIBILITY CANARY FAILED**
