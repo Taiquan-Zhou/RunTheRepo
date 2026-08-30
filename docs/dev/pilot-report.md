@@ -434,3 +434,31 @@ one execution HEAD/environment fingerprint. Cross-cohort reporting is separate:
 it retains Windows history, Linux diagnostic attempts, failed/infrastructure
 attempts, and explicit supersession links without mixing them into the current
 cohort numerator, denominator, latency, convergence, or cleanup result.
+
+## 13. M7.5 WSL2 compatibility diagnostic canary
+
+Task 2 resumed on the calibrated dedicated WSL2 Ubuntu 24.04 environment at
+execution HEAD `4565301f1307cfec3de8c97549c978244bce793d`. The frozen manifest
+hash matched, SBX was v0.39.0, diagnose was `12/12` PASS, and initial inventory
+was empty. The first three frozen repositories were each executed exactly once
+in order. Detailed bounded command, recovery, lifecycle, and inventory evidence
+is retained in
+[`pilot-evidence/m7.5-compatibility-diagnostic.md`](pilot-evidence/m7.5-compatibility-diagnostic.md).
+
+| Repo | Run ID | Role / metric attribution | Expected = actual SHA | Outer / evidence exit | Target workload started? | First failed command / phase | Recovery / exact stop reason | Cleanup / post-list |
+|---|---|---|---|---|---|---|---|---|
+| Umami | `c4c95907-43a2-465c-b14e-40519ab85134` | diagnostic / `diagnostic-only` | `ca661c7057984aa98ed4f7083d84dae2f65bfcb0` | `1` / `3` | `true` | `up`, baseline Boot, exit `1`: host artifact Compose path absent in guest | `stop` / `stopped` / `boot_recovery_stopped` | PASS / exact empty |
+| Listmonk | `efd48f46-5c24-4f3d-9c83-4dec02c61003` | diagnostic / `diagnostic-only` | `670c01717d48647093335cc23a6be6f4b79c3b6b` | `1` / `3` | `true` | `up`, baseline Boot, exit `1`: host artifact Compose path absent in guest | `stop` / `stopped` / `boot_recovery_stopped` | PASS / exact empty |
+| changedetection.io | `e8c3a9df-44c8-4e44-8857-d429ea80e9a3` | diagnostic / `diagnostic-only` | `5d9c7c6da76340597243e8163c4f2439237fa0e8` | `1` / `3` | `true` | `up`, baseline Boot, exit `1`: host artifact Compose path absent in guest | `stop` / `stopped` / `boot_recovery_stopped` | PASS / exact empty |
+
+**Dominant-cause ruling: 3/3 qualifying, Category A — same RepoTrial generic
+bug.** Each non-truncated retained Boot stream has the same command and phase,
+compatible exit, and normalized causal signature:
+`open <host-ext4-checkout>/artifacts/<run_id>/workspace/docker-compose.yml: no
+such file or directory`. This proves a generic host-to-guest Compose path
+mapping/command-construction defect after the target-workload execution boundary
+but before any target service started. The ruling does not
+come from `boot_recovery_stopped`, has no dissenting repository, and does not
+establish Task 3's bounded-recovery or missing-environment entry gate. No later
+task was started. All three lifecycle cleanups succeeded and all three
+post-attempt inventories were exactly empty.
