@@ -36,6 +36,7 @@ class _DestinationClaim:
     device: int
     inode: int
     file_type: int
+    directory_fd: int | None
 
 
 def parse_github_url(url: str, requested_ref: str | None = None) -> RepoRef:
@@ -138,6 +139,8 @@ async def clone_and_resolve(
     except RepoIntakeError:
         _remove_owned_destination(claim)
         raise
+    finally:
+        _close_directory_fd(claim.directory_fd)
 
 
 def _validate_requested_ref(requested_ref: str | None) -> None:
@@ -230,17 +233,48 @@ def _claim_destination(destination: Path) -> _DestinationClaim:
         raise RepoIntakeError("destination_exists") from None
     except OSError:
         raise RepoIntakeError("destination_create") from None
+    directory_fd: int | None = None
     try:
         identity = destination.lstat()
+        if not stat.S_ISDIR(identity.st_mode):
+            raise RepoIntakeError("destination_claim")
+
+        flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            directory_fd = os.open(destination, flags)
+        except PermissionError:
+            if os.name != "nt":
+                raise
+
+        if directory_fd is not None:
+            os.set_inheritable(directory_fd, False)
+            opened_identity = os.fstat(directory_fd)
+            current_identity = destination.lstat()
+            if (
+                opened_identity.st_dev != identity.st_dev
+                or opened_identity.st_ino != identity.st_ino
+                or stat.S_IFMT(opened_identity.st_mode) != stat.S_IFMT(identity.st_mode)
+                or current_identity.st_dev != identity.st_dev
+                or current_identity.st_ino != identity.st_ino
+                or stat.S_IFMT(current_identity.st_mode)
+                != stat.S_IFMT(identity.st_mode)
+            ):
+                raise RepoIntakeError("destination_claim")
+            identity = opened_identity
     except OSError:
+        _close_directory_fd(directory_fd)
         raise RepoIntakeError("destination_claim") from None
-    if not stat.S_ISDIR(identity.st_mode):
-        raise RepoIntakeError("destination_claim")
+    except RepoIntakeError:
+        _close_directory_fd(directory_fd)
+        raise
     return _DestinationClaim(
         path=destination,
         device=identity.st_dev,
         inode=identity.st_ino,
         file_type=stat.S_IFMT(identity.st_mode),
+        directory_fd=directory_fd,
     )
 
 
@@ -315,6 +349,17 @@ async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
 
 
 def _remove_owned_destination(claim: _DestinationClaim) -> None:
+    if claim.directory_fd is not None:
+        try:
+            leased_identity = os.fstat(claim.directory_fd)
+        except OSError:
+            return
+        if (
+            leased_identity.st_dev != claim.device
+            or leased_identity.st_ino != claim.inode
+            or stat.S_IFMT(leased_identity.st_mode) != claim.file_type
+        ):
+            return
     try:
         current_identity = claim.path.lstat()
     except OSError:
@@ -327,3 +372,12 @@ def _remove_owned_destination(claim: _DestinationClaim) -> None:
     ):
         return
     shutil.rmtree(claim.path, ignore_errors=True)
+
+
+def _close_directory_fd(directory_fd: int | None) -> None:
+    if directory_fd is None:
+        return
+    try:
+        os.close(directory_fd)
+    except OSError:
+        pass
