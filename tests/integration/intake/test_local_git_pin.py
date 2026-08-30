@@ -28,6 +28,13 @@ def _supports_fd_anchored_cleanup() -> bool:
     )
 
 
+def _assert_normal_clone_cleanup_result(destination: Path) -> None:
+    if _supports_fd_anchored_cleanup():
+        assert not destination.exists()
+    else:
+        assert destination.is_dir()
+
+
 def _git(repo: Path, *arguments: str) -> str:
     completed = subprocess.run(
         ["git", *arguments],
@@ -132,7 +139,7 @@ def test_clone_and_resolve_removes_owned_destination_after_missing_ref(
 
     assert "does-not-exist" not in str(raised.value)
     assert str(source) not in str(raised.value)
-    assert not destination.exists()
+    _assert_normal_clone_cleanup_result(destination)
 
 
 def test_clone_and_resolve_preserves_preexisting_destination(
@@ -161,7 +168,7 @@ def test_clone_and_resolve_removes_owned_destination_after_non_git_source(
         asyncio.run(github.clone_and_resolve(str(source), destination))
 
     assert str(source) not in str(raised.value)
-    assert not destination.exists()
+    _assert_normal_clone_cleanup_result(destination)
 
 
 @pytest.mark.parametrize(
@@ -304,7 +311,7 @@ def test_clone_timeout_kills_and_reaps_direct_child(
 
     assert process.killed is True
     assert process.communicate_calls == 2
-    assert not destination.exists()
+    _assert_normal_clone_cleanup_result(destination)
 
 
 def test_clone_cancellation_kills_and_reaps_direct_child(
@@ -343,7 +350,7 @@ def test_clone_cancellation_kills_and_reaps_direct_child(
 
     assert process.killed is True
     assert process.communicate_calls == 2
-    assert not destination.exists()
+    _assert_normal_clone_cleanup_result(destination)
 
 
 def test_clone_does_not_follow_a_final_component_symlink_inserted_during_claim(
@@ -412,6 +419,9 @@ def test_clone_cleanup_preserves_a_replacement_destination(
     assert sentinel.read_text(encoding="utf-8") == "do not delete"
 
 
+@pytest.mark.skipif(
+    not _supports_fd_anchored_cleanup(), reason="safe fd-anchored cleanup unavailable"
+)
 def test_clone_cleanup_preserves_replacement_rebound_after_final_identity_check(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -518,22 +528,60 @@ def test_clone_cleanup_preserves_nonempty_claim_when_fd_operations_are_unsupport
     assert sentinel.read_text(encoding="utf-8") == "preserve me"
 
 
-def test_clone_cleanup_never_uses_path_recursive_root_deletion(
+def test_clone_failure_preserves_empty_root_when_fd_cleanup_is_unsupported(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
     destination = tmp_path / "destination"
-    claim = github._claim_destination(destination)
+
+    async def fail_clone(*_args: object) -> bytes:
+        raise github.RepoIntakeError("clone")
 
     def forbid_path_recursive_cleanup(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("cleanup used path-recursive root deletion")
 
+    monkeypatch.setattr(github.os, "supports_dir_fd", set())
+    monkeypatch.setattr(github.os, "supports_fd", set())
+    monkeypatch.setattr(github.os, "supports_follow_symlinks", set())
+    monkeypatch.setattr(github, "_run_git", fail_clone)
     monkeypatch.setattr(shutil, "rmtree", forbid_path_recursive_cleanup)
 
-    try:
-        github._remove_owned_destination(claim)
-    finally:
-        github._close_directory_fd(claim.directory_fd)
+    with pytest.raises(github.RepoIntakeError) as raised:
+        asyncio.run(github.clone_and_resolve(str(source), destination))
 
+    assert raised.value.operation == "clone"
+    assert destination.is_dir()
+    assert list(destination.iterdir()) == []
+
+
+def test_clone_claim_failure_removes_empty_root_when_fd_cleanup_is_unsupported(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "destination"
+    original_open = os.open
+
+    def fail_destination_open(
+        path: str | os.PathLike[str], flags: int, *args: object, **kwargs: object
+    ) -> int:
+        if Path(path) == destination:
+            raise OSError("SECRET directory-open failure")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(github.os, "supports_dir_fd", set())
+    monkeypatch.setattr(github.os, "supports_fd", set())
+    monkeypatch.setattr(github.os, "supports_follow_symlinks", set())
+    monkeypatch.setattr(github.os, "open", fail_destination_open)
+
+    with pytest.raises(github.RepoIntakeError) as raised:
+        asyncio.run(github.clone_and_resolve(str(source), destination))
+
+    assert raised.value.operation == "destination_claim"
+    assert "SECRET" not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__ is True
     assert not destination.exists()
 
 
@@ -553,6 +601,10 @@ def test_clone_claim_failure_removes_the_directory_it_created(
     destination_open_calls = 0
     destination_lstat_calls = 0
     fstat_calls = 0
+
+    monkeypatch.setattr(github.os, "supports_dir_fd", set())
+    monkeypatch.setattr(github.os, "supports_fd", set())
+    monkeypatch.setattr(github.os, "supports_follow_symlinks", set())
 
     def fail_first_destination_open(
         path: str | os.PathLike[str], flags: int, *args: object, **kwargs: object
@@ -648,7 +700,7 @@ def test_clone_times_out_when_subprocess_spawn_hangs(
 
     asyncio.run(assert_internal_timeout())
 
-    assert not destination.exists()
+    _assert_normal_clone_cleanup_result(destination)
 
 
 class _CommunicateOSErrorProcess:
@@ -701,7 +753,7 @@ def test_clone_sanitizes_communicate_oserror_and_cleans_destination(
 
     assert "SECRET" not in str(raised.value)
     assert process.killed is True
-    assert not destination.exists()
+    _assert_normal_clone_cleanup_result(destination)
 
 
 def test_clone_sanitizes_communicate_file_not_found_and_cleans_destination(
@@ -731,7 +783,7 @@ def test_clone_sanitizes_communicate_file_not_found_and_cleans_destination(
     assert raised.value.__suppress_context__ is True
     assert process.killed is True
     assert process.communicate_calls == 2
-    assert not destination.exists()
+    _assert_normal_clone_cleanup_result(destination)
 
 
 class _KillOSErrorProcess:
@@ -771,7 +823,7 @@ def test_clone_timeout_is_not_masked_by_kill_oserror(
         asyncio.run(github.clone_and_resolve(str(source), destination))
 
     assert "SECRET" not in str(raised.value)
-    assert not destination.exists()
+    _assert_normal_clone_cleanup_result(destination)
 
 
 def test_clone_cancellation_is_not_masked_by_kill_oserror(
@@ -801,7 +853,7 @@ def test_clone_cancellation_is_not_masked_by_kill_oserror(
 
     asyncio.run(cancel_clone())
 
-    assert not destination.exists()
+    _assert_normal_clone_cleanup_result(destination)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows-specific drive path form")

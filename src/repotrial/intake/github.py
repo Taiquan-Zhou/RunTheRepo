@@ -274,7 +274,8 @@ def _claim_destination(destination: Path) -> _DestinationClaim:
                     inode=identity.st_ino,
                     file_type=stat.S_IFMT(identity.st_mode),
                     directory_fd=directory_fd,
-                )
+                ),
+                allow_unanchored_empty_root_removal=True,
             )
         _close_directory_fd(directory_fd)
         if isinstance(error, RepoIntakeError):
@@ -360,11 +361,18 @@ async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
         pass
 
 
-def _remove_owned_destination(claim: _DestinationClaim) -> None:
+def _remove_owned_destination(
+    claim: _DestinationClaim,
+    *,
+    allow_unanchored_empty_root_removal: bool = False,
+) -> None:
+    supports_fd_anchored_cleanup = _supports_fd_anchored_cleanup()
+    if not supports_fd_anchored_cleanup and not allow_unanchored_empty_root_removal:
+        return
     if claim.directory_fd is not None:
         if not _directory_fd_matches_claim(claim):
             return
-        if _supports_fd_anchored_cleanup():
+        if supports_fd_anchored_cleanup:
             try:
                 entries_removed = _remove_directory_entries(claim.directory_fd)
             except RecursionError:
