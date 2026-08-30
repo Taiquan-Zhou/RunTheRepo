@@ -5,7 +5,6 @@ import os
 import re
 import shutil
 import stat
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from string import ascii_letters, digits
@@ -235,7 +234,6 @@ def _claim_destination(destination: Path) -> _DestinationClaim:
     except OSError:
         raise RepoIntakeError("destination_create") from None
     directory_fd: int | None = None
-    identity: os.stat_result | None = None
     try:
         identity = destination.lstat()
         if not stat.S_ISDIR(identity.st_mode):
@@ -266,32 +264,11 @@ def _claim_destination(destination: Path) -> _DestinationClaim:
                 raise RepoIntakeError("destination_claim")
             identity = opened_identity
     except OSError:
-        if identity is not None:
-            _remove_owned_destination(
-                _DestinationClaim(
-                    path=destination,
-                    device=identity.st_dev,
-                    inode=identity.st_ino,
-                    file_type=stat.S_IFMT(identity.st_mode),
-                    directory_fd=None,
-                )
-            )
         _close_directory_fd(directory_fd)
         raise RepoIntakeError("destination_claim") from None
     except RepoIntakeError:
-        if identity is not None:
-            _remove_owned_destination(
-                _DestinationClaim(
-                    path=destination,
-                    device=identity.st_dev,
-                    inode=identity.st_ino,
-                    file_type=stat.S_IFMT(identity.st_mode),
-                    directory_fd=None,
-                )
-            )
         _close_directory_fd(directory_fd)
         raise
-    assert identity is not None
     return _DestinationClaim(
         path=destination,
         device=identity.st_dev,
@@ -394,41 +371,7 @@ def _remove_owned_destination(claim: _DestinationClaim) -> None:
         or stat.S_IFMT(current_identity.st_mode) != claim.file_type
     ):
         return
-    try:
-        quarantine = Path(
-            tempfile.mkdtemp(prefix=".repotrial-cleanup-", dir=claim.path.parent)
-        )
-    except OSError:
-        return
-    quarantined_path = quarantine / "owned"
-    try:
-        os.rename(claim.path, quarantined_path)
-    except OSError:
-        _remove_empty_directory(quarantine)
-        return
-    try:
-        quarantined_identity = quarantined_path.lstat()
-    except OSError:
-        return
-    if (
-        not stat.S_ISDIR(quarantined_identity.st_mode)
-        or quarantined_identity.st_dev != claim.device
-        or quarantined_identity.st_ino != claim.inode
-        or stat.S_IFMT(quarantined_identity.st_mode) != claim.file_type
-    ):
-        return
-    try:
-        shutil.rmtree(quarantined_path, ignore_errors=True)
-    except OSError:
-        return
-    _remove_empty_directory(quarantine)
-
-
-def _remove_empty_directory(directory: Path) -> None:
-    try:
-        directory.rmdir()
-    except OSError:
-        pass
+    shutil.rmtree(claim.path, ignore_errors=True)
 
 
 def _close_directory_fd(directory_fd: int | None) -> None:
