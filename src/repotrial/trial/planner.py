@@ -806,7 +806,12 @@ def _combined_logs(logs: dict[str, str]) -> str | None:
         return None
     total_length = 0
     bounded_entries: list[tuple[str, str]] = []
-    for name, value in logs.items():
+    ordered_names = [name for name in ("up", "ps", "logs") if name in logs]
+    ordered_names.extend(
+        sorted(name for name in logs if name not in {"up", "ps", "logs"})
+    )
+    for name in ordered_names:
+        value = logs[name]
         if (
             not isinstance(name, str)
             or len(name) > _MAX_LOG_KEY_LENGTH
@@ -820,7 +825,7 @@ def _combined_logs(logs: dict[str, str]) -> str | None:
         if total_length > _MAX_AGGREGATE_LOG_LENGTH:
             return None
         bounded_entries.append((name, value))
-    return "\n".join(value for _, value in sorted(bounded_entries))
+    return "\n".join(value for _, value in bounded_entries)
 
 
 def _bounded_authority(allowed_env_keys: set[str]) -> frozenset[str] | None:

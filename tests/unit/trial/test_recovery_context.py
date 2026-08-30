@@ -65,7 +65,7 @@ def test_projection_limits_aggregate_content_without_mutating_short_values() -> 
     assert logs["later"] == "must-not-appear"
 
 
-def test_projection_never_exceeds_aggregate_budget_with_a_small_remainder() -> None:
+def test_projection_skips_field_when_small_remainder_cannot_hold_marker() -> None:
     logs = {
         "up": "u" * 4_096,
         "ps": "p" * 4_096,
@@ -76,11 +76,11 @@ def test_projection_never_exceeds_aggregate_budget_with_a_small_remainder() -> N
 
     projected = project_recovery_evidence(logs)
 
-    assert len(projected.logs["later"]) == 14
-    assert sum(map(len, projected.logs.values())) == 16_384
+    assert "later" not in projected.logs
+    assert sum(map(len, projected.logs.values())) + len(projected.logs) - 1 <= 16_384
 
 
-def test_projection_skips_non_string_values_and_marks_tiny_remainders() -> None:
+def test_projection_skips_non_string_values_and_tiny_marker_remainders() -> None:
     logs: dict[str, object] = {
         "up": "u" * 4_096,
         "ps": "p" * 4_096,
@@ -92,7 +92,7 @@ def test_projection_skips_non_string_values_and_marks_tiny_remainders() -> None:
 
     projected = project_recovery_evidence(cast(Mapping[str, str], logs))
 
-    assert projected.logs["later"] == "\n[TRU"
+    assert "later" not in projected.logs
     assert "ignored" not in projected.logs
 
 
