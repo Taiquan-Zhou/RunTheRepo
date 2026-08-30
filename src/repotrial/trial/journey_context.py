@@ -62,6 +62,7 @@ def _read_bounded_root_file(path: Path) -> str | None:
         len(raw) > _MAX_SOURCE_BYTES
         or not _same_file(opened, final_handle)
         or not _same_file(final_handle, final_path)
+        or final_handle.st_size > _MAX_SOURCE_BYTES
         or not _is_regular_file(path, final_path)
     ):
         return None
@@ -73,7 +74,9 @@ def _read_bounded_root_file(path: Path) -> str | None:
 
 def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
     return (
-        left.st_dev == right.st_dev
+        left.st_ino != 0
+        and right.st_ino != 0
+        and left.st_dev == right.st_dev
         and left.st_ino == right.st_ino
         and stat.S_IFMT(left.st_mode) == stat.S_IFMT(right.st_mode)
     )

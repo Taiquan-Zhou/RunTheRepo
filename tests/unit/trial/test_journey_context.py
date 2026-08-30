@@ -28,7 +28,7 @@ def test_derivation_never_searches_recursively_when_root_readme_is_absent(
     assert derive_journey_readme_excerpt(tmp_path) == ""
 
 
-def test_derivation_rejects_linked_root_readmes_without_falling_back(
+def test_derivation_falls_back_after_rejecting_a_linked_preferred_root_candidate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     readme = tmp_path / "README.md"
@@ -93,6 +93,61 @@ def test_derivation_accepts_exact_source_limit_and_bounds_excerpt_characters(
     assert len(readme.read_bytes()) == 65_536
     assert excerpt == content[:4_096]
     assert len(excerpt) == 4_096
+
+
+def test_derivation_rejects_readme_that_grows_before_final_handle_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    readme = tmp_path / "README.md"
+    content = b"[health](/health)\n"
+    readme.write_bytes(content)
+    original_fstat = os.fstat
+    fstat_calls = 0
+
+    def grown_final_fstat(descriptor: int) -> os.stat_result:
+        nonlocal fstat_calls
+        result = original_fstat(descriptor)
+        fstat_calls += 1
+        if fstat_calls != 2:
+            return result
+        values = list(result)
+        values[6] = 65_537
+        return os.stat_result(values)
+
+    monkeypatch.setattr(journey_context.os, "fstat", grown_final_fstat)
+
+    assert derive_journey_readme_excerpt(tmp_path) == ""
+
+
+def test_derivation_rejects_zero_inode_file_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    readme = tmp_path / "README.md"
+    readme.write_bytes(b"[health](/health)\n")
+    original_lstat = Path.lstat
+    original_fstat = os.fstat
+
+    class ZeroInodeStat:
+        def __init__(self, source: os.stat_result) -> None:
+            self.st_dev = source.st_dev
+            self.st_ino = 0
+            self.st_mode = source.st_mode
+            self.st_size = source.st_size
+            self.st_file_attributes = 0
+
+    def zero_inode(metadata: os.stat_result) -> ZeroInodeStat:
+        return ZeroInodeStat(metadata)
+
+    def zero_inode_lstat(path: Path) -> object:
+        result = original_lstat(path)
+        return zero_inode(result) if path == readme else result
+
+    monkeypatch.setattr(Path, "lstat", zero_inode_lstat)
+    monkeypatch.setattr(
+        journey_context.os, "fstat", lambda fd: zero_inode(original_fstat(fd))
+    )
+
+    assert derive_journey_readme_excerpt(tmp_path) == ""
 
 
 def test_derivation_returns_malicious_readme_as_inert_text(

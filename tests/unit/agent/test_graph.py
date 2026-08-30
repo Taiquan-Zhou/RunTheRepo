@@ -1007,12 +1007,24 @@ def test_pinned_intake_derives_root_readme_only_for_deterministic_journey_planni
     assert context.readme_excerpt == ""
 
 
-def test_explicit_readme_excerpt_wins_without_a_root_readme(tmp_path: Path) -> None:
+def test_explicit_readme_excerpt_wins_without_filesystem_derivation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     with _healthy_server() as (_, port):
         provider = GraphProvider(host_port=port)
         context, source = _context(tmp_path, provider, journeys=[])
         (context.workspace / "repotrial.journeys.json").unlink()
         context = replace(context, readme_excerpt="[explicit](/health)")
+
+        def forbidden_derivation(workspace: Path) -> str:
+            del workspace
+            raise AssertionError(
+                "explicit README must not trigger filesystem derivation"
+            )
+
+        monkeypatch.setattr(
+            graph_module, "derive_journey_readme_excerpt", forbidden_derivation
+        )
 
         result = _run(_state(source.parent), context)
 
