@@ -39,6 +39,9 @@ _FAILURE_OUTCOMES: frozenset[str] = frozenset(
         "adapter_error",
     }
 )
+_CLOSE_FAILURE_NOTE = (
+    "secondary model evidence close failed; descriptor ownership is uncertain"
+)
 
 
 class ModelAttemptEvidenceError(RuntimeError):
@@ -85,6 +88,7 @@ class ModelAttemptRecorder:
             ),
         )
         self._descriptor: int | None = descriptor
+        self._last_close_error: ModelAttemptEvidenceError | None = None
 
     @property
     def path(self) -> Path:
@@ -113,11 +117,25 @@ class ModelAttemptRecorder:
         descriptor = self._descriptor
         if descriptor is None:
             return
-        self._descriptor = None
         try:
             os.close(descriptor)
         except OSError as error:
-            raise ModelAttemptEvidenceError("could not close model evidence") from error
+            close_error = ModelAttemptEvidenceError("could not close model evidence")
+            self._last_close_error = close_error
+            raise close_error from error
+        self._descriptor = None
+        self._last_close_error = None
+
+    def _close_preserving_primary(self, primary: BaseException) -> None:
+        if self._descriptor is None or primary is self._last_close_error:
+            return
+        if self._last_close_error is not None:
+            _add_close_failure_note(primary)
+            return
+        try:
+            self.close()
+        except ModelAttemptEvidenceError:
+            _add_close_failure_note(primary)
 
     def _finish(
         self,
@@ -134,6 +152,7 @@ class ModelAttemptRecorder:
         descriptor = self._descriptor
         if descriptor is None:
             raise ModelAttemptEvidenceError("model attempt is closed")
+        primary: BaseException | None = None
         try:
             _write_all(
                 descriptor,
@@ -153,14 +172,20 @@ class ModelAttemptRecorder:
             )
             os.fsync(descriptor)
             self._finished = True
-        except ModelAttemptEvidenceError:
+        except ModelAttemptEvidenceError as error:
+            primary = error
             raise
         except OSError as error:
-            raise ModelAttemptEvidenceError(
-                "could not append model evidence"
-            ) from error
+            primary = ModelAttemptEvidenceError("could not append model evidence")
+            raise primary from error
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            self.close()
+            if primary is None:
+                self.close()
+            else:
+                self._close_preserving_primary(primary)
 
 
 def _canonical_schema_bytes(schema: type[BaseModel]) -> bytes:
@@ -228,12 +253,31 @@ def _try_create_new_file(path: Path, payload: bytes) -> int | None:
         _write_all(descriptor, payload, "create")
         os.fsync(descriptor)
         return descriptor
-    except ModelAttemptEvidenceError:
-        os.close(descriptor)
+    except ModelAttemptEvidenceError as error:
+        _close_descriptor_preserving_primary(descriptor, error)
         raise
     except OSError as error:
+        primary = ModelAttemptEvidenceError("could not create model evidence")
+        _close_descriptor_preserving_primary(descriptor, primary)
+        raise primary from error
+    except BaseException as error:
+        _close_descriptor_preserving_primary(descriptor, error)
+        raise
+
+
+def _close_descriptor_preserving_primary(
+    descriptor: int, primary: BaseException
+) -> None:
+    try:
         os.close(descriptor)
-        raise ModelAttemptEvidenceError("could not create model evidence") from error
+    except OSError:
+        _add_close_failure_note(primary)
+
+
+def _add_close_failure_note(primary: BaseException) -> None:
+    notes = getattr(primary, "__notes__", ())
+    if _CLOSE_FAILURE_NOTE not in notes:
+        primary.add_note(_CLOSE_FAILURE_NOTE)
 
 
 def _write_all(descriptor: int, payload: bytes, operation: str) -> None:

@@ -659,6 +659,53 @@ def test_model_recovery_cancellation_closes_retained_evidence_handle(
     asyncio.run(exercise())
 
 
+def test_model_recovery_cancellation_survives_secondary_close_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = CancellationTrackingModelAdapter()
+    real_close = os.close
+    close_attempts: list[int] = []
+
+    async def exercise() -> None:
+        proposal = asyncio.create_task(
+            planner_module._propose_recovery_with_evidence(
+                logs={"logs": "unrecognized startup failure"},
+                readme_excerpt="",
+                allowed_env_keys=set(),
+                repeated_error_count=0,
+                model=model,
+                evidence_dir=tmp_path,
+            )
+        )
+        await asyncio.wait_for(model.started.wait(), timeout=0.1)
+
+        def fail_close(descriptor: int) -> None:
+            close_attempts.append(descriptor)
+            raise OSError("secondary close")
+
+        monkeypatch.setattr("repotrial.trial.model_evidence.os.close", fail_close)
+        proposal.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await proposal
+        finally:
+            monkeypatch.setattr("repotrial.trial.model_evidence.os.close", real_close)
+            for descriptor in close_attempts:
+                try:
+                    os.fstat(descriptor)
+                except OSError:
+                    continue
+                real_close(descriptor)
+
+        await asyncio.wait_for(model.cancelled.wait(), timeout=0.1)
+        assert caught.value.__notes__ == [
+            "secondary model evidence close failed; descriptor ownership is uncertain"
+        ]
+        assert len(close_attempts) == 1
+
+    asyncio.run(exercise())
+
+
 def test_repeated_error_count_is_explicit_per_call() -> None:
     first = _propose(logs={"logs": "unrecognized startup failure"})
     later = _propose(

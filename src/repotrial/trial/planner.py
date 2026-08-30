@@ -4,6 +4,7 @@ import math
 import os
 import re
 import stat
+import sys
 from pathlib import Path
 from unicodedata import category
 from urllib.parse import unquote, urlsplit
@@ -1071,8 +1072,13 @@ def _record_model_success(
 
 
 def _close_model_recorder(recorder: ModelAttemptRecorder | None) -> None:
-    if recorder is not None:
+    if recorder is None:
+        return
+    primary = sys.exception()
+    if primary is None:
         recorder.close()
+        return
+    recorder._close_preserving_primary(primary)
 
 
 def _validated_or_stop(

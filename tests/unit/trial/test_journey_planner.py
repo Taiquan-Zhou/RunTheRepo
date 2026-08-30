@@ -971,6 +971,51 @@ def test_model_journey_cancellation_closes_retained_evidence_handle(
     asyncio.run(exercise())
 
 
+def test_model_journey_cancellation_survives_secondary_close_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = CancellationTrackingModelAdapter()
+    real_close = os.close
+    close_attempts: list[int] = []
+
+    async def exercise() -> None:
+        planner = asyncio.create_task(
+            planner_module._plan_journeys_with_evidence(
+                tmp_path,
+                "",
+                model,
+                evidence_dir=tmp_path,
+            )
+        )
+        await asyncio.wait_for(model.started.wait(), timeout=0.1)
+
+        def fail_close(descriptor: int) -> None:
+            close_attempts.append(descriptor)
+            raise OSError("secondary close")
+
+        monkeypatch.setattr("repotrial.trial.model_evidence.os.close", fail_close)
+        planner.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await planner
+        finally:
+            monkeypatch.setattr("repotrial.trial.model_evidence.os.close", real_close)
+            for descriptor in close_attempts:
+                try:
+                    os.fstat(descriptor)
+                except OSError:
+                    continue
+                real_close(descriptor)
+
+        await asyncio.wait_for(model.cancelled.wait(), timeout=0.1)
+        assert caught.value.__notes__ == [
+            "secondary model evidence close failed; descriptor ownership is uncertain"
+        ]
+        assert len(close_attempts) == 1
+
+    asyncio.run(exercise())
+
+
 def test_none_model_returns_no_journeys_when_no_safe_source_exists(
     tmp_path: Path,
 ) -> None:
