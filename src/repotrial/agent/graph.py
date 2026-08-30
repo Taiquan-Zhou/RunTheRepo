@@ -791,7 +791,7 @@ def _reject_linked_components(workspace: Path, target: Path) -> None:
 
 def _is_link(path: Path, path_stat: os.stat_result) -> bool:
     return path.is_symlink() or bool(
-        _REPARSE_POINT and path_stat.st_file_attributes & _REPARSE_POINT
+        _REPARSE_POINT and getattr(path_stat, "st_file_attributes", 0) & _REPARSE_POINT
     )
 
 
