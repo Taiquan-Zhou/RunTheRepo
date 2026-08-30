@@ -877,6 +877,22 @@ def test_default_graph_composes_real_baseline_services_in_one_sandbox(
     assert len([call for call in provider.calls if call[0] == "create"]) == 1
     assert len([call for call in provider.calls if call[0] == "destroy"]) == 1
     assert result.run.sandbox_id is None
+    evidence_paths = list(
+        context.artifact_dir.glob("baseline-*/baseline-observation-boundary.jsonl")
+    )
+    assert len(evidence_paths) == 1
+    evidence_rows = [
+        json.loads(line)
+        for line in evidence_paths[0].read_text(encoding="utf-8").splitlines()
+    ]
+    assert [(row["operation"], row["outcome"]) for row in evidence_rows] == [
+        ("discovery", "start"),
+        ("discovery", "success"),
+        ("network", "start"),
+        ("network", "success"),
+    ]
+    assert not any("observation-boundary" in item for item in result.run.artifacts)
+    assert "collector_succeeded" not in result.run.model_dump_json()
 
 
 def test_graph_persists_baseline_journeys_before_workload_and_rejects_tampering(

@@ -3,12 +3,18 @@ import json
 import math
 import re
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
 from repotrial.domain.models import ObservationSnapshot
 from repotrial.sandbox.base import ExecResult, NetworkLogResult, SandboxProvider
+from repotrial.trial.observation_evidence import (
+    ObservationEvidenceError,
+    ObservationEvidenceRecorder,
+    ObservationOperation,
+)
 
 _COMMAND_TIMEOUT_SECONDS = 30
 _MAX_CONTAINERS = 64
@@ -39,6 +45,19 @@ class ObservationParseError(ObservationCollectionError):
     pass
 
 
+_RESOURCE_LIMIT_MARKER = "_repotrial_observation_resource_limit"
+
+
+def _resource_error(message: str) -> ObservationParseError:
+    error = ObservationParseError(message)
+    setattr(error, _RESOURCE_LIMIT_MARKER, True)
+    return error
+
+
+def _is_resource_error(error: BaseException) -> bool:
+    return getattr(error, _RESOURCE_LIMIT_MARKER, False) is True
+
+
 @dataclass(slots=True)
 class _CollectionBudget:
     stdout_characters: int = 0
@@ -46,20 +65,20 @@ class _CollectionBudget:
 
     def accept_stdout(self, stdout: str) -> None:
         if len(stdout) > _MAX_COMMAND_STDOUT:
-            raise ObservationParseError("collector stdout exceeds resource limit")
+            raise _resource_error("collector stdout exceeds resource limit")
         self.stdout_characters += len(stdout)
         if self.stdout_characters > _MAX_TOTAL_STDOUT:
-            raise ObservationParseError("collector stdout exceeds total resource limit")
+            raise _resource_error("collector stdout exceeds total resource limit")
 
     def copy_json(self, value: object) -> JsonValue:
         return self._copy_json(value, depth=1, active=set())
 
     def _copy_json(self, value: object, *, depth: int, active: set[int]) -> JsonValue:
         if depth > _MAX_JSON_DEPTH:
-            raise ObservationParseError("JSON value exceeds depth limit")
+            raise _resource_error("JSON value exceeds depth limit")
         self.json_nodes += 1
         if self.json_nodes > _MAX_JSON_NODES:
-            raise ObservationParseError("JSON value exceeds node limit")
+            raise _resource_error("JSON value exceeds node limit")
 
         if value is None or isinstance(value, bool):
             return value
@@ -111,6 +130,58 @@ async def collect_observation(
     overlay_path: str | None = None,
 ) -> ObservationSnapshot:
     _validate_inputs(sandbox_id, compose_path, artifact_path, overlay_path)
+    return await _collect_observation(
+        provider,
+        sandbox_id,
+        compose_path,
+        artifact_path,
+        overlay_path=overlay_path,
+        recorder=None,
+    )
+
+
+async def _collect_observation_with_evidence(
+    provider: SandboxProvider,
+    sandbox_id: str,
+    compose_path: str,
+    artifact_path: Path,
+    *,
+    overlay_path: str | None = None,
+    evidence_path: Path,
+) -> ObservationSnapshot:
+    _validate_inputs(sandbox_id, compose_path, artifact_path, overlay_path)
+    if not isinstance(evidence_path, Path):
+        raise TypeError("observation evidence path must be a Path")
+    if evidence_path == artifact_path:
+        raise ObservationEvidenceError("atomic_persistence", "destination_collision")
+    if evidence_path.parent != artifact_path.parent:
+        raise ObservationEvidenceError("atomic_persistence", "parent_invalid")
+    recorder = ObservationEvidenceRecorder(evidence_path)
+    try:
+        snapshot = await _collect_observation(
+            provider,
+            sandbox_id,
+            compose_path,
+            artifact_path,
+            overlay_path=overlay_path,
+            recorder=recorder,
+        )
+    except BaseException as error:
+        recorder.close_preserving_primary(error)
+        raise
+    recorder.close()
+    return snapshot
+
+
+async def _collect_observation(
+    provider: SandboxProvider,
+    sandbox_id: str,
+    compose_path: str,
+    artifact_path: Path,
+    *,
+    overlay_path: str | None,
+    recorder: ObservationEvidenceRecorder | None,
+) -> ObservationSnapshot:
     budget = _CollectionBudget()
     discovery_argv = [
         "docker",
@@ -130,10 +201,15 @@ async def collect_observation(
             "json",
         ]
     )
-    discovery_result = await _exec_collector(
-        provider, sandbox_id, discovery_argv, budget
+    discovery_result, containers = await _collect_exec_operation(
+        provider,
+        sandbox_id,
+        discovery_argv,
+        budget,
+        operation="discovery",
+        parser=_parse_discovery,
+        recorder=recorder,
     )
-    containers = _parse_discovery(discovery_result.stdout, budget)
 
     inspect_by_service: dict[str, list[dict[str, object]]] = {}
     file_changes: list[dict[str, object]] = []
@@ -150,14 +226,33 @@ async def collect_observation(
             "-eo",
             "pid=,ppid=,user=,comm=",
         ]
-        inspect_result = await _exec_collector(
-            provider, sandbox_id, inspect_argv, budget
+        inspect_result, inspect_data = await _collect_exec_operation(
+            provider,
+            sandbox_id,
+            inspect_argv,
+            budget,
+            operation="inspect",
+            parser=_parse_inspect,
+            recorder=recorder,
         )
-        inspect_data = _parse_inspect(inspect_result.stdout, budget)
-        diff_result = await _exec_collector(provider, sandbox_id, diff_argv, budget)
-        parsed_diff = _parse_diff(diff_result.stdout, budget)
-        top_result = await _exec_collector(provider, sandbox_id, top_argv, budget)
-        parsed_top = _parse_top(top_result.stdout, budget)
+        diff_result, parsed_diff = await _collect_exec_operation(
+            provider,
+            sandbox_id,
+            diff_argv,
+            budget,
+            operation="diff",
+            parser=_parse_diff,
+            recorder=recorder,
+        )
+        top_result, parsed_top = await _collect_exec_operation(
+            provider,
+            sandbox_id,
+            top_argv,
+            budget,
+            operation="top",
+            parser=_parse_top,
+            recorder=recorder,
+        )
 
         inspect_by_service.setdefault(service, []).append(
             {"container_id": container_id, "data": inspect_data}
@@ -193,9 +288,15 @@ async def collect_observation(
             }
         )
 
-    network_result = await provider.network_log(sandbox_id)
-    network_events, unsupported_collectors = _validated_network_result(
-        network_result, budget
+    (
+        network_result,
+        network_events,
+        unsupported_collectors,
+    ) = await _collect_network_operation(
+        provider,
+        sandbox_id,
+        budget,
+        recorder=recorder,
     )
     snapshot = ObservationSnapshot(
         inspect=inspect_by_service,
@@ -258,28 +359,186 @@ def _validate_compose_path(path: object, label: str) -> None:
         raise ValueError(f"{label} contains a control character")
 
 
-async def _exec_collector(
+async def _collect_exec_operation[ParsedT](
     provider: SandboxProvider,
     sandbox_id: str,
     argv: list[str],
     budget: _CollectionBudget,
-) -> ExecResult:
-    result = await provider.exec(
-        sandbox_id,
-        argv,
-        timeout_s=_COMMAND_TIMEOUT_SECONDS,
-    )
+    *,
+    operation: ObservationOperation,
+    parser: Callable[[str, _CollectionBudget], ParsedT],
+    recorder: ObservationEvidenceRecorder | None,
+) -> tuple[ExecResult, ParsedT]:
+    if recorder is not None:
+        recorder.record_start(operation, argv)
+    try:
+        result = await provider.exec(
+            sandbox_id,
+            argv,
+            timeout_s=_COMMAND_TIMEOUT_SECONDS,
+        )
+    except BaseException as error:
+        if recorder is not None:
+            recorder.record_terminal_preserving_primary(
+                operation,
+                argv,
+                phase="provider_execution",
+                reason="provider_exception",
+                result=None,
+                primary=error,
+            )
+        raise
     if (
         not isinstance(result, ExecResult)
         or type(result.exit_code) is not int
         or not isinstance(result.stdout, str)
         or not isinstance(result.stderr, str)
     ):
-        raise ObservationParseError("collector returned a malformed result")
+        validation_error = ObservationParseError(
+            "collector returned a malformed result"
+        )
+        if recorder is not None:
+            recorder.record_terminal_preserving_primary(
+                operation,
+                argv,
+                phase="result_validation",
+                reason="malformed_exec_result",
+                result=None,
+                primary=validation_error,
+            )
+        raise validation_error
     if result.exit_code != 0:
-        raise ObservationCollectionError("collector command failed")
-    budget.accept_stdout(result.stdout)
-    return result
+        command_error = ObservationCollectionError("collector command failed")
+        if recorder is not None:
+            recorder.record_terminal_preserving_primary(
+                operation,
+                argv,
+                phase="result_validation",
+                reason="nonzero_exit",
+                result=result,
+                primary=command_error,
+            )
+        raise command_error
+    try:
+        budget.accept_stdout(result.stdout)
+        parsed = parser(result.stdout, budget)
+    except ObservationParseError as error:
+        if recorder is not None:
+            recorder.record_terminal_preserving_primary(
+                operation,
+                argv,
+                phase="parsing",
+                reason=(
+                    "resource_limit_exceeded"
+                    if _is_resource_error(error)
+                    else "parse_failure"
+                ),
+                result=result,
+                primary=error,
+            )
+        raise
+    except BaseException as error:
+        if recorder is not None:
+            recorder.record_terminal_preserving_primary(
+                operation,
+                argv,
+                phase="parsing",
+                reason="parse_failure",
+                result=result,
+                primary=error,
+            )
+        raise
+    if recorder is not None:
+        recorder.record_terminal(
+            operation,
+            argv,
+            phase="parsing",
+            outcome="success",
+            reason="collector_succeeded",
+            result=result,
+        )
+    return result, parsed
+
+
+async def _collect_network_operation(
+    provider: SandboxProvider,
+    sandbox_id: str,
+    budget: _CollectionBudget,
+    *,
+    recorder: ObservationEvidenceRecorder | None,
+) -> tuple[NetworkLogResult, list[dict[str, JsonValue]], list[str]]:
+    operation: ObservationOperation = "network"
+    argv: list[str] = []
+    if recorder is not None:
+        recorder.record_start(operation, argv)
+    try:
+        unvalidated = await provider.network_log(sandbox_id)
+    except BaseException as error:
+        if recorder is not None:
+            recorder.record_terminal_preserving_primary(
+                operation,
+                argv,
+                phase="provider_execution",
+                reason="provider_exception",
+                result=None,
+                primary=error,
+            )
+        raise
+    if not isinstance(unvalidated, NetworkLogResult):
+        validation_error = ObservationParseError(
+            "network collector returned a malformed result"
+        )
+        if recorder is not None:
+            recorder.record_terminal_preserving_primary(
+                operation,
+                argv,
+                phase="result_validation",
+                reason="malformed_network_result",
+                result=None,
+                primary=validation_error,
+            )
+        raise validation_error
+    try:
+        events, unsupported = _validated_network_result(unvalidated, budget)
+    except ObservationParseError as error:
+        if recorder is not None:
+            recorder.record_terminal_preserving_primary(
+                operation,
+                argv,
+                phase="parsing",
+                reason=(
+                    "resource_limit_exceeded"
+                    if _is_resource_error(error)
+                    else "parse_failure"
+                ),
+                result=None,
+                primary=error,
+            )
+        raise
+    except BaseException as error:
+        if recorder is not None:
+            recorder.record_terminal_preserving_primary(
+                operation,
+                argv,
+                phase="parsing",
+                reason="parse_failure",
+                result=None,
+                primary=error,
+            )
+        raise
+    if recorder is not None:
+        recorder.record_terminal(
+            operation,
+            argv,
+            phase="parsing",
+            outcome="success",
+            reason=(
+                "network_unsupported"
+                if not unvalidated.supported
+                else "collector_succeeded"
+            ),
+        )
+    return unvalidated, events, unsupported
 
 
 def _parse_discovery(stdout: str, budget: _CollectionBudget) -> list[tuple[str, str]]:
@@ -306,7 +565,7 @@ def _parse_discovery(stdout: str, budget: _CollectionBudget) -> list[tuple[str, 
         seen_ids.add(container_id)
         containers.append((service, container_id))
         if len(containers) > _MAX_CONTAINERS:
-            raise ObservationParseError("discovery exceeds container limit")
+            raise _resource_error("discovery exceeds container limit")
     return sorted(containers)
 
 
@@ -355,7 +614,7 @@ def _parse_diff(stdout: str, budget: _CollectionBudget) -> list[dict[str, JsonVa
         )
         rows.append(cast(dict[str, JsonValue], copied))
         if len(rows) > _MAX_DIFF_ROWS:
-            raise ObservationParseError("diff output exceeds row limit")
+            raise _resource_error("diff output exceeds row limit")
     return rows
 
 
@@ -389,7 +648,7 @@ def _parse_top(stdout: str, budget: _CollectionBudget) -> list[dict[str, JsonVal
         )
         rows.append(cast(dict[str, JsonValue], copied))
         if len(rows) > _MAX_PROCESS_ROWS:
-            raise ObservationParseError("top output exceeds row limit")
+            raise _resource_error("top output exceeds row limit")
     return rows
 
 
@@ -404,7 +663,7 @@ def _validated_network_result(
     if type(supported) is not bool or type(events) is not list:
         raise ObservationParseError("network collector returned a malformed result")
     if len(events) > _MAX_NETWORK_EVENTS:
-        raise ObservationParseError("network events exceed event limit")
+        raise _resource_error("network events exceed event limit")
     if supported:
         if reason is not None:
             raise ObservationParseError("network collector result is contradictory")
@@ -510,7 +769,7 @@ def _valid_bounded_text(value: str) -> bool:
 
 def _require_bounded_string(value: str, label: str) -> None:
     if len(value) > _MAX_STRING_LENGTH:
-        raise ObservationParseError(f"{label} exceeds string limit")
+        raise _resource_error(f"{label} exceeds string limit")
 
 
 def _contains_unicode_category_c(value: str) -> bool:

@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import hashlib
+import inspect
 import json
 import os
 import subprocess
@@ -135,6 +136,25 @@ def _collect(provider: SandboxProvider, artifact_path: Path) -> ObservationSnaps
             artifact_path=artifact_path,
         )
     )
+
+
+def test_public_collect_observation_signature_remains_unchanged() -> None:
+    assert str(inspect.signature(collect_observation)) == (
+        "(provider: repotrial.sandbox.base.SandboxProvider, sandbox_id: str, "
+        "compose_path: str, artifact_path: pathlib.Path, *, "
+        "overlay_path: str | None = None) -> "
+        "repotrial.domain.models.ObservationSnapshot"
+    )
+
+
+def test_public_collection_without_diagnostics_creates_only_audit_artifact(
+    tmp_path: Path,
+) -> None:
+    artifact_path = tmp_path / "observation.json"
+
+    _collect(ScriptedProvider(_scripts_for([])), artifact_path)
+
+    assert list(tmp_path.iterdir()) == [artifact_path]
 
 
 def _assert_parse_failure(
@@ -748,6 +768,7 @@ def test_single_stdout_limit_is_checked_before_parsing(tmp_path: Path) -> None:
         _collect(ScriptedProvider(scripts), artifact_path)
 
     assert "raw-secret" not in str(raised.value)
+    assert type(raised.value) is ObservationParseError
     assert not artifact_path.exists()
 
 

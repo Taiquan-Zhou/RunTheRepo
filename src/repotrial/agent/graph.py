@@ -51,7 +51,7 @@ from repotrial.trial.journey_artifact import (
     write_or_verify_baseline_journeys,
 )
 from repotrial.trial.journey_context import derive_journey_readme_excerpt
-from repotrial.trial.observer import collect_observation
+from repotrial.trial.observer import _collect_observation_with_evidence
 from repotrial.trial.planner import (
     _plan_journeys_with_evidence,
     _propose_recovery_with_evidence,
@@ -257,6 +257,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
     )
     lifecycle_artifact = attempt_dir / "baseline-lifecycle.jsonl"
     observation_artifact = attempt_dir / "baseline-observation.json"
+    observation_evidence = attempt_dir / "baseline-observation-boundary.jsonl"
     evidence_artifact = attempt_dir / "baseline-boot-attempt.json"
     evidence_enabled = boot_compose is boot_module.boot_compose
     verify_baseline_journeys(
@@ -293,11 +294,12 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                 sandbox_id,
                 attempt_dir,
             )
-            observation = await collect_observation(
+            observation = await _collect_observation_with_evidence(
                 context.provider,
                 sandbox_id,
                 compose_path,
                 observation_artifact,
+                evidence_path=observation_evidence,
             )
     update: NodeUpdate = {
         "boot_attempt": attempt,
