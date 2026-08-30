@@ -120,6 +120,50 @@ def test_calibration_mount_parser_binds_requested_path_to_real_identity(
         )
 
 
+def test_calibration_mount_parser_accepts_absent_uuid(
+    calibration_module: ModuleType,
+) -> None:
+    mount = calibration_module._parse_mount(
+        "overlay overlay 0:28 /",
+        "/",
+    )
+
+    assert mount.source == "overlay"
+    assert mount.filesystem == "overlay"
+    assert mount.identity == ("0:28", "")
+    assert mount.target == "/"
+
+
+@pytest.mark.parametrize(
+    ("output", "requested_path"),
+    [
+        ("", "/workspace"),
+        ("/dev/vdb ext4 8:16", "/workspace"),
+        ("/dev/vdb ext4 8:16 fixture-uuid /workspace extra", "/workspace extra"),
+        ("/dev/vdb ext4 8:16x /workspace", "/workspace"),
+        ("/dev/vdb ext4 8:16 /", "/workspace"),
+        ("/dev/vdb ext4 8:16 /workspace\n/dev/vdc ext4 8:32 /data", "/workspace"),
+        ("   ", "/workspace"),
+    ],
+    ids=[
+        "empty",
+        "too-few-fields",
+        "too-many-fields",
+        "invalid-major-minor",
+        "mismatched-target",
+        "multiple-lines",
+        "whitespace-only",
+    ],
+)
+def test_calibration_mount_parser_rejects_malformed_output(
+    calibration_module: ModuleType,
+    output: str,
+    requested_path: str,
+) -> None:
+    with pytest.raises(AssertionError):
+        calibration_module._parse_mount(output, requested_path)
+
+
 def test_calibration_network_evidence_requires_a_new_or_advanced_event(
     calibration_module: ModuleType,
 ) -> None:

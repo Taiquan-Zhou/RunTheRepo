@@ -441,11 +441,15 @@ async def _exec(
 def _parse_mount(output: str, requested_path: str) -> _Mount:
     lines = [line for line in output.splitlines() if line]
     assert len(lines) == 1
-    fields = lines[0].split(maxsplit=4)
-    assert len(fields) == 5
-    source, filesystem, major_minor, filesystem_uuid, target = fields
+    fields = lines[0].split()
+    assert len(fields) in (4, 5)
+    if len(fields) == 4:
+        source, filesystem, major_minor, target = fields
+        filesystem_uuid = ""
+    else:
+        source, filesystem, major_minor, filesystem_uuid, target = fields
     assert source and filesystem and _MAJOR_MINOR_PATTERN.fullmatch(major_minor)
-    assert filesystem_uuid and target == requested_path
+    assert target == requested_path
     return _Mount(
         source=source,
         filesystem=filesystem,
