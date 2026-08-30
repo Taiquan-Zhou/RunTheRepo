@@ -481,3 +481,49 @@ existing floors) and requires guest top-level/work-tree/HEAD/clean-status
 postconditions before allowing public network or recording ACTIVE. This is a
 tested-workload compatibility decision, not a global compatibility or
 least-privilege claim.
+
+## 15. Post-fix Task 2A compatibility diagnostics
+
+This append-only section records the three post-fix diagnostic-only reruns at
+code/evidence HEAD `0ae81d8eec376c4af7f89a60c5351d841b28b41c`. It supersedes
+only the prior correct-path-but-empty-clone symptom. Sections 13 and 14, their
+attempts, and their original path-mapping attribution remain unchanged. Every
+rerun used the frozen repository URL, SHA, Compose path, and port; all actual
+SHAs matched their pins. These runs are not metric-bearing and no repository was
+replaced. Full retained evidence is appended to
+[`pilot-evidence/m7.5-compatibility-diagnostic.md`](pilot-evidence/m7.5-compatibility-diagnostic.md).
+
+| Repo | Run ID | Exact SHA | Duration | Command results | Boot / retained outcome | Recovery / lifecycle |
+|---|---|---|---:|---|---|---|
+| Umami | `f4167de9-c652-47be-bcc8-db7190d66bba` | `ca661c7057984aa98ed4f7083d84dae2f65bfcb0` | `102.2119506329982 s` | `up=1` (stderr truncated; causal tail retained), `ps=0`, `logs=0` | Compose present; images pulled; containers created and started; `db=restarting`, `umami=created`; Boot fail; PostgreSQL `initdb` could not create `/var/lib/postgresql/data/pg_wal`: `No space left on device` | `stop` / `stopped` / `invalid recovery evidence` / `boot_recovery_stopped`; `create_success -> destroy_attempt -> destroy_success` |
+| Listmonk | `9aca7344-e60a-4d84-ac9a-34c8dfc5b8b9` | `670c01717d48647093335cc23a6be6f4b79c3b6b` | `60.388527538001654 s` | `up=0`, `ps=0`, `logs=0`; no truncation | Compose present; images pulled; containers created and started; `app=restarting`, `db=running/starting`; Boot fail. Later logs show PostgreSQL ready and Listmonk `http server started on [::]:9000`; bounded immediate post-up startup/readiness transition | `stop` / `stopped` / `invalid recovery evidence` / `boot_recovery_stopped`; `create_success -> destroy_attempt -> destroy_success` |
+| changedetection.io | `e5211ae6-a2e5-411b-abf6-9038b7b354ba` | `5d9c7c6da76340597243e8163c4f2439237fa0e8` | `113.89821543700236 s` | `up=0`, `ps=0`, `logs=0`; no truncation | Compose present; `changedetection=running`; Boot pass; Flask listened on port 5000. Later Observation collection failed with `ObservationCollectionError`, exit `4`, `internal:observationcollectionerror`; no more specific collector reason retained | No Recovery ruling; `create_success -> destroy_attempt -> destroy_success` |
+
+The Task 2A cloned-workspace correction is empirically validated `3/3`: every
+rerun reached its exact Compose workload and the old correct-path-but-empty
+workspace failure did not recur. The controller's final inventory check after
+the third rerun was exactly `No sandboxes found.` It is not evidence of a
+separate immediate post-attempt inventory check after each individual rerun.
+
+The primary workload outcomes are heterogeneous: Umami has a hard
+Docker/workload disk-exhaustion signature, Listmonk has a bounded
+startup/readiness transition, and changedetection.io passes Boot before a later
+`ObservationCollectionError`.
+
+Independently of those workload causes, Umami and Listmonk share one exact
+Recovery-phase failure: `action=stop`, `disposition=stopped`, reason
+`invalid recovery evidence`. Current code accepts empty `allowed_env_keys` and
+an empty README as valid; `_combined_logs()` rejects fields above `4,096`
+characters or aggregate logs above `16,384` characters. Both retained attempts
+have sanitized Boot evidence beyond those bounds, yielding the same Recovery
+phase and normalized planner-input rejection signature in `2/3`.
+
+The frozen Task 3 entry gate is therefore met for bounded recovery projection.
+This authorizes only the repair that enables the deterministic planner to receive
+valid bounded evidence; it does not claim to fix Umami's disk exhaustion or
+Listmonk's startup transition. Task 4's readiness entry gate is not met: only
+Listmonk shows the bounded startup/readiness transition, while Umami has a hard
+disk error and changedetection.io passes Boot. Task 5 is not ruled on by this
+documentation task, and Task 3 is not implemented here.
+
+**TASK 3 ENTRY GATE MET — BOUNDED RECOVERY PROJECTION AUTHORIZED**
