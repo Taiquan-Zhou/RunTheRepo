@@ -89,7 +89,7 @@ def _read_document(path: Path) -> dict[str, object]:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode) or not _same_identity(initial, opened):
             raise JourneyArtifactError("baseline journey artifact target changed")
-        payload = os.read(descriptor, _MAX_ARTIFACT_BYTES + 1)
+        payload = _read_bounded(descriptor)
     except JourneyArtifactError:
         raise
     except OSError as error:
@@ -115,6 +115,20 @@ def _read_document(path: Path) -> dict[str, object]:
     ):
         raise JourneyArtifactError("baseline journey artifact is invalid")
     return document
+
+
+def _read_bounded(descriptor: int) -> bytes:
+    remaining = _MAX_ARTIFACT_BYTES + 1
+    chunks: list[bytes] = []
+    while remaining > 0:
+        chunk = os.read(descriptor, remaining)
+        if not chunk:
+            break
+        if len(chunk) > remaining:
+            raise JourneyArtifactError("baseline journey artifact exceeds byte budget")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def _canonical_json_bytes(value: object) -> bytes:

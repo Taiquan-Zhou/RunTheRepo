@@ -185,33 +185,36 @@ async def _propose_recovery(
         schema=RecoveryAction,
     )
     try:
-        proposal = await _model_proposal_before_deadline(
-            model,
-            evidence,
-            readme_excerpt,
-            authority,
-        )
-    except ModelAdapterError as error:
-        _record_model_failure(recorder, error.reason_code)
-        return _stop("model timeout")
-    except TimeoutError:
-        _record_model_failure(recorder, "planner_timeout")
-        return _stop("model timeout")
-    except _UnknownAdapterError:
-        _record_model_failure(recorder, "adapter_error")
-        return _stop("model adapter error")
-    except ValidationError:
-        _record_model_failure(recorder, "policy_rejected")
-        return _stop("unsafe proposal")
-    if proposal is _MODEL_DEADLINE_EXPIRED:
-        _record_model_failure(recorder, "planner_timeout")
-        return _stop("model timeout")
-    action = _validated_or_stop(proposal, authority)
-    if action.reason == "unsafe proposal":
-        _record_model_failure(recorder, "policy_rejected")
-    else:
-        _record_model_success(recorder, action.model_dump(mode="json"), None)
-    return action
+        try:
+            proposal = await _model_proposal_before_deadline(
+                model,
+                evidence,
+                readme_excerpt,
+                authority,
+            )
+        except ModelAdapterError as error:
+            _record_model_failure(recorder, error.reason_code)
+            return _stop("model timeout")
+        except TimeoutError:
+            _record_model_failure(recorder, "planner_timeout")
+            return _stop("model timeout")
+        except _UnknownAdapterError:
+            _record_model_failure(recorder, "adapter_error")
+            return _stop("model adapter error")
+        except ValidationError:
+            _record_model_failure(recorder, "policy_rejected")
+            return _stop("unsafe proposal")
+        if proposal is _MODEL_DEADLINE_EXPIRED:
+            _record_model_failure(recorder, "planner_timeout")
+            return _stop("model timeout")
+        action = _validated_or_stop(proposal, authority)
+        if action.reason == "unsafe proposal":
+            _record_model_failure(recorder, "policy_rejected")
+        else:
+            _record_model_success(recorder, action.model_dump(mode="json"), None)
+        return action
+    finally:
+        _close_model_recorder(recorder)
 
 
 async def plan_journeys(
@@ -265,32 +268,35 @@ async def _plan_journeys(
         schema=_JourneyProposal,
     )
     try:
-        proposal = await _journey_proposal_before_deadline(model, readme_excerpt)
-    except ModelAdapterError as error:
-        _record_model_failure(recorder, error.reason_code)
-        return []
-    except TimeoutError:
-        _record_model_failure(recorder, "planner_timeout")
-        return []
-    except _UnknownAdapterError:
-        _record_model_failure(recorder, "adapter_error")
-        return []
-    except (ValidationError, TypeError, ValueError):
-        _record_model_failure(recorder, "policy_rejected")
-        return []
-    if not isinstance(proposal, _JourneyProposal):
-        _record_model_failure(recorder, "planner_timeout")
-        return []
-    journeys = _materialize_journey_proposal(proposal)
-    if journeys is None:
-        _record_model_failure(recorder, "policy_rejected")
-        return []
-    _record_model_success(
-        recorder,
-        [journey.model_dump(mode="json") for journey in journeys],
-        len(journeys),
-    )
-    return journeys
+        try:
+            proposal = await _journey_proposal_before_deadline(model, readme_excerpt)
+        except ModelAdapterError as error:
+            _record_model_failure(recorder, error.reason_code)
+            return []
+        except TimeoutError:
+            _record_model_failure(recorder, "planner_timeout")
+            return []
+        except _UnknownAdapterError:
+            _record_model_failure(recorder, "adapter_error")
+            return []
+        except (ValidationError, TypeError, ValueError):
+            _record_model_failure(recorder, "policy_rejected")
+            return []
+        if not isinstance(proposal, _JourneyProposal):
+            _record_model_failure(recorder, "planner_timeout")
+            return []
+        journeys = _materialize_journey_proposal(proposal)
+        if journeys is None:
+            _record_model_failure(recorder, "policy_rejected")
+            return []
+        _record_model_success(
+            recorder,
+            [journey.model_dump(mode="json") for journey in journeys],
+            len(journeys),
+        )
+        return journeys
+    finally:
+        _close_model_recorder(recorder)
 
 
 def _read_declared_journeys(repo_root: Path) -> list[Journey] | None:
@@ -1062,6 +1068,11 @@ def _record_model_success(
 ) -> None:
     if recorder is not None:
         recorder.finish_success(accepted_output, journey_count=journey_count)
+
+
+def _close_model_recorder(recorder: ModelAttemptRecorder | None) -> None:
+    if recorder is not None:
+        recorder.close()
 
 
 def _validated_or_stop(

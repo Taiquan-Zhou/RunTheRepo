@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -923,6 +924,49 @@ def test_caller_cancellation_cancels_and_observes_inner_model_task(
         with pytest.raises(asyncio.CancelledError):
             await planner
         await asyncio.wait_for(model.cancelled.wait(), timeout=0.1)
+
+    asyncio.run(exercise())
+
+
+def test_model_journey_cancellation_closes_retained_evidence_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = CancellationTrackingModelAdapter()
+    real_open = os.open
+    opened: list[int] = []
+
+    def record_open(path: str | bytes | Path, flags: int, mode: int = 0o777) -> int:
+        descriptor = real_open(path, flags, mode)
+        opened.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr("repotrial.trial.model_evidence.os.open", record_open)
+
+    async def exercise() -> None:
+        planner = asyncio.create_task(
+            planner_module._plan_journeys_with_evidence(
+                tmp_path,
+                "",
+                model,
+                evidence_dir=tmp_path,
+            )
+        )
+        await asyncio.wait_for(model.started.wait(), timeout=0.1)
+        claimed = opened[0]
+        try:
+            os.fstat(claimed)
+        finally:
+            planner.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await planner
+        await asyncio.wait_for(model.cancelled.wait(), timeout=0.1)
+        with pytest.raises(OSError):
+            os.fstat(claimed)
+        rows = [
+            json.loads(line)
+            for line in next(tmp_path.glob("*.jsonl")).read_text().splitlines()
+        ]
+        assert [row["phase"] for row in rows] == ["start"]
 
     asyncio.run(exercise())
 

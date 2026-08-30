@@ -65,7 +65,7 @@ class ModelAttemptRecorder:
         self._started_at = time.monotonic()
         self._finished = False
         self._purpose = purpose
-        self._path, self._identity = _claim_attempt_slot(
+        self._path, descriptor = _claim_attempt_slot(
             evidence_dir,
             _PURPOSE_PREFIXES[purpose],
             _serialize(
@@ -84,6 +84,7 @@ class ModelAttemptRecorder:
                 }
             ),
         )
+        self._descriptor: int | None = descriptor
 
     @property
     def path(self) -> Path:
@@ -108,6 +109,16 @@ class ModelAttemptRecorder:
             raise ValueError("invalid model attempt outcome")
         self._finish(outcome, accepted_output_sha256=None, journey_count=None)
 
+    def close(self) -> None:
+        descriptor = self._descriptor
+        if descriptor is None:
+            return
+        self._descriptor = None
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise ModelAttemptEvidenceError("could not close model evidence") from error
+
     def _finish(
         self,
         outcome: ModelAttemptOutcome,
@@ -120,23 +131,36 @@ class ModelAttemptRecorder:
         elapsed_s = time.monotonic() - self._started_at
         if not math.isfinite(elapsed_s) or elapsed_s < 0:
             raise ModelAttemptEvidenceError("model attempt clock is invalid")
-        _append_existing_file(
-            self._path,
-            self._identity,
-            _serialize(
-                {
-                    "accepted_output_sha256": accepted_output_sha256,
-                    "elapsed_s": elapsed_s,
-                    "journey_count": journey_count,
-                    "outcome": outcome,
-                    "phase": "terminal",
-                    "purpose": self._purpose,
-                    "schema_version": _SCHEMA_VERSION,
-                    "sequence": 2,
-                }
-            ),
-        )
-        self._finished = True
+        descriptor = self._descriptor
+        if descriptor is None:
+            raise ModelAttemptEvidenceError("model attempt is closed")
+        try:
+            _write_all(
+                descriptor,
+                _serialize(
+                    {
+                        "accepted_output_sha256": accepted_output_sha256,
+                        "elapsed_s": elapsed_s,
+                        "journey_count": journey_count,
+                        "outcome": outcome,
+                        "phase": "terminal",
+                        "purpose": self._purpose,
+                        "schema_version": _SCHEMA_VERSION,
+                        "sequence": 2,
+                    }
+                ),
+                "append",
+            )
+            os.fsync(descriptor)
+            self._finished = True
+        except ModelAttemptEvidenceError:
+            raise
+        except OSError as error:
+            raise ModelAttemptEvidenceError(
+                "could not append model evidence"
+            ) from error
+        finally:
+            self.close()
 
 
 def _canonical_schema_bytes(schema: type[BaseModel]) -> bytes:
@@ -167,7 +191,7 @@ def _sha256(value: bytes) -> str:
 
 def _claim_attempt_slot(
     evidence_dir: Path, prefix: str, payload: bytes
-) -> tuple[Path, tuple[int, int]]:
+) -> tuple[Path, int]:
     if not isinstance(evidence_dir, Path):
         raise TypeError("model evidence directory must be a Path")
     _validate_parent(evidence_dir)
@@ -179,9 +203,10 @@ def _claim_attempt_slot(
     raise ModelAttemptEvidenceError("model evidence attempt slots are exhausted")
 
 
-def _try_create_new_file(path: Path, payload: bytes) -> tuple[int, int] | None:
+def _try_create_new_file(path: Path, payload: bytes) -> int | None:
     flags = (
         os.O_WRONLY
+        | os.O_APPEND
         | os.O_CREAT
         | os.O_EXCL
         | getattr(os, "O_BINARY", 0)
@@ -202,48 +227,13 @@ def _try_create_new_file(path: Path, payload: bytes) -> tuple[int, int] | None:
             )
         _write_all(descriptor, payload, "create")
         os.fsync(descriptor)
-        return opened.st_dev, opened.st_ino
+        return descriptor
     except ModelAttemptEvidenceError:
+        os.close(descriptor)
         raise
     except OSError as error:
+        os.close(descriptor)
         raise ModelAttemptEvidenceError("could not create model evidence") from error
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-
-
-def _append_existing_file(
-    path: Path, expected_identity: tuple[int, int], payload: bytes
-) -> None:
-    _validate_parent(path.parent)
-    flags = (
-        os.O_WRONLY
-        | os.O_APPEND
-        | getattr(os, "O_BINARY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(path, flags)
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or (
-                opened.st_dev,
-                opened.st_ino,
-            )
-            != expected_identity
-        ):
-            raise ModelAttemptEvidenceError("model evidence target changed")
-        _write_all(descriptor, payload, "append")
-        os.fsync(descriptor)
-    except ModelAttemptEvidenceError:
-        raise
-    except OSError as error:
-        raise ModelAttemptEvidenceError("could not append model evidence") from error
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
 
 
 def _write_all(descriptor: int, payload: bytes, operation: str) -> None:

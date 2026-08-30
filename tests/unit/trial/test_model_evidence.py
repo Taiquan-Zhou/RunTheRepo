@@ -89,9 +89,33 @@ def test_model_attempt_slot_symlink_is_never_followed_or_overwritten(
     assert outside.read_bytes() == b"outside\n"
 
 
-def test_model_attempt_append_validates_the_open_descriptor_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("terminal", ["success", "failure"])
+def test_model_attempt_terminal_reuses_claimed_descriptor_without_reopening_and_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, terminal: str
 ) -> None:
+    real_open = os.open
+    real_write = os.write
+    real_close = os.close
+    opened: list[int] = []
+    written: list[int] = []
+    closed: list[int] = []
+
+    def record_open(path: str | bytes | Path, flags: int, mode: int = 0o777) -> int:
+        descriptor = real_open(path, flags, mode)
+        opened.append(descriptor)
+        return descriptor
+
+    def record_write(descriptor: int, payload: bytes) -> int:
+        written.append(descriptor)
+        return real_write(descriptor, payload)
+
+    def record_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr("repotrial.trial.model_evidence.os.open", record_open)
+    monkeypatch.setattr("repotrial.trial.model_evidence.os.write", record_write)
+    monkeypatch.setattr("repotrial.trial.model_evidence.os.close", record_close)
     recorder = ModelAttemptRecorder(
         tmp_path,
         purpose="journey",
@@ -99,21 +123,61 @@ def test_model_attempt_append_validates_the_open_descriptor_identity(
         user="user",
         schema=_Proposal,
     )
-    decoy = tmp_path / "decoy.jsonl"
-    decoy.write_bytes(b"decoy\n")
-    real_open = os.open
+    assert len(opened) == 1
+    claimed = opened[0]
+    os.fstat(claimed)
 
-    def open_decoy(path: str | bytes | Path, flags: int, mode: int = 0o777) -> int:
-        if flags & os.O_APPEND:
-            return real_open(decoy, flags, mode)
-        return real_open(path, flags, mode)
+    def reject_reopen(path: str | bytes | Path, flags: int, mode: int = 0o777) -> int:
+        del path, flags, mode
+        raise AssertionError("terminal must not reopen the evidence path")
 
-    monkeypatch.setattr("repotrial.trial.model_evidence.os.open", open_decoy)
-
-    with pytest.raises(ModelAttemptEvidenceError, match="target changed"):
+    monkeypatch.setattr("repotrial.trial.model_evidence.os.open", reject_reopen)
+    if terminal == "success":
+        recorder.finish_success({"answer": "ok"}, journey_count=1)
+    else:
         recorder.finish_failure("adapter_error")
+    recorder.close()
+    recorder.close()
 
-    assert decoy.read_bytes() == b"decoy\n"
+    assert written and set(written) == {claimed}
+    assert closed.count(claimed) == 1
+    with pytest.raises(OSError):
+        os.fstat(claimed)
+
+
+def test_model_attempt_explicit_close_is_idempotent_and_preserves_start_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_open = os.open
+    real_close = os.close
+    opened: list[int] = []
+    closed: list[int] = []
+
+    def record_open(path: str | bytes | Path, flags: int, mode: int = 0o777) -> int:
+        descriptor = real_open(path, flags, mode)
+        opened.append(descriptor)
+        return descriptor
+
+    def record_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr("repotrial.trial.model_evidence.os.open", record_open)
+    monkeypatch.setattr("repotrial.trial.model_evidence.os.close", record_close)
+    recorder = ModelAttemptRecorder(
+        tmp_path,
+        purpose="journey",
+        system="system",
+        user="user",
+        schema=_Proposal,
+    )
+
+    recorder.close()
+    recorder.close()
+
+    assert closed.count(opened[0]) == 1
+    rows = [json.loads(line) for line in recorder.path.read_text().splitlines()]
+    assert [row["phase"] for row in rows] == ["start"]
 
 
 def test_model_attempt_short_writes_are_completed_and_fsynced(

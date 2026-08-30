@@ -208,6 +208,27 @@ def test_baseline_journey_read_is_bounded_to_limit_plus_one(
     assert sum(requested) <= artifact_module._MAX_ARTIFACT_BYTES + 1
 
 
+def test_baseline_journey_segmented_short_reads_do_not_hide_trailing_junk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "baseline-journeys.json"
+    write_baseline_journeys(path, _journeys())
+    canonical = path.read_bytes()
+    path.write_bytes(canonical + b"trailing-junk")
+    chunks = iter((canonical, b"trailing-junk", b""))
+
+    def segmented_read(descriptor: int, count: int) -> bytes:
+        del descriptor
+        chunk = next(chunks)
+        assert len(chunk) <= count
+        return chunk
+
+    monkeypatch.setattr("repotrial.trial.journey_artifact.os.read", segmented_read)
+
+    with pytest.raises(JourneyArtifactError, match="invalid"):
+        verify_baseline_journeys(path, _journeys())
+
+
 def test_baseline_journey_symlink_is_never_followed(tmp_path: Path) -> None:
     outside = tmp_path / "outside.json"
     outside.write_bytes(b"outside")
