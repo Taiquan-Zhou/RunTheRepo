@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -76,6 +78,22 @@ def test_projection_never_exceeds_aggregate_budget_with_a_small_remainder() -> N
 
     assert len(projected.logs["later"]) == 14
     assert sum(map(len, projected.logs.values())) == 16_384
+
+
+def test_projection_skips_non_string_values_and_marks_tiny_remainders() -> None:
+    logs: dict[str, object] = {
+        "up": "u" * 4_096,
+        "ps": "p" * 4_096,
+        "logs": "l" * 4_096,
+        "extra": "e" * 4_091,
+        "later": "x" * 100,
+        "ignored": 1,
+    }
+
+    projected = project_recovery_evidence(cast(Mapping[str, str], logs))
+
+    assert projected.logs["later"] == "\n[TRU"
+    assert "ignored" not in projected.logs
 
 
 def test_derivation_collects_compose_forms_and_env_example_names_without_values(
@@ -216,3 +234,25 @@ def test_derivation_limits_and_sorts_portable_keys(tmp_path: Path) -> None:
 
     assert context.allowed_env_keys == frozenset(keys[:32])
     assert [item.key for item in context.declarations] == keys[:32]
+
+
+@pytest.mark.parametrize("compose_path", ["../compose.yml", "missing.yml", "nested\\compose.yml"])
+def test_derivation_rejects_unsafe_or_missing_selected_compose(
+    tmp_path: Path, compose_path: str
+) -> None:
+    _write(tmp_path / "compose.yml", "services: {}\n")
+
+    with pytest.raises(ValueError, match="compose"):
+        derive_recovery_context(tmp_path, compose_path)
+
+
+def test_derivation_rejects_linked_component_in_selected_compose_path(
+    tmp_path: Path,
+) -> None:
+    source_directory = tmp_path / "source"
+    source_directory.mkdir()
+    _write(source_directory / "compose.yml", "services: {}\n")
+    (tmp_path / "nested").symlink_to(source_directory, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="link"):
+        derive_recovery_context(tmp_path, "nested/compose.yml")
