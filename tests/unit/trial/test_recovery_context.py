@@ -203,6 +203,24 @@ def test_derivation_reads_interpolations_only_from_yaml_values_and_honors_escape
     )
 
 
+def test_derivation_ignores_single_quoted_compose_interpolation(
+    tmp_path: Path,
+) -> None:
+    _write(
+        tmp_path / "compose.yml",
+        "services:\n"
+        "  app:\n"
+        "    environment:\n"
+        "      SINGLE: '${LITERAL_ONLY}'\n"
+        "      UNQUOTED: ${UNQUOTED_TOKEN}\n"
+        '      DOUBLE: "${DOUBLE_TOKEN}"\n',
+    )
+
+    context = derive_recovery_context(tmp_path, "compose.yml")
+
+    assert context.allowed_env_keys == frozenset({"UNQUOTED_TOKEN", "DOUBLE_TOKEN"})
+
+
 def test_derivation_rejects_compose_yaml_over_node_limit(tmp_path: Path) -> None:
     _write(
         tmp_path / "compose.yml",

@@ -206,6 +206,55 @@ def test_projected_multifield_evidence_reaches_planner_in_recovery_order() -> No
     assert model.user.index("a-first") < model.user.index("z-last")
 
 
+def test_exact_boundary_projected_evidence_reaches_planner_in_recovery_order() -> None:
+    model = CapturingModelAdapter(
+        RecoveryAction(action="retry", params={}, reason="retry once")
+    )
+    projected = project_recovery_evidence(
+        {
+            "z-later": "z-later",
+            "logs": "l" * 4_096,
+            "up": "u" * 4_096,
+            "ps": "p" * 4_096,
+            "a-first": "a" * 4_093,
+        }
+    )
+
+    action = _propose(logs=projected.logs, model=model)
+
+    assert sum(map(len, projected.logs.values())) + len(projected.logs) - 1 == 16_384
+    assert list(projected.logs) == ["up", "ps", "logs", "a-first"]
+    assert action.action == "retry"
+    assert action.reason != "invalid recovery evidence"
+    assert model.calls == 1
+    assert model.user.index("u" * 64) < model.user.index("p" * 64)
+    assert model.user.index("p" * 64) < model.user.index("l" * 64)
+    assert model.user.index("l" * 64) < model.user.index("a" * 64)
+
+
+def test_malformed_mixed_log_keys_fail_closed_before_planner_sorting() -> None:
+    model = FakeModelAdapter(
+        RecoveryAction(action="retry", params={}, reason="should not be proposed")
+    )
+
+    action = _propose(
+        logs=cast(
+            dict[str, str],
+            {
+                "logs": "unrecognized startup failure",
+                "otherwise-valid": "other evidence",
+                1: "bad",
+            },
+        ),
+        model=model,
+    )
+
+    assert action == RecoveryAction(
+        action="stop", params={}, reason="invalid recovery evidence"
+    )
+    assert model.calls == 0
+
+
 def test_readme_instruction_to_read_ssh_key_is_refused() -> None:
     model = FakeModelAdapter(
         RecoveryAction(
