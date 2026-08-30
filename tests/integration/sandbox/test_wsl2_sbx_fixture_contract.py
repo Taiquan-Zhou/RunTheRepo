@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import json
 import subprocess
 import sys
 import threading
@@ -55,6 +56,34 @@ def test_wsl2_compose_fixture_has_pinned_minimal_web_service() -> None:
         "repotrial-wsl2-sbx-ok\n"
     )
     assert (_FIXTURE_ROOT / "www" / "health.txt").read_text(encoding="utf-8") == "ok\n"
+
+
+def test_calibration_compose_ps_parser_normalizes_single_service_object(
+    calibration_module: ModuleType,
+) -> None:
+    service = {"Service": "web", "State": "running"}
+
+    assert calibration_module._parse_compose_ps(json.dumps(service)) == [service]
+
+
+def test_calibration_compose_ps_parser_preserves_non_empty_service_array(
+    calibration_module: ModuleType,
+) -> None:
+    services = [{"Service": "web", "State": "running"}]
+
+    assert calibration_module._parse_compose_ps(json.dumps(services)) == services
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [[], {}, 0, "web", [{"Service": "web"}, "invalid"]],
+    ids=["empty-list", "empty-object", "scalar-number", "scalar-string", "mixed-list"],
+)
+def test_calibration_compose_ps_parser_rejects_invalid_shapes(
+    calibration_module: ModuleType, payload: object
+) -> None:
+    with pytest.raises(AssertionError):
+        calibration_module._parse_compose_ps(json.dumps(payload))
 
 
 def test_calibration_workload_spawn_guard_only_matches_owned_sleep(

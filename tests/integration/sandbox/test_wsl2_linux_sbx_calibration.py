@@ -476,6 +476,9 @@ def _parse_mem_total_kib(output: str) -> int:
 
 def _parse_compose_ps(output: str) -> list[dict[str, object]]:
     decoded = json.loads(output)
+    if isinstance(decoded, dict):
+        assert decoded
+        decoded = [decoded]
     assert isinstance(decoded, list) and decoded
     assert all(isinstance(item, dict) for item in decoded)
     return decoded
