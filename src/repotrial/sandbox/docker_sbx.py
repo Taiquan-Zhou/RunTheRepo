@@ -206,7 +206,7 @@ class _ProcessCleanupError(RuntimeError):
     pass
 
 
-class _DuplicateNetworkLogKeyError(ValueError):
+class _DuplicateJsonKeyError(ValueError):
     pass
 
 
@@ -808,8 +808,11 @@ def _parse_published_port(output: bytes, container_port: int) -> int:
     except UnicodeDecodeError:
         raise DockerSbxError("publish_port", "port_mapping_invalid_utf8") from None
     try:
-        decoded: Any = json.loads(text)
-    except json.JSONDecodeError:
+        decoded: Any = json.loads(
+            text,
+            object_pairs_hook=_strict_json_object_from_pairs,
+        )
+    except (json.JSONDecodeError, _DuplicateJsonKeyError):
         raise DockerSbxError("publish_port", "port_mapping_invalid") from None
     if not isinstance(decoded, list) or len(decoded) > 128:
         raise DockerSbxError("publish_port", "port_mapping_invalid")
@@ -827,10 +830,12 @@ def _parse_published_port(output: bytes, container_port: int) -> int:
             or not 1 <= host_port <= 65_535
             or type(sandbox_port) is not int
             or not 1 <= sandbox_port <= 65_535
-            or protocol != "tcp4"
+            or protocol not in ("tcp", "tcp4")
         ):
             raise DockerSbxError("publish_port", "port_mapping_invalid")
         if sandbox_port == container_port:
+            if protocol != "tcp4":
+                raise DockerSbxError("publish_port", "port_mapping_invalid")
             matches.append(host_port)
     if len(matches) != 1:
         raise DockerSbxError("publish_port", "port_mapping_missing_or_ambiguous")
@@ -847,9 +852,9 @@ def _parse_network_events(
     try:
         decoded: Any = json.loads(
             text,
-            object_pairs_hook=_network_log_object_from_pairs,
+            object_pairs_hook=_strict_json_object_from_pairs,
         )
-    except (json.JSONDecodeError, _DuplicateNetworkLogKeyError):
+    except (json.JSONDecodeError, _DuplicateJsonKeyError):
         return None
     if not isinstance(decoded, dict) or set(decoded) != _NETWORK_LOG_KEYS:
         return None
@@ -900,13 +905,13 @@ def _parse_network_events(
     return events
 
 
-def _network_log_object_from_pairs(
+def _strict_json_object_from_pairs(
     pairs: list[tuple[str, Any]],
 ) -> dict[str, Any]:
     parsed: dict[str, Any] = {}
     for key, value in pairs:
         if key in parsed:
-            raise _DuplicateNetworkLogKeyError
+            raise _DuplicateJsonKeyError
         parsed[key] = value
     return parsed
 

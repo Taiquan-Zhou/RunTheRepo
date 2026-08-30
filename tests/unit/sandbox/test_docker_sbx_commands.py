@@ -1234,15 +1234,59 @@ def test_exec_lossy_utf8_output_is_bounded_after_encoding(
 @pytest.mark.parametrize(
     "payload",
     [
-        b"[]",
-        b"not-json",
-        b'{"host_ip":"127.0.0.1"}',
-        b'[{"host_ip":"127.0.0.1","host_port":0,"sandbox_port":8080,"protocol":"tcp"}]',
-        b'[{"host_ip":"0.0.0.0","host_port":49152,"sandbox_port":8080,"protocol":"tcp"}]',
-        b'[{"host_ip":"127.0.0.1","host_port":49152,"sandbox_port":8080,"protocol":"tcp","extra":1}]',
-        (
-            b'[{"host_ip":"127.0.0.1","host_port":49152,"sandbox_port":8080,"protocol":"tcp"},'
-            b'{"host_ip":"::1","host_port":49152,"sandbox_port":8080,"protocol":"tcp"}]'
+        pytest.param(b"[]", id="missing-requested-mapping"),
+        pytest.param(b"not-json", id="malformed-json"),
+        pytest.param(b'{"host_ip":"127.0.0.1"}', id="non-list-json"),
+        pytest.param(
+            b'[{"host_ip":"127.0.0.1","host_port":0,'
+            b'"sandbox_port":8080,"protocol":"tcp4"}]',
+            id="host-port-out-of-range",
+        ),
+        pytest.param(
+            b'[{"host_ip":"0.0.0.0","host_port":49152,'
+            b'"sandbox_port":8080,"protocol":"tcp4"}]',
+            id="unsafe-host-ip",
+        ),
+        pytest.param(
+            b'[{"host_ip":"127.0.0.1","host_port":49152,'
+            b'"sandbox_port":8080,"protocol":"tcp4","extra":1}]',
+            id="extra-key",
+        ),
+        pytest.param(
+            b'[{"host_ip":"127.0.0.1","host_port":49152,'
+            b'"sandbox_port":8080,"protocol":"tcp4"},'
+            b'{"host_ip":"127.0.0.1","host_port":49153,'
+            b'"sandbox_port":8080,"protocol":"tcp4"}]',
+            id="ambiguous-requested-mapping",
+        ),
+        pytest.param(
+            b'[{"host_ip":"127.0.0.1","host_port":49152,'
+            b'"sandbox_port":8080,"protocol":"tcp"}]',
+            id="requested-tcp",
+        ),
+        pytest.param(
+            b'[{"host_ip":"127.0.0.1","host_port":49152,'
+            b'"sandbox_port":8080,"protocol":"udp"}]',
+            id="requested-unknown-protocol",
+        ),
+        pytest.param(
+            b'[{"host_ip":"127.0.0.1","host_port":49152,'
+            b'"sandbox_port":8080,"protocol":[]}]',
+            id="malformed-protocol-type",
+        ),
+        pytest.param(
+            b'[{"host_ip":"127.0.0.1","host_port":true,'
+            b'"sandbox_port":9418,"protocol":"tcp"},'
+            b'{"host_ip":"127.0.0.1","host_port":49152,'
+            b'"sandbox_port":8080,"protocol":"tcp4"}]',
+            id="unrelated-non-integer-port",
+        ),
+        pytest.param(
+            b'[{"host_ip":"127.0.0.1","host_port":49153,'
+            b'"sandbox_port":9418,"protocol":"udp"},'
+            b'{"host_ip":"127.0.0.1","host_port":49152,'
+            b'"sandbox_port":8080,"protocol":"tcp4"}]',
+            id="unrelated-unknown-protocol",
         ),
     ],
 )
@@ -1269,6 +1313,26 @@ def test_publish_port_rejects_missing_malformed_unsafe_or_ambiguous_json(
     calls_before_destroy = len(spawner.calls)
     asyncio.run(provider.destroy(sandbox_id))
     assert len(spawner.calls) == calls_before_destroy
+
+
+def test_publish_port_rejects_duplicate_json_key_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = (
+        b'[{"host_ip":"127.0.0.1","host_port":49151,'
+        b'"host_port":49152,"sandbox_port":8080,"protocol":"tcp4"}]'
+    )
+    spawner = _SbxSpawner()
+    spawner.handler = lambda command: (
+        _Outcome(stdout=payload) if command[-1:] == ("--json",) else _Outcome()
+    )
+    provider = _provider(monkeypatch, spawner)
+    sandbox_id = _create(provider, tmp_path)
+
+    with pytest.raises(DockerSbxError, match="port_mapping"):
+        asyncio.run(provider.publish_port(sandbox_id, 8080))
+
+    assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
 
 
 @pytest.mark.parametrize("failed_stage", ["publish", "list"])
@@ -1368,11 +1432,13 @@ def test_publish_timeout_force_destroys_owned_sandbox(
     assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
 
 
-def test_publish_port_returns_one_strict_ephemeral_loopback_mapping(
+def test_publish_port_accepts_strict_unrelated_tcp_mapping(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     payload = (
-        b'[{"host_ip":"127.0.0.1","host_port":49152,'
+        b'[{"host_ip":"127.0.0.1","host_port":49151,'
+        b'"sandbox_port":9418,"protocol":"tcp"},'
+        b'{"host_ip":"127.0.0.1","host_port":49152,'
         b'"sandbox_port":8080,"protocol":"tcp4"}]'
     )
     spawner = _SbxSpawner()
