@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import traceback
 from pathlib import Path
 from typing import cast
 
@@ -340,25 +341,33 @@ def test_model_attempt_close_only_failure_drops_uncertain_ownership_without_retr
     with pytest.raises(ModelAttemptEvidenceError, match="could not close") as caught:
         recorder.close()
 
-    assert isinstance(caught.value.__cause__, OSError)
-    assert str(caught.value) == "could not close model evidence"
-    assert str(caught.value.__cause__) == "raw close secret"
     assert close_attempts == [claimed]
     assert "__del__" not in ModelAttemptRecorder.__dict__
 
     victim = tmp_path / "victim.txt"
-    victim_descriptor = real_open(victim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    source_descriptor: int | None = real_open(
+        victim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+    )
     try:
-        assert victim_descriptor == claimed
+        if source_descriptor != claimed:
+            os.dup2(source_descriptor, claimed)
+            real_close(source_descriptor)
+            source_descriptor = None
         recorder.close()
         recorder.close()
         assert close_attempts == [claimed]
-        assert os.write(victim_descriptor, b"victim remains usable") == 21
-        os.fsync(victim_descriptor)
+        assert os.write(claimed, b"victim remains usable") == 21
+        os.fsync(claimed)
     finally:
-        _close_if_open(victim_descriptor, real_close)
+        _close_if_open(claimed, real_close)
+        if source_descriptor is not None and source_descriptor != claimed:
+            _close_if_open(source_descriptor, real_close)
 
     assert victim.read_bytes() == b"victim remains usable"
+    assert str(caught.value) == "could not close model evidence"
+    assert caught.value.__cause__ is None
+    formatted = "".join(traceback.format_exception(caught.value))
+    assert "raw close secret" not in formatted
 
 
 def test_model_attempt_short_writes_are_completed_and_fsynced(

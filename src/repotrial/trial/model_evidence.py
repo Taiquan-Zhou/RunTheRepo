@@ -119,9 +119,8 @@ class ModelAttemptRecorder:
         self._descriptor = None
         try:
             os.close(descriptor)
-        except OSError as error:
-            close_error = ModelAttemptEvidenceError("could not close model evidence")
-            raise close_error from error
+        except OSError:
+            raise ModelAttemptEvidenceError("could not close model evidence") from None
 
     def _close_preserving_primary(self, primary: BaseException) -> None:
         if self._descriptor is None:
