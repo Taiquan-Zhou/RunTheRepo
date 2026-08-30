@@ -83,7 +83,9 @@ def derive_recovery_context(
     sources: list[tuple[Path, str]] = [(compose, compose.relative_to(root).as_posix())]
     env_example = root / ".env.example"
     if env_example.exists() or env_example.is_symlink():
-        sources.append((_regular_file(env_example, root, ".env.example"), ".env.example"))
+        sources.append(
+            (_regular_file(env_example, root, ".env.example"), ".env.example")
+        )
 
     declarations: list[DeclaredEnvSource] = []
     for source, relative_path in sources:
@@ -102,9 +104,7 @@ def derive_recovery_context(
     allowed = sorted({declaration.key for declaration in declarations})[:_MAX_ENV_KEYS]
     allowed_keys = frozenset(allowed)
     bounded = [item for item in declarations if item.key in allowed_keys]
-    unique = {
-        (item.key, item.relative_path, item.sha256): item for item in bounded
-    }
+    unique = {(item.key, item.relative_path, item.sha256): item for item in bounded}
     ordered = tuple(item for _, item in sorted(unique.items()))
     return RecoveryRepositoryContext(
         allowed_env_keys=allowed_keys,

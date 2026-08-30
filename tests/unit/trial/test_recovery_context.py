@@ -112,12 +112,22 @@ def test_derivation_collects_compose_forms_and_env_example_names_without_values(
         "      E: ${REQUIRED_TWO?missing}\n",
     )
     env_example = tmp_path / ".env.example"
-    _write(env_example, "DATABASE_URL=example-secret-value\nexport EXTRA_TOKEN=also-secret\n")
+    _write(
+        env_example,
+        "DATABASE_URL=example-secret-value\nexport EXTRA_TOKEN=also-secret\n",
+    )
 
     context = derive_recovery_context(tmp_path, "compose.yml")
 
     assert context.allowed_env_keys == frozenset(
-        {"APP_TOKEN", "DATABASE_URL", "CACHE_URL", "REQUIRED_ONE", "REQUIRED_TWO", "EXTRA_TOKEN"}
+        {
+            "APP_TOKEN",
+            "DATABASE_URL",
+            "CACHE_URL",
+            "REQUIRED_ONE",
+            "REQUIRED_TWO",
+            "EXTRA_TOKEN",
+        }
     )
     assert [(item.key, item.relative_path) for item in context.declarations] == [
         ("APP_TOKEN", "compose.yml"),
@@ -128,12 +138,16 @@ def test_derivation_collects_compose_forms_and_env_example_names_without_values(
         ("REQUIRED_ONE", "compose.yml"),
         ("REQUIRED_TWO", "compose.yml"),
     ]
-    assert {item.sha256 for item in context.declarations if item.relative_path == "compose.yml"} == {
-        hashlib.sha256(compose.read_bytes()).hexdigest()
-    }
-    assert {item.sha256 for item in context.declarations if item.relative_path == ".env.example"} == {
-        hashlib.sha256(env_example.read_bytes()).hexdigest()
-    }
+    assert {
+        item.sha256
+        for item in context.declarations
+        if item.relative_path == "compose.yml"
+    } == {hashlib.sha256(compose.read_bytes()).hexdigest()}
+    assert {
+        item.sha256
+        for item in context.declarations
+        if item.relative_path == ".env.example"
+    } == {hashlib.sha256(env_example.read_bytes()).hexdigest()}
     assert "example-secret-value" not in context.model_dump_json()
     assert "also-secret" not in context.model_dump_json()
 
@@ -236,7 +250,9 @@ def test_derivation_limits_and_sorts_portable_keys(tmp_path: Path) -> None:
     assert [item.key for item in context.declarations] == keys[:32]
 
 
-@pytest.mark.parametrize("compose_path", ["../compose.yml", "missing.yml", "nested\\compose.yml"])
+@pytest.mark.parametrize(
+    "compose_path", ["../compose.yml", "missing.yml", "nested\\compose.yml"]
+)
 def test_derivation_rejects_unsafe_or_missing_selected_compose(
     tmp_path: Path, compose_path: str
 ) -> None:

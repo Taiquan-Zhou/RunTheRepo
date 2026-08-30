@@ -346,8 +346,7 @@ def test_boot_derives_declared_environment_after_intake_without_readme_expansion
     )
     context, source = _context(tmp_path, provider, journeys=[])
     source.write_text(
-        _compose_text(())
-        + "    environment:\n      TOKEN: ${APP_DECLARED_TOKEN}\n",
+        _compose_text(()) + "    environment:\n      TOKEN: ${APP_DECLARED_TOKEN}\n",
         encoding="utf-8",
     )
     context = replace(
@@ -377,8 +376,7 @@ def test_explicit_allowed_environment_keys_override_pinned_declarations(
     provider = GraphProvider(baseline_boots=[(False, "APP_DECLARED_TOKEN is required")])
     context, source = _context(tmp_path, provider, journeys=[])
     source.write_text(
-        _compose_text(())
-        + "    environment:\n      TOKEN: ${APP_DECLARED_TOKEN}\n",
+        _compose_text(()) + "    environment:\n      TOKEN: ${APP_DECLARED_TOKEN}\n",
         encoding="utf-8",
     )
     context = replace(context, allowed_env_keys=frozenset({"EXPLICIT_ONLY"}))
@@ -955,8 +953,7 @@ def test_pinned_intake_derives_declared_environment_once_before_boot(
         pinner_calls += 1
         destination.mkdir()
         (destination / "compose.yaml").write_text(
-            _compose_text(())
-            + "    environment:\n      TOKEN: ${PINNED_TOKEN}\n",
+            _compose_text(()) + "    environment:\n      TOKEN: ${PINNED_TOKEN}\n",
             encoding="utf-8",
         )
         return PinnedRepo(
