@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import AbstractContextManager
+from dataclasses import replace
 from pathlib import Path
 from typing import TypeVar
 
@@ -12,6 +13,7 @@ from pydantic import BaseModel
 from eval import model_runtime_calibration as calibration
 from repotrial.domain.models import Journey, JourneyAssertion, JourneyStep
 from repotrial.models.base import ModelAdapter, RecoveryAction
+from repotrial.trial.planner import propose_recovery
 
 RAW_SENTINEL = "RAW_MODEL_OUTPUT_MUST_NOT_APPEAR"
 METRIC_FIELDS = {
@@ -118,7 +120,9 @@ class FakeClock:
         return self.value
 
 
-class FakeInvalidSessionContext(AbstractContextManager[object]):
+class FakeInvalidSessionContext(
+    AbstractContextManager[calibration.InvalidProbeSession]
+):
     def __init__(self, session: calibration.InvalidProbeSession) -> None:
         self.session = session
 
@@ -290,10 +294,13 @@ def test_cli_config_failure_does_not_echo_credentials(
     }
 
 
-def test_recovery_calibration_evidence_reaches_public_model_path() -> None:
-    class SchemaAdapter:
+def test_public_unsafe_stop_is_not_attributed_to_internal_proposal_disposition() -> (
+    None
+):
+    class LegalStopAdapter:
         def __init__(self) -> None:
             self.calls = 0
+            self.trace = calibration.RequestTrace(modes=["json_schema"], statuses=[200])
 
         async def structured(
             self, *, system: str, user: str, schema: type[ModelT]
@@ -301,19 +308,27 @@ def test_recovery_calibration_evidence_reaches_public_model_path() -> None:
             del system, user
             self.calls += 1
             return schema.model_validate(
-                {"action": "retry", "params": {}, "reason": "bounded retry"}
+                {"action": "stop", "params": {}, "reason": "unsafe proposal"}
             )
 
-    adapter = SchemaAdapter()
+    adapter = LegalStopAdapter()
+    dependencies, _, _ = _dependencies()
+    dependencies = replace(
+        dependencies,
+        adapter_factory=lambda endpoint, model: adapter,
+        propose_recovery=propose_recovery,
+    )
+    metrics: list[calibration.MetricRecord] = []
 
-    result = asyncio.run(
-        calibration.propose_recovery(
-            {"logs": calibration.RECOVERY_EVIDENCE}, "", set(), 0, adapter
+    asyncio.run(
+        calibration._recovery_probe(
+            calibration.CalibrationConfig(), dependencies, metrics.append, 1
         )
     )
 
     assert adapter.calls == 1
-    assert result.action == "retry"
+    assert metrics[0]["validation"] == "public_stop_unsafe_proposal"
+    assert metrics[0]["public_stop_reason"] == "unsafe proposal"
 
 
 def test_complete_calibration_uses_public_planners_and_emits_only_sanitized_metrics() -> (
@@ -348,9 +363,17 @@ def test_complete_calibration_uses_public_planners_and_emits_only_sanitized_metr
         metric for metric in metrics if metric["event"] == "warm_recovery"
     ]
     assert all(
-        metric["validation"] == "schema_valid_policy_rejected"
+        metric["validation"] == "public_stop_unsafe_proposal"
         and metric["public_stop_reason"] == "unsafe proposal"
         for metric in recovery_metrics
+    )
+    journey_metrics = [
+        metric
+        for metric in metrics
+        if metric["event"] in {"warm_journey", "cold_journey"}
+    ]
+    assert all(
+        metric["validation"] == "public_journeys_returned" for metric in journey_metrics
     )
     invalid = next(
         metric for metric in metrics if metric["event"] == "intentionally_invalid"

@@ -53,6 +53,19 @@ _SAFE_PUBLIC_STOP_REASONS = frozenset(
         "unsafe proposal",
     }
 )
+_PUBLIC_STOP_VALIDATION_BY_REASON = {
+    "invalid recovery evidence": "public_stop_invalid_recovery_evidence",
+    "model adapter error": "public_stop_model_adapter_error",
+    "model timeout": "public_stop_model_timeout",
+    "no recovery action": "public_stop_no_recovery_action",
+    "too many errors": "public_stop_too_many_errors",
+    "unsafe proposal": "public_stop_unsafe_proposal",
+}
+_PUBLIC_ACTION_VALIDATION = {
+    "retry": "public_action_retry",
+    "set_env": "public_action_set_env",
+    "wait": "public_action_wait",
+}
 _METRIC_FIELD_ALLOWLIST = frozenset(
     {
         "schema_version",
@@ -449,11 +462,6 @@ async def _recovery_probe(
     if stop_reason is not None:
         metric["public_stop_reason"] = stop_reason
     _emit(emit, **metric)
-    if validation not in {
-        "schema_valid_policy_valid",
-        "schema_valid_policy_rejected",
-    }:
-        raise CalibrationError("recovery_schema_probe_failed")
 
 
 async def _journey_probe(
@@ -475,7 +483,7 @@ async def _journey_probe(
     ):
         raise CalibrationError("journey_public_contract_error")
     fallback = _validated_trace(adapter.trace)
-    validation = "schema_valid_policy_valid" if result else "policy_rejected"
+    validation = "public_journeys_returned" if result else "public_no_journeys"
     _emit(
         emit,
         event=event,
@@ -489,7 +497,7 @@ async def _journey_probe(
         elapsed_seconds=round(elapsed, 6),
     )
     if not result:
-        raise CalibrationError("journey_policy_rejected")
+        raise CalibrationError("journey_not_returned")
     if event == "cold_journey" and elapsed >= config.outer_deadline_seconds:
         raise CalibrationError("cold_journey_deadline_exceeded")
 
@@ -571,17 +579,16 @@ def _validated_trace(trace: RequestTrace) -> bool:
 
 def _recovery_validation(result: RecoveryAction) -> tuple[str, str | None]:
     if result.action != "stop":
-        return "schema_valid_policy_valid", None
+        return _PUBLIC_ACTION_VALIDATION.get(result.action, "public_action_other"), None
     public_reason = (
         result.reason
         if result.reason in _SAFE_PUBLIC_STOP_REASONS
         else "model_supplied_redacted"
     )
-    if result.reason == "unsafe proposal":
-        return "schema_valid_policy_rejected", public_reason
-    if result.reason in _SAFE_PUBLIC_STOP_REASONS:
-        return "public_planner_failure", public_reason
-    return "schema_valid_policy_valid", public_reason
+    return (
+        _PUBLIC_STOP_VALIDATION_BY_REASON.get(result.reason, "public_stop_other"),
+        public_reason,
+    )
 
 
 def _tag_digest(tags: dict[str, object] | None, model: str) -> str | None:
