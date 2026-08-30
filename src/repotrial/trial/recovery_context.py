@@ -225,9 +225,7 @@ def _reject_linked_components(workspace: Path, target: Path) -> None:
             raise ValueError("trusted path contains a link")
 
 
-def _read_utf8_source(
-    workspace: Path, source: Path, label: str
-) -> tuple[str, str]:
+def _read_utf8_source(workspace: Path, source: Path, label: str) -> tuple[str, str]:
     try:
         source_stat = source.lstat()
     except OSError:
@@ -240,7 +238,10 @@ def _read_utf8_source(
     try:
         with source.open("rb") as source_file:
             handle_stat = os.fstat(source_file.fileno())
-            if not _is_regular_file(handle_stat) or _file_identity(handle_stat) != source_identity:
+            if (
+                not _is_regular_file(handle_stat)
+                or _file_identity(handle_stat) != source_identity
+            ):
                 raise ValueError(f"{label} changed while reading")
             _require_path_identity(workspace, source, source_identity, label)
             if handle_stat.st_size > _MAX_SOURCE_BYTES:
@@ -283,7 +284,9 @@ def _yaml_scalar_values(content: str, label: str) -> list[str]:
                 document_count += 1
                 if document_count > 1:
                     raise ValueError(f"{label} must contain one YAML document")
-            if isinstance(event, (AliasEvent, MappingStartEvent, ScalarEvent, SequenceStartEvent)):
+            if isinstance(
+                event, (AliasEvent, MappingStartEvent, ScalarEvent, SequenceStartEvent)
+            ):
                 node_count += 1
                 if node_count > _MAX_YAML_NODES:
                     raise ValueError(f"{label} exceeds YAML resource limit")
@@ -291,7 +294,14 @@ def _yaml_scalar_values(content: str, label: str) -> list[str]:
                 _begin_collection_value(collections, label)
                 if len(collections) >= _MAX_YAML_DEPTH:
                     raise ValueError(f"{label} exceeds YAML resource limit")
-                collections.append(["mapping" if isinstance(event, MappingStartEvent) else "sequence", True])
+                collections.append(
+                    [
+                        "mapping"
+                        if isinstance(event, MappingStartEvent)
+                        else "sequence",
+                        True,
+                    ]
+                )
             elif isinstance(event, ScalarEvent):
                 if _scalar_is_mapping_key(collections):
                     collections[-1][1] = False
