@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import repotrial.trial.recovery_context as recovery_context
 from repotrial.trial.recovery_context import (
     derive_recovery_context,
     project_recovery_evidence,
@@ -165,6 +166,40 @@ def test_derivation_rejects_linked_compose_and_env_example_without_skipping(
     env_target = tmp_path / "env-target"
     _write(env_target, "DECLARED=secret\n")
     (tmp_path / ".env.example").symlink_to(env_target)
+
+    with pytest.raises(ValueError, match="env.example"):
+        derive_recovery_context(tmp_path, "compose.yml")
+
+
+def test_derivation_rejects_windows_reparse_compose_without_skipping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    compose = tmp_path / "compose.yml"
+    _write(compose, "services: {}\n")
+    original_lstat = Path.lstat
+
+    class ReparseStat:
+        def __init__(self, mode: int) -> None:
+            self.st_mode = mode
+            self.st_file_attributes = 1
+
+    def reparse_lstat(path: Path) -> object:
+        result = original_lstat(path)
+        return ReparseStat(result.st_mode) if path == compose else result
+
+    monkeypatch.setattr(recovery_context, "_REPARSE_POINT", 1)
+    monkeypatch.setattr(Path, "lstat", reparse_lstat)
+
+    with pytest.raises(ValueError, match="compose"):
+        derive_recovery_context(tmp_path, "compose.yml")
+
+
+@pytest.mark.parametrize("payload", [b"\xff", b"x" * 65_537])
+def test_derivation_rejects_invalid_or_oversized_env_example(
+    tmp_path: Path, payload: bytes
+) -> None:
+    _write(tmp_path / "compose.yml", "services: {}\n")
+    (tmp_path / ".env.example").write_bytes(payload)
 
     with pytest.raises(ValueError, match="env.example"):
         derive_recovery_context(tmp_path, "compose.yml")

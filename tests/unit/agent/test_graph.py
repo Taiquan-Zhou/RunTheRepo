@@ -389,6 +389,23 @@ def test_explicit_allowed_environment_keys_override_pinned_declarations(
     assert len([call for call in provider.calls if call[0] == "create"]) == 1
 
 
+def test_boot_passes_only_projected_large_evidence_to_recovery(
+    tmp_path: Path,
+) -> None:
+    provider = GraphProvider(
+        baseline_boots=[
+            (False, "x" * 65_000 + " APP_REQUIRED_TOKEN is required"),
+            (True, ""),
+        ]
+    )
+    context, source = _context(tmp_path, provider, journeys=[])
+
+    result = _run(_state(source.parent), context)
+
+    assert len([call for call in provider.calls if call[0] == "create"]) == 2
+    assert result.run.stop_reason == "insufficient_coverage"
+
+
 def test_repeated_boot_error_stops_after_four_attempts_without_retry_storm(
     tmp_path: Path,
 ) -> None:
