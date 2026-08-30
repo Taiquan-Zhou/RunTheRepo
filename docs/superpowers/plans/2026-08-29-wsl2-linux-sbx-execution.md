@@ -205,7 +205,12 @@ assert service["image"] == (
 assert service["command"] == ["httpd", "-f", "-p", "8080", "-h", "/www"]
 assert service["volumes"] == ["./www:/www:ro"]
 assert service["healthcheck"]["test"] == [
-    "CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/health.txt"
+    "CMD",
+    "wget",
+    "-q",
+    "-O",
+    "-",
+    "http://127.0.0.1:8080/health.txt",
 ]
 assert "ports" not in service
 assert "privileged" not in service
