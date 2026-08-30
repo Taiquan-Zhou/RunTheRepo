@@ -96,6 +96,33 @@ def test_projection_skips_non_string_values_and_marks_tiny_remainders() -> None:
     assert "ignored" not in projected.logs
 
 
+def test_projection_accounts_for_planner_newlines_and_skips_partial_marker() -> None:
+    logs = {
+        "up": "u" * 4_096,
+        "ps": "p" * 4_096,
+        "logs": "l" * 4_096,
+        "extra": "e" * 4_081,
+        "later": "x" * 100,
+    }
+
+    projected = project_recovery_evidence(logs)
+
+    assert "later" not in projected.logs
+    assert all(
+        "[TRUNCATED]" not in value or value.count("[TRUNCATED]") == 1
+        for value in projected.logs.values()
+    )
+    assert sum(map(len, projected.logs.values())) + len(projected.logs) - 1 <= 16_384
+
+
+def test_projection_ignores_non_string_keys_before_ordering() -> None:
+    logs: dict[object, str] = {1: "ignored", "logs": "usable", "z": "last"}
+
+    projected = project_recovery_evidence(cast(Mapping[str, str], logs))
+
+    assert projected.logs == {"logs": "usable", "z": "last"}
+
+
 def test_derivation_collects_compose_forms_and_env_example_names_without_values(
     tmp_path: Path,
 ) -> None:
@@ -150,6 +177,40 @@ def test_derivation_collects_compose_forms_and_env_example_names_without_values(
     } == {hashlib.sha256(env_example.read_bytes()).hexdigest()}
     assert "example-secret-value" not in context.model_dump_json()
     assert "also-secret" not in context.model_dump_json()
+
+
+def test_derivation_reads_interpolations_only_from_yaml_values_and_honors_escape(
+    tmp_path: Path,
+) -> None:
+    _write(
+        tmp_path / "compose.yml",
+        "${KEY_IN_MAPPING}: ignored\n"
+        "# ${KEY_IN_COMMENT}\n"
+        "services:\n"
+        "  app:\n"
+        "    environment:\n"
+        "      - ${DECLARED_TOKEN}\n"
+        "      - $${ESCAPED_TOKEN}\n"
+        "      - $$${AFTER_ESCAPE_TOKEN}\n"
+        "    labels:\n"
+        "      ${KEY_IN_NESTED_MAPPING}: plain\n",
+    )
+
+    context = derive_recovery_context(tmp_path, "compose.yml")
+
+    assert context.allowed_env_keys == frozenset(
+        {"DECLARED_TOKEN", "AFTER_ESCAPE_TOKEN"}
+    )
+
+
+def test_derivation_rejects_compose_yaml_over_node_limit(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "compose.yml",
+        "values:\n" + "".join("  - value\n" for _ in range(4_097)),
+    )
+
+    with pytest.raises(ValueError, match="resource limit"):
+        derive_recovery_context(tmp_path, "compose.yml")
 
 
 def test_derivation_ignores_env_host_readme_and_non_root_sources(
@@ -272,3 +333,24 @@ def test_derivation_rejects_linked_component_in_selected_compose_path(
 
     with pytest.raises(ValueError, match="link"):
         derive_recovery_context(tmp_path, "nested/compose.yml")
+
+
+def test_derivation_rejects_source_replaced_between_path_check_and_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    compose = tmp_path / "compose.yml"
+    replacement = tmp_path / "replacement.yml"
+    _write(compose, "services:\n  app: ${BEFORE_REPLACEMENT}\n")
+    _write(replacement, "services:\n  app: ${AFTER_REPLACEMENT}\n")
+    original_open = Path.open
+
+    def replace_then_open(path: Path, *args: object, **kwargs: object) -> object:
+        if path == compose:
+            replacement.replace(compose)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", replace_then_open)
+    monkeypatch.setattr(Path, "read_bytes", lambda _: pytest.fail("read_bytes used"))
+
+    with pytest.raises(ValueError, match="compose"):
+        derive_recovery_context(tmp_path, "compose.yml")

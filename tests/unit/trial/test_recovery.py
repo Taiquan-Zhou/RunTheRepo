@@ -26,6 +26,22 @@ class FakeModelAdapter:
         return self.response
 
 
+class CapturingModelAdapter(FakeModelAdapter):
+    def __init__(self, response: RecoveryAction) -> None:
+        super().__init__(response)
+        self.user = ""
+
+    async def structured(
+        self,
+        *,
+        system: str,
+        user: str,
+        schema: type[RecoveryAction],
+    ) -> RecoveryAction:
+        self.user = user
+        return await super().structured(system=system, user=user, schema=schema)
+
+
 class ValidationErrorModelAdapter:
     async def structured(
         self,
@@ -164,6 +180,30 @@ def test_projected_boot_evidence_avoids_invalid_recovery_evidence() -> None:
         },
         reason="missing allowlisted environment variable",
     )
+
+
+def test_projected_multifield_evidence_reaches_planner_in_recovery_order() -> None:
+    model = CapturingModelAdapter(
+        RecoveryAction(action="retry", params={}, reason="retry once")
+    )
+    projected = project_recovery_evidence(
+        {
+            "z-last": "z-last",
+            "logs": "logs-value",
+            "up": "up-value",
+            "ps": "ps-value",
+            "a-first": "a-first",
+        }
+    )
+
+    action = _propose(logs=projected.logs, model=model)
+
+    assert action.action == "retry"
+    assert model.calls == 1
+    assert model.user.index("up-value") < model.user.index("ps-value")
+    assert model.user.index("ps-value") < model.user.index("logs-value")
+    assert model.user.index("logs-value") < model.user.index("a-first")
+    assert model.user.index("a-first") < model.user.index("z-last")
 
 
 def test_readme_instruction_to_read_ssh_key_is_refused() -> None:
