@@ -804,6 +804,14 @@ def _observe_model_task(task: asyncio.Task[RecoveryAction]) -> None:
 def _combined_logs(logs: dict[str, str]) -> str | None:
     if not isinstance(logs, dict) or len(logs) > _MAX_LOG_ENTRIES:
         return None
+    if any(
+        not isinstance(name, str)
+        or len(name) > _MAX_LOG_KEY_LENGTH
+        or not isinstance(value, str)
+        or len(value) > _MAX_LOG_FIELD_LENGTH
+        for name, value in logs.items()
+    ):
+        return None
     total_length = 0
     bounded_entries: list[tuple[str, str]] = []
     ordered_names: list[str] = [name for name in ("up", "ps", "logs") if name in logs]
@@ -812,13 +820,6 @@ def _combined_logs(logs: dict[str, str]) -> str | None:
     )
     for name in ordered_names:
         value = logs[name]
-        if (
-            not isinstance(name, str)
-            or len(name) > _MAX_LOG_KEY_LENGTH
-            or not isinstance(value, str)
-            or len(value) > _MAX_LOG_FIELD_LENGTH
-        ):
-            return None
         total_length += len(value)
         if bounded_entries:
             total_length += 1

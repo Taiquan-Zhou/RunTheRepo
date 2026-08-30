@@ -268,13 +268,18 @@ def _read_utf8_source(workspace: Path, source: Path, label: str) -> tuple[str, s
 
 def _compose_value_keys(content: str, label: str) -> list[str]:
     values = _yaml_scalar_values(content, label)
-    return [key for value in values for key in _interpolation_keys(value)]
+    return [
+        key
+        for value, style in values
+        if style != "'"
+        for key in _interpolation_keys(value)
+    ]
 
 
-def _yaml_scalar_values(content: str, label: str) -> list[str]:
+def _yaml_scalar_values(content: str, label: str) -> list[tuple[str, str | None]]:
     yaml = YAML(typ="rt", pure=True)
     yaml.allow_duplicate_keys = False
-    values: list[str] = []
+    values: list[tuple[str, str | None]] = []
     collections: list[list[object]] = []
     document_count = 0
     node_count = 0
@@ -306,7 +311,7 @@ def _yaml_scalar_values(content: str, label: str) -> list[str]:
                 if _scalar_is_mapping_key(collections):
                     collections[-1][1] = False
                 else:
-                    values.append(event.value)
+                    values.append((event.value, event.style))
                     _complete_collection_value(collections)
             elif isinstance(event, AliasEvent):
                 if _scalar_is_mapping_key(collections):
