@@ -46,6 +46,7 @@ from repotrial.sandbox.lifecycle import managed_sandbox
 from repotrial.trial import boot as boot_module
 from repotrial.trial.boot import _boot_compose_with_evidence, boot_compose
 from repotrial.trial.boot_evidence import record_recovery_evidence
+from repotrial.trial.journey_context import derive_journey_readme_excerpt
 from repotrial.trial.observer import collect_observation
 from repotrial.trial.planner import plan_journeys, propose_recovery
 from repotrial.trial.recovery_context import (
@@ -183,9 +184,14 @@ async def _baseline(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUp
         raise ValueError("current_config_hash does not match compose")
     journeys = list(state.run.journeys)
     if not journeys:
+        journey_readme_excerpt = (
+            context.readme_excerpt
+            if context.readme_excerpt
+            else derive_journey_readme_excerpt(workspace)
+        )
         journeys = await plan_journeys(
             workspace,
-            context.readme_excerpt,
+            journey_readme_excerpt,
             context.model,
         )
     run = state.run.model_copy(

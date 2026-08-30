@@ -14,6 +14,7 @@ from langgraph.errors import NodeCancelledError
 from pydantic import BaseModel
 from ruamel.yaml import YAML
 
+from repotrial.agent import graph as graph_module
 from repotrial.agent.graph import ainvoke_run, aresume_run, build_run_graph
 from repotrial.agent.state import GraphContext, GraphState
 from repotrial.compose.mutations import apply_mutation
@@ -932,6 +933,121 @@ def test_missing_commit_uses_narrow_repository_pinner_then_real_baseline(
     assert result.run.compose_path == "compose.yaml"
     assert result.run.baseline_journey_results[0].verdict is Verdict.PASS
     assert result.run.sandbox_id is None
+
+
+def test_pinned_intake_derives_root_readme_only_for_deterministic_journey_planning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port)
+        workspace = tmp_path / "pinned-workspace"
+        artifact_dir = tmp_path / "pinned-artifacts"
+        artifact_dir.mkdir()
+        captured_recovery_excerpts: list[str] = []
+
+        async def fake_pinner(
+            url: str, destination: Path, requested_ref: str | None
+        ) -> PinnedRepo:
+            del url, requested_ref
+            destination.mkdir()
+            (destination / "compose.yaml").write_text(
+                _compose_text(()), encoding="utf-8"
+            )
+            (destination / "README.md").write_text(
+                "[health](/health)\n", encoding="utf-8"
+            )
+            return PinnedRepo(
+                repo=RepoRef(
+                    url="https://github.com/example/repo", owner="example", repo="repo"
+                ),
+                commit_sha="d" * 40,
+                local_path=destination,
+            )
+
+        async def capture_recovery(
+            logs: dict[str, str],
+            readme_excerpt: str,
+            allowed_env_keys: set[str],
+            repeated_error_count: int,
+            model: object = None,
+        ) -> RecoveryAction:
+            del logs, allowed_env_keys, repeated_error_count, model
+            captured_recovery_excerpts.append(readme_excerpt)
+            return RecoveryAction(action="stop", params={}, reason="stop")
+
+        monkeypatch.setattr(graph_module, "propose_recovery", capture_recovery)
+        context = GraphContext(
+            provider=provider,
+            workspace=workspace,
+            artifact_dir=artifact_dir,
+            overlay_dir=workspace / ".repotrial-overlays",
+            accepted_compose_dir=workspace / ".repotrial-accepted",
+            env={},
+            allowed_env_keys=frozenset(),
+            readme_excerpt="",
+            container_port=8080,
+            repository_pinner=fake_pinner,
+        )
+
+        result = _run(
+            RunState(
+                run_id="journey-after-intake", repo_url="https://example.invalid/repo"
+            ),
+            context,
+        )
+
+    assert result.run.commit_sha == "d" * 40
+    assert [journey.journey_id for journey in result.run.journeys] == ["readme-1"]
+    assert result.run.journeys[0].steps[0].params == {
+        "method": "GET",
+        "path": "/health",
+    }
+    assert captured_recovery_excerpts == []
+    assert context.readme_excerpt == ""
+
+
+def test_explicit_readme_excerpt_wins_without_a_root_readme(tmp_path: Path) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port)
+        context, source = _context(tmp_path, provider, journeys=[])
+        (context.workspace / "repotrial.journeys.json").unlink()
+        context = replace(context, readme_excerpt="[explicit](/health)")
+
+        result = _run(_state(source.parent), context)
+
+    assert [journey.journey_id for journey in result.run.journeys] == ["readme-1"]
+
+
+def test_derived_readme_is_never_passed_to_no_model_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = GraphProvider(baseline_boots=[(False, "unclassified failure")])
+    context, source = _context(tmp_path, provider, journeys=[])
+    (context.workspace / "repotrial.journeys.json").unlink()
+    (context.workspace / "README.md").write_text(
+        "[health](/health)\n", encoding="utf-8"
+    )
+    captured: list[str] = []
+
+    async def capture_recovery(
+        logs: dict[str, str],
+        readme_excerpt: str,
+        allowed_env_keys: set[str],
+        repeated_error_count: int,
+        model: object = None,
+    ) -> RecoveryAction:
+        del logs, allowed_env_keys, repeated_error_count, model
+        captured.append(readme_excerpt)
+        return RecoveryAction(action="stop", params={}, reason="stop")
+
+    monkeypatch.setattr(graph_module, "propose_recovery", capture_recovery)
+
+    result = _run(_state(source.parent), context)
+
+    assert [journey.journey_id for journey in result.run.journeys] == ["readme-1"]
+    assert captured == [""]
 
 
 def test_pinned_intake_derives_declared_environment_once_before_boot(

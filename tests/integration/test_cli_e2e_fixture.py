@@ -890,6 +890,49 @@ def test_inspect_returns_unsupported_for_an_unsupported_baseline_journey(
     assert result.exit_code == 2, result.output
 
 
+def test_inspect_derives_a_baseline_journey_from_the_pinned_root_readme(
+    tmp_path: Path,
+) -> None:
+    source = create_fixture_repo(tmp_path)
+    (source / "repotrial.journeys.json").unlink()
+    (source / "README.md").write_text("[health](/health)\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "repotrial.journeys.json", "README.md"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "root readme journey"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    artifacts_root = tmp_path / "artifacts"
+
+    with healthy_server() as port:
+        result = CliRunner().invoke(
+            make_app(artifacts_root, FixtureProvider(host_port=port)),
+            ["inspect", str(source), "--provider", "fake", "--max-experiments", "8"],
+        )
+
+    assert result.exit_code == 0, result.output
+    report = json.loads(
+        (artifacts_root / FIXED_RUN_ID / "report" / "trial-report.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["coverage"]["journeys"] == [
+        {
+            "classification": "PASS",
+            "journey_id": "readme-1",
+            "name": "GET /health",
+        }
+    ]
+
+
 def test_inspect_returns_unsupported_for_an_unsupported_experiment_journey(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
