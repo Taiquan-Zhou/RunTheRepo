@@ -186,10 +186,12 @@ def record_recovery_evidence(
 
 
 def _stream_evidence(text: str, redactions: tuple[str, ...]) -> _StreamEvidence:
+    source_truncated = _TRUNCATION_MARKER in text
     redacted = _redact_text(text, redactions)
     encoded = redacted.encode("utf-8")
-    if len(encoded) <= _MAX_STREAM_BYTES:
-        return _StreamEvidence(text=redacted, truncated=False)
+    evidence_view_truncated = len(encoded) > _MAX_STREAM_BYTES
+    if not evidence_view_truncated:
+        return _StreamEvidence(text=redacted, truncated=source_truncated)
     payload_limit = _MAX_STREAM_BYTES - len(_TRUNCATION_MARKER.encode("ascii"))
     head_limit = payload_limit // 2
     tail_limit = payload_limit - head_limit
@@ -197,7 +199,7 @@ def _stream_evidence(text: str, redactions: tuple[str, ...]) -> _StreamEvidence:
     tail = encoded[-tail_limit:]
     return _StreamEvidence(
         text=_decode_head(head) + _TRUNCATION_MARKER + _decode_tail(tail),
-        truncated=True,
+        truncated=source_truncated or evidence_view_truncated,
     )
 
 

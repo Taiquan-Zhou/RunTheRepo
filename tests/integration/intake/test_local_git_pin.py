@@ -15,6 +15,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _supports_fd_anchored_cleanup() -> bool:
+    return (
+        os.open in os.supports_dir_fd
+        and os.stat in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+        and os.rmdir in os.supports_dir_fd
+        and os.listdir in os.supports_fd
+        and os.stat in os.supports_follow_symlinks
+        and bool(getattr(os, "O_DIRECTORY", 0))
+        and bool(getattr(os, "O_NOFOLLOW", 0))
+    )
+
+
 def _git(repo: Path, *arguments: str) -> str:
     completed = subprocess.run(
         ["git", *arguments],
@@ -397,6 +410,131 @@ def test_clone_cleanup_preserves_a_replacement_destination(
         asyncio.run(github.clone_and_resolve(str(source), destination))
 
     assert sentinel.read_text(encoding="utf-8") == "do not delete"
+
+
+def test_clone_cleanup_preserves_replacement_rebound_after_final_identity_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    destination = tmp_path / "destination"
+    claim = github._claim_destination(destination)
+    moved_owned_destination = tmp_path / "moved owned destination"
+    sentinel = destination / "replacement-sentinel.txt"
+    original_lstat = Path.lstat
+    rebound = False
+
+    def rebind_after_identity_check(self: Path) -> os.stat_result:
+        nonlocal rebound
+        identity = original_lstat(self)
+        if self == destination and not rebound:
+            rebound = True
+            destination.rename(moved_owned_destination)
+            destination.mkdir()
+            sentinel.write_text("do not delete", encoding="utf-8")
+        return identity
+
+    monkeypatch.setattr(Path, "lstat", rebind_after_identity_check)
+
+    try:
+        github._remove_owned_destination(claim)
+    finally:
+        github._close_directory_fd(claim.directory_fd)
+
+    assert rebound is True
+    assert sentinel.read_text(encoding="utf-8") == "do not delete"
+
+
+@pytest.mark.skipif(
+    not _supports_fd_anchored_cleanup(), reason="safe fd-anchored cleanup unavailable"
+)
+def test_clone_cleanup_removes_owned_nested_content_before_root_path_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    destination = tmp_path / "destination"
+    claim = github._claim_destination(destination)
+    nested = destination / "one" / "two"
+    nested.mkdir(parents=True)
+    (nested / "owned.txt").write_text("remove me", encoding="utf-8")
+    original_lstat = Path.lstat
+
+    def require_empty_root_before_identity_check(self: Path) -> os.stat_result:
+        if self == destination:
+            assert not any(destination.iterdir())
+        return original_lstat(self)
+
+    monkeypatch.setattr(Path, "lstat", require_empty_root_before_identity_check)
+
+    try:
+        github._remove_owned_destination(claim)
+    finally:
+        github._close_directory_fd(claim.directory_fd)
+
+    assert not destination.exists()
+
+
+@pytest.mark.skipif(
+    not _supports_fd_anchored_cleanup(), reason="safe fd-anchored cleanup unavailable"
+)
+def test_clone_cleanup_unlinks_child_symlink_without_following_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    destination = tmp_path / "destination"
+    claim = github._claim_destination(destination)
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "sentinel.txt"
+    sentinel.write_text("preserve me", encoding="utf-8")
+    (destination / "external-link").symlink_to(external, target_is_directory=True)
+
+    def forbid_path_recursive_cleanup(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("cleanup used path-recursive root deletion")
+
+    monkeypatch.setattr(shutil, "rmtree", forbid_path_recursive_cleanup)
+
+    try:
+        github._remove_owned_destination(claim)
+    finally:
+        github._close_directory_fd(claim.directory_fd)
+
+    assert sentinel.read_text(encoding="utf-8") == "preserve me"
+    assert not destination.exists()
+
+
+def test_clone_cleanup_preserves_nonempty_claim_when_fd_operations_are_unsupported(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    destination = tmp_path / "destination"
+    claim = github._claim_destination(destination)
+    sentinel = destination / "sentinel.txt"
+    sentinel.write_text("preserve me", encoding="utf-8")
+    monkeypatch.setattr(github.os, "supports_dir_fd", set())
+    monkeypatch.setattr(github.os, "supports_fd", set())
+    monkeypatch.setattr(github.os, "supports_follow_symlinks", set())
+
+    try:
+        github._remove_owned_destination(claim)
+    finally:
+        github._close_directory_fd(claim.directory_fd)
+
+    assert sentinel.read_text(encoding="utf-8") == "preserve me"
+
+
+def test_clone_cleanup_never_uses_path_recursive_root_deletion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    destination = tmp_path / "destination"
+    claim = github._claim_destination(destination)
+
+    def forbid_path_recursive_cleanup(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("cleanup used path-recursive root deletion")
+
+    monkeypatch.setattr(shutil, "rmtree", forbid_path_recursive_cleanup)
+
+    try:
+        github._remove_owned_destination(claim)
+    finally:
+        github._close_directory_fd(claim.directory_fd)
+
+    assert not destination.exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory fd behavior")

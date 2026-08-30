@@ -3,7 +3,6 @@
 import asyncio
 import os
 import re
-import shutil
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +15,8 @@ COMMAND_TIMEOUT_SECONDS = 120
 REAP_TIMEOUT_SECONDS = 5
 _FULL_COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
 _RAW_URI_CHARACTERS = frozenset(ascii_letters + digits + "-._~:/?#[]@!$&'()*+,;=%")
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
 class RepoIntakeError(RuntimeError):
@@ -361,28 +362,130 @@ async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
 
 def _remove_owned_destination(claim: _DestinationClaim) -> None:
     if claim.directory_fd is not None:
-        try:
-            leased_identity = os.fstat(claim.directory_fd)
-        except OSError:
+        if not _directory_fd_matches_claim(claim):
             return
-        if (
-            leased_identity.st_dev != claim.device
-            or leased_identity.st_ino != claim.inode
-            or stat.S_IFMT(leased_identity.st_mode) != claim.file_type
-        ):
-            return
+        if _supports_fd_anchored_cleanup():
+            try:
+                entries_removed = _remove_directory_entries(claim.directory_fd)
+            except RecursionError:
+                return
+            if not entries_removed or not _directory_fd_matches_claim(claim):
+                return
+    if not _path_matches_claim(claim):
+        return
     try:
-        current_identity = claim.path.lstat()
+        claim.path.rmdir()
     except OSError:
-        return
-    if (
-        not stat.S_ISDIR(current_identity.st_mode)
-        or current_identity.st_dev != claim.device
-        or current_identity.st_ino != claim.inode
-        or stat.S_IFMT(current_identity.st_mode) != claim.file_type
-    ):
-        return
-    shutil.rmtree(claim.path, ignore_errors=True)
+        pass
+
+
+def _supports_fd_anchored_cleanup() -> bool:
+    return (
+        os.open in os.supports_dir_fd
+        and os.stat in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+        and os.rmdir in os.supports_dir_fd
+        and os.listdir in os.supports_fd
+        and os.stat in os.supports_follow_symlinks
+        and bool(_O_DIRECTORY)
+        and bool(_O_NOFOLLOW)
+    )
+
+
+def _remove_directory_entries(directory_fd: int) -> bool:
+    try:
+        names = sorted(os.listdir(directory_fd))
+    except OSError:
+        return False
+    return all(_remove_directory_entry(directory_fd, name) for name in names)
+
+
+def _remove_directory_entry(parent_fd: int, name: str) -> bool:
+    try:
+        entry_identity = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    if stat.S_ISDIR(entry_identity.st_mode) and not _is_reparse_point(entry_identity):
+        return _remove_child_directory(parent_fd, name, entry_identity)
+    try:
+        os.unlink(name, dir_fd=parent_fd)
+    except OSError:
+        return False
+    return True
+
+
+def _remove_child_directory(
+    parent_fd: int, name: str, expected_identity: os.stat_result
+) -> bool:
+    child_fd: int | None = None
+    opened_identity: os.stat_result | None = None
+    try:
+        flags = os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW
+        child_fd = os.open(name, flags, dir_fd=parent_fd)
+        os.set_inheritable(child_fd, False)
+        opened_identity = os.fstat(child_fd)
+        if not _same_identity(opened_identity, expected_identity):
+            return False
+        if not _remove_directory_entries(child_fd):
+            return False
+        if not _same_identity(os.fstat(child_fd), opened_identity):
+            return False
+    except OSError:
+        return False
+    finally:
+        _close_directory_fd(child_fd)
+
+    assert opened_identity is not None
+    try:
+        current_identity = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _same_identity(current_identity, opened_identity):
+            return False
+        os.rmdir(name, dir_fd=parent_fd)
+    except OSError:
+        return False
+    return True
+
+
+def _directory_fd_matches_claim(claim: _DestinationClaim) -> bool:
+    assert claim.directory_fd is not None
+    try:
+        identity = os.fstat(claim.directory_fd)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(identity.st_mode)
+        and identity.st_dev == claim.device
+        and identity.st_ino == claim.inode
+        and stat.S_IFMT(identity.st_mode) == claim.file_type
+    )
+
+
+def _path_matches_claim(claim: _DestinationClaim) -> bool:
+    try:
+        identity = claim.path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(identity.st_mode)
+        and identity.st_dev == claim.device
+        and identity.st_ino == claim.inode
+        and stat.S_IFMT(identity.st_mode) == claim.file_type
+    )
+
+
+def _same_identity(first: os.stat_result, second: os.stat_result) -> bool:
+    return (
+        first.st_dev == second.st_dev
+        and first.st_ino == second.st_ino
+        and stat.S_IFMT(first.st_mode) == stat.S_IFMT(second.st_mode)
+    )
+
+
+def _is_reparse_point(identity: os.stat_result) -> bool:
+    reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(
+        reparse_point and getattr(identity, "st_file_attributes", 0) & reparse_point
+    )
 
 
 def _close_directory_fd(directory_fd: int | None) -> None:

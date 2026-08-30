@@ -103,6 +103,29 @@ def test_evidence_redacts_four_byte_values_before_crossing_head_boundary(
     assert "-secret" not in persisted
 
 
+def test_evidence_preserves_provider_truncation_after_redaction_shrinks_view(
+    tmp_path: Path,
+) -> None:
+    evidence_path = tmp_path / "baseline-boot-attempt.json"
+    secret = "provider-secret-" + ("x" * 984)
+    provider_output = (secret * 32) + "\n...[truncated]" + (secret * 33) + ("y" * 521)
+    assert len(provider_output.encode("utf-8")) == 65_536
+
+    session = _session(evidence_path, {"PROVIDER_SECRET": secret})
+    session.record_command(
+        "logs",
+        ExecResult(exit_code=0, stdout=provider_output, stderr=""),
+    )
+    session.finalize(Verdict.PASS, {"web": "running"})
+
+    persisted = evidence_path.read_text(encoding="utf-8")
+    payload = json.loads(persisted)
+    stdout = payload["commands"][0]["stdout"]
+    assert len(stdout["text"].encode("utf-8")) < 32_000
+    assert stdout["truncated"] is True
+    assert secret not in persisted
+
+
 def test_evidence_session_rejects_invalid_attempt_identity(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="attempt"):
         boot_evidence._BootEvidenceSession(
