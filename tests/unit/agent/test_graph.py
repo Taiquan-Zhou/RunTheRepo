@@ -338,6 +338,57 @@ def test_boot_failure_uses_bounded_recovery_then_returns_to_boot(
     }
 
 
+def test_boot_derives_declared_environment_after_intake_without_readme_expansion(
+    tmp_path: Path,
+) -> None:
+    provider = GraphProvider(
+        baseline_boots=[(False, "APP_DECLARED_TOKEN is required"), (True, "")]
+    )
+    context, source = _context(tmp_path, provider, journeys=[])
+    source.write_text(
+        _compose_text(())
+        + "    environment:\n      TOKEN: ${APP_DECLARED_TOKEN}\n",
+        encoding="utf-8",
+    )
+    context = replace(
+        context,
+        allowed_env_keys=frozenset(),
+        readme_excerpt="${README_MUST_NOT_AUTHORIZE}",
+    )
+
+    result = _run(_state(source.parent), context)
+
+    up_commands = [
+        call[2]
+        for call in provider.calls
+        if call[0] == "exec" and call[2][-2:] == ("up", "-d")
+    ]
+    assert up_commands[1][:2] == (
+        "env",
+        "APP_DECLARED_TOKEN=repotrial-synthetic-value",
+    )
+    assert result.run.journeys == []
+    assert context.readme_excerpt == "${README_MUST_NOT_AUTHORIZE}"
+
+
+def test_explicit_allowed_environment_keys_override_pinned_declarations(
+    tmp_path: Path,
+) -> None:
+    provider = GraphProvider(baseline_boots=[(False, "APP_DECLARED_TOKEN is required")])
+    context, source = _context(tmp_path, provider, journeys=[])
+    source.write_text(
+        _compose_text(())
+        + "    environment:\n      TOKEN: ${APP_DECLARED_TOKEN}\n",
+        encoding="utf-8",
+    )
+    context = replace(context, allowed_env_keys=frozenset({"EXPLICIT_ONLY"}))
+
+    result = _run(_state(source.parent), context)
+
+    assert result.run.stop_reason == "boot_recovery_stopped"
+    assert len([call for call in provider.calls if call[0] == "create"]) == 1
+
+
 def test_repeated_boot_error_stops_after_four_attempts_without_retry_storm(
     tmp_path: Path,
 ) -> None:
@@ -866,3 +917,63 @@ def test_missing_commit_uses_narrow_repository_pinner_then_real_baseline(
     assert result.run.compose_path == "compose.yaml"
     assert result.run.baseline_journey_results[0].verdict is Verdict.PASS
     assert result.run.sandbox_id is None
+
+
+def test_pinned_intake_derives_declared_environment_once_before_boot(
+    tmp_path: Path,
+) -> None:
+    provider = GraphProvider(
+        baseline_boots=[(False, "PINNED_TOKEN is required"), (True, "")]
+    )
+    workspace = tmp_path / "pinned-workspace"
+    artifact_dir = tmp_path / "pinned-artifacts"
+    artifact_dir.mkdir()
+    pinner_calls = 0
+
+    async def fake_pinner(
+        url: str, destination: Path, requested_ref: str | None
+    ) -> PinnedRepo:
+        nonlocal pinner_calls
+        del url, requested_ref
+        pinner_calls += 1
+        destination.mkdir()
+        (destination / "compose.yaml").write_text(
+            _compose_text(())
+            + "    environment:\n      TOKEN: ${PINNED_TOKEN}\n",
+            encoding="utf-8",
+        )
+        return PinnedRepo(
+            repo=RepoRef(
+                url="https://github.com/example/repo", owner="example", repo="repo"
+            ),
+            commit_sha="c" * 40,
+            local_path=destination,
+        )
+
+    context = GraphContext(
+        provider=provider,
+        workspace=workspace,
+        artifact_dir=artifact_dir,
+        overlay_dir=workspace / ".repotrial-overlays",
+        accepted_compose_dir=workspace / ".repotrial-accepted",
+        env={},
+        allowed_env_keys=frozenset(),
+        readme_excerpt="${README_MUST_NOT_AUTHORIZE}",
+        container_port=8080,
+        repository_pinner=fake_pinner,
+    )
+
+    result = _run(
+        RunState(run_id="derive-after-intake", repo_url="https://example.invalid/repo"),
+        context,
+    )
+
+    up_commands = [
+        call[2]
+        for call in provider.calls
+        if call[0] == "exec" and call[2][-2:] == ("up", "-d")
+    ]
+    assert pinner_calls == 1
+    assert result.run.commit_sha == "c" * 40
+    assert up_commands[1][:2] == ("env", "PINNED_TOKEN=repotrial-synthetic-value")
+    assert result.run.journeys == []

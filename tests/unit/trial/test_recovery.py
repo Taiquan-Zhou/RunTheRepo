@@ -5,6 +5,7 @@ import pytest
 
 from repotrial.models.base import ModelAdapter, RecoveryAction
 from repotrial.trial.planner import propose_recovery
+from repotrial.trial.recovery_context import project_recovery_evidence
 
 
 class FakeModelAdapter:
@@ -137,6 +138,17 @@ def test_missing_allowlisted_env_proposes_fixed_synthetic_value() -> None:
         logs={"logs": "RuntimeError: APP_REQUIRED_TOKEN is required"},
         allowed_env_keys={"APP_REQUIRED_TOKEN"},
     )
+
+
+def test_projected_boot_evidence_avoids_invalid_recovery_evidence() -> None:
+    action = _propose(
+        logs=project_recovery_evidence(
+            {"logs": "x" * 65_000 + " APP_REQUIRED_TOKEN is required"}
+        ).logs,
+        allowed_env_keys={"APP_REQUIRED_TOKEN"},
+    )
+
+    assert action.action == "set_env"
 
     assert action == RecoveryAction(
         action="set_env",
