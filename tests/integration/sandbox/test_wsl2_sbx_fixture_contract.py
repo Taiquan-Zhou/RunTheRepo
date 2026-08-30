@@ -254,13 +254,23 @@ def test_calibration_inventory_parser_only_accepts_canonical_empty_output(
     calibration_module: ModuleType,
 ) -> None:
     assert (
-        calibration_module._parse_empty_sbx_inventory(b"No sandboxes found.\n", b"")
+        calibration_module._parse_empty_sbx_inventory(
+            b"No sandboxes found.\nLaunch one: sbx run claude\n", b""
+        )
         is None
     )
     for stdout, stderr in (
+        (b"No sandboxes found.\n", b""),
         (b"", b""),
         (b"No sandboxes found\n", b""),
-        (b"No sandboxes found.\n", b"warning\n"),
+        (b"sandbox-123 running\n", b""),
+        (b"No sandboxes found.\nLaunch one: sbx run claude\nextra\n", b""),
+        (b"No sandboxes found.\nLaunch one: sbx run codex\n", b""),
+        (b"No sandboxes found.\nLaunch one: sbx run claude", b""),
+        (
+            b"No sandboxes found.\nLaunch one: sbx run claude\n",
+            b"warning\n",
+        ),
     ):
         with pytest.raises(AssertionError):
             calibration_module._parse_empty_sbx_inventory(stdout, stderr)
