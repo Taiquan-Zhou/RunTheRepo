@@ -2,6 +2,8 @@ services:
   web:
     image: busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
     command: [httpd, -f, -p, "8080", -h, /www]
+    ports:
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./www:/www:ro
     healthcheck:

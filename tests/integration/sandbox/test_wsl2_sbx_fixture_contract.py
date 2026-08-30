@@ -86,7 +86,7 @@ def test_wsl2_compose_fixture_has_pinned_minimal_web_service() -> None:
         "-",
         "http://127.0.0.1:8080/health.txt",
     ]
-    assert "ports" not in service
+    assert service["ports"] == ["127.0.0.1:8080:8080"]
     assert "privileged" not in service
     assert "network_mode" not in service
     assert "/var/run/docker.sock" not in fixture_text
