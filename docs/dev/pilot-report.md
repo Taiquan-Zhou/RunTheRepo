@@ -462,3 +462,22 @@ come from `boot_recovery_stopped`, has no dissenting repository, and does not
 establish Task 3's bounded-recovery or missing-environment entry gate. No later
 task was started. All three lifecycle cleanups succeeded and all three
 post-attempt inventories were exactly empty.
+
+## 14. Correction: cloned-workspace allocation and clone postcondition
+
+The original path-mapping attribution in section 13 is retained as historical
+symptom evidence, but is superseded by later direct 5/64 MiB A/B probes. At a
+5 MiB cloned-workspace allocation, guest `pwd` was the correct target path but
+the directory was empty, with neither Git metadata nor a Compose file, even
+though `sbx create` succeeded. With only cloned-workspace allocation raised to
+64 MiB under the same 512 MiB total policy, Umami, Listmonk, and
+changedetection.io each had the exact frozen guest SHA, their selected Compose
+file, and successful `docker compose config`.
+
+Every probe completed `create_attempt -> create_success -> destroy_attempt ->
+destroy_success`, with exact empty final inventory. The bounded provider
+correction allocates cloned workspace proportionally at 1:8 (subject to the
+existing floors) and requires guest top-level/work-tree/HEAD/clean-status
+postconditions before allowing public network or recording ACTIVE. This is a
+tested-workload compatibility decision, not a global compatibility or
+least-privilege claim.

@@ -33,6 +33,21 @@ def test_real_sbx_disposable_lifecycle(tmp_path: Path) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
+    (workspace / "README.md").write_text("# smoke\n", encoding="utf-8")
+    for argv in (
+        ["git", "config", "user.email", "repotrial-smoke@example.invalid"],
+        ["git", "config", "user.name", "RepoTrial Smoke"],
+        ["git", "add", "README.md"],
+        ["git", "commit", "--quiet", "-m", "smoke fixture"],
+    ):
+        subprocess.run(
+            argv,
+            cwd=workspace,
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
     provider = DockerSbxProvider(
         DockerSbxPolicy(
             cpus=1,

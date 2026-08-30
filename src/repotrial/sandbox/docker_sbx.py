@@ -25,11 +25,13 @@ REAP_TIMEOUT_SECONDS = 5
 _TRUNCATION_MARKER = b"\n...[truncated]"
 # Calibrated against Docker Sandboxes v0.39.0 on Windows. Root and Docker
 # filesystems work at the smallest positive integer MiB policy value. The
-# cloned-workspace floor is the smallest value that clones this trusted fixture
-# without warnings and passes git fsck with positive free capacity.
+# cloned-workspace floor is the minimum compatible allocation; larger policies
+# reserve one eighth of the total budget for the cloned workspace.
 ROOT_FLOOR_MB = 1
 DOCKER_FLOOR_MB = 1
 WORKSPACE_FLOOR_MB = 5
+_REPARSE_POINT_ATTRIBUTE = 0x400
+_COMMIT_SHA_LINE = re.compile(rb"[0-9a-f]{40}\r?\n\Z")
 _DISK_SIZE_ENVIRONMENT_VARIABLES = (
     "DOCKER_SANDBOXES_ROOT_SIZE",
     "DOCKER_SANDBOXES_DOCKER_SIZE",
@@ -140,13 +142,14 @@ def calculate_disk_allocation(disk_mb: int) -> DiskAllocation:
     """Allocate the policy disk budget across Docker Sandboxes filesystems."""
     if isinstance(disk_mb, bool) or not isinstance(disk_mb, int) or disk_mb <= 0:
         raise ValueError("disk_mb must be a positive integer")
-    docker_mb = disk_mb - ROOT_FLOOR_MB - WORKSPACE_FLOOR_MB
+    workspace_mb = max(WORKSPACE_FLOOR_MB, disk_mb // 8)
+    docker_mb = disk_mb - ROOT_FLOOR_MB - workspace_mb
     if docker_mb < DOCKER_FLOOR_MB:
         raise DockerSbxUnsupportedError("disk_budget_insufficient")
     return DiskAllocation(
         root_mb=ROOT_FLOOR_MB,
         docker_mb=docker_mb,
-        workspace_mb=WORKSPACE_FLOOR_MB,
+        workspace_mb=workspace_mb,
     )
 
 
@@ -236,8 +239,17 @@ class DockerSbxProvider(SandboxProvider):
         first_successful_create = deadline is None
         if deadline is None:
             deadline = time.monotonic() + self._policy.total_duration_s
+        resolved_workspace = _resolve_workspace(workspace)
+        workspace_identity = _workspace_identity(resolved_workspace)
         allocation = calculate_disk_allocation(self._policy.disk_mb)
+        host_head = await self._host_head(resolved_workspace, deadline)
         network_log_supported = await self._probe(deadline)
+        self._require_workspace_unchanged(
+            resolved_workspace,
+            workspace_identity,
+        )
+        if await self._host_head(resolved_workspace, deadline) != host_head:
+            raise DockerSbxError("clone_verification", "host_head_changed")
         sandbox_id = _new_sandbox_id(name)
         self._sandbox_states[sandbox_id] = _SandboxState.PENDING
         arguments = [
@@ -252,7 +264,7 @@ class DockerSbxProvider(SandboxProvider):
         ]
         for resource in sorted(self._policy.deny_network):
             arguments.extend(("--deny-network", resource))
-        arguments.extend(("shell", str(workspace)))
+        arguments.extend(("shell", str(resolved_workspace)))
         try:
             result = await self._run(
                 "create",
@@ -262,6 +274,7 @@ class DockerSbxProvider(SandboxProvider):
                 deadline=deadline,
             )
             _require_success("create", result)
+            await self._verify_guest_clone(sandbox_id, host_head, deadline)
             allow_network = await self._run(
                 "allow_network",
                 [
@@ -290,6 +303,112 @@ class DockerSbxProvider(SandboxProvider):
         if network_log_supported:
             self._network_log_sandboxes.add(sandbox_id)
         return sandbox_id
+
+    async def _host_head(self, workspace: Path, deadline: float) -> str:
+        result = await self._run_command(
+            "git",
+            "clone_verification",
+            [
+                "-C",
+                str(workspace),
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                "HEAD^{commit}",
+            ],
+            self._command_timeout_s,
+            env=self._host_git_environment(),
+            deadline=deadline,
+        )
+        _require_success("clone_verification", result)
+        return _parse_commit_sha(result.stdout, "host_head_invalid")
+
+    def _require_workspace_unchanged(
+        self, workspace: Path, expected_identity: tuple[int, int]
+    ) -> None:
+        if _workspace_identity(workspace) != expected_identity:
+            raise DockerSbxError("clone_verification", "workspace_changed")
+
+    def _host_git_environment(self) -> dict[str, str]:
+        environment = self._subprocess_environment.copy()
+        for variable in tuple(environment):
+            if variable.upper().startswith("GIT_") or variable.upper() == "SSH_ASKPASS":
+                environment.pop(variable)
+        environment.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_TERMINAL_PROMPT": "0",
+                "GCM_INTERACTIVE": "never",
+            }
+        )
+        return environment
+
+    async def _verify_guest_clone(
+        self, sandbox_id: str, host_head: str, deadline: float
+    ) -> None:
+        guest_workspace = _parse_guest_path(
+            await self._guest_clone_command(sandbox_id, ["pwd"], deadline),
+            "guest_pwd_invalid",
+        )
+        guest_top_level = _parse_guest_path(
+            await self._guest_clone_command(
+                sandbox_id, ["git", "rev-parse", "--show-toplevel"], deadline
+            ),
+            "guest_top_level_invalid",
+        )
+        if guest_top_level != guest_workspace:
+            raise DockerSbxError("clone_verification", "guest_workspace_mismatch")
+        inside_work_tree = await self._guest_clone_command(
+            sandbox_id,
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            deadline,
+        )
+        if inside_work_tree not in (b"true\n", b"true\r\n"):
+            raise DockerSbxError("clone_verification", "guest_not_work_tree")
+        guest_head = _parse_commit_sha(
+            await self._guest_clone_command(
+                sandbox_id,
+                [
+                    "git",
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    "HEAD^{commit}",
+                ],
+                deadline,
+            ),
+            "guest_head_invalid",
+        )
+        if guest_head != host_head:
+            raise DockerSbxError("clone_verification", "guest_head_mismatch")
+        status = await self._guest_clone_command(
+            sandbox_id,
+            [
+                "git",
+                "-c",
+                "core.fsmonitor=false",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=no",
+            ],
+            deadline,
+        )
+        if status:
+            raise DockerSbxError("clone_verification", "guest_status_not_clean")
+
+    async def _guest_clone_command(
+        self, sandbox_id: str, argv: list[str], deadline: float
+    ) -> bytes:
+        result = await self._run(
+            "clone_verification",
+            ["exec", sandbox_id, "--", *argv],
+            self._command_timeout_s,
+            deadline=deadline,
+            sandbox_id=sandbox_id,
+        )
+        _require_success("clone_verification", result)
+        return result.stdout
 
     def _disk_environment(self, allocation: DiskAllocation) -> dict[str, str]:
         environment = self._subprocess_environment.copy()
@@ -566,6 +685,27 @@ class DockerSbxProvider(SandboxProvider):
         deadline: float | None = None,
         sandbox_id: str | None = None,
     ) -> _CommandResult:
+        return await self._run_command(
+            "sbx",
+            operation,
+            arguments,
+            timeout_s,
+            env=env,
+            deadline=deadline,
+            sandbox_id=sandbox_id,
+        )
+
+    async def _run_command(
+        self,
+        executable: str,
+        operation: str,
+        arguments: list[str],
+        timeout_s: float,
+        *,
+        env: dict[str, str] | None = None,
+        deadline: float | None = None,
+        sandbox_id: str | None = None,
+    ) -> _CommandResult:
         process: asyncio.subprocess.Process | None = None
         try:
             effective_timeout_s, deadline_limited = self._effective_timeout(
@@ -582,7 +722,7 @@ class DockerSbxProvider(SandboxProvider):
                     "env": env if env is not None else self._subprocess_environment,
                 }
                 process = await asyncio.create_subprocess_exec(
-                    "sbx",
+                    executable,
                     *arguments,
                     **spawn_kwargs,
                 )
@@ -793,6 +933,60 @@ def _sanitized_environment() -> dict[str, str]:
     for variable in _DISK_SIZE_ENVIRONMENT_VARIABLES:
         environment.pop(variable, None)
     return environment
+
+
+def _resolve_workspace(workspace: Path) -> Path:
+    candidate = Path(workspace)
+    try:
+        if _is_link_or_reparse_point(candidate):
+            raise DockerSbxError("clone_verification", "workspace_invalid")
+        resolved = candidate.resolve(strict=True)
+        _workspace_identity(resolved)
+    except DockerSbxError:
+        raise
+    except (OSError, RuntimeError) as error:
+        raise DockerSbxError("clone_verification", "workspace_invalid") from error
+    return resolved
+
+
+def _workspace_identity(workspace: Path) -> tuple[int, int]:
+    try:
+        if _is_link_or_reparse_point(workspace) or not workspace.is_dir():
+            raise DockerSbxError("clone_verification", "workspace_invalid")
+        status = workspace.stat()
+    except DockerSbxError:
+        raise
+    except OSError as error:
+        raise DockerSbxError("clone_verification", "workspace_invalid") from error
+    return status.st_dev, status.st_ino
+
+
+def _is_link_or_reparse_point(path: Path) -> bool:
+    status = path.lstat()
+    attributes = getattr(status, "st_file_attributes", 0)
+    return path.is_symlink() or bool(attributes & _REPARSE_POINT_ATTRIBUTE)
+
+
+def _parse_commit_sha(output: bytes, reason: str) -> str:
+    if _COMMIT_SHA_LINE.fullmatch(output) is None:
+        raise DockerSbxError("clone_verification", reason)
+    return output[:40].decode("ascii")
+
+
+def _parse_guest_path(output: bytes, reason: str) -> str:
+    try:
+        text = output.decode("utf-8")
+    except UnicodeDecodeError:
+        raise DockerSbxError("clone_verification", reason) from None
+    if text.endswith("\r\n"):
+        path = text[:-2]
+    elif text.endswith("\n"):
+        path = text[:-1]
+    else:
+        raise DockerSbxError("clone_verification", reason)
+    if not path.startswith("/") or "\r" in path or "\n" in path:
+        raise DockerSbxError("clone_verification", reason)
+    return path
 
 
 def _new_sandbox_id(name: str) -> str:

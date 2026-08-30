@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -59,6 +60,8 @@ PROBE_CALLS = [
     ("sbx", "policy", "allow", "network", "--help"),
     ("sbx", "policy", "log", "--help"),
 ]
+HOST_HEAD = b"0123456789abcdef0123456789abcdef01234567\n"
+GUEST_WORKSPACE = b"/workspace\n"
 
 
 @dataclass(frozen=True)
@@ -142,6 +145,9 @@ class _SbxSpawner:
         self.handler: Callable[[tuple[str, ...]], _Outcome | BaseException] | None = (
             None
         )
+        self.intercept: Callable[[tuple[str, ...]], _Outcome | BaseException] | None = (
+            None
+        )
         self.before_spawn: Callable[[tuple[str, ...]], None] | None = None
 
     async def __call__(self, *argv: str, **kwargs: object) -> _FakeProcess:
@@ -153,10 +159,16 @@ class _SbxSpawner:
         outcome: _Outcome | BaseException
         if command in self.overrides:
             outcome = self.overrides[command]
+        elif self.intercept is not None:
+            outcome = self.intercept(command)
+        elif command[:1] == ("git",):
+            outcome = _Outcome(stdout=HOST_HEAD)
         elif command == ("sbx", "version"):
             outcome = _Outcome(stdout=b"sbx 99.0.0\n")
         elif command in HELP_OUTPUTS:
             outcome = _Outcome(stdout=HELP_OUTPUTS[command].encode())
+        elif command[:2] == ("sbx", "exec") and _is_guest_verification_call(command):
+            outcome = _guest_verification_outcome(command)
         elif self.handler is not None:
             outcome = self.handler(command)
         else:
@@ -289,6 +301,45 @@ def _actual_create_call(spawner: _SbxSpawner) -> tuple[str, ...]:
     )
 
 
+def _guest_verification_outcome(command: tuple[str, ...]) -> _Outcome:
+    argv = command[4:]
+    if argv == ("pwd",):
+        return _Outcome(stdout=GUEST_WORKSPACE)
+    if argv == ("git", "rev-parse", "--show-toplevel"):
+        return _Outcome(stdout=GUEST_WORKSPACE)
+    if argv == ("git", "rev-parse", "--is-inside-work-tree"):
+        return _Outcome(stdout=b"true\n")
+    if argv == ("git", "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"):
+        return _Outcome(stdout=HOST_HEAD)
+    if argv == (
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=no",
+    ):
+        return _Outcome()
+    return _Outcome()
+
+
+def _is_guest_verification_call(command: tuple[str, ...]) -> bool:
+    return command[4:] in {
+        ("pwd",),
+        ("git", "rev-parse", "--show-toplevel"),
+        ("git", "rev-parse", "--is-inside-work-tree"),
+        ("git", "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"),
+        (
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=no",
+        ),
+    }
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -356,11 +407,11 @@ def test_policy_is_immutable_and_mandatory_denies_cannot_be_removed() -> None:
 
 
 @pytest.mark.parametrize(
-    ("disk_mb", "expected_docker_mb"),
-    [(7, 1), (8, 2), (2048, 2042), (4096, 4090)],
+    ("disk_mb", "expected_docker_mb", "expected_workspace_mb"),
+    [(7, 1, 5), (512, 447, 64), (2048, 1791, 256)],
 )
 def test_disk_allocation_preserves_budget_and_uses_calibrated_floors(
-    disk_mb: int, expected_docker_mb: int
+    disk_mb: int, expected_docker_mb: int, expected_workspace_mb: int
 ) -> None:
     allocation = calculate_disk_allocation(disk_mb)
 
@@ -369,7 +420,7 @@ def test_disk_allocation_preserves_budget_and_uses_calibrated_floors(
     assert WORKSPACE_FLOOR_MB == 5
     assert allocation.root_mb == 1
     assert allocation.docker_mb == expected_docker_mb
-    assert allocation.workspace_mb == 5
+    assert allocation.workspace_mb == expected_workspace_mb
     assert (
         allocation.root_mb + allocation.docker_mb + allocation.workspace_mb == disk_mb
     )
@@ -403,6 +454,423 @@ def test_insufficient_disk_budget_fails_before_any_sbx_subprocess(
     assert spawner.calls == []
 
 
+def test_create_binds_resolved_host_head_and_guest_clone_before_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for variable, value in {
+        "GIT_DIR": "host-git-dir-must-not-leak",
+        "GIT_CONFIG_GLOBAL": "host-git-config-must-not-leak",
+        "GIT_ASKPASS": "host-git-askpass-must-not-leak",
+        "SSH_ASKPASS": "host-ssh-askpass-must-not-leak",
+    }.items():
+        monkeypatch.setenv(variable, value)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    requested_workspace = workspace / ".."
+    resolved_workspace = requested_workspace.resolve(strict=True)
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+
+    sandbox_id = _create(provider, requested_workspace)
+
+    host_command = (
+        "git",
+        "-C",
+        str(resolved_workspace),
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        "HEAD^{commit}",
+    )
+    host_indices = [
+        index for index, command in enumerate(spawner.calls) if command == host_command
+    ]
+    assert len(host_indices) == 2
+    create_call = _actual_create_call(spawner)
+    create_index = spawner.calls.index(create_call)
+    assert host_indices[0] < len(PROBE_CALLS) < host_indices[1] == create_index - 1
+    assert create_call[-2:] == ("shell", str(resolved_workspace))
+    expected_guest_calls = [
+        ("sbx", "exec", sandbox_id, "--", "pwd"),
+        ("sbx", "exec", sandbox_id, "--", "git", "rev-parse", "--show-toplevel"),
+        (
+            "sbx",
+            "exec",
+            sandbox_id,
+            "--",
+            "git",
+            "rev-parse",
+            "--is-inside-work-tree",
+        ),
+        (
+            "sbx",
+            "exec",
+            sandbox_id,
+            "--",
+            "git",
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            "HEAD^{commit}",
+        ),
+        (
+            "sbx",
+            "exec",
+            sandbox_id,
+            "--",
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=no",
+        ),
+    ]
+    allow_index = next(
+        index
+        for index, command in enumerate(spawner.calls)
+        if command[:5] == ("sbx", "policy", "allow", "network", "--sandbox")
+    )
+    assert spawner.calls[create_index + 1 : allow_index] == expected_guest_calls
+    for index in host_indices:
+        environment = cast(dict[str, str], spawner.kwargs[index]["env"])
+        assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+        assert environment["GIT_TERMINAL_PROMPT"] == "0"
+        assert environment["GCM_INTERACTIVE"] == "never"
+        assert "SSH_ASKPASS" not in {key.upper() for key in environment}
+        assert {
+            key.upper() for key in environment if key.upper().startswith("GIT_")
+        } == {"GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT"}
+
+
+@pytest.mark.parametrize(
+    "host_output",
+    [
+        b" 0123456789abcdef0123456789abcdef01234567\n",
+        b"0123456789abcdef0123456789abcdef01234567\nextra\n",
+        b"0123456789abcdef0123456789abcdef0123456g\n",
+        b"0123456789abcdef0123456789abcdef01234567\xff\n",
+    ],
+)
+def test_create_rejects_malformed_host_head_before_sbx_create(
+    host_output: bytes, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    host_command = (
+        "git",
+        "-C",
+        str(tmp_path.resolve(strict=True)),
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        "HEAD^{commit}",
+    )
+    spawner.overrides[host_command] = _Outcome(stdout=host_output)
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert (raised.value.operation, raised.value.reason) == (
+        "clone_verification",
+        "host_head_invalid",
+    )
+    assert _non_help_create_calls(spawner) == []
+    assert provider._trial_deadline is None
+    assert provider._sandbox_deadlines == {}
+
+
+@pytest.mark.parametrize(
+    ("guest_argv", "outcome", "expected_reason"),
+    [
+        (("pwd",), _Outcome(returncode=7), "nonzero_exit"),
+        (
+            ("git", "rev-parse", "--show-toplevel"),
+            _Outcome(stdout=b"/other\n"),
+            "guest_workspace_mismatch",
+        ),
+        (
+            ("git", "rev-parse", "--is-inside-work-tree"),
+            _Outcome(stdout=b"false\n"),
+            "guest_not_work_tree",
+        ),
+        (
+            ("git", "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"),
+            _Outcome(stdout=b"ffffffffffffffffffffffffffffffffffffffff\n"),
+            "guest_head_mismatch",
+        ),
+        (
+            (
+                "git",
+                "-c",
+                "core.fsmonitor=false",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=no",
+            ),
+            _Outcome(stdout=b"?? unexpected\n"),
+            "guest_status_not_clean",
+        ),
+    ],
+)
+def test_create_cleans_up_when_guest_clone_postcondition_fails(
+    guest_argv: tuple[str, ...],
+    outcome: _Outcome,
+    expected_reason: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+
+    def respond(command: tuple[str, ...]) -> _Outcome:
+        if command[:1] == ("git",):
+            return _Outcome(stdout=HOST_HEAD)
+        if command == ("sbx", "version"):
+            return _Outcome(stdout=b"sbx 99.0.0\n")
+        if command in HELP_OUTPUTS:
+            return _Outcome(stdout=HELP_OUTPUTS[command].encode())
+        if command[:2] == ("sbx", "exec") and command[4:] == guest_argv:
+            return outcome
+        if command[:2] == ("sbx", "exec"):
+            return _guest_verification_outcome(command)
+        return _Outcome()
+
+    spawner.intercept = respond
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    create_call = _actual_create_call(spawner)
+    sandbox_id = create_call[create_call.index("--name") + 1]
+    assert (raised.value.operation, raised.value.reason) == (
+        "clone_verification",
+        expected_reason,
+    )
+    assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
+    assert not any(
+        command[:5] == ("sbx", "policy", "allow", "network", "--sandbox")
+        for command in spawner.calls
+    )
+    assert provider._trial_deadline is None
+    assert provider._sandbox_deadlines == {}
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_reason"),
+    [
+        (_Outcome(hang=True), "timeout"),
+        (_Outcome(hang=True, reap_hang=True), "process_cleanup_unconfirmed"),
+    ],
+)
+def test_host_git_timeout_reaps_before_create_or_reports_unconfirmed_cleanup(
+    outcome: _Outcome,
+    expected_reason: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if outcome.reap_hang:
+        monkeypatch.setattr("repotrial.sandbox.docker_sbx.REAP_TIMEOUT_SECONDS", 0.01)
+    spawner = _SbxSpawner()
+    spawner.intercept = lambda command: (
+        outcome if command[:1] == ("git",) else _Outcome()
+    )
+    provider = _provider(monkeypatch, spawner, command_timeout_s=0.05)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert (raised.value.operation, raised.value.reason) == (
+        "clone_verification",
+        expected_reason,
+    )
+    assert spawner.processes[0].killed is True
+    assert spawner.processes[0].waited is (expected_reason == "timeout")
+    assert not any(command[:1] == ("sbx",) for command in spawner.calls)
+
+
+def test_cancelled_host_git_reaps_before_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    spawner.intercept = lambda command: (
+        _Outcome(hang=True) if command[:1] == ("git",) else _Outcome()
+    )
+    provider = _provider(monkeypatch, spawner)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(provider.create(tmp_path, "trial"))
+        while not any(command[:1] == ("git",) for command in spawner.calls):
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+
+    assert spawner.processes[0].killed is True
+    assert spawner.processes[0].waited is True
+    assert not any(command[:1] == ("sbx",) for command in spawner.calls)
+
+
+def test_guest_malformed_head_enters_partial_create_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+
+    def respond(command: tuple[str, ...]) -> _Outcome:
+        if command[:1] == ("git",):
+            return _Outcome(stdout=HOST_HEAD)
+        if command == ("sbx", "version"):
+            return _Outcome(stdout=b"sbx 99.0.0\n")
+        if command in HELP_OUTPUTS:
+            return _Outcome(stdout=HELP_OUTPUTS[command].encode())
+        if command[:2] == ("sbx", "exec") and command[4:] == (
+            "git",
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            "HEAD^{commit}",
+        ):
+            return _Outcome(stdout=b"not-a-commit\n")
+        if command[:2] == ("sbx", "exec"):
+            return _guest_verification_outcome(command)
+        return _Outcome()
+
+    spawner.intercept = respond
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert (raised.value.operation, raised.value.reason) == (
+        "clone_verification",
+        "guest_head_invalid",
+    )
+    create_call = _actual_create_call(spawner)
+    sandbox_id = create_call[create_call.index("--name") + 1]
+    assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
+
+
+def test_guest_timeout_enters_partial_create_cleanup_without_network_or_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+
+    def respond(command: tuple[str, ...]) -> _Outcome:
+        if command[:1] == ("git",):
+            return _Outcome(stdout=HOST_HEAD)
+        if command == ("sbx", "version"):
+            return _Outcome(stdout=b"sbx 99.0.0\n")
+        if command in HELP_OUTPUTS:
+            return _Outcome(stdout=HELP_OUTPUTS[command].encode())
+        if command[:2] == ("sbx", "exec") and command[4:] == ("pwd",):
+            return _Outcome(hang=True)
+        if command[:2] == ("sbx", "exec"):
+            return _guest_verification_outcome(command)
+        return _Outcome()
+
+    spawner.intercept = respond
+    provider = _provider(monkeypatch, spawner, command_timeout_s=0.05)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert (raised.value.operation, raised.value.reason) == (
+        "clone_verification",
+        "timeout",
+    )
+    assert spawner.processes[-2].killed is True
+    assert spawner.processes[-2].waited is True
+    assert provider._trial_deadline is None
+    assert provider._sandbox_deadlines == {}
+
+
+def test_cancelled_guest_clone_verification_enters_partial_create_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+
+    def respond(command: tuple[str, ...]) -> _Outcome:
+        if command[:1] == ("git",):
+            return _Outcome(stdout=HOST_HEAD)
+        if command == ("sbx", "version"):
+            return _Outcome(stdout=b"sbx 99.0.0\n")
+        if command in HELP_OUTPUTS:
+            return _Outcome(stdout=HELP_OUTPUTS[command].encode())
+        if command[:2] == ("sbx", "exec") and command[4:] == ("pwd",):
+            return _Outcome(hang=True)
+        if command[:2] == ("sbx", "exec"):
+            return _guest_verification_outcome(command)
+        return _Outcome()
+
+    spawner.intercept = respond
+    provider = _provider(monkeypatch, spawner)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(provider.create(tmp_path, "trial"))
+        while not any(
+            command[:2] == ("sbx", "exec") and command[4:] == ("pwd",)
+            for command in spawner.calls
+        ):
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+
+    create_call = _actual_create_call(spawner)
+    sandbox_id = create_call[create_call.index("--name") + 1]
+    assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
+    assert provider._trial_deadline is None
+    assert provider._sandbox_deadlines == {}
+
+
+def test_guest_clone_cleanup_failure_retains_partial_create_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+
+    def respond(command: tuple[str, ...]) -> _Outcome:
+        if command[:1] == ("git",):
+            return _Outcome(stdout=HOST_HEAD)
+        if command == ("sbx", "version"):
+            return _Outcome(stdout=b"sbx 99.0.0\n")
+        if command in HELP_OUTPUTS:
+            return _Outcome(stdout=HELP_OUTPUTS[command].encode())
+        if command[:2] == ("sbx", "exec") and command[4:] == (
+            "git",
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            "HEAD^{commit}",
+        ):
+            return _Outcome(stdout=b"not-a-commit\n")
+        if command[:3] == ("sbx", "rm", "--force"):
+            return _Outcome(returncode=9, stderr=b"cleanup blocked")
+        if command[:2] == ("sbx", "exec"):
+            return _guest_verification_outcome(command)
+        return _Outcome()
+
+    spawner.intercept = respond
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert (raised.value.operation, raised.value.reason) == (
+        "clone_verification",
+        "guest_head_invalid",
+    )
+    context = raised.value.partial_create_cleanup
+    assert context.create_failure is raised.value
+    assert "cleanup blocked" in str(context.cleanup_failure)
+    assert provider._trial_deadline is None
+    assert provider._sandbox_deadlines == {}
+
+
 @pytest.mark.parametrize("bad_resource", ["", "two hosts", "line\nbreak"])
 def test_policy_rejects_ambiguous_network_deny_resources(bad_resource: str) -> None:
     with pytest.raises(ValueError, match="deny_network"):
@@ -420,7 +888,8 @@ def test_missing_sbx_executable_is_explicitly_unsupported_before_create(
         _create(provider, tmp_path)
 
     assert raised.value.reason == "sbx_unavailable"
-    assert spawner.calls == [("sbx", "version")]
+    assert spawner.calls[-1] == ("sbx", "version")
+    assert spawner.calls[0][:3] == ("git", "-C", str(tmp_path.resolve(strict=True)))
 
 
 def test_nonzero_probe_preserves_bounded_stderr_on_unsupported_error(
@@ -516,7 +985,7 @@ def test_each_missing_create_boundary_fails_closed_without_target_execution(
     assert raised.value.reason == f"create_missing_capability:{missing_flag}"
     assert _non_help_create_calls(spawner) == []
     assert not marker.exists()
-    assert all(call[0] == "sbx" for call in spawner.calls)
+    assert spawner.calls[0][0] == "git"
 
 
 @pytest.mark.parametrize(
@@ -606,7 +1075,7 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
 
     sandbox_id = _create(provider, tmp_path)
 
-    assert spawner.calls[: len(PROBE_CALLS)] == PROBE_CALLS
+    assert spawner.calls[1 : len(PROBE_CALLS) + 1] == PROBE_CALLS
     expected = [
         "sbx",
         "create",
@@ -623,22 +1092,49 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
     expected.extend(("shell", str(tmp_path)))
     assert _actual_create_call(spawner) == tuple(expected)
     create_index = spawner.calls.index(tuple(expected))
-    assert spawner.calls[create_index + 1] == (
-        "sbx",
-        "policy",
-        "allow",
-        "network",
-        "--sandbox",
-        sandbox_id,
-        "**",
-    )
+    assert spawner.calls[create_index + 1 : create_index + 6] == [
+        ("sbx", "exec", sandbox_id, "--", "pwd"),
+        ("sbx", "exec", sandbox_id, "--", "git", "rev-parse", "--show-toplevel"),
+        (
+            "sbx",
+            "exec",
+            sandbox_id,
+            "--",
+            "git",
+            "rev-parse",
+            "--is-inside-work-tree",
+        ),
+        (
+            "sbx",
+            "exec",
+            sandbox_id,
+            "--",
+            "git",
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            "HEAD^{commit}",
+        ),
+        (
+            "sbx",
+            "exec",
+            sandbox_id,
+            "--",
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=no",
+        ),
+    ]
     assert "--pids-limit" not in _actual_create_call(spawner)
     assert sandbox_id.startswith("repotrial-trial-")
     assert all("shell" not in kwargs for kwargs in spawner.kwargs)
     create_env = cast(dict[str, str], spawner.kwargs[create_index].get("env"))
     assert create_env["DOCKER_SANDBOXES_ROOT_SIZE"] == "1m"
-    assert create_env["DOCKER_SANDBOXES_DOCKER_SIZE"] == "2042m"
-    assert create_env["DOCKER_SANDBOXES_CLONED_WORKSPACE_SIZE"] == "5m"
+    assert create_env["DOCKER_SANDBOXES_DOCKER_SIZE"] == "1791m"
+    assert create_env["DOCKER_SANDBOXES_CLONED_WORKSPACE_SIZE"] == "256m"
     assert create_env["REPOTRIAL_TEST_SENTINEL"] == "preserved"
     for index, kwargs in enumerate(spawner.kwargs):
         if index == create_index:
@@ -700,8 +1196,7 @@ def test_policy_allow_failure_force_removes_pending_sandbox_without_deadline(
         "allow_network",
         expected_reason,
     )
-    assert spawner.calls[-3:] == [
-        create_call,
+    assert spawner.calls[-2:] == [
         allow_call,
         ("sbx", "rm", "--force", sandbox_id),
     ]
@@ -875,8 +1370,9 @@ def test_cancelled_create_force_removes_pending_id_and_preserves_cancellation(
     create_call = _actual_create_call(spawner)
     sandbox_id = create_call[create_call.index("--name") + 1]
     assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
-    assert spawner.processes[len(PROBE_CALLS)].killed is True
-    assert spawner.processes[len(PROBE_CALLS)].waited is True
+    create_index = spawner.calls.index(create_call)
+    assert spawner.processes[create_index].killed is True
+    assert spawner.processes[create_index].waited is True
 
 
 @pytest.mark.parametrize("failure", ["timeout", "io_error"])
@@ -1594,7 +2090,7 @@ def test_cancellation_kills_and_reaps_child(
 
     async def exercise() -> None:
         task = asyncio.create_task(provider.exec(sandbox_id, ["wait"]))
-        while len(spawner.processes) < len(PROBE_CALLS) + 3:
+        while command not in spawner.calls:
             await asyncio.sleep(0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -1646,7 +2142,7 @@ def test_process_cleanup_resists_second_cancellation_and_reaps_before_raising(
 
     async def exercise() -> None:
         task = asyncio.create_task(provider.exec(sandbox_id, ["wait"]))
-        while len(spawner.processes) < len(PROBE_CALLS) + 3:
+        while command not in spawner.calls:
             await asyncio.sleep(0)
         process = spawner.processes[-1]
         task.cancel()
@@ -1675,7 +2171,7 @@ def test_cancelled_process_cleanup_failure_is_visible_after_second_cancellation(
 
     async def exercise() -> None:
         task = asyncio.create_task(provider.exec(sandbox_id, ["wait"]))
-        while len(spawner.processes) < len(PROBE_CALLS) + 3:
+        while command not in spawner.calls:
             await asyncio.sleep(0)
         process = spawner.processes[-1]
         task.cancel()
@@ -2068,7 +2564,7 @@ def test_network_log_deadline_timeout_propagates_unconfirmed_process_cleanup(
         "--json",
     )
     spawner.overrides[command] = _Outcome(hang=True, kill_error=OSError("kill denied"))
-    provider._sandbox_deadlines[sandbox_id] = time.monotonic() + 0.01
+    provider._sandbox_deadlines[sandbox_id] = time.monotonic() + 0.1
 
     with pytest.raises(DockerSbxError) as raised:
         asyncio.run(provider.network_log(sandbox_id))
@@ -2212,28 +2708,73 @@ def test_create_deadline_starts_before_probes_and_limits_create_subprocess(
 
     sandbox_id = _create(provider, tmp_path)
 
-    assert _timeouts_by_command(spawner, recorder)[: len(PROBE_CALLS)] == list(
+    timed_commands = _timeouts_by_command(spawner, recorder)
+    assert timed_commands[0][0][:2] == ("git", "-C")
+    assert timed_commands[0][1] == 20.0
+    assert timed_commands[1 : len(PROBE_CALLS) + 1] == list(
         zip(
             PROBE_CALLS,
-            (20.0, 19.0, 18.0, 17.0, 16.0, 15.0, 14.0, 13.0, 12.0),
+            (19.0, 18.0, 17.0, 16.0, 15.0, 14.0, 13.0, 12.0, 11.0),
             strict=True,
         )
     )
     create_call = _actual_create_call(spawner)
-    assert _timeouts_by_command(spawner, recorder)[-2:] == [
-        (create_call, 11.0),
+    assert timed_commands[len(PROBE_CALLS) + 1][0][:2] == ("git", "-C")
+    assert timed_commands[len(PROBE_CALLS) + 1][1] == 10.0
+    assert [timeout for _, timeout in timed_commands[-7:]] == [
+        9.0,
+        8.0,
+        7.0,
+        6.0,
+        5.0,
+        4.0,
+        3.0,
+    ]
+    assert [command for command, _ in timed_commands[-7:]] == [
+        create_call,
+        ("sbx", "exec", sandbox_id, "--", "pwd"),
         (
-            (
-                "sbx",
-                "policy",
-                "allow",
-                "network",
-                "--sandbox",
-                sandbox_id,
-                "**",
-            ),
-            10.0,
+            "sbx",
+            "exec",
+            sandbox_id,
+            "--",
+            "git",
+            "rev-parse",
+            "--show-toplevel",
         ),
+        (
+            "sbx",
+            "exec",
+            sandbox_id,
+            "--",
+            "git",
+            "rev-parse",
+            "--is-inside-work-tree",
+        ),
+        (
+            "sbx",
+            "exec",
+            sandbox_id,
+            "--",
+            "git",
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            "HEAD^{commit}",
+        ),
+        (
+            "sbx",
+            "exec",
+            sandbox_id,
+            "--",
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=no",
+        ),
+        ("sbx", "policy", "allow", "network", "--sandbox", sandbox_id, "**"),
     ]
     assert provider._sandbox_deadlines == {sandbox_id: 20.0}
 
@@ -2276,7 +2817,7 @@ def test_trial_exhaustion_before_first_probe_prevents_subprocess(
     with pytest.raises(DockerSbxError) as raised:
         _create(provider, tmp_path)
 
-    assert raised.value.operation == "probe_version"
+    assert raised.value.operation == "clone_verification"
     assert raised.value.reason == "total_duration_exhausted"
     assert spawner.calls == []
 
