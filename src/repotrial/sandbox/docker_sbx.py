@@ -205,6 +205,10 @@ class _ProcessCleanupError(RuntimeError):
     pass
 
 
+class _DuplicateNetworkLogKeyError(ValueError):
+    pass
+
+
 class DockerSbxProvider(SandboxProvider):
     """Run Docker Sandboxes only after an exact capability probe succeeds."""
 
@@ -840,8 +844,11 @@ def _parse_network_events(
     except UnicodeDecodeError:
         return None
     try:
-        decoded: Any = json.loads(text)
-    except json.JSONDecodeError:
+        decoded: Any = json.loads(
+            text,
+            object_pairs_hook=_network_log_object_from_pairs,
+        )
+    except (json.JSONDecodeError, _DuplicateNetworkLogKeyError):
         return None
     if not isinstance(decoded, dict) or set(decoded) != _NETWORK_LOG_KEYS:
         return None
@@ -890,6 +897,17 @@ def _parse_network_events(
                 }
             )
     return events
+
+
+def _network_log_object_from_pairs(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in parsed:
+            raise _DuplicateNetworkLogKeyError
+        parsed[key] = value
+    return parsed
 
 
 def _unsupported_network_log(reason: str) -> NetworkLogResult:

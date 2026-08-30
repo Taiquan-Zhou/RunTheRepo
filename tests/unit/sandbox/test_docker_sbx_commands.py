@@ -1761,6 +1761,44 @@ def test_network_log_empty_wrapper_is_supported_observability(
     assert result == NetworkLogResult(events=[], supported=True)
 
 
+def test_network_log_rejects_duplicate_top_level_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+    sandbox_id = _create(provider, tmp_path)
+    _set_network_log_output(
+        spawner,
+        sandbox_id,
+        b'{"blocked_hosts":[],"blocked_hosts":[],"allowed_hosts":[]}',
+    )
+
+    result = asyncio.run(provider.network_log(sandbox_id))
+
+    assert result.unsupported_reason == "network_log_invalid_json_contract"
+
+
+def test_network_log_rejects_duplicate_nested_entry_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+    sandbox_id = _create(provider, tmp_path)
+    payload = (
+        '{"blocked_hosts":[],"allowed_hosts":[{'
+        '"host":"api.example.test","host":"api.example.test",'
+        f'"vm_name":"{sandbox_id}","proxy_type":"forward","rule":"**",'
+        '"last_seen":"2026-08-26T00:01:00Z",'
+        '"since":"2026-08-26T00:00:30Z","count_since":1'
+        "}]}"
+    ).encode()
+    _set_network_log_output(spawner, sandbox_id, payload)
+
+    result = asyncio.run(provider.network_log(sandbox_id))
+
+    assert result.unsupported_reason == "network_log_invalid_json_contract"
+
+
 @pytest.mark.parametrize(
     "payload",
     [
