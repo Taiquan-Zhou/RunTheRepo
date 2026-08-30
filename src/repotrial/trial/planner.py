@@ -806,9 +806,7 @@ def _combined_logs(logs: dict[str, str]) -> str | None:
         return None
     total_length = 0
     bounded_entries: list[tuple[str, str]] = []
-    ordered_names: list[str] = [
-        name for name in ("up", "ps", "logs") if name in logs
-    ]
+    ordered_names: list[str] = [name for name in ("up", "ps", "logs") if name in logs]
     ordered_names.extend(
         sorted(name for name in logs if name not in {"up", "ps", "logs"})
     )
