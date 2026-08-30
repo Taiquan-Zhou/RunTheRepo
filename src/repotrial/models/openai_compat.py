@@ -8,7 +8,7 @@ from pydantic import BaseModel, ValidationError
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
-_REQUEST_TIMEOUT: Final = httpx.Timeout(10.0, connect=3.0)
+_REQUEST_TIMEOUT: Final = httpx.Timeout(90.0, connect=3.0)
 _MAX_PROMPT_CHARS: Final = 16_384
 _MAX_SCHEMA_BYTES: Final = 65_536
 _MAX_RESPONSE_BYTES: Final = 1_048_576

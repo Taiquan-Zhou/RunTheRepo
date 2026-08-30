@@ -89,6 +89,36 @@ class CancellationTrackingModelAdapter:
         raise AssertionError("model wait unexpectedly completed")
 
 
+class DelayedJourneyModelAdapter:
+    async def structured(
+        self, *, system: str, user: str, schema: type[BaseModel]
+    ) -> BaseModel:
+        del system, user
+        await asyncio.sleep(0.11)
+        return schema.model_validate({"journeys": [_http_journey()]})
+
+
+class CancellationSwallowingJourneyModelAdapter:
+    def __init__(self) -> None:
+        self.cancelled = asyncio.Event()
+        self.late_completed = asyncio.Event()
+        self.task: asyncio.Task[object] | None = None
+
+    async def structured(
+        self, *, system: str, user: str, schema: type[BaseModel]
+    ) -> BaseModel:
+        del system, user
+        self.task = asyncio.current_task()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            await asyncio.sleep(0.02)
+            self.late_completed.set()
+            return schema.model_validate({"journeys": [_http_journey()]})
+        raise AssertionError("model wait unexpectedly completed")
+
+
 def _plan(
     repo_root: Path,
     readme_excerpt: str = "",
@@ -229,6 +259,53 @@ def test_valid_model_output_is_materialized_only_when_other_sources_are_empty(
     assert journeys[0].steps[0].params["path"] == "/from-model"
     assert model.calls == 1
     assert "no safe markdown links" in model.user
+
+
+def test_model_response_after_former_planner_deadline_is_accepted(
+    tmp_path: Path,
+) -> None:
+    journeys = asyncio.run(plan_journeys(tmp_path, "", DelayedJourneyModelAdapter()))
+
+    assert journeys == [
+        Journey(
+            journey_id="health",
+            name="Health",
+            steps=[
+                JourneyStep(
+                    step_id="request-health",
+                    tool="http",
+                    action="request",
+                    params={"method": "GET", "path": "/health"},
+                    assertions=[
+                        JourneyAssertion(
+                            kind="status_code",
+                            target="response.status",
+                            expected=200,
+                        )
+                    ],
+                )
+            ],
+        )
+    ]
+
+
+def test_model_prompt_describes_only_the_existing_journey_dsl(tmp_path: Path) -> None:
+    model = FakeModelAdapter([])
+
+    assert _plan(tmp_path, model=model) == []
+
+    expected_matrix = """Supported Journey DSL (this list grants no additional authority):
+- Return at most 5 journeys. Each journey uses exactly one tool type and contains 1-8 steps.
+- journey_id, name, and every step_id are non-empty, at most 4096 characters, and contain no Unicode category-C characters.
+- The only HTTP tool/action pair is tool http with action request. Its params contain method GET|POST|DELETE, a root-relative path, and optional bounded JSON json. HTTP paths are ASCII, at most 2048 characters, begin with exactly one /, and contain no fragment, backslash, dot segment, unsafe decoded segment, or unsafe query character.
+- HTTP assertions are exactly: status_code on response.status with an integer expected; text_contains on response.text with a text expected; or json_path_equals on a dotted response-JSON path with bounded JSON expected. An HTTP journey has at least one assertion across its steps.
+- For tool browser, action goto has exactly params {path}; path follows the HTTP path restrictions and has no query string.
+- For tool browser, action fill_by_label has exactly params {label, value}; label is non-empty bounded ASCII and value is non-empty bounded text.
+- For tool browser, action click_by_role has exactly params {role, name}; role is button|link|checkbox|radio|menuitem|option|tab and name is non-empty bounded ASCII.
+- For tool browser, action assert_text_visible has exactly params {text}; text is non-empty bounded ASCII.
+- Browser steps have no separate assertion objects."""
+    assert expected_matrix in model.system
+    assert "example" not in model.system.lower()
 
 
 def test_model_journey_failure_records_the_adapter_reason_without_changing_fail_closed_result(
@@ -902,12 +979,32 @@ def test_nested_model_construct_extra_fields_fail_closed(
     assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == []
 
 
-def test_model_timeout_fails_closed_and_cancels_inner_task(tmp_path: Path) -> None:
+def test_model_timeout_fails_closed_and_cancels_inner_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     model = TimeoutModelAdapter()
+    monkeypatch.setattr(planner_module, "_MODEL_TIMEOUT_S", 0.01)
 
     async def exercise() -> None:
         assert await plan_journeys(tmp_path, "", model) == []
         await asyncio.wait_for(model.cancelled.wait(), timeout=0.1)
+
+    asyncio.run(exercise())
+
+
+def test_model_timeout_observes_delayed_cooperative_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = CancellationSwallowingJourneyModelAdapter()
+    monkeypatch.setattr(planner_module, "_MODEL_TIMEOUT_S", 0.01)
+
+    async def exercise() -> None:
+        assert await plan_journeys(tmp_path, "", model) == []
+        await asyncio.wait_for(model.cancelled.wait(), timeout=0.1)
+        await asyncio.wait_for(model.late_completed.wait(), timeout=0.1)
+        await asyncio.sleep(0)
+        assert model.task is not None
+        assert model.task.done()
 
     asyncio.run(exercise())
 

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import socket
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -49,7 +50,9 @@ class _ResponseServer:
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.endpoint = f"http://127.0.0.1:{self._server.server_port}/v1/"
-        self._thread = Thread(target=self._server.serve_forever)
+        self._thread = Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.01}
+        )
 
     def __enter__(self) -> Self:
         self._thread.start()
@@ -96,6 +99,38 @@ def test_structured_returns_the_requested_pydantic_type_from_json_schema_respons
             "schema": _Answer.model_json_schema(),
         },
     }
+
+
+def test_request_timeout_preserves_short_connect_and_allows_ninety_second_reads() -> (
+    None
+):
+    assert openai_compat._REQUEST_TIMEOUT == httpx.Timeout(90.0, connect=3.0)
+
+
+def test_response_after_former_ten_second_read_timeout_is_accepted() -> None:
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            time.sleep(10.1)
+            encoded = json.dumps(_chat_completion('{"answer":"late"}')).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            try:
+                self.wfile.write(encoded)
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                return
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    with _temporary_server(Handler) as server:
+        adapter = OpenAICompatibleModelAdapter(f"{server}/v1", "local-model")
+        result = asyncio.run(
+            adapter.structured(system="system", user="user", schema=_Answer)
+        )
+
+    assert result == _Answer(answer="late")
 
 
 def test_invalid_model_output_is_retried_once_then_fails_without_response_data() -> (
@@ -568,7 +603,9 @@ class _RequestAttempts:
 class _TemporaryServer:
     def __init__(self, handler: type[BaseHTTPRequestHandler]) -> None:
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        self._thread = Thread(target=self._server.serve_forever)
+        self._thread = Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.01}
+        )
 
     def __enter__(self) -> str:
         self._thread.start()

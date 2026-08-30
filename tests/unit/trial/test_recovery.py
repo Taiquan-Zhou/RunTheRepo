@@ -99,6 +99,34 @@ class CancellationSwallowingModelAdapter:
         raise AssertionError("model wait unexpectedly completed")
 
 
+class CancellationDeferringModelAdapter:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.release = asyncio.Event()
+        self.task: asyncio.Task[RecoveryAction] | None = None
+
+    async def structured(
+        self,
+        *,
+        system: str,
+        user: str,
+        schema: type[RecoveryAction],
+    ) -> RecoveryAction:
+        del system, user
+        assert schema is RecoveryAction
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        self.task = current_task
+        self.started.set()
+        while not self.release.is_set():
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+        return RecoveryAction(action="retry", params={}, reason="released")
+
+
 class CancellationTrackingModelAdapter:
     def __init__(self) -> None:
         self.started = asyncio.Event()
@@ -129,6 +157,20 @@ class NativeTimeoutModelAdapter:
         schema: type[RecoveryAction],
     ) -> RecoveryAction:
         raise TimeoutError("adapter transport timeout")
+
+
+class DelayedRecoveryModelAdapter:
+    async def structured(
+        self,
+        *,
+        system: str,
+        user: str,
+        schema: type[RecoveryAction],
+    ) -> RecoveryAction:
+        del system, user
+        assert schema is RecoveryAction
+        await asyncio.sleep(0.11)
+        return RecoveryAction(action="retry", params={}, reason="retry once")
 
 
 class EmptyLike:
@@ -402,6 +444,15 @@ def test_model_fallback_is_used_only_after_no_deterministic_result() -> None:
     assert model.calls == 1
 
 
+def test_model_response_after_former_planner_deadline_is_accepted() -> None:
+    action = _propose(
+        logs={"logs": "unrecognized startup failure"},
+        model=DelayedRecoveryModelAdapter(),
+    )
+
+    assert action == RecoveryAction(action="retry", params={}, reason="retry once")
+
+
 def test_none_model_falls_back_to_stop_without_model_access() -> None:
     action = _propose(logs={"logs": "unrecognized startup failure"}, model=None)
 
@@ -560,8 +611,11 @@ def test_oversized_proposal_inputs_stop_before_model_invocation(
     assert model.calls == 0
 
 
-def test_model_timeout_wins_when_adapter_swallows_cancellation() -> None:
+def test_model_timeout_wins_when_adapter_swallows_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     model = CancellationSwallowingModelAdapter()
+    monkeypatch.setattr(planner_module, "_MODEL_TIMEOUT_S", 0.01)
 
     async def exercise() -> None:
         proposal = asyncio.create_task(
@@ -579,6 +633,49 @@ def test_model_timeout_wins_when_adapter_swallows_cancellation() -> None:
         )
         await asyncio.wait_for(model.cancelled.wait(), timeout=0.1)
         await asyncio.wait_for(model.late_completed.wait(), timeout=0.5)
+        await asyncio.sleep(0)
+        model_tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and "CancellationSwallowingModelAdapter.structured"
+            in task.get_coro().__qualname__
+        ]
+        assert model_tasks == []
+
+    asyncio.run(exercise())
+
+
+def test_outer_model_deadline_does_not_drain_a_non_cooperative_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = CancellationDeferringModelAdapter()
+    monkeypatch.setattr(planner_module, "_MODEL_TIMEOUT_S", 0.01)
+
+    async def exercise() -> None:
+        proposal = asyncio.create_task(
+            propose_recovery(
+                logs={"logs": "unrecognized startup failure"},
+                readme_excerpt="",
+                allowed_env_keys=set(),
+                repeated_error_count=0,
+                model=model,
+            )
+        )
+        await asyncio.wait_for(model.started.wait(), timeout=0.1)
+        try:
+            completed, _ = await asyncio.wait({proposal}, timeout=0.05)
+            assert completed == {proposal}
+            assert await proposal == RecoveryAction(
+                action="stop", params={}, reason="model timeout"
+            )
+            await asyncio.wait_for(model.cancelled.wait(), timeout=0.1)
+            assert model.task is not None
+            assert not model.task.done()
+        finally:
+            model.release.set()
+            if model.task is not None:
+                await asyncio.wait_for(model.task, timeout=0.1)
 
     asyncio.run(exercise())
 
