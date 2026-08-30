@@ -58,6 +58,36 @@ def test_wsl2_compose_fixture_has_pinned_minimal_web_service() -> None:
     assert (_FIXTURE_ROOT / "www" / "health.txt").read_text(encoding="utf-8") == "ok\n"
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://example.com/",
+        "http://169.254.169.254/latest/meta-data/",
+    ],
+    ids=["public", "denied"],
+)
+def test_calibration_network_probe_argv_enters_trusted_compose_web_service(
+    calibration_module: ModuleType,
+    url: str,
+) -> None:
+    argv = calibration_module._compose_web_wget_argv(url)
+
+    assert argv == [
+        "docker",
+        "compose",
+        "exec",
+        "-T",
+        "web",
+        "wget",
+        "-q",
+        "-O",
+        "-",
+        url,
+    ]
+    assert argv.count(url) == 1
+    assert not {"sh", "bash", "-c", "&&", ";", "|"}.intersection(argv)
+
+
 def test_calibration_compose_ps_parser_normalizes_single_service_object(
     calibration_module: ModuleType,
 ) -> None:

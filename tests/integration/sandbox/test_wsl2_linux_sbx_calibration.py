@@ -438,6 +438,21 @@ async def _exec(
     return result.stdout
 
 
+def _compose_web_wget_argv(url: str) -> list[str]:
+    return [
+        "docker",
+        "compose",
+        "exec",
+        "-T",
+        "web",
+        "wget",
+        "-q",
+        "-O",
+        "-",
+        url,
+    ]
+
+
 def _parse_mount(output: str, requested_path: str) -> _Mount:
     lines = [line for line in output.splitlines() if line]
     assert len(lines) == 1
@@ -564,7 +579,7 @@ async def _assert_network_policy(provider: DockerSbxProvider, sandbox_id: str) -
     public_body = await _exec(
         provider,
         sandbox_id,
-        ["wget", "-q", "-O", "-", "http://example.com/"],
+        _compose_web_wget_argv("http://example.com/"),
         timeout_s=15,
     )
     assert "Example Domain" in public_body
@@ -582,7 +597,7 @@ async def _assert_network_policy(provider: DockerSbxProvider, sandbox_id: str) -
         before = await _observed_network_events(provider, sandbox_id)
         result = await provider.exec(
             sandbox_id,
-            ["wget", "-q", "-O", "-", probe],
+            _compose_web_wget_argv(probe),
             timeout_s=10,
         )
         assert result.exit_code != 0, (probe, result.stdout, result.stderr)
