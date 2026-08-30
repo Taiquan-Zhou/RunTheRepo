@@ -7,7 +7,7 @@ from typing import cast
 
 import pytest
 
-import repotrial.trial.recovery_context as recovery_context
+from repotrial.trial import recovery_context
 from repotrial.trial.recovery_context import (
     derive_recovery_context,
     project_recovery_evidence,

@@ -138,6 +138,14 @@ def test_missing_allowlisted_env_proposes_fixed_synthetic_value() -> None:
         logs={"logs": "RuntimeError: APP_REQUIRED_TOKEN is required"},
         allowed_env_keys={"APP_REQUIRED_TOKEN"},
     )
+    assert action == RecoveryAction(
+        action="set_env",
+        params={
+            "key": "APP_REQUIRED_TOKEN",
+            "value": "repotrial-synthetic-value",
+        },
+        reason="missing allowlisted environment variable",
+    )
 
 
 def test_projected_boot_evidence_avoids_invalid_recovery_evidence() -> None:
@@ -147,8 +155,6 @@ def test_projected_boot_evidence_avoids_invalid_recovery_evidence() -> None:
         ).logs,
         allowed_env_keys={"APP_REQUIRED_TOKEN"},
     )
-
-    assert action.action == "set_env"
 
     assert action == RecoveryAction(
         action="set_env",
