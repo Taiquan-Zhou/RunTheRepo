@@ -1639,22 +1639,82 @@ def test_missing_executable_after_create_is_an_explicit_operation_error(
     assert raised.value.reason == "executable_unavailable"
 
 
+def _blocked_network_log_entry(sandbox_id: str) -> dict[str, object]:
+    return {
+        "host": "10.0.0.1",
+        "vm_name": sandbox_id,
+        "proxy_type": "network",
+        "rule": "private",
+        "last_seen": "2026-08-26T00:00:00Z",
+        "since": "2026-08-25T23:59:00Z",
+        "count_since": 2,
+        "reason": "deny",
+    }
+
+
+def _allowed_network_log_entry(sandbox_id: str) -> dict[str, object]:
+    return {
+        "host": "api.example.test",
+        "vm_name": sandbox_id,
+        "proxy_type": "forward",
+        "rule": "**",
+        "last_seen": "2026-08-26T00:01:00Z",
+        "since": "2026-08-26T00:00:30Z",
+        "count_since": 1,
+    }
+
+
+def _network_log_wrapper(
+    sandbox_id: str,
+) -> dict[str, list[dict[str, object]]]:
+    return {
+        "blocked_hosts": [_blocked_network_log_entry(sandbox_id)],
+        "allowed_hosts": [_allowed_network_log_entry(sandbox_id)],
+    }
+
+
+def _set_network_log_output(
+    spawner: _SbxSpawner, sandbox_id: str, payload: bytes
+) -> None:
+    spawner.overrides[
+        ("sbx", "policy", "log", sandbox_id, "--type", "network", "--json")
+    ] = _Outcome(stdout=payload)
+
+
 def test_network_log_returns_strict_observed_events(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     spawner = _SbxSpawner()
     provider = _provider(monkeypatch, spawner)
     sandbox_id = _create(provider, tmp_path)
-    payload = (
-        "["
-        f'{{"sandbox":"{sandbox_id}","decision":"blocked",'
-        '"host":"10.0.0.1","proxy":"network","rule":"private",'
-        '"reason":"deny","last_seen":"2026-08-26T00:00:00Z","count":1}'
-        "]"
+    payload = json.dumps(
+        {
+            "blocked_hosts": [
+                {
+                    "host": "10.0.0.1",
+                    "vm_name": sandbox_id,
+                    "proxy_type": "network",
+                    "rule": "private",
+                    "last_seen": "2026-08-26T00:00:00Z",
+                    "since": "2026-08-25T23:59:00Z",
+                    "count_since": 2,
+                    "reason": "deny",
+                }
+            ],
+            "allowed_hosts": [
+                {
+                    "host": "api.example.test",
+                    "vm_name": sandbox_id,
+                    "proxy_type": "forward",
+                    "rule": "**",
+                    "last_seen": "2026-08-26T00:01:00Z",
+                    "since": "2026-08-26T00:00:30Z",
+                    "count_since": 1,
+                }
+            ],
+        }
     ).encode()
-    spawner.overrides[
-        ("sbx", "policy", "log", sandbox_id, "--type", "network", "--json")
-    ] = _Outcome(stdout=payload)
+    _set_network_log_output(spawner, sandbox_id, payload)
 
     result = asyncio.run(provider.network_log(sandbox_id))
 
@@ -1669,48 +1729,178 @@ def test_network_log_returns_strict_observed_events(
             "rule": "private",
             "reason": "deny",
             "last_seen": "2026-08-26T00:00:00Z",
+            "count": 2,
+        },
+        {
+            "sandbox": sandbox_id,
+            "decision": "allowed",
+            "host": "api.example.test",
+            "proxy": "forward",
+            "rule": "**",
+            "reason": "",
+            "last_seen": "2026-08-26T00:01:00Z",
             "count": 1,
-        }
+        },
     ]
+
+
+def test_network_log_empty_wrapper_is_supported_observability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+    sandbox_id = _create(provider, tmp_path)
+    _set_network_log_output(
+        spawner,
+        sandbox_id,
+        b'{"blocked_hosts":[],"allowed_hosts":[]}',
+    )
+
+    result = asyncio.run(provider.network_log(sandbox_id))
+
+    assert result == NetworkLogResult(events=[], supported=True)
 
 
 @pytest.mark.parametrize(
     "payload",
     [
-        b"not-json",
-        b"{}",
-        b'[{"sandbox":"wrong"}]',
-        b"[" + b"{}" + b",{}" * 100 + b"]",
-        (
-            b'[{"sandbox":"ID","decision":"maybe","host":"h","proxy":"network",'
-            b'"rule":"r","reason":"x","last_seen":"now","count":1}]'
+        pytest.param(b"not-json", id="invalid-json"),
+        pytest.param(b"[]", id="fictional-flat-list"),
+        pytest.param(b"{}", id="missing-wrapper-keys"),
+        pytest.param(
+            b'{"blocked_hosts":[],"allowed_hosts":[],"extra":[]}',
+            id="extra-wrapper-key",
+        ),
+        pytest.param(
+            b'{"blocked_hosts":{},"allowed_hosts":[]}',
+            id="blocked-hosts-not-list",
+        ),
+        pytest.param(
+            b'{"blocked_hosts":[],"allowed_hosts":null}',
+            id="allowed-hosts-not-list",
+        ),
+        pytest.param(
+            b'{"blocked_hosts":[null],"allowed_hosts":[]}',
+            id="entry-not-object",
         ),
     ],
 )
-def test_network_log_malformed_or_unbounded_json_is_explicitly_unsupported(
+def test_network_log_rejects_malformed_top_level_contract(
     payload: bytes, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     spawner = _SbxSpawner()
     provider = _provider(monkeypatch, spawner)
     sandbox_id = _create(provider, tmp_path)
-    command = (
-        "sbx",
-        "policy",
-        "log",
-        sandbox_id,
-        "--type",
-        "network",
-        "--json",
-    )
-    spawner.overrides[command] = _Outcome(
-        stdout=payload.replace(b"ID", sandbox_id.encode())
-    )
+    _set_network_log_output(spawner, sandbox_id, payload)
 
     result = asyncio.run(provider.network_log(sandbox_id))
 
     assert result.events == []
     assert result.supported is False
     assert result.unsupported_reason == "network_log_invalid_json_contract"
+
+
+@pytest.mark.parametrize(
+    ("bucket", "operation", "key"),
+    [
+        pytest.param("blocked_hosts", "remove", "reason", id="blocked-missing-key"),
+        pytest.param("blocked_hosts", "add", "extra", id="blocked-extra-key"),
+        pytest.param("allowed_hosts", "remove", "since", id="allowed-missing-key"),
+        pytest.param("allowed_hosts", "add", "reason", id="allowed-extra-key"),
+    ],
+)
+def test_network_log_rejects_inexact_entry_keys(
+    bucket: str,
+    operation: str,
+    key: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+    sandbox_id = _create(provider, tmp_path)
+    wrapper = _network_log_wrapper(sandbox_id)
+    entry = wrapper[bucket][0]
+    if operation == "remove":
+        entry.pop(key)
+    else:
+        entry[key] = "unexpected"
+    _set_network_log_output(spawner, sandbox_id, json.dumps(wrapper).encode())
+
+    result = asyncio.run(provider.network_log(sandbox_id))
+
+    assert result.unsupported_reason == "network_log_invalid_json_contract"
+
+
+@pytest.mark.parametrize(
+    ("bucket", "key", "value"),
+    [
+        pytest.param("blocked_hosts", "vm_name", "wrong", id="wrong-vm"),
+        pytest.param("allowed_hosts", "proxy_type", "unknown", id="unknown-proxy"),
+        pytest.param("blocked_hosts", "count_since", 0, id="zero-count"),
+        pytest.param("allowed_hosts", "count_since", True, id="boolean-count"),
+        pytest.param("blocked_hosts", "count_since", "1", id="string-count"),
+        pytest.param("blocked_hosts", "host", 1, id="non-string-host"),
+        pytest.param("allowed_hosts", "rule", None, id="non-string-rule"),
+        pytest.param("blocked_hosts", "reason", [], id="non-string-reason"),
+        pytest.param("blocked_hosts", "host", "", id="empty-host"),
+        pytest.param("allowed_hosts", "last_seen", "", id="empty-last-seen"),
+        pytest.param("blocked_hosts", "since", "", id="empty-since"),
+        pytest.param("allowed_hosts", "rule", "x" * 1025, id="unbounded-string"),
+    ],
+)
+def test_network_log_rejects_invalid_entry_values(
+    bucket: str,
+    key: str,
+    value: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+    sandbox_id = _create(provider, tmp_path)
+    wrapper = _network_log_wrapper(sandbox_id)
+    wrapper[bucket][0][key] = value
+    _set_network_log_output(spawner, sandbox_id, json.dumps(wrapper).encode())
+
+    result = asyncio.run(provider.network_log(sandbox_id))
+
+    assert result.unsupported_reason == "network_log_invalid_json_contract"
+
+
+def test_network_log_rejects_combined_event_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+    sandbox_id = _create(provider, tmp_path)
+    wrapper = {
+        "blocked_hosts": [_blocked_network_log_entry(sandbox_id) for _ in range(50)],
+        "allowed_hosts": [_allowed_network_log_entry(sandbox_id) for _ in range(51)],
+    }
+    _set_network_log_output(spawner, sandbox_id, json.dumps(wrapper).encode())
+
+    result = asyncio.run(provider.network_log(sandbox_id))
+
+    assert result.unsupported_reason == "network_log_invalid_json_contract"
+
+
+def test_network_log_accepts_combined_event_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+    sandbox_id = _create(provider, tmp_path)
+    wrapper = {
+        "blocked_hosts": [_blocked_network_log_entry(sandbox_id) for _ in range(50)],
+        "allowed_hosts": [_allowed_network_log_entry(sandbox_id) for _ in range(50)],
+    }
+    _set_network_log_output(spawner, sandbox_id, json.dumps(wrapper).encode())
+
+    result = asyncio.run(provider.network_log(sandbox_id))
+
+    assert result.supported is True
+    assert len(result.events) == 100
 
 
 def test_network_log_rejects_invalid_utf8_that_lossy_decode_would_accept(
@@ -1720,14 +1910,11 @@ def test_network_log_rejects_invalid_utf8_that_lossy_decode_would_accept(
     provider = _provider(monkeypatch, spawner)
     sandbox_id = _create(provider, tmp_path)
     payload = (
-        b'[{"sandbox":"'
-        + sandbox_id.encode()
-        + b'","decision":"blocked","host":"10.0.0.1","proxy":"network",'
-        b'"rule":"private","reason":"\xff","last_seen":"now","count":1}]'
+        json.dumps(_network_log_wrapper(sandbox_id))
+        .encode()
+        .replace(b'"deny"', b'"\xff"')
     )
-    spawner.overrides[
-        ("sbx", "policy", "log", sandbox_id, "--type", "network", "--json")
-    ] = _Outcome(stdout=payload)
+    _set_network_log_output(spawner, sandbox_id, payload)
 
     result = asyncio.run(provider.network_log(sandbox_id))
 

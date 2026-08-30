@@ -44,16 +44,18 @@ _CREATE_FLAGS = (
 )
 PID_HARD_BOUND_LIMITATION = "pid_hard_bound_unsupported"
 _PORT_KEYS = {"host_ip", "host_port", "sandbox_port", "protocol"}
-_NETWORK_EVENT_KEYS = {
-    "sandbox",
-    "decision",
+_NETWORK_LOG_KEYS = {"blocked_hosts", "allowed_hosts"}
+_NETWORK_LOG_COMMON_ENTRY_KEYS = {
     "host",
-    "proxy",
+    "vm_name",
+    "proxy_type",
     "rule",
-    "reason",
     "last_seen",
-    "count",
+    "since",
+    "count_since",
 }
+_BLOCKED_NETWORK_LOG_ENTRY_KEYS = _NETWORK_LOG_COMMON_ENTRY_KEYS | {"reason"}
+_ALLOWED_NETWORK_LOG_ENTRY_KEYS = _NETWORK_LOG_COMMON_ENTRY_KEYS
 _NETWORK_PROXIES = {
     "forward",
     "forward-bypass",
@@ -841,36 +843,52 @@ def _parse_network_events(
         decoded: Any = json.loads(text)
     except json.JSONDecodeError:
         return None
-    if not isinstance(decoded, list) or len(decoded) > MAX_NETWORK_EVENTS:
+    if not isinstance(decoded, dict) or set(decoded) != _NETWORK_LOG_KEYS:
+        return None
+    blocked_hosts = decoded["blocked_hosts"]
+    allowed_hosts = decoded["allowed_hosts"]
+    if (
+        not isinstance(blocked_hosts, list)
+        or not isinstance(allowed_hosts, list)
+        or len(blocked_hosts) + len(allowed_hosts) > MAX_NETWORK_EVENTS
+    ):
         return None
     events: list[dict[str, Any]] = []
-    for item in decoded:
-        if not isinstance(item, dict) or set(item) != _NETWORK_EVENT_KEYS:
-            return None
-        string_fields = (
-            "sandbox",
-            "decision",
-            "host",
-            "proxy",
-            "rule",
-            "reason",
-            "last_seen",
-        )
-        if any(
-            not isinstance(item[field], str) or len(item[field]) > 1024
-            for field in string_fields
-        ):
-            return None
-        if (
-            item["sandbox"] != sandbox_id
-            or item["decision"] not in {"allowed", "blocked"}
-            or not item["host"]
-            or item["proxy"] not in _NETWORK_PROXIES
-            or type(item["count"]) is not int
-            or item["count"] < 1
-        ):
-            return None
-        events.append(dict(item))
+    for decision, entries, entry_keys in (
+        ("blocked", blocked_hosts, _BLOCKED_NETWORK_LOG_ENTRY_KEYS),
+        ("allowed", allowed_hosts, _ALLOWED_NETWORK_LOG_ENTRY_KEYS),
+    ):
+        for item in entries:
+            if not isinstance(item, dict) or set(item) != entry_keys:
+                return None
+            string_fields = tuple(entry_keys - {"count_since"})
+            if any(
+                not isinstance(item[field], str) or len(item[field]) > 1024
+                for field in string_fields
+            ):
+                return None
+            if (
+                not item["host"]
+                or not item["last_seen"]
+                or not item["since"]
+                or item["vm_name"] != sandbox_id
+                or item["proxy_type"] not in _NETWORK_PROXIES
+                or type(item["count_since"]) is not int
+                or item["count_since"] < 1
+            ):
+                return None
+            events.append(
+                {
+                    "sandbox": item["vm_name"],
+                    "decision": decision,
+                    "host": item["host"],
+                    "proxy": item["proxy_type"],
+                    "rule": item["rule"],
+                    "reason": item["reason"] if decision == "blocked" else "",
+                    "last_seen": item["last_seen"],
+                    "count": item["count_since"],
+                }
+            )
     return events
 
 
