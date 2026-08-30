@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import stat
+from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ import pytest
 
 from repotrial.sandbox.base import ExecResult, NetworkLogResult, SandboxProvider
 from repotrial.trial import observation_evidence as evidence_module
+from repotrial.trial import observer as observer_module
 from repotrial.trial.observation_evidence import (
     ObservationEvidenceError,
     ObservationEvidenceRecorder,
@@ -151,12 +153,176 @@ def test_success_records_two_deterministic_events_per_collector(
         ("top", "success"),
         ("network", "start"),
         ("network", "success"),
+        ("audit", "start"),
+        ("audit", "success"),
     ]
-    assert [row["sequence"] for row in rows] == list(range(1, 11))
-    assert {row["phase"] for row in rows[::2]} == {"provider_execution"}
-    assert {row["reason"] for row in rows[::2]} == {"collector_started"}
-    assert {row["phase"] for row in rows[1::2]} == {"parsing"}
-    assert {row["reason"] for row in rows[1::2]} == {"collector_succeeded"}
+    assert [row["sequence"] for row in rows] == list(range(1, 13))
+    assert {row["phase"] for row in rows[:10:2]} == {"provider_execution"}
+    assert {row["reason"] for row in rows[:10:2]} == {"collector_started"}
+    assert {row["phase"] for row in rows[1:10:2]} == {"parsing"}
+    assert {row["reason"] for row in rows[1:10:2]} == {"collector_succeeded"}
+    assert (rows[-2]["phase"], rows[-2]["reason"]) == (
+        "serialization",
+        "audit_started",
+    )
+    assert (rows[-1]["phase"], rows[-1]["reason"]) == (
+        "atomic_persistence",
+        "audit_persisted",
+    )
+    assert [row["exit_code"] for row in rows] == [
+        None,
+        0,
+        None,
+        0,
+        None,
+        0,
+        None,
+        0,
+        None,
+        None,
+        None,
+        None,
+    ]
+
+
+def test_maximum_container_run_records_bounded_390_event_ledger(
+    tmp_path: Path,
+) -> None:
+    containers = [(f"service-{index}", f"{index + 1:012x}") for index in range(64)]
+    discovery = "\n".join(
+        json.dumps({"Service": service, "ID": container_id})
+        for service, container_id in containers
+    )
+    scripts: dict[tuple[str, ...], object] = {DISCOVERY_ARGV: _result(discovery)}
+    for _, container_id in containers:
+        scripts[("docker", "inspect", container_id)] = _result(
+            json.dumps([{"Id": container_id, "Config": {"Env": []}}])
+        )
+        scripts[("docker", "diff", container_id)] = _result()
+        scripts[
+            (
+                "docker",
+                "top",
+                container_id,
+                "-eo",
+                "pid=,ppid=,user=,comm=",
+            )
+        ] = _result()
+    evidence = tmp_path / "observer-boundary.jsonl"
+
+    _collect(_Provider(scripts), tmp_path / "observation.json", evidence)
+
+    rows = _rows(evidence)
+    assert len(rows) == 390
+    assert [row["sequence"] for row in rows] == list(range(1, 391))
+    assert Counter(row["operation"] for row in rows) == {
+        "discovery": 2,
+        "inspect": 128,
+        "diff": 128,
+        "top": 128,
+        "network": 2,
+        "audit": 2,
+    }
+
+
+@pytest.mark.parametrize(
+    ("failure", "error_type", "message", "reason"),
+    [
+        (
+            "serialization",
+            ObservationParseError,
+            "audit data is not serializable",
+            "audit_serialization_failed",
+        ),
+        (
+            "oversize",
+            ObservationCollectionError,
+            "audit artifact exceeds size limit",
+            "audit_too_large",
+        ),
+    ],
+)
+def test_audit_serialization_failures_receive_audit_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    error_type: type[Exception],
+    message: str,
+    reason: str,
+) -> None:
+    if failure == "serialization":
+        monkeypatch.setattr(
+            observer_module,
+            "_command_audit",
+            lambda argv, stdout, parsed: {"unserializable": object()},
+        )
+    else:
+        monkeypatch.setattr(observer_module, "_MAX_ARTIFACT_BYTES", 1)
+    evidence = tmp_path / "observer-boundary.jsonl"
+
+    with pytest.raises(error_type, match=f"^{message}$"):
+        _collect(
+            _Provider({DISCOVERY_ARGV: _result("")}),
+            tmp_path / "observation.json",
+            evidence,
+        )
+
+    rows = _rows(evidence)
+    assert [(row["operation"], row["outcome"]) for row in rows[-2:]] == [
+        ("audit", "start"),
+        ("audit", "failure"),
+    ]
+    assert rows[-2]["phase"] == "serialization"
+    assert rows[-1]["phase"] == "serialization"
+    assert rows[-1]["reason"] == reason
+
+
+class _ArtifactCollisionProvider(_Provider):
+    def __init__(
+        self, scripts: Mapping[tuple[str, ...], object], artifact: Path
+    ) -> None:
+        super().__init__(scripts)
+        self._artifact = artifact
+
+    async def network_log(self, sandbox_id: str) -> NetworkLogResult:
+        result = await super().network_log(sandbox_id)
+        self._artifact.write_text("sentinel\n", encoding="utf-8")
+        return result
+
+
+@pytest.mark.parametrize("failure", ["collision", "write"])
+def test_audit_persistence_failures_receive_audit_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    artifact = tmp_path / "observation.json"
+    evidence = tmp_path / "observer-boundary.jsonl"
+    provider: SandboxProvider = _Provider({DISCOVERY_ARGV: _result("")})
+    if failure == "collision":
+        provider = _ArtifactCollisionProvider({DISCOVERY_ARGV: _result("")}, artifact)
+        expected_message = "artifact target is already in use"
+        expected_reason = "audit_destination_collision"
+    else:
+        real_open = Path.open
+
+        def fail_artifact_open(
+            path: Path, mode: str = "r", *args: object, **kwargs: object
+        ) -> object:
+            if path == artifact:
+                raise OSError("raw audit write secret")
+            return real_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", fail_artifact_open)
+        expected_message = "audit artifact could not be written"
+        expected_reason = "audit_persistence_failed"
+
+    with pytest.raises(ObservationCollectionError, match=f"^{expected_message}$"):
+        _collect(provider, artifact, evidence)
+
+    terminal = _terminal(evidence)
+    assert terminal["operation"] == "audit"
+    assert terminal["phase"] == "atomic_persistence"
+    assert terminal["outcome"] == "failure"
+    assert terminal["reason"] == expected_reason
 
 
 class _SentinelProviderError(RuntimeError):
@@ -191,31 +357,44 @@ def test_provider_exception_is_recorded_safely_and_propagated_unchanged(
 
 
 @pytest.mark.parametrize(
-    ("discovery", "error", "phase", "reason"),
+    ("discovery", "error", "phase", "reason", "exit_code"),
     [
         (
             _result("stdout-secret", exit_code=17, stderr="stderr-secret"),
             ObservationCollectionError,
             "result_validation",
             "nonzero_exit",
+            17,
         ),
         (
             object(),
             ObservationParseError,
             "result_validation",
             "malformed_exec_result",
+            None,
+        ),
+        (
+            ExecResult.model_construct(
+                exit_code=True, stdout="stdout-secret", stderr="stderr-secret"
+            ),
+            ObservationParseError,
+            "result_validation",
+            "malformed_exec_result",
+            None,
         ),
         (
             _result("not-json-secret"),
             ObservationParseError,
             "parsing",
             "parse_failure",
+            0,
         ),
         (
             _result("x" * 1_048_577),
             ObservationParseError,
             "parsing",
             "resource_limit_exceeded",
+            0,
         ),
     ],
 )
@@ -225,6 +404,7 @@ def test_exec_failure_taxonomy_is_closed_and_stable(
     error: type[Exception],
     phase: str,
     reason: str,
+    exit_code: int | None,
 ) -> None:
     evidence = tmp_path / "observer-boundary.jsonl"
 
@@ -240,6 +420,7 @@ def test_exec_failure_taxonomy_is_closed_and_stable(
     assert terminal["phase"] == phase
     assert terminal["outcome"] == "failure"
     assert terminal["reason"] == reason
+    assert terminal["exit_code"] == exit_code
 
 
 def test_network_unsupported_is_a_successful_observed_terminal(
@@ -256,7 +437,7 @@ def test_network_unsupported_is_a_successful_observed_terminal(
     snapshot = _collect(provider, tmp_path / "observation.json", evidence)
 
     assert snapshot.unsupported_collectors == ["network_runtime"]
-    terminal = _terminal(evidence)
+    terminal = [row for row in _rows(evidence) if row["operation"] == "network"][-1]
     assert terminal["operation"] == "network"
     assert terminal["phase"] == "parsing"
     assert terminal["outcome"] == "success"
@@ -384,20 +565,48 @@ def test_destination_creation_race_is_rejected_without_overwrite_or_provider_wor
     real_close = os.close
     raced = False
 
-    def racing_open(path: str | bytes | Path, flags: int, mode: int = 0o777) -> int:
+    def racing_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
         nonlocal raced
-        if not raced:
+        is_destination = (dir_fd is not None and Path(path) == Path(evidence.name)) or (
+            dir_fd is None and Path(path) == evidence
+        )
+        if is_destination and not raced:
             raced = True
-            decoy = real_open(
-                path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
-                0o600,
+            decoy_flags = (
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+            )
+            decoy = (
+                real_open(path, decoy_flags, 0o600)
+                if dir_fd is None
+                else real_open(path, decoy_flags, 0o600, dir_fd=dir_fd)
             )
             os.write(decoy, b"sentinel\n")
             real_close(decoy)
-        return real_open(path, flags, mode)
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(evidence_module.os, "open", racing_open)
+    if os.name == "nt":
+        real_windows_open = evidence_module._open_windows_destination
+
+        def racing_windows_open(name: str, parent_handle: int) -> int:
+            nonlocal raced
+            if not raced:
+                raced = True
+                evidence.write_bytes(b"sentinel\n")
+            return real_windows_open(name, parent_handle)
+
+        monkeypatch.setattr(
+            evidence_module, "_open_windows_destination", racing_windows_open
+        )
+    else:
+        monkeypatch.setattr(evidence_module.os, "open", racing_open)
 
     with pytest.raises(ObservationEvidenceError) as raised:
         _collect(provider, tmp_path / "observation.json", evidence)
@@ -405,6 +614,121 @@ def test_destination_creation_race_is_rejected_without_overwrite_or_provider_wor
     assert raised.value.reason == "destination_collision"
     assert evidence.read_bytes() == b"sentinel\n"
     assert provider.calls == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory descriptors required")
+def test_parent_symlink_swap_cannot_create_escaped_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    displaced = tmp_path / "displaced"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    artifact = attempt / "observation.json"
+    evidence = attempt / "observer-boundary.jsonl"
+    provider = _Provider(_scripts())
+    real_open = os.open
+    swapped = False
+
+    def swap_parent_before_destination_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        is_destination = (dir_fd is not None and Path(path) == Path(evidence.name)) or (
+            dir_fd is None and Path(path) == evidence
+        )
+        if is_destination and not swapped:
+            swapped = True
+            attempt.rename(displaced)
+            attempt.symlink_to(outside, target_is_directory=True)
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(evidence_module.os, "open", swap_parent_before_destination_open)
+
+    with pytest.raises(ObservationEvidenceError) as raised:
+        _collect(provider, artifact, evidence)
+
+    assert raised.value.phase == "atomic_persistence"
+    assert raised.value.reason == "parent_invalid"
+    assert not (outside / evidence.name).exists()
+    assert provider.calls == []
+
+
+def test_windows_parent_guard_fault_fails_closed_before_destination_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened_destinations: list[Path] = []
+    real_open = os.open
+
+    def fail_directory_handle(path: Path) -> int:
+        del path
+        raise OSError("raw Windows handle secret")
+
+    def record_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        opened_destinations.append(Path(path))
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(evidence_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        evidence_module, "_open_windows_directory_handle", fail_directory_handle
+    )
+    monkeypatch.setattr(evidence_module.os, "open", record_open)
+
+    with pytest.raises(ObservationEvidenceError) as raised:
+        ObservationEvidenceRecorder(tmp_path / "observer-boundary.jsonl")
+
+    assert raised.value.phase == "atomic_persistence"
+    assert raised.value.reason == "parent_invalid"
+    assert opened_destinations == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory handle required")
+def test_windows_parent_handle_relative_create_cannot_escape_replaced_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    displaced = tmp_path / "displaced"
+    evidence = attempt / "observer-boundary.jsonl"
+    real_open_destination = evidence_module._open_windows_destination
+    swapped = False
+
+    def swap_parent_before_relative_create(name: str, parent_handle: int) -> int:
+        nonlocal swapped
+        attempt.rename(displaced)
+        attempt.mkdir()
+        swapped = True
+        return real_open_destination(name, parent_handle)
+
+    monkeypatch.setattr(
+        evidence_module,
+        "_open_windows_destination",
+        swap_parent_before_relative_create,
+    )
+
+    with pytest.raises(ObservationEvidenceError) as raised:
+        ObservationEvidenceRecorder(evidence)
+
+    assert raised.value.reason == "parent_invalid"
+    assert swapped
+    assert attempt.is_dir()
+    assert not evidence.exists()
+    assert (displaced / evidence.name).is_file()
 
 
 def test_terminal_destination_link_or_reparse_is_rejected_before_provider_work(
@@ -438,7 +762,12 @@ def test_symlink_destination_is_never_followed_or_overwritten(
     outside = tmp_path / "outside.jsonl"
     outside.write_text("sentinel\n", encoding="utf-8")
     evidence = tmp_path / "observer-boundary.jsonl"
-    evidence.symlink_to(outside)
+    try:
+        evidence.symlink_to(outside)
+    except OSError as error:
+        if os.name == "nt" and getattr(error, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is unavailable")
+        raise
     provider = _Provider(_scripts())
 
     with pytest.raises(ObservationEvidenceError) as raised:
@@ -489,12 +818,22 @@ def test_short_writes_are_completed_fsynced_and_never_reopen_path(
     writes = 0
     fsyncs = 0
     opened_flags: list[int] = []
+    windows_opens = 0
+    real_windows_open = evidence_module._open_windows_destination
 
-    def record_open(path: str | bytes | Path, flags: int, mode: int = 0o777) -> int:
+    def record_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
         nonlocal opens
         opens += 1
         opened_flags.append(flags)
-        return real_open(path, flags, mode)
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
 
     def short_write(descriptor: int, payload: bytes) -> int:
         nonlocal writes
@@ -506,9 +845,18 @@ def test_short_writes_are_completed_fsynced_and_never_reopen_path(
         fsyncs += 1
         real_fsync(descriptor)
 
+    def record_windows_open(name: str, parent_handle: int) -> int:
+        nonlocal windows_opens
+        windows_opens += 1
+        return real_windows_open(name, parent_handle)
+
     monkeypatch.setattr(evidence_module.os, "open", record_open)
     monkeypatch.setattr(evidence_module.os, "write", short_write)
     monkeypatch.setattr(evidence_module.os, "fsync", record_fsync)
+    if os.name == "nt":
+        monkeypatch.setattr(
+            evidence_module, "_open_windows_destination", record_windows_open
+        )
     recorder = ObservationEvidenceRecorder(tmp_path / "observer-boundary.jsonl")
     recorder.record_start("discovery", list(DISCOVERY_ARGV))
     recorder.record_terminal(
@@ -521,12 +869,17 @@ def test_short_writes_are_completed_fsynced_and_never_reopen_path(
     )
     recorder.close()
 
-    assert opens == 1
-    assert opened_flags[0] & os.O_APPEND
-    assert opened_flags[0] & os.O_CREAT
-    assert opened_flags[0] & os.O_EXCL
-    if nofollow := getattr(os, "O_NOFOLLOW", 0):
-        assert opened_flags[0] & nofollow
+    if os.name == "nt":
+        assert opens == 0
+        assert windows_opens == 1
+    else:
+        assert opens == 2
+        destination_flags = opened_flags[-1]
+        assert destination_flags & os.O_APPEND
+        assert destination_flags & os.O_CREAT
+        assert destination_flags & os.O_EXCL
+        if nofollow := getattr(os, "O_NOFOLLOW", 0):
+            assert destination_flags & nofollow
     assert writes > 2
     assert fsyncs == 2
 
@@ -554,6 +907,155 @@ def test_persistence_failure_closes_descriptor_and_reports_atomic_phase(
     recorder.close()
 
 
+def test_partial_write_failure_retains_incomplete_final_line_and_never_reuses_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = tmp_path / "observer-boundary.jsonl"
+    recorder = ObservationEvidenceRecorder(evidence)
+    recorder.record_start("discovery", list(DISCOVERY_ARGV))
+    first_line = evidence.read_bytes()
+    real_write = os.write
+    writes = 0
+
+    def partial_then_fail(descriptor: int, payload: bytes) -> int:
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            return real_write(descriptor, payload[:7])
+        raise OSError("raw persistence secret")
+
+    monkeypatch.setattr(evidence_module.os, "write", partial_then_fail)
+
+    with pytest.raises(ObservationEvidenceError) as raised:
+        recorder.record_terminal(
+            "discovery",
+            list(DISCOVERY_ARGV),
+            phase="parsing",
+            outcome="success",
+            reason="collector_succeeded",
+            result=_result("ok"),
+        )
+
+    assert raised.value.phase == "atomic_persistence"
+    assert raised.value.reason == "persistence_failed"
+    retained = evidence.read_bytes()
+    assert retained.startswith(first_line)
+    assert first_line.endswith(b"\n")
+    assert not retained.endswith(b"\n")
+    complete, incomplete = retained.split(b"\n", maxsplit=1)
+    assert json.loads(complete)["outcome"] == "start"
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(incomplete)
+    with pytest.raises(ObservationEvidenceError) as collision:
+        ObservationEvidenceRecorder(evidence)
+    assert collision.value.reason == "destination_collision"
+
+
+def test_persistence_close_failure_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = ObservationEvidenceRecorder(tmp_path / "observer-boundary.jsonl")
+    close_calls = 0
+
+    def fail_write(descriptor: int, payload: bytes) -> int:
+        del descriptor, payload
+        raise OSError("raw write secret")
+
+    def uncertain_close(descriptor: int) -> None:
+        nonlocal close_calls
+        close_calls += 1
+        del descriptor
+        raise OSError("raw close secret")
+
+    monkeypatch.setattr(evidence_module.os, "write", fail_write)
+    monkeypatch.setattr(evidence_module.os, "close", uncertain_close)
+
+    with pytest.raises(ObservationEvidenceError) as raised:
+        recorder.record_start("discovery", list(DISCOVERY_ARGV))
+
+    assert raised.value.reason == "persistence_failed"
+    assert getattr(raised.value, "__notes__", ()) == [
+        "secondary observation evidence close failed; descriptor ownership is uncertain"
+    ]
+    recorder.close()
+    assert close_calls == 1
+
+
+def test_constructor_cleanup_never_retries_uncertain_destination_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_open = os.open
+    real_fstat = os.fstat
+    real_close = os.close
+    real_handle_to_descriptor = evidence_module._windows_handle_to_descriptor
+    destination_descriptor: int | None = None
+    close_calls = 0
+
+    def record_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal destination_descriptor
+        descriptor = (
+            real_open(path, flags, mode)
+            if dir_fd is None
+            else real_open(path, flags, mode, dir_fd=dir_fd)
+        )
+        if flags & os.O_CREAT:
+            destination_descriptor = descriptor
+        return descriptor
+
+    def invalidate_destination(descriptor: int) -> object:
+        if descriptor == destination_descriptor:
+            return SimpleNamespace(st_mode=stat.S_IFDIR)
+        return real_fstat(descriptor)
+
+    def record_handle_to_descriptor(handle: int) -> int:
+        nonlocal destination_descriptor
+        descriptor = real_handle_to_descriptor(handle)
+        destination_descriptor = descriptor
+        return descriptor
+
+    def uncertain_destination_close(descriptor: int) -> None:
+        nonlocal close_calls
+        if descriptor == destination_descriptor:
+            close_calls += 1
+            raise OSError("raw close secret")
+        real_close(descriptor)
+
+    monkeypatch.setattr(evidence_module.os, "open", record_open)
+    monkeypatch.setattr(evidence_module.os, "fstat", invalidate_destination)
+    monkeypatch.setattr(evidence_module.os, "close", uncertain_destination_close)
+    if os.name == "nt":
+        monkeypatch.setattr(
+            evidence_module,
+            "_windows_handle_to_descriptor",
+            record_handle_to_descriptor,
+        )
+    try:
+        with pytest.raises(ObservationEvidenceError) as raised:
+            ObservationEvidenceRecorder(tmp_path / "observer-boundary.jsonl")
+    finally:
+        if destination_descriptor is not None:
+            monkeypatch.setattr(evidence_module.os, "close", real_close)
+            try:
+                real_fstat(destination_descriptor)
+            except OSError:
+                pass
+            else:
+                real_close(destination_descriptor)
+
+    assert raised.value.phase == "atomic_persistence"
+    assert raised.value.reason == "persistence_failed"
+    assert getattr(raised.value, "__notes__", ()) == [
+        "secondary observation evidence close failed; descriptor ownership is uncertain"
+    ]
+    assert close_calls == 1
+
+
 def test_cancellation_and_secondary_close_failure_preserve_same_cancellation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -561,19 +1063,46 @@ def test_cancellation_and_secondary_close_failure_preserve_same_cancellation(
     provider = _Provider({DISCOVERY_ARGV: cancellation})
     real_open = os.open
     real_close = os.close
+    real_handle_to_descriptor = evidence_module._windows_handle_to_descriptor
     opened: list[int] = []
+    destination_descriptors: set[int] = set()
 
-    def record_open(path: str | bytes | Path, flags: int, mode: int = 0o777) -> int:
-        descriptor = real_open(path, flags, mode)
+    def record_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = (
+            real_open(path, flags, mode)
+            if dir_fd is None
+            else real_open(path, flags, mode, dir_fd=dir_fd)
+        )
         opened.append(descriptor)
+        if flags & os.O_CREAT:
+            destination_descriptors.add(descriptor)
         return descriptor
 
     def fail_close(descriptor: int) -> None:
-        del descriptor
-        raise OSError("raw close secret")
+        if descriptor in destination_descriptors:
+            raise OSError("raw close secret")
+        real_close(descriptor)
+
+    def record_handle_to_descriptor(handle: int) -> int:
+        descriptor = real_handle_to_descriptor(handle)
+        opened.append(descriptor)
+        destination_descriptors.add(descriptor)
+        return descriptor
 
     monkeypatch.setattr(evidence_module.os, "open", record_open)
     monkeypatch.setattr(evidence_module.os, "close", fail_close)
+    if os.name == "nt":
+        monkeypatch.setattr(
+            evidence_module,
+            "_windows_handle_to_descriptor",
+            record_handle_to_descriptor,
+        )
     try:
         with pytest.raises(asyncio.CancelledError) as raised:
             _collect(
@@ -624,23 +1153,49 @@ def test_provider_exception_survives_terminal_persistence_failure(
     ]
 
 
-def test_close_failure_retains_descriptor_for_explicit_retry(
+def test_close_failure_relinquishes_descriptor_without_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     real_open = os.open
     real_close = os.close
+    real_handle_to_descriptor = evidence_module._windows_handle_to_descriptor
     opened: list[int] = []
 
-    def record_open(path: str | bytes | Path, flags: int, mode: int = 0o777) -> int:
-        descriptor = real_open(path, flags, mode)
+    def record_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = (
+            real_open(path, flags, mode)
+            if dir_fd is None
+            else real_open(path, flags, mode, dir_fd=dir_fd)
+        )
         opened.append(descriptor)
         return descriptor
 
+    close_calls = 0
+
     def fail_close(descriptor: int) -> None:
+        nonlocal close_calls
+        close_calls += 1
         del descriptor
         raise OSError("raw close secret")
 
+    def record_handle_to_descriptor(handle: int) -> int:
+        descriptor = real_handle_to_descriptor(handle)
+        opened.append(descriptor)
+        return descriptor
+
     monkeypatch.setattr(evidence_module.os, "open", record_open)
+    if os.name == "nt":
+        monkeypatch.setattr(
+            evidence_module,
+            "_windows_handle_to_descriptor",
+            record_handle_to_descriptor,
+        )
     recorder = ObservationEvidenceRecorder(tmp_path / "observer-boundary.jsonl")
     monkeypatch.setattr(evidence_module.os, "close", fail_close)
 
@@ -650,13 +1205,17 @@ def test_close_failure_retains_descriptor_for_explicit_retry(
     assert raised.value.phase == "atomic_persistence"
     assert raised.value.reason == "close_failed"
     assert "secret" not in str(raised.value)
-    os.fstat(opened[0])
+    recorder.close()
+    recorder.close()
+    assert close_calls == 1
 
     monkeypatch.setattr(evidence_module.os, "close", real_close)
-    recorder.close()
-    recorder.close()
-    with pytest.raises(OSError):
-        os.fstat(opened[0])
+    for descriptor in opened:
+        try:
+            os.fstat(descriptor)
+        except OSError:
+            continue
+        real_close(descriptor)
 
 
 def test_runtime_taxonomy_rejects_unknown_values(tmp_path: Path) -> None:

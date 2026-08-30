@@ -1,14 +1,19 @@
+import ctypes
 import hashlib
+import importlib
 import json
 import os
 import re
 import stat
+from collections.abc import Callable
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol, cast
 
 from repotrial.sandbox.base import ExecResult
 
-type ObservationOperation = Literal["discovery", "inspect", "diff", "top", "network"]
+type ObservationOperation = Literal[
+    "discovery", "inspect", "diff", "top", "network", "audit"
+]
 type EvidencePhase = Literal[
     "provider_execution",
     "result_validation",
@@ -32,18 +37,28 @@ type EvidenceReason = Literal[
     "parent_invalid",
     "persistence_failed",
     "close_failed",
+    "audit_started",
+    "audit_serialization_failed",
+    "audit_too_large",
+    "audit_destination_collision",
+    "audit_persistence_failed",
+    "audit_persisted",
 ]
 
 _SCHEMA_VERSION = 1
-_MAX_EVENTS = 388
+_MAX_EVENTS = 390
 _MAX_EVENT_BYTES = 4_096
 _MAX_LEDGER_BYTES = 1_048_576
 _MAX_ARGV_COUNT = 64
 _MAX_ARGV_BYTES = 65_536
 _MAX_HASHED_OUTPUT_BYTES = 65_536
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+_IS_WINDOWS = os.name == "nt"
 _EXCEPTION_CLASS = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
 _OPERATIONS: frozenset[str] = frozenset(
+    {"discovery", "inspect", "diff", "top", "network", "audit"}
+)
+_COLLECTOR_OPERATIONS: frozenset[str] = frozenset(
     {"discovery", "inspect", "diff", "top", "network"}
 )
 _TERMINAL_TAXONOMY: frozenset[tuple[str, str, str]] = frozenset(
@@ -56,6 +71,15 @@ _TERMINAL_TAXONOMY: frozenset[tuple[str, str, str]] = frozenset(
         ("parsing", "failure", "resource_limit_exceeded"),
         ("parsing", "success", "collector_succeeded"),
         ("parsing", "success", "network_unsupported"),
+    }
+)
+_AUDIT_TERMINAL_TAXONOMY: frozenset[tuple[str, str, str]] = frozenset(
+    {
+        ("serialization", "failure", "audit_serialization_failed"),
+        ("serialization", "failure", "audit_too_large"),
+        ("atomic_persistence", "failure", "audit_destination_collision"),
+        ("atomic_persistence", "failure", "audit_persistence_failed"),
+        ("atomic_persistence", "success", "audit_persisted"),
     }
 )
 _CLOSE_FAILURE_NOTE = (
@@ -81,21 +105,28 @@ class ObservationEvidenceRecorder:
     def __init__(self, path: Path) -> None:
         if not isinstance(path, Path):
             raise TypeError("observation evidence path must be a Path")
-        _validate_parent(path.parent)
+        parent_identity = _validate_parent(path.parent)
         _reject_existing_destination(path)
         self._path = path
-        self._descriptor: int | None = _create_destination(path)
+        self._descriptor: int | None = _create_destination(path, parent_identity)
         self._sequence = 0
         self._written_bytes = 0
         self._active_operation: ObservationOperation | None = None
-        self._last_close_error: ObservationEvidenceError | None = None
 
     @property
     def path(self) -> Path:
         return self._path
 
-    def record_start(self, operation: ObservationOperation, argv: list[str]) -> None:
+    def record_start(
+        self,
+        operation: ObservationOperation,
+        argv: list[str],
+        *,
+        phase: EvidencePhase = "provider_execution",
+        reason: EvidenceReason = "collector_started",
+    ) -> None:
         _validate_operation(operation)
+        _validate_start_taxonomy(operation, phase, reason)
         if self._active_operation is not None:
             raise ValueError("collector evidence already has an active operation")
         event = self._base_event(operation, argv)
@@ -103,8 +134,8 @@ class ObservationEvidenceRecorder:
             {
                 "exception_class": None,
                 "outcome": "start",
-                "phase": "provider_execution",
-                "reason": "collector_started",
+                "phase": phase,
+                "reason": reason,
                 "stderr": None,
                 "stdout": None,
             }
@@ -124,7 +155,7 @@ class ObservationEvidenceRecorder:
         exception: BaseException | None = None,
     ) -> None:
         _validate_operation(operation)
-        _validate_terminal_taxonomy(phase, outcome, reason)
+        _validate_terminal_taxonomy(operation, phase, outcome, reason)
         if self._active_operation != operation:
             raise ValueError(
                 "collector evidence terminal operation does not match start"
@@ -138,6 +169,11 @@ class ObservationEvidenceRecorder:
             stderr = None
         event.update(
             {
+                "exit_code": (
+                    result.exit_code
+                    if isinstance(result, ExecResult) and type(result.exit_code) is int
+                    else None
+                ),
                 "exception_class": _exception_class(exception),
                 "outcome": outcome,
                 "phase": phase,
@@ -153,20 +189,15 @@ class ObservationEvidenceRecorder:
         descriptor = self._descriptor
         if descriptor is None:
             return
+        self._descriptor = None
         try:
             os.close(descriptor)
         except OSError as error:
             close_error = ObservationEvidenceError("atomic_persistence", "close_failed")
-            self._last_close_error = close_error
             raise close_error from error
-        self._descriptor = None
-        self._last_close_error = None
 
     def close_preserving_primary(self, primary: BaseException) -> None:
-        if self._descriptor is None or primary is self._last_close_error:
-            return
-        if self._last_close_error is not None:
-            _add_note(primary, _CLOSE_FAILURE_NOTE)
+        if self._descriptor is None:
             return
         try:
             self.close()
@@ -203,6 +234,7 @@ class ObservationEvidenceRecorder:
         return {
             "argv_count": argv_count,
             "argv_sha256": argv_sha256,
+            "exit_code": None,
             "operation": operation,
             "schema_version": _SCHEMA_VERSION,
             "sequence": self._sequence + 1,
@@ -236,12 +268,11 @@ class ObservationEvidenceRecorder:
         descriptor = self._descriptor
         if descriptor is None:
             return
+        self._descriptor = None
         try:
             os.close(descriptor)
         except OSError:
             _add_note(primary, _CLOSE_FAILURE_NOTE)
-            return
-        self._descriptor = None
 
 
 def _validate_operation(operation: object) -> None:
@@ -249,7 +280,22 @@ def _validate_operation(operation: object) -> None:
         raise ValueError("invalid observation evidence operation")
 
 
-def _validate_terminal_taxonomy(phase: object, outcome: object, reason: object) -> None:
+def _validate_start_taxonomy(operation: object, phase: object, reason: object) -> None:
+    if operation == "audit":
+        valid = phase == "serialization" and reason == "audit_started"
+    else:
+        valid = (
+            operation in _COLLECTOR_OPERATIONS
+            and phase == "provider_execution"
+            and reason == "collector_started"
+        )
+    if not valid:
+        raise ValueError("invalid observation evidence start taxonomy")
+
+
+def _validate_terminal_taxonomy(
+    operation: object, phase: object, outcome: object, reason: object
+) -> None:
     if not isinstance(phase, str) or phase not in {
         "provider_execution",
         "result_validation",
@@ -260,10 +306,14 @@ def _validate_terminal_taxonomy(phase: object, outcome: object, reason: object) 
         raise ValueError("invalid observation evidence phase")
     if not isinstance(outcome, str) or outcome not in {"success", "failure"}:
         raise ValueError("invalid observation evidence outcome")
-    if (
-        not isinstance(reason, str)
-        or (phase, outcome, reason) not in _TERMINAL_TAXONOMY
-    ):
+    if operation == "audit":
+        valid_reason = (phase, outcome, reason) in _AUDIT_TERMINAL_TAXONOMY
+    else:
+        valid_reason = (
+            operation in _COLLECTOR_OPERATIONS
+            and (phase, outcome, reason) in _TERMINAL_TAXONOMY
+        )
+    if not isinstance(reason, str) or not valid_reason:
         raise ValueError("invalid observation evidence reason")
 
 
@@ -344,7 +394,7 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         offset += written
 
 
-def _validate_parent(path: Path) -> None:
+def _validate_parent(path: Path) -> object:
     try:
         identity = path.lstat()
         resolved = path.resolve(strict=True)
@@ -354,6 +404,7 @@ def _validate_parent(path: Path) -> None:
         ) from error
     if not stat.S_ISDIR(identity.st_mode) or _is_link(identity) or resolved != path:
         raise ObservationEvidenceError("atomic_persistence", "parent_invalid")
+    return identity
 
 
 def _reject_existing_destination(path: Path) -> None:
@@ -368,7 +419,114 @@ def _reject_existing_destination(path: Path) -> None:
     raise ObservationEvidenceError("atomic_persistence", "destination_collision")
 
 
-def _create_destination(path: Path) -> int:
+def _create_destination(path: Path, expected_parent: object) -> int:
+    if _IS_WINDOWS:
+        return _create_windows_destination(path, expected_parent)
+    return _create_posix_destination(path, expected_parent)
+
+
+def _create_posix_destination(path: Path, expected_parent: object) -> int:
+    parent_descriptor = _open_posix_parent(path.parent, expected_parent)
+    descriptor: int | None = None
+    try:
+        descriptor = _open_destination(path.name, dir_fd=parent_descriptor)
+        _validate_destination_descriptor(descriptor)
+        _validate_parent_identity(path.parent, expected_parent)
+    except BaseException as error:
+        if descriptor is not None:
+            owned_descriptor = descriptor
+            descriptor = None
+            _close_descriptor_preserving(owned_descriptor, error)
+        owned_parent = parent_descriptor
+        parent_descriptor = -1
+        _close_descriptor_preserving(owned_parent, error)
+        raise
+
+    owned_parent = parent_descriptor
+    parent_descriptor = -1
+    try:
+        os.close(owned_parent)
+    except OSError as error:
+        close_error = ObservationEvidenceError("atomic_persistence", "close_failed")
+        if descriptor is not None:
+            owned_descriptor = descriptor
+            descriptor = None
+            _close_descriptor_preserving(owned_descriptor, close_error)
+        raise close_error from error
+    if descriptor is None:
+        raise ObservationEvidenceError("atomic_persistence", "persistence_failed")
+    return descriptor
+
+
+def _open_posix_parent(path: Path, expected_parent: object) -> int:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ObservationEvidenceError(
+            "atomic_persistence", "parent_invalid"
+        ) from error
+    try:
+        held_identity = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(held_identity.st_mode)
+            or _is_link(held_identity)
+            or not _same_identity(held_identity, expected_parent)
+        ):
+            raise ObservationEvidenceError("atomic_persistence", "parent_invalid")
+    except BaseException as error:
+        owned_descriptor = descriptor
+        descriptor = -1
+        _close_descriptor_preserving(owned_descriptor, error)
+        raise
+    return descriptor
+
+
+def _create_windows_destination(path: Path, expected_parent: object) -> int:
+    try:
+        parent_handle = _open_windows_directory_handle(path.parent)
+    except OSError as error:
+        raise ObservationEvidenceError(
+            "atomic_persistence", "parent_invalid"
+        ) from error
+    descriptor: int | None = None
+    try:
+        _validate_windows_parent_handle(path.parent, parent_handle, expected_parent)
+        descriptor = _open_windows_destination(path.name, parent_handle)
+        _validate_destination_descriptor(descriptor)
+        _validate_windows_parent_handle(path.parent, parent_handle, expected_parent)
+    except BaseException as error:
+        if descriptor is not None:
+            owned_descriptor = descriptor
+            descriptor = None
+            _close_descriptor_preserving(owned_descriptor, error)
+        owned_handle = parent_handle
+        parent_handle = -1
+        _close_windows_handle_preserving(owned_handle, error)
+        raise
+
+    owned_handle = parent_handle
+    parent_handle = -1
+    try:
+        _close_windows_directory_handle(owned_handle)
+    except OSError as error:
+        close_error = ObservationEvidenceError("atomic_persistence", "close_failed")
+        if descriptor is not None:
+            owned_descriptor = descriptor
+            descriptor = None
+            _close_descriptor_preserving(owned_descriptor, close_error)
+        raise close_error from error
+    if descriptor is None:
+        raise ObservationEvidenceError("atomic_persistence", "persistence_failed")
+    return descriptor
+
+
+def _open_destination(path: str | Path, *, dir_fd: int | None = None) -> int:
     flags = (
         os.O_WRONLY
         | os.O_APPEND
@@ -378,7 +536,10 @@ def _create_destination(path: Path) -> int:
         | getattr(os, "O_NOFOLLOW", 0)
     )
     try:
-        descriptor = os.open(path, flags, 0o600)
+        if dir_fd is None:
+            descriptor = os.open(path, flags, 0o600)
+        else:
+            descriptor = os.open(path, flags, 0o600, dir_fd=dir_fd)
     except FileExistsError as error:
         raise ObservationEvidenceError(
             "atomic_persistence", "destination_collision"
@@ -387,17 +548,279 @@ def _create_destination(path: Path) -> int:
         raise ObservationEvidenceError(
             "atomic_persistence", "persistence_failed"
         ) from error
+    return descriptor
+
+
+def _validate_destination_descriptor(descriptor: int) -> None:
     try:
         identity = os.fstat(descriptor)
-        if not stat.S_ISREG(identity.st_mode):
-            raise ObservationEvidenceError("atomic_persistence", "persistence_failed")
+    except OSError as error:
+        raise ObservationEvidenceError(
+            "atomic_persistence", "persistence_failed"
+        ) from error
+    if not stat.S_ISREG(identity.st_mode):
+        raise ObservationEvidenceError("atomic_persistence", "persistence_failed")
+
+
+def _validate_parent_identity(path: Path, expected_parent: object) -> None:
+    try:
+        current = path.lstat()
+    except OSError as error:
+        raise ObservationEvidenceError(
+            "atomic_persistence", "parent_invalid"
+        ) from error
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or _is_link(current)
+        or not _same_identity(current, expected_parent)
+    ):
+        raise ObservationEvidenceError("atomic_persistence", "parent_invalid")
+
+
+def _same_identity(left: object, right: object) -> bool:
+    return (
+        getattr(left, "st_dev", None),
+        getattr(left, "st_ino", None),
+    ) == (
+        getattr(right, "st_dev", None),
+        getattr(right, "st_ino", None),
+    )
+
+
+class _ByHandleFileInformation(ctypes.Structure):
+    _fields_ = [
+        ("file_attributes", ctypes.c_uint32),
+        ("creation_time_low", ctypes.c_uint32),
+        ("creation_time_high", ctypes.c_uint32),
+        ("access_time_low", ctypes.c_uint32),
+        ("access_time_high", ctypes.c_uint32),
+        ("write_time_low", ctypes.c_uint32),
+        ("write_time_high", ctypes.c_uint32),
+        ("volume_serial_number", ctypes.c_uint32),
+        ("file_size_high", ctypes.c_uint32),
+        ("file_size_low", ctypes.c_uint32),
+        ("number_of_links", ctypes.c_uint32),
+        ("file_index_high", ctypes.c_uint32),
+        ("file_index_low", ctypes.c_uint32),
+    ]
+
+
+class _UnicodeString(ctypes.Structure):
+    _fields_ = [
+        ("length", ctypes.c_ushort),
+        ("maximum_length", ctypes.c_ushort),
+        ("buffer", ctypes.c_void_p),
+    ]
+
+
+class _ObjectAttributes(ctypes.Structure):
+    _fields_ = [
+        ("length", ctypes.c_ulong),
+        ("root_directory", ctypes.c_void_p),
+        ("object_name", ctypes.POINTER(_UnicodeString)),
+        ("attributes", ctypes.c_ulong),
+        ("security_descriptor", ctypes.c_void_p),
+        ("security_quality_of_service", ctypes.c_void_p),
+    ]
+
+
+class _IoStatusBlock(ctypes.Structure):
+    _fields_ = [
+        ("status_or_pointer", ctypes.c_void_p),
+        ("information", ctypes.c_size_t),
+    ]
+
+
+class _WindowsFunction(Protocol):
+    argtypes: list[object]
+    restype: object
+
+    def __call__(self, *args: object) -> int | None: ...
+
+
+class _WindowsLoader(Protocol):
+    def __call__(self, name: str, *, use_last_error: bool) -> object: ...
+
+
+class _MsvcrtModule(Protocol):
+    def open_osfhandle(self, handle: int, flags: int) -> int: ...
+
+
+def _windows_function(name: str, *, library: str = "kernel32") -> _WindowsFunction:
+    loader = getattr(ctypes, "WinDLL", None)
+    if not callable(loader):
+        raise OSError("Windows API is unavailable")
+    windows_library = cast(_WindowsLoader, loader)(library, use_last_error=True)
+    return cast(_WindowsFunction, getattr(windows_library, name))
+
+
+def _windows_last_error() -> int:
+    get_last_error = getattr(ctypes, "get_last_error", None)
+    if not callable(get_last_error):
+        return 0
+    return cast(Callable[[], int], get_last_error)()
+
+
+def _open_windows_directory_handle(path: Path) -> int:
+    create_file = _windows_function("CreateFileW")
+    create_file.argtypes = cast(
+        list[object],
+        [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ],
+    )
+    create_file.restype = ctypes.c_void_p
+    handle = create_file(
+        str(path),
+        0x0080,
+        0x00000001 | 0x00000002,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle is None or handle == invalid_handle:
+        raise OSError(_windows_last_error(), "Windows directory handle open failed")
+    return int(handle)
+
+
+def _open_windows_destination(name: str, parent_handle: int) -> int:
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        raise ObservationEvidenceError("atomic_persistence", "persistence_failed")
+    name_buffer = ctypes.create_unicode_buffer(name)
+    encoded_length = len(name.encode("utf-16-le"))
+    object_name = _UnicodeString(
+        encoded_length,
+        encoded_length + ctypes.sizeof(ctypes.c_wchar),
+        ctypes.cast(name_buffer, ctypes.c_void_p),
+    )
+    object_attributes = _ObjectAttributes(
+        ctypes.sizeof(_ObjectAttributes),
+        ctypes.c_void_p(parent_handle),
+        ctypes.pointer(object_name),
+        0x00000040,
+        None,
+        None,
+    )
+    io_status = _IoStatusBlock()
+    child_handle = ctypes.c_void_p()
+    nt_create_file = _windows_function("NtCreateFile", library="ntdll")
+    nt_create_file.argtypes = cast(
+        list[object],
+        [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_ulong,
+            ctypes.POINTER(_ObjectAttributes),
+            ctypes.POINTER(_IoStatusBlock),
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+        ],
+    )
+    nt_create_file.restype = ctypes.c_long
+    status = nt_create_file(
+        ctypes.byref(child_handle),
+        0x00000004 | 0x00000080 | 0x00100000,
+        ctypes.byref(object_attributes),
+        ctypes.byref(io_status),
+        None,
+        0x00000080,
+        0x00000001 | 0x00000002 | 0x00000004,
+        2,
+        0x00000020 | 0x00000040 | 0x00200000,
+        None,
+        0,
+    )
+    if status is None:
+        raise ObservationEvidenceError("atomic_persistence", "persistence_failed")
+    unsigned_status = status & 0xFFFFFFFF
+    if status < 0 or child_handle.value is None:
+        failure = ObservationEvidenceError(
+            "atomic_persistence",
+            (
+                "destination_collision"
+                if unsigned_status == 0xC0000035
+                else "persistence_failed"
+            ),
+        )
+        if child_handle.value is not None:
+            owned_failed_handle = int(child_handle.value)
+            child_handle.value = None
+            _close_windows_handle_preserving(owned_failed_handle, failure)
+        raise failure
+    owned_handle = int(child_handle.value)
+    try:
+        return _windows_handle_to_descriptor(owned_handle)
     except BaseException as error:
-        try:
-            os.close(descriptor)
-        except OSError:
-            _add_note(error, _CLOSE_FAILURE_NOTE)
-        raise
-    return descriptor
+        _close_windows_handle_preserving(owned_handle, error)
+        if isinstance(error, ObservationEvidenceError):
+            raise
+        raise ObservationEvidenceError(
+            "atomic_persistence", "persistence_failed"
+        ) from error
+
+
+def _windows_handle_to_descriptor(handle: int) -> int:
+    msvcrt = cast(_MsvcrtModule, importlib.import_module("msvcrt"))
+    try:
+        return msvcrt.open_osfhandle(handle, os.O_APPEND | getattr(os, "O_BINARY", 0))
+    except OSError as error:
+        raise ObservationEvidenceError(
+            "atomic_persistence", "persistence_failed"
+        ) from error
+
+
+def _validate_windows_parent_handle(
+    path: Path, handle: int, expected_parent: object
+) -> None:
+    get_information = _windows_function("GetFileInformationByHandle")
+    get_information.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    get_information.restype = ctypes.c_int
+    information = _ByHandleFileInformation()
+    if not get_information(ctypes.c_void_p(handle), ctypes.byref(information)):
+        raise ObservationEvidenceError("atomic_persistence", "parent_invalid")
+    if not information.file_attributes & 0x00000010:
+        raise ObservationEvidenceError("atomic_persistence", "parent_invalid")
+    if information.file_attributes & 0x00000400:
+        raise ObservationEvidenceError("atomic_persistence", "parent_invalid")
+    _validate_parent_identity(path, expected_parent)
+    expected_ino = getattr(expected_parent, "st_ino", 0)
+    handle_ino = (information.file_index_high << 32) | information.file_index_low
+    if expected_ino and handle_ino and expected_ino != handle_ino:
+        raise ObservationEvidenceError("atomic_persistence", "parent_invalid")
+
+
+def _close_windows_directory_handle(handle: int) -> None:
+    close_handle = _windows_function("CloseHandle")
+    close_handle.argtypes = [ctypes.c_void_p]
+    close_handle.restype = ctypes.c_int
+    if not close_handle(ctypes.c_void_p(handle)):
+        raise OSError(_windows_last_error(), "Windows directory handle close failed")
+
+
+def _close_descriptor_preserving(descriptor: int, primary: BaseException) -> None:
+    try:
+        os.close(descriptor)
+    except OSError:
+        _add_note(primary, _CLOSE_FAILURE_NOTE)
+
+
+def _close_windows_handle_preserving(handle: int, primary: BaseException) -> None:
+    try:
+        _close_windows_directory_handle(handle)
+    except OSError:
+        _add_note(primary, _CLOSE_FAILURE_NOTE)
 
 
 def _is_link(identity: object) -> bool:

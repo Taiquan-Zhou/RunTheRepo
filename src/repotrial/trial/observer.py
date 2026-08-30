@@ -6,7 +6,7 @@ import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from repotrial.domain.models import ObservationSnapshot
 from repotrial.sandbox.base import ExecResult, NetworkLogResult, SandboxProvider
@@ -46,6 +46,14 @@ class ObservationParseError(ObservationCollectionError):
 
 
 _RESOURCE_LIMIT_MARKER = "_repotrial_observation_resource_limit"
+_AUDIT_FAILURE_MARKER = "_repotrial_observation_audit_failure"
+type _AuditFailurePhase = Literal["serialization", "atomic_persistence"]
+type _AuditFailureReason = Literal[
+    "audit_serialization_failed",
+    "audit_too_large",
+    "audit_destination_collision",
+    "audit_persistence_failed",
+]
 
 
 def _resource_error(message: str) -> ObservationParseError:
@@ -323,7 +331,58 @@ async def _collect_observation(
         },
         "snapshot": snapshot.model_dump(mode="json"),
     }
-    _write_artifact(artifact_path, audit)
+    audit_argv: list[str] = []
+    if recorder is not None:
+        recorder.record_start(
+            "audit",
+            audit_argv,
+            phase="serialization",
+            reason="audit_started",
+        )
+    try:
+        serialized_audit = _serialize_artifact(audit)
+    except BaseException as error:
+        if recorder is not None:
+            _, reason = _audit_failure(
+                error,
+                default_phase="serialization",
+                default_reason="audit_serialization_failed",
+            )
+            recorder.record_terminal_preserving_primary(
+                "audit",
+                audit_argv,
+                phase="serialization",
+                reason=reason,
+                result=None,
+                primary=error,
+            )
+        raise
+    try:
+        _persist_artifact(artifact_path, serialized_audit)
+    except BaseException as error:
+        if recorder is not None:
+            _, reason = _audit_failure(
+                error,
+                default_phase="atomic_persistence",
+                default_reason="audit_persistence_failed",
+            )
+            recorder.record_terminal_preserving_primary(
+                "audit",
+                audit_argv,
+                phase="atomic_persistence",
+                reason=reason,
+                result=None,
+                primary=error,
+            )
+        raise
+    if recorder is not None:
+        recorder.record_terminal(
+            "audit",
+            audit_argv,
+            phase="atomic_persistence",
+            outcome="success",
+            reason="audit_persisted",
+        )
     return snapshot
 
 
@@ -693,7 +752,39 @@ def _command_audit(argv: list[str], stdout: str, parsed: object) -> dict[str, ob
     return {"argv": list(argv), "stdout_sha256": digest, "parsed": parsed}
 
 
-def _write_artifact(artifact_path: Path, audit: dict[str, object]) -> None:
+def _mark_audit_failure(
+    error: ObservationCollectionError,
+    phase: _AuditFailurePhase,
+    reason: _AuditFailureReason,
+) -> ObservationCollectionError:
+    setattr(error, _AUDIT_FAILURE_MARKER, (phase, reason))
+    return error
+
+
+def _audit_failure(
+    error: BaseException,
+    *,
+    default_phase: _AuditFailurePhase,
+    default_reason: _AuditFailureReason,
+) -> tuple[_AuditFailurePhase, _AuditFailureReason]:
+    marker = getattr(error, _AUDIT_FAILURE_MARKER, None)
+    if (
+        isinstance(marker, tuple)
+        and len(marker) == 2
+        and marker[0] in {"serialization", "atomic_persistence"}
+        and marker[1]
+        in {
+            "audit_serialization_failed",
+            "audit_too_large",
+            "audit_destination_collision",
+            "audit_persistence_failed",
+        }
+    ):
+        return cast(tuple[_AuditFailurePhase, _AuditFailureReason], marker)
+    return default_phase, default_reason
+
+
+def _serialize_artifact(audit: dict[str, object]) -> bytes:
     try:
         serialized = (
             json.dumps(
@@ -706,18 +797,39 @@ def _write_artifact(artifact_path: Path, audit: dict[str, object]) -> None:
             + "\n"
         ).encode("utf-8")
     except (TypeError, ValueError, UnicodeEncodeError) as error:
-        raise ObservationParseError("audit data is not serializable") from error
+        classified = _mark_audit_failure(
+            ObservationParseError("audit data is not serializable"),
+            "serialization",
+            "audit_serialization_failed",
+        )
+        raise classified from error
     if len(serialized) > _MAX_ARTIFACT_BYTES:
-        raise ObservationCollectionError("audit artifact exceeds size limit")
+        raise _mark_audit_failure(
+            ObservationCollectionError("audit artifact exceeds size limit"),
+            "serialization",
+            "audit_too_large",
+        )
+    return serialized
+
+
+def _persist_artifact(artifact_path: Path, serialized: bytes) -> None:
     try:
         with artifact_path.open("xb") as artifact_file:
             artifact_file.write(serialized)
     except FileExistsError as error:
-        raise ObservationCollectionError("artifact target is already in use") from error
+        classified = _mark_audit_failure(
+            ObservationCollectionError("artifact target is already in use"),
+            "atomic_persistence",
+            "audit_destination_collision",
+        )
+        raise classified from error
     except OSError as error:
-        raise ObservationCollectionError(
-            "audit artifact could not be written"
-        ) from error
+        classified = _mark_audit_failure(
+            ObservationCollectionError("audit artifact could not be written"),
+            "atomic_persistence",
+            "audit_persistence_failed",
+        )
+        raise classified from error
 
 
 def _decode_json(text: str) -> object:

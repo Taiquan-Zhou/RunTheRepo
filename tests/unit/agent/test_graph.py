@@ -890,6 +890,8 @@ def test_default_graph_composes_real_baseline_services_in_one_sandbox(
         ("discovery", "success"),
         ("network", "start"),
         ("network", "success"),
+        ("audit", "start"),
+        ("audit", "success"),
     ]
     assert not any("observation-boundary" in item for item in result.run.artifacts)
     assert "collector_succeeded" not in result.run.model_dump_json()
