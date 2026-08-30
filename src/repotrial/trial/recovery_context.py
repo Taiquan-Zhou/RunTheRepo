@@ -102,7 +102,10 @@ def derive_recovery_context(
     allowed = sorted({declaration.key for declaration in declarations})[:_MAX_ENV_KEYS]
     allowed_keys = frozenset(allowed)
     bounded = [item for item in declarations if item.key in allowed_keys]
-    ordered = tuple(sorted(set(bounded), key=lambda item: (item.key, item.relative_path, item.sha256)))
+    unique = {
+        (item.key, item.relative_path, item.sha256): item for item in bounded
+    }
+    ordered = tuple(item for _, item in sorted(unique.items()))
     return RecoveryRepositoryContext(
         allowed_env_keys=allowed_keys,
         declarations=ordered,
@@ -116,7 +119,9 @@ def _head_tail(value: str, limit: int) -> str:
         return _TRUNCATION_MARKER[:limit]
     retained = limit - len(_TRUNCATION_MARKER)
     head_length = (retained + 1) // 2
-    return f"{value[:head_length]}{_TRUNCATION_MARKER}{value[-(retained - head_length):]}"
+    tail_length = retained - head_length
+    tail = value[-tail_length:] if tail_length else ""
+    return f"{value[:head_length]}{_TRUNCATION_MARKER}{tail}"
 
 
 def _env_example_keys(content: str) -> list[str]:
