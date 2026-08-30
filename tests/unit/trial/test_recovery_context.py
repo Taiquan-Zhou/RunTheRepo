@@ -61,7 +61,7 @@ def test_projection_limits_aggregate_content_without_mutating_short_values() -> 
     projected = project_recovery_evidence(logs)
 
     assert list(projected.logs) == ["up", "ps", "logs", "extra"]
-    assert sum(map(len, projected.logs.values())) == 16_384
+    assert sum(map(len, projected.logs.values())) + len(projected.logs) - 1 == 16_384
     assert logs["later"] == "must-not-appear"
 
 

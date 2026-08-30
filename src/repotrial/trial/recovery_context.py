@@ -106,9 +106,10 @@ def derive_recovery_context(
 
     declarations: list[DeclaredEnvSource] = []
     for source, relative_path in sources:
-        content, sha256 = _read_utf8_source(root, source, relative_path)
+        label = ".env.example" if relative_path == ".env.example" else "compose"
+        content, sha256 = _read_utf8_source(root, source, label)
         keys = (
-            _compose_value_keys(content, relative_path)
+            _compose_value_keys(content, label)
             if relative_path != ".env.example"
             else _env_example_keys(content)
         )
@@ -345,6 +346,7 @@ def _interpolation_keys(value: str) -> list[str]:
             continue
         keys.append(match.group(1))
         position = match.end()
+    return keys
 
 
 def _file_identity(stat_result: os.stat_result) -> tuple[int, int, int]:
