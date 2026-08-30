@@ -48,6 +48,10 @@ from repotrial.trial.boot import _boot_compose_with_evidence, boot_compose
 from repotrial.trial.boot_evidence import record_recovery_evidence
 from repotrial.trial.observer import collect_observation
 from repotrial.trial.planner import plan_journeys, propose_recovery
+from repotrial.trial.recovery_context import (
+    derive_recovery_context,
+    project_recovery_evidence,
+)
 
 type RunGraph = CompiledStateGraph[GraphState, GraphContext, GraphState, GraphState]
 type NodeUpdate = dict[str, object]
@@ -213,6 +217,16 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
     env.update(state.recovery_env)
     context = runtime.context
     compose_path = _required_compose_path(state.run)
+    recovery_context = (
+        None
+        if context.allowed_env_keys
+        else derive_recovery_context(context.workspace, compose_path)
+    )
+    allowed_env_keys = (
+        context.allowed_env_keys
+        if recovery_context is None
+        else recovery_context.allowed_env_keys
+    )
     attempt_dir, attempt_slot = _claim_attempt_directory(
         state.run,
         context,
@@ -273,14 +287,15 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
         update["run"] = state.run.model_copy(update={"stop_reason": "boot_unsupported"})
         return update
 
-    fingerprint = _boot_error_fingerprint(result.logs)
+    recovery_evidence = project_recovery_evidence(result.logs)
+    fingerprint = _boot_error_fingerprint(recovery_evidence.logs)
     repeated = (
         state.repeated_error_count + 1 if fingerprint == state.boot_error_hash else 0
     )
     recovery = await propose_recovery(
-        result.logs,
+        recovery_evidence.logs,
         runtime.context.readme_excerpt,
-        set(runtime.context.allowed_env_keys),
+        set(allowed_env_keys),
         repeated,
         runtime.context.model,
     )
