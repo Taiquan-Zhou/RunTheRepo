@@ -38,6 +38,19 @@ attempt ledger, evidence references, and Kill Criteria analysis.
 - Reports describe only tested-journey/workload-conditioned hardened candidates.
   They are not global safety or least-privilege proofs.
 
+## Supported execution
+
+On Windows, the recommended and RepoTrial-tested development path is a dedicated
+WSL2 Ubuntu 24.04 distribution running the official Linux Docker Sandboxes
+package. Native Windows Docker Sandboxes remains a historical blocker because
+the retained stable/nightly runtimes could not connect to their own sandboxd
+socket; it is not the active execution path.
+
+RepoTrial never falls back to Windows Docker Desktop, a host Docker Engine, or
+host-side Compose. Follow the [WSL2 Linux SBX setup guide](docs/dev/wsl2-linux-sbx-setup.md)
+and review the [accepted calibration evidence](docs/dev/pilot-evidence/wsl2-linux-sbx-calibration.md)
+before enabling real-runtime tests or Pilot execution.
+
 ## Development
 
 Use the locked environment and run the repository gates:

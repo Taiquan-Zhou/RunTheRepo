@@ -169,3 +169,47 @@
   is safe, globally least-privileged, or free of unobserved risk.
 - No push or remote GitHub Actions run was performed. M2.1 and later tasks were
   not started.
+
+## M7.5 environment recovery — WSL2 Linux Docker Sandboxes
+
+- Native Windows Docker Sandboxes remains historical evidence, not the active
+  execution path. Stable v0.39.0 and nightly
+  `v0.42.0-rc1-34-gc5fab2cd4` both retained the sandboxd AF_UNIX
+  self-connect failure; neither result was rewritten or represented as fixed.
+- The selected execution environment is the dedicated WSL2 distro
+  `RepoTrial-Ubuntu`: Ubuntu `24.04.4 LTS`, kernel
+  `6.6.87.2-microsoft-standard-WSL2`, systemd, accessible KVM, and an ext4
+  checkout under `/home/repotrial/src/RepoTrial`. The distro is registered at
+  `D:\DockerData\WSL\RepoTrial-Ubuntu`; the pre-existing `Ubuntu` and
+  `docker-desktop` distributions were not used or modified.
+- Calibrated execution HEAD:
+  `760f73c15aba839a71ac036699b527334808b73f`. Calibration evidence commit:
+  `6baf2e65e313c051e91d2062416262be7f7dd6f1`. This docs-only attestation does
+  not and cannot identify its own future commit.
+- Runtime-input fingerprint:
+  `3598b61c3fca786bfcf9b81f9e5d030ea38613f13736ecb92bd5d14d7feabcff`;
+  manifest SHA-256:
+  `4a963f0ee730ddf4be7243ad31cc2899ce19cdbfed3c4570498ff7d1c617551a`;
+  environment fingerprint:
+  `521b50be7c0ca064799f1f0f7e1cdd478fddc765d9ab6d5f8c49d2e26d13b005`.
+- Official Linux SBX v0.39.0 diagnose completed `12 pass / 0 warn / 0 fail /
+  0 skip`. Trusted real calibration passed `3 passed in 170.66s`; the opt-in
+  Provider smoke passed `1 passed in 21.94s`; every lifecycle ended with exact
+  empty inventory and no host Docker fallback.
+- Linux quality gates at the calibrated HEAD: Ruff lint PASS; Ruff format
+  `90 files already formatted`; mypy PASS for 39 source files; full pytest
+  `1178 passed, 5 skipped, 1 warning`; branch coverage `88.78%` against the
+  required `85%`; pre-commit and `git diff --check` PASS.
+- A client-process proxy A/B first reproduced Docker JWKS timeout without
+  `HTTP_PROXY`/`HTTPS_PROXY`, while the same Rule-mode route passed through the
+  approved LAN proxy. With explicit trusted-client proxy variables and
+  `NO_PROXY=localhost,127.0.0.1`, diagnose and the complete calibration passed.
+  This client layer remains independent from Docker-official `proxy.daemon`
+  and `proxy.sandbox` settings.
+- Calibrated safety evidence covers CPU, memory, the exact three-part disk
+  budget, shared host-side monotonic whole-trial duration, fail-closed network
+  policy, cleanup, and no-host-fallback. PID hard bound remains explicitly
+  unsupported and is not claimed or emulated.
+- Environment recovery now hands execution to existing Task 2 of the M7.5
+  compatibility-recovery plan. The frozen manifest, repository order, SHAs,
+  thresholds, and Boot/Recovery/Journey/experiment semantics are unchanged.

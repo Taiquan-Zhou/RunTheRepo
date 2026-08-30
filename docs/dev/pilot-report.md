@@ -397,3 +397,40 @@ Owner decision is required between a bounded, generic boot-evidence/root-cause
 task and stopping the MVP line. Any future production change after these
 metric-bearing results requires marking them superseded and rerunning the complete
 frozen cohort on one final unified HEAD. No repository may be replaced.
+
+## 12. WSL2 Linux environment and cohort handoff
+
+The accepted execution environment for the next release decision is the
+dedicated WSL2 Ubuntu 24.04 topology documented in the
+[setup guide](wsl2-linux-sbx-setup.md) and
+[calibration evidence](pilot-evidence/wsl2-linux-sbx-calibration.md).
+Calibration ran at
+`760f73c15aba839a71ac036699b527334808b73f`; the report was persisted by
+calibration evidence commit
+`6baf2e65e313c051e91d2062416262be7f7dd6f1`.
+
+All Windows attempts and rows above remain immutable append-only evidence. The
+Windows execution cohort is superseded only at cohort level for the next release
+decision; no attempt ID, raw stop reason, role, SHA, artifact reference, or
+historical metric is deleted, overwritten, or reclassified.
+
+Execution resumes at existing Task 2 of the M7.5 compatibility-recovery plan:
+
+1. Linux attempts for frozen repositories #1 Umami, #2 Listmonk, and #3
+   changedetection.io are initially `diagnostic-only`. They diagnose the
+   dominant generic cause and are not current release metrics.
+2. If Task 2 authorizes one or more generic corrections under the existing
+   evidence and review gates, every correction is completed before the final
+   Linux cohort is frozen.
+3. On the final unified Linux execution HEAD, repositories #1–#3 are
+   simultaneously the 2/3 canary and the first three `metric-bearing` entries.
+   If the canary passes, execution continues with frozen repositories #4–#10;
+   #1–#3 are not rerun between those two roles.
+4. The frozen manifest, order, URLs, exact SHAs, thresholds, and
+   Boot/Recovery/Journey/experiment/KEEP/ROLLBACK semantics remain unchanged.
+
+Current release metrics aggregate only attempts from that final Linux cohort and
+one execution HEAD/environment fingerprint. Cross-cohort reporting is separate:
+it retains Windows history, Linux diagnostic attempts, failed/infrastructure
+attempts, and explicit supersession links without mixing them into the current
+cohort numerator, denominator, latency, convergence, or cleanup result.

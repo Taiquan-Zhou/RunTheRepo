@@ -212,7 +212,7 @@ assert service["healthcheck"]["test"] == [
     "-",
     "http://127.0.0.1:8080/health.txt",
 ]
-assert "ports" not in service
+assert service["ports"] == ["8080:8080"]
 assert "privileged" not in service
 assert "network_mode" not in service
 assert "/var/run/docker.sock" not in fixture_text
@@ -242,6 +242,8 @@ services:
     command: [httpd, -f, -p, "8080", -h, /www]
     volumes:
       - ./www:/www:ro
+    ports:
+      - "8080:8080"
     healthcheck:
       test: [CMD, wget, -q, -O, -, http://127.0.0.1:8080/health.txt]
       interval: 1s
@@ -250,8 +252,10 @@ services:
       start_period: 1s
 ```
 
-Do not add a Dockerfile, mutable tag, host port, host path, secret, or Docker
-socket.
+Do not add a Dockerfile, mutable tag, host path, secret, Docker socket, or any
+port mapping beyond the exact guest-local `8080:8080` above. That mapping exists
+only inside the disposable sandbox; outer publication must still pass the
+Provider's strict `127.0.0.1` host-binding validation.
 
 - [ ] **Step 4: Write the opt-in calibration integration test**
 
