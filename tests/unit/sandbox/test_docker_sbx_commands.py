@@ -75,6 +75,18 @@ class _Outcome:
     reap_error: OSError | None = None
 
 
+class _PathFlags:
+    def __init__(self, *, is_symlink: bool, file_attributes: int) -> None:
+        self._is_symlink = is_symlink
+        self._file_attributes = file_attributes
+
+    def lstat(self) -> SimpleNamespace:
+        return SimpleNamespace(st_file_attributes=self._file_attributes)
+
+    def is_symlink(self) -> bool:
+        return self._is_symlink
+
+
 class _FakeStream:
     def __init__(self, data: bytes, release: asyncio.Event) -> None:
         self._data = data
@@ -582,6 +594,100 @@ def test_create_rejects_malformed_host_head_before_sbx_create(
 
 
 @pytest.mark.parametrize(
+    ("is_symlink", "file_attributes"),
+    [
+        pytest.param(True, 0, id="symlink"),
+        pytest.param(False, 0x400, id="windows-reparse-point"),
+    ],
+)
+def test_workspace_link_or_reparse_flags_are_rejected(
+    is_symlink: bool, file_attributes: int
+) -> None:
+    workspace = _PathFlags(
+        is_symlink=is_symlink,
+        file_attributes=file_attributes,
+    )
+
+    assert docker_sbx._is_link_or_reparse_point(workspace) is True
+
+
+def test_create_rejects_workspace_link_or_reparse_before_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+    monkeypatch.setattr(
+        docker_sbx,
+        "_is_link_or_reparse_point",
+        lambda _: True,
+    )
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert (raised.value.operation, raised.value.reason) == (
+        "clone_verification",
+        "workspace_invalid",
+    )
+    assert spawner.calls == []
+
+
+def test_create_rejects_changed_workspace_identity_before_sbx_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identities = iter(((1, 1), (1, 1), (2, 2)))
+    monkeypatch.setattr(
+        docker_sbx,
+        "_workspace_identity",
+        lambda _: next(identities),
+    )
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert (raised.value.operation, raised.value.reason) == (
+        "clone_verification",
+        "workspace_changed",
+    )
+    assert _non_help_create_calls(spawner) == []
+
+
+def test_create_rejects_second_host_head_change_before_sbx_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host_heads = iter(
+        (
+            HOST_HEAD,
+            b"ffffffffffffffffffffffffffffffffffffffff\n",
+        )
+    )
+    spawner = _SbxSpawner()
+
+    def respond(command: tuple[str, ...]) -> _Outcome:
+        if command[:1] == ("git",):
+            return _Outcome(stdout=next(host_heads))
+        if command == ("sbx", "version"):
+            return _Outcome(stdout=b"sbx 99.0.0\n")
+        if command in HELP_OUTPUTS:
+            return _Outcome(stdout=HELP_OUTPUTS[command].encode())
+        return _Outcome()
+
+    spawner.intercept = respond
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert (raised.value.operation, raised.value.reason) == (
+        "clone_verification",
+        "host_head_changed",
+    )
+    assert _non_help_create_calls(spawner) == []
+
+
+@pytest.mark.parametrize(
     ("guest_argv", "outcome", "expected_reason"),
     [
         (("pwd",), _Outcome(returncode=7), "nonzero_exit"),
@@ -615,6 +721,66 @@ def test_create_rejects_malformed_host_head_before_sbx_create(
     ],
 )
 def test_create_cleans_up_when_guest_clone_postcondition_fails(
+    guest_argv: tuple[str, ...],
+    outcome: _Outcome,
+    expected_reason: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+
+    def respond(command: tuple[str, ...]) -> _Outcome:
+        if command[:1] == ("git",):
+            return _Outcome(stdout=HOST_HEAD)
+        if command == ("sbx", "version"):
+            return _Outcome(stdout=b"sbx 99.0.0\n")
+        if command in HELP_OUTPUTS:
+            return _Outcome(stdout=HELP_OUTPUTS[command].encode())
+        if command[:2] == ("sbx", "exec") and command[4:] == guest_argv:
+            return outcome
+        if command[:2] == ("sbx", "exec"):
+            return _guest_verification_outcome(command)
+        return _Outcome()
+
+    spawner.intercept = respond
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    create_call = _actual_create_call(spawner)
+    sandbox_id = create_call[create_call.index("--name") + 1]
+    assert (raised.value.operation, raised.value.reason) == (
+        "clone_verification",
+        expected_reason,
+    )
+    assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
+    assert not any(
+        command[:5] == ("sbx", "policy", "allow", "network", "--sandbox")
+        for command in spawner.calls
+    )
+    assert provider._trial_deadline is None
+    assert provider._sandbox_deadlines == {}
+
+
+@pytest.mark.parametrize(
+    ("guest_argv", "outcome", "expected_reason"),
+    [
+        pytest.param(
+            ("pwd",),
+            _Outcome(stdout=b"\xff\n"),
+            "guest_pwd_invalid",
+            id="pwd-invalid-utf8",
+        ),
+        pytest.param(
+            ("git", "rev-parse", "--show-toplevel"),
+            _Outcome(stdout=b"/workspace"),
+            "guest_top_level_invalid",
+            id="top-level-missing-newline",
+        ),
+    ],
+)
+def test_create_forces_partial_cleanup_after_malformed_guest_workspace_output(
     guest_argv: tuple[str, ...],
     outcome: _Outcome,
     expected_reason: str,
