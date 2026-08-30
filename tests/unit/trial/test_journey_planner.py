@@ -6,6 +6,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from repotrial.domain.models import Journey, JourneyAssertion, JourneyStep
+from repotrial.models.openai_compat import ModelAdapterError
 from repotrial.trial import planner as planner_module
 from repotrial.trial.planner import plan_journeys
 
@@ -226,6 +227,71 @@ def test_valid_model_output_is_materialized_only_when_other_sources_are_empty(
     assert journeys[0].steps[0].params["path"] == "/from-model"
     assert model.calls == 1
     assert "no safe markdown links" in model.user
+
+
+def test_model_journey_failure_records_the_adapter_reason_without_changing_fail_closed_result(
+    tmp_path: Path,
+) -> None:
+    class FailingAdapter:
+        async def structured(
+            self, *, system: str, user: str, schema: type[BaseModel]
+        ) -> BaseModel:
+            del system, user, schema
+            raise ModelAdapterError(
+                "model request failed", reason_code="transport_error"
+            )
+
+    evidence_path = tmp_path / "baseline-model-attempt.jsonl"
+
+    journeys = asyncio.run(
+        plan_journeys(
+            tmp_path,
+            "no safe markdown links",
+            FailingAdapter(),
+            evidence_path=evidence_path,
+        )
+    )
+
+    assert journeys == []
+    rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    assert rows[-1]["outcome"] == "transport_error"
+
+
+def test_model_journey_policy_rejection_is_recorded_without_raw_model_output(
+    tmp_path: Path,
+) -> None:
+    evidence_path = tmp_path / "baseline-model-attempt.jsonl"
+    model = FakeModelAdapter(
+        [
+            {
+                "journey_id": "invalid",
+                "name": "Invalid",
+                "steps": [
+                    {
+                        "step_id": "bad",
+                        "tool": "http",
+                        "action": "request",
+                        "params": {"method": "PUT", "path": "/secret-value"},
+                        "assertions": [],
+                    }
+                ],
+            }
+        ]
+    )
+
+    journeys = asyncio.run(
+        plan_journeys(
+            tmp_path,
+            "no safe markdown links",
+            model,
+            evidence_path=evidence_path,
+        )
+    )
+
+    assert journeys == []
+    content = evidence_path.read_text(encoding="utf-8")
+    assert json.loads(content.splitlines()[-1])["outcome"] == "policy_rejected"
+    assert "secret-value" not in content
 
 
 def test_mixed_tool_declared_journey_fails_closed_without_model_fallback(

@@ -46,6 +46,10 @@ from repotrial.sandbox.lifecycle import managed_sandbox
 from repotrial.trial import boot as boot_module
 from repotrial.trial.boot import _boot_compose_with_evidence, boot_compose
 from repotrial.trial.boot_evidence import record_recovery_evidence
+from repotrial.trial.journey_artifact import (
+    verify_baseline_journeys,
+    write_baseline_journeys,
+)
 from repotrial.trial.journey_context import derive_journey_readme_excerpt
 from repotrial.trial.observer import collect_observation
 from repotrial.trial.planner import plan_journeys, propose_recovery
@@ -189,11 +193,16 @@ async def _baseline(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUp
             if context.readme_excerpt
             else derive_journey_readme_excerpt(workspace)
         )
-        journeys = await plan_journeys(
-            workspace,
-            journey_readme_excerpt,
-            context.model,
-        )
+        if context.model is None:
+            journeys = await plan_journeys(workspace, journey_readme_excerpt)
+        else:
+            journeys = await plan_journeys(
+                workspace,
+                journey_readme_excerpt,
+                context.model,
+                evidence_path=_baseline_model_evidence_artifact(state.run, context),
+            )
+    write_baseline_journeys(_baseline_journey_artifact(state.run, context), journeys)
     run = state.run.model_copy(
         deep=True,
         update={
@@ -243,6 +252,9 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
     observation_artifact = attempt_dir / "baseline-observation.json"
     evidence_artifact = attempt_dir / "baseline-boot-attempt.json"
     evidence_enabled = boot_compose is boot_module.boot_compose
+    verify_baseline_journeys(
+        _baseline_journey_artifact(state.run, context), state.run.journeys
+    )
     async with managed_sandbox(
         context.provider,
         context.workspace,
@@ -298,13 +310,22 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
     repeated = (
         state.repeated_error_count + 1 if fingerprint == state.boot_error_hash else 0
     )
-    recovery = await propose_recovery(
-        recovery_evidence.logs,
-        runtime.context.readme_excerpt,
-        set(allowed_env_keys),
-        repeated,
-        runtime.context.model,
-    )
+    if runtime.context.model is None:
+        recovery = await propose_recovery(
+            recovery_evidence.logs,
+            runtime.context.readme_excerpt,
+            set(allowed_env_keys),
+            repeated,
+        )
+    else:
+        recovery = await propose_recovery(
+            recovery_evidence.logs,
+            runtime.context.readme_excerpt,
+            set(allowed_env_keys),
+            repeated,
+            runtime.context.model,
+            evidence_path=attempt_dir / "baseline-model-attempt.jsonl",
+        )
     update["boot_error_hash"] = fingerprint
     update["repeated_error_count"] = repeated
     await _apply_recovery(state, update, recovery, runtime.context)
@@ -442,6 +463,9 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
         env={**context.env, **state.recovery_env},
         container_port=context.container_port,
     )
+    verify_baseline_journeys(
+        _baseline_journey_artifact(state.run, context), state.run.journeys
+    )
     record = await run_experiment(
         state.run.model_copy(deep=True),
         mutation,
@@ -515,6 +539,32 @@ def _boot_error_fingerprint(logs: Mapping[str, str]) -> str:
 
 def _run_token(run_id: str) -> str:
     return hashlib.sha256(run_id.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _baseline_journey_artifact(run: RunState, context: GraphContext) -> Path:
+    return _run_evidence_directory(run, context) / "baseline-journeys.json"
+
+
+def _baseline_model_evidence_artifact(run: RunState, context: GraphContext) -> Path:
+    return _run_evidence_directory(run, context) / "baseline-model-attempt.jsonl"
+
+
+def _run_evidence_directory(run: RunState, context: GraphContext) -> Path:
+    artifact_root = _real_directory(context.artifact_dir, "artifact_dir")
+    directory = artifact_root / f"run-{_run_token(run.run_id)}"
+    if directory.exists() or directory.is_symlink():
+        existing = _real_directory(directory, "run evidence directory")
+        if existing.parent != artifact_root:
+            raise ValueError("run evidence directory must resolve inside artifact_dir")
+        return existing
+    try:
+        directory.mkdir()
+    except OSError:
+        raise ValueError("run evidence directory could not be created") from None
+    created = _real_directory(directory, "run evidence directory")
+    if created.parent != artifact_root:
+        raise ValueError("run evidence directory must resolve inside artifact_dir")
+    return created
 
 
 async def _run_baseline_journeys(

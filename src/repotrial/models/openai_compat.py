@@ -1,6 +1,6 @@
 import json
 from dataclasses import dataclass
-from typing import Final, TypeVar
+from typing import Final, Literal, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -17,10 +17,32 @@ _GENERIC_REQUEST_ERROR_TYPES: Final = (
     "bad_request",
     "request_error",
 )
+_MODEL_ADAPTER_FAILURE_CODES: Final = frozenset(
+    {
+        "transport_error",
+        "http_error",
+        "response_too_large",
+        "structured_response_invalid",
+    }
+)
 
 
-class ModelAdapterError(TimeoutError):
+type ModelAdapterFailureCode = Literal[
+    "transport_error",
+    "http_error",
+    "response_too_large",
+    "structured_response_invalid",
+]
+
+
+class ModelAdapterError(RuntimeError):
     """Credential-free failure returned by the OpenAI-compatible boundary."""
+
+    def __init__(self, message: str, *, reason_code: ModelAdapterFailureCode) -> None:
+        if reason_code not in _MODEL_ADAPTER_FAILURE_CODES:
+            raise ValueError("invalid model adapter reason code")
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 @dataclass(frozen=True)
@@ -64,7 +86,7 @@ class OpenAICompatibleModelAdapter:
             )
 
         if not _is_success(first_response.status_code):
-            raise ModelAdapterError("model request failed")
+            raise ModelAdapterError("model request failed", reason_code="http_error")
         try:
             return _validated_result(schema, first_response.body)
         except ModelAdapterError:
@@ -75,7 +97,7 @@ class OpenAICompatibleModelAdapter:
     async def _successful_response(self, payload: dict[str, object]) -> bytes:
         response = await self._request(payload)
         if not _is_success(response.status_code):
-            raise ModelAdapterError("model request failed")
+            raise ModelAdapterError("model request failed", reason_code="http_error")
         return response.body
 
     async def _request(self, payload: dict[str, object]) -> _HttpResponse:
@@ -98,11 +120,16 @@ class OpenAICompatibleModelAdapter:
             ):
                 declared_length = response.headers.get("Content-Length")
                 if _declared_response_is_too_large(declared_length):
-                    raise ModelAdapterError("model response exceeds size limit")
+                    raise ModelAdapterError(
+                        "model response exceeds size limit",
+                        reason_code="response_too_large",
+                    )
                 body = await _read_bounded_response(response)
                 return _HttpResponse(response.status_code, body)
         except httpx.HTTPError:
-            raise ModelAdapterError("model request failed") from None
+            raise ModelAdapterError(
+                "model request failed", reason_code="transport_error"
+            ) from None
 
 
 def _normalize_endpoint(endpoint: str) -> str:
@@ -188,7 +215,9 @@ async def _read_bounded_response(response: httpx.Response) -> bytes:
     async for chunk in response.aiter_bytes():
         total += len(chunk)
         if total > _MAX_RESPONSE_BYTES:
-            raise ModelAdapterError("model response exceeds size limit")
+            raise ModelAdapterError(
+                "model response exceeds size limit", reason_code="response_too_large"
+            )
         chunks.append(chunk)
     return b"".join(chunks)
 
@@ -295,7 +324,9 @@ def _validated_result[ResultModelT: BaseModel](
         TypeError,
         ValueError,
     ):
-        raise ModelAdapterError("invalid structured response") from None
+        raise ModelAdapterError(
+            "invalid structured response", reason_code="structured_response_invalid"
+        ) from None
 
 
 def _chat_completion_content(response: object) -> str:

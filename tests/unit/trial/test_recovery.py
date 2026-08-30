@@ -1,4 +1,6 @@
 import asyncio
+import json
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -162,6 +164,29 @@ def test_missing_allowlisted_env_proposes_fixed_synthetic_value() -> None:
         },
         reason="missing allowlisted environment variable",
     )
+
+
+def test_model_recovery_evidence_is_written_to_the_claimed_attempt_directory(
+    tmp_path: Path,
+) -> None:
+    evidence_path = tmp_path / "baseline-model-attempt.jsonl"
+    model = FakeModelAdapter(RecoveryAction(action="retry", params={}, reason="retry"))
+
+    action = asyncio.run(
+        propose_recovery(
+            {"logs": "unrecognized startup failure"},
+            "",
+            set(),
+            0,
+            model,
+            evidence_path=evidence_path,
+        )
+    )
+
+    rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    assert action.action == "retry"
+    assert rows[0]["purpose"] == "recovery"
+    assert rows[-1]["outcome"] == "success"
 
 
 def test_projected_boot_evidence_avoids_invalid_recovery_evidence() -> None:

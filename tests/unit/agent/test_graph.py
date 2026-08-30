@@ -32,6 +32,7 @@ from repotrial.domain.models import (
 from repotrial.models.base import RecoveryAction
 from repotrial.sandbox.base import ExecResult, SandboxProvider
 from repotrial.sandbox.fake import FakeSandboxProvider
+from repotrial.trial.journey_artifact import JourneyArtifactError
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -876,6 +877,64 @@ def test_default_graph_composes_real_baseline_services_in_one_sandbox(
     assert len([call for call in provider.calls if call[0] == "create"]) == 1
     assert len([call for call in provider.calls if call[0] == "destroy"]) == 1
     assert result.run.sandbox_id is None
+
+
+def test_graph_persists_baseline_journeys_before_workload_and_rejects_tampering(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port)
+        context, source = _context(tmp_path, provider)
+        graph = build_run_graph(interrupt_after=("baseline",))
+
+        asyncio.run(
+            ainvoke_run(
+                graph, _state(source.parent, run_id="journey-guard"), context=context
+            )
+        )
+        artifact = graph_module._baseline_journey_artifact(
+            _state(source.parent, run_id="journey-guard"), context
+        )
+        document = json.loads(artifact.read_text(encoding="utf-8"))
+        document["journeys"][0]["steps"][0]["params"]["path"] = "/tampered"
+        artifact.write_text(json.dumps(document), encoding="utf-8")
+
+        with pytest.raises(
+            JourneyArtifactError, match="baseline journey artifact hash mismatch"
+        ):
+            asyncio.run(aresume_run(graph, "journey-guard", context=context))
+
+    assert [call for call in provider.calls if call[0] == "create"] == []
+
+
+def test_graph_rejects_tampered_baseline_journeys_before_candidate_replay(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+        graph = build_run_graph(interrupt_after=("propose_mutation",))
+
+        asyncio.run(
+            ainvoke_run(
+                graph,
+                _state(source.parent, run_id="candidate-journey-guard"),
+                context=context,
+            )
+        )
+        artifact = graph_module._baseline_journey_artifact(
+            _state(source.parent, run_id="candidate-journey-guard"), context
+        )
+        document = json.loads(artifact.read_text(encoding="utf-8"))
+        document["journeys"][0]["name"] = "Tampered"
+        artifact.write_text(json.dumps(document), encoding="utf-8")
+
+        with pytest.raises(
+            JourneyArtifactError, match="baseline journey artifact hash mismatch"
+        ):
+            asyncio.run(aresume_run(graph, "candidate-journey-guard", context=context))
+
+    assert _candidate_create_calls(provider) == []
 
 
 def test_missing_commit_uses_narrow_repository_pinner_then_real_baseline(

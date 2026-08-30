@@ -5,7 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Event, Lock, Thread
 from types import TracebackType
-from typing import Self
+from typing import Self, cast
 
 import httpx
 import pytest
@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from repotrial.models import openai_compat
 from repotrial.models.openai_compat import (
     ModelAdapterError,
+    ModelAdapterFailureCode,
     OpenAICompatibleModelAdapter,
 )
 from repotrial.trial.planner import plan_journeys, propose_recovery
@@ -117,6 +118,21 @@ def test_invalid_model_output_is_retried_once_then_fails_without_response_data()
 
     assert len(server.requests) == 2
     assert "answer" not in str(error.value)
+
+
+def test_model_adapter_error_exposes_a_closed_reason_code_without_timeout_inheritance() -> (
+    None
+):
+    error = ModelAdapterError("model request failed", reason_code="http_error")
+
+    assert error.reason_code == "http_error"
+    assert not isinstance(error, TimeoutError)
+
+    with pytest.raises(ValueError, match="reason code"):
+        ModelAdapterError(
+            "model request failed",
+            reason_code=cast(ModelAdapterFailureCode, "unknown"),
+        )
 
 
 def test_explicit_json_schema_unsupported_response_uses_one_json_only_fallback() -> (
