@@ -438,17 +438,13 @@ async def _exec(
     return result.stdout
 
 
-def _compose_web_wget_argv(url: str) -> list[str]:
+def _shell_curl_argv(url: str) -> list[str]:
     return [
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "web",
-        "wget",
-        "-q",
-        "-O",
-        "-",
+        "curl",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--location",
         url,
     ]
 
@@ -579,7 +575,7 @@ async def _assert_network_policy(provider: DockerSbxProvider, sandbox_id: str) -
     public_body = await _exec(
         provider,
         sandbox_id,
-        _compose_web_wget_argv("http://example.com/"),
+        _shell_curl_argv("http://example.com/"),
         timeout_s=15,
     )
     assert "Example Domain" in public_body
@@ -597,7 +593,7 @@ async def _assert_network_policy(provider: DockerSbxProvider, sandbox_id: str) -
         before = await _observed_network_events(provider, sandbox_id)
         result = await provider.exec(
             sandbox_id,
-            _compose_web_wget_argv(probe),
+            _shell_curl_argv(probe),
             timeout_s=10,
         )
         assert result.exit_code != 0, (probe, result.stdout, result.stderr)

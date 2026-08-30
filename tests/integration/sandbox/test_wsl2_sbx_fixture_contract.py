@@ -66,22 +66,18 @@ def test_wsl2_compose_fixture_has_pinned_minimal_web_service() -> None:
     ],
     ids=["public", "denied"],
 )
-def test_calibration_network_probe_argv_enters_trusted_compose_web_service(
+def test_calibration_network_probe_argv_uses_sbx_shell_curl(
     calibration_module: ModuleType,
     url: str,
 ) -> None:
-    argv = calibration_module._compose_web_wget_argv(url)
+    argv = calibration_module._shell_curl_argv(url)
 
     assert argv == [
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "web",
-        "wget",
-        "-q",
-        "-O",
-        "-",
+        "curl",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--location",
         url,
     ]
     assert argv.count(url) == 1
