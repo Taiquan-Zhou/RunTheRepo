@@ -234,6 +234,7 @@ def _claim_destination(destination: Path) -> _DestinationClaim:
     except OSError:
         raise RepoIntakeError("destination_create") from None
     directory_fd: int | None = None
+    identity: os.stat_result | None = None
     try:
         identity = destination.lstat()
         if not stat.S_ISDIR(identity.st_mode):
@@ -263,12 +264,22 @@ def _claim_destination(destination: Path) -> _DestinationClaim:
             ):
                 raise RepoIntakeError("destination_claim")
             identity = opened_identity
-    except OSError:
+    except (OSError, RepoIntakeError) as error:
+        if identity is not None:
+            _remove_owned_destination(
+                _DestinationClaim(
+                    path=destination,
+                    device=identity.st_dev,
+                    inode=identity.st_ino,
+                    file_type=stat.S_IFMT(identity.st_mode),
+                    directory_fd=directory_fd,
+                )
+            )
         _close_directory_fd(directory_fd)
+        if isinstance(error, RepoIntakeError):
+            raise
         raise RepoIntakeError("destination_claim") from None
-    except RepoIntakeError:
-        _close_directory_fd(directory_fd)
-        raise
+    assert identity is not None
     return _DestinationClaim(
         path=destination,
         device=identity.st_dev,

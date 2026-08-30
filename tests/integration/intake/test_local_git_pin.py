@@ -399,6 +399,74 @@ def test_clone_cleanup_preserves_a_replacement_destination(
     assert sentinel.read_text(encoding="utf-8") == "do not delete"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fd behavior")
+@pytest.mark.parametrize(
+    "failure_stage", ["open", "set_inheritable", "fstat", "second_lstat"]
+)
+def test_clone_claim_failure_removes_the_directory_it_created(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_stage: str
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "destination"
+    original_open = os.open
+    original_lstat = Path.lstat
+    original_fstat = os.fstat
+    destination_open_calls = 0
+    destination_lstat_calls = 0
+    fstat_calls = 0
+
+    def fail_first_destination_open(
+        path: str | os.PathLike[str], flags: int, *args: object, **kwargs: object
+    ) -> int:
+        nonlocal destination_open_calls
+        if Path(path) == destination:
+            destination_open_calls += 1
+            if destination_open_calls == 1:
+                raise OSError("SECRET directory-open failure")
+        return original_open(path, flags, *args, **kwargs)
+
+    def fail_to_make_directory_fd_non_inheritable(
+        _directory_fd: int, _inheritable: bool
+    ) -> None:
+        raise OSError("SECRET set-inheritable failure")
+
+    def fail_first_fstat(directory_fd: int) -> os.stat_result:
+        nonlocal fstat_calls
+        fstat_calls += 1
+        if fstat_calls == 1:
+            raise OSError("SECRET fstat failure")
+        return original_fstat(directory_fd)
+
+    def fail_second_destination_lstat(self: Path) -> os.stat_result:
+        nonlocal destination_lstat_calls
+        if self == destination:
+            destination_lstat_calls += 1
+            if destination_lstat_calls == 2:
+                raise OSError("SECRET second-lstat failure")
+        return original_lstat(self)
+
+    if failure_stage == "open":
+        monkeypatch.setattr(github.os, "open", fail_first_destination_open)
+    elif failure_stage == "set_inheritable":
+        monkeypatch.setattr(
+            github.os, "set_inheritable", fail_to_make_directory_fd_non_inheritable
+        )
+    elif failure_stage == "fstat":
+        monkeypatch.setattr(github.os, "fstat", fail_first_fstat)
+    else:
+        monkeypatch.setattr(Path, "lstat", fail_second_destination_lstat)
+
+    with pytest.raises(github.RepoIntakeError) as raised:
+        asyncio.run(github.clone_and_resolve(str(source), destination))
+
+    assert raised.value.operation == "destination_claim"
+    assert "SECRET" not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__ is True
+    assert not destination.exists()
+
+
 def test_clone_sanitizes_destination_parent_oserror(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
