@@ -35,14 +35,14 @@ def test_projection_orders_commands_bounds_fields_and_preserves_input() -> None:
 
 
 def test_projection_enforces_entry_key_and_aggregate_limits_deterministically() -> None:
-    logs = {f"unknown-{index:02d}": "x" * 4_096 for index in range(40)}
+    logs = {f"unknown-{index:02d}": "x" for index in range(40)}
     logs["k" * 129] = "ignored"
 
     projected = project_recovery_evidence(logs)
 
     assert len(projected.logs) == 32
     assert list(projected.logs) == [f"unknown-{index:02d}" for index in range(32)]
-    assert sum(map(len, projected.logs.values())) == 16_384
+    assert sum(map(len, projected.logs.values())) == 32
     assert "k" * 129 not in projected.logs
 
 
@@ -60,6 +60,21 @@ def test_projection_limits_aggregate_content_without_mutating_short_values() -> 
     assert list(projected.logs) == ["up", "ps", "logs", "extra"]
     assert sum(map(len, projected.logs.values())) == 16_384
     assert logs["later"] == "must-not-appear"
+
+
+def test_projection_never_exceeds_aggregate_budget_with_a_small_remainder() -> None:
+    logs = {
+        "up": "u" * 4_096,
+        "ps": "p" * 4_096,
+        "logs": "l" * 4_096,
+        "extra": "e" * 4_082,
+        "later": "x" * 100,
+    }
+
+    projected = project_recovery_evidence(logs)
+
+    assert len(projected.logs["later"]) == 14
+    assert sum(map(len, projected.logs.values())) == 16_384
 
 
 def test_derivation_collects_compose_forms_and_env_example_names_without_values(
