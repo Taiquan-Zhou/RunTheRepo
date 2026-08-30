@@ -80,6 +80,7 @@ MANDATORY_DENY_NETWORK = frozenset(
         "host-gateway",
         "host.containers.internal",
         "host.docker.internal",
+        "localhost",
         "metadata.google.internal",
     }
 )

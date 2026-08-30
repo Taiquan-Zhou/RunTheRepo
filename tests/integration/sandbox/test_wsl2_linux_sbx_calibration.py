@@ -587,7 +587,7 @@ async def _assert_network_policy(provider: DockerSbxProvider, sandbox_id: str) -
             "169.254.0.0/16",
         },
         "http://10.255.255.1:81/": {"10.255.255.1", "10.0.0.0/8"},
-        "http://host.docker.internal:80/": {"host.docker.internal"},
+        "http://host.docker.internal:80/": {"host.docker.internal", "localhost"},
     }
     for probe, expected_evidence in probes.items():
         before = await _observed_network_events(provider, sandbox_id)

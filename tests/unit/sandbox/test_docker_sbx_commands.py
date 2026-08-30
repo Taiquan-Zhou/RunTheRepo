@@ -345,6 +345,7 @@ def test_policy_is_immutable_and_mandatory_denies_cannot_be_removed() -> None:
         "host-gateway",
         "host.containers.internal",
         "host.docker.internal",
+        "localhost",
         "metadata.google.internal",
     }
 
