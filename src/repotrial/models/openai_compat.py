@@ -138,7 +138,7 @@ class OpenAICompatibleModelAdapter:
             raise TimeoutError("model operation deadline exceeded")
         try:
             response = await asyncio.wait_for(
-                self._request(payload, timeout=_request_timeout_budget(remaining)),
+                self._request(payload),
                 timeout=remaining,
             )
         except TimeoutError:
@@ -147,17 +147,14 @@ class OpenAICompatibleModelAdapter:
             raise TimeoutError("model operation deadline exceeded")
         return response
 
-    async def _request(
-        self, payload: dict[str, object], *, timeout: float | None = None
-    ) -> _HttpResponse:
+    async def _request(self, payload: dict[str, object]) -> _HttpResponse:
         headers = {"Content-Type": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
-        request_timeout = _bounded_http_timeout(timeout)
         try:
             async with (
                 httpx.AsyncClient(
-                    timeout=request_timeout,
+                    timeout=_REQUEST_TIMEOUT,
                     follow_redirects=False,
                     trust_env=False,
                 ) as client,
@@ -180,28 +177,6 @@ class OpenAICompatibleModelAdapter:
             raise ModelAdapterError(
                 "model request failed", reason_code="transport_error"
             ) from None
-
-
-def _request_timeout_budget(remaining: float) -> float:
-    read_timeout = _REQUEST_TIMEOUT.read
-    if read_timeout is None:
-        return remaining
-    return min(read_timeout, remaining)
-
-
-def _bounded_http_timeout(budget: float | None) -> httpx.Timeout:
-    if budget is None:
-        return _REQUEST_TIMEOUT
-
-    def bounded(value: float | None) -> float | None:
-        return None if value is None else min(value, budget)
-
-    return httpx.Timeout(
-        connect=bounded(_REQUEST_TIMEOUT.connect),
-        read=bounded(_REQUEST_TIMEOUT.read),
-        write=bounded(_REQUEST_TIMEOUT.write),
-        pool=bounded(_REQUEST_TIMEOUT.pool),
-    )
 
 
 def _normalize_endpoint(endpoint: str) -> str:

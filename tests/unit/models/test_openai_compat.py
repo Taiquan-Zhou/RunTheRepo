@@ -2,6 +2,7 @@ import asyncio
 import json
 import socket
 import time
+from collections.abc import Awaitable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -77,6 +78,20 @@ def _chat_completion(content: str) -> dict[str, object]:
     return {"choices": [{"message": {"content": content}}]}
 
 
+def _observe_wait_for_timeouts(monkeypatch: pytest.MonkeyPatch) -> list[float | None]:
+    observed: list[float | None] = []
+    actual_wait_for = asyncio.wait_for
+
+    async def observed_wait_for(
+        awaitable: Awaitable[object], timeout: float | None = None
+    ) -> object:
+        observed.append(timeout)
+        return await actual_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(openai_compat.asyncio, "wait_for", observed_wait_for)
+    return observed
+
+
 class _ControlledClock:
     def __init__(self) -> None:
         self.value = 0.0
@@ -86,6 +101,31 @@ class _ControlledClock:
 
     def advance(self, seconds: float) -> None:
         self.value += seconds
+
+
+def test_request_override_with_original_signature_remains_compatible() -> None:
+    class LegacyRequestAdapter(OpenAICompatibleModelAdapter):
+        def __init__(self) -> None:
+            super().__init__("http://127.0.0.1", "model")
+            self.calls = 0
+
+        async def _request(
+            self, payload: dict[str, object]
+        ) -> openai_compat._HttpResponse:
+            self.calls += 1
+            assert "response_format" in payload
+            return openai_compat._HttpResponse(
+                200, json.dumps(_chat_completion('{"answer":"ok"}')).encode()
+            )
+
+    adapter = LegacyRequestAdapter()
+
+    result = asyncio.run(
+        adapter.structured(system="system", user="user", schema=_Answer)
+    )
+
+    assert result == _Answer(answer="ok")
+    assert adapter.calls == 1
 
 
 def test_structured_returns_the_requested_pydantic_type_from_json_schema_response() -> (
@@ -246,14 +286,11 @@ def test_strict_request_consumption_reduces_fallback_timeout(
     clock = _ControlledClock()
     monkeypatch.setattr(openai_compat, "_OPERATION_TIMEOUT_S", 10.0, raising=False)
     monkeypatch.setattr(openai_compat, "_monotonic", clock, raising=False)
-    request_timeouts: list[float | None] = []
+    wait_for_timeouts = _observe_wait_for_timeouts(monkeypatch)
 
-    async def request(
-        payload: dict[str, object], *, timeout: float | None = None
-    ) -> openai_compat._HttpResponse:
+    async def request(payload: dict[str, object]) -> openai_compat._HttpResponse:
         del payload
-        request_timeouts.append(timeout)
-        if len(request_timeouts) == 1:
+        if len(wait_for_timeouts) == 1:
             clock.advance(3.0)
             return openai_compat._HttpResponse(
                 400,
@@ -269,7 +306,7 @@ def test_strict_request_consumption_reduces_fallback_timeout(
     assert asyncio.run(
         adapter.structured(system="system", user="user", schema=_Answer)
     ) == _Answer(answer="ok")
-    assert request_timeouts == [10.0, 7.0]
+    assert wait_for_timeouts == [10.0, 7.0]
 
 
 def test_expired_operation_deadline_does_not_start_fallback_request(
@@ -278,13 +315,12 @@ def test_expired_operation_deadline_does_not_start_fallback_request(
     clock = _ControlledClock()
     monkeypatch.setattr(openai_compat, "_OPERATION_TIMEOUT_S", 5.0, raising=False)
     monkeypatch.setattr(openai_compat, "_monotonic", clock, raising=False)
+    wait_for_timeouts = _observe_wait_for_timeouts(monkeypatch)
     request_count = 0
 
-    async def request(
-        payload: dict[str, object], *, timeout: float | None = None
-    ) -> openai_compat._HttpResponse:
+    async def request(payload: dict[str, object]) -> openai_compat._HttpResponse:
         nonlocal request_count
-        del payload, timeout
+        del payload
         request_count += 1
         clock.advance(5.0)
         if request_count == 1:
@@ -303,6 +339,7 @@ def test_expired_operation_deadline_does_not_start_fallback_request(
         asyncio.run(adapter.structured(system="system", user="user", schema=_Answer))
 
     assert request_count == 1
+    assert wait_for_timeouts == [5.0]
 
 
 def test_strict_retry_shares_operation_deadline_and_stops_at_two_requests(
@@ -311,13 +348,10 @@ def test_strict_retry_shares_operation_deadline_and_stops_at_two_requests(
     clock = _ControlledClock()
     monkeypatch.setattr(openai_compat, "_OPERATION_TIMEOUT_S", 10.0, raising=False)
     monkeypatch.setattr(openai_compat, "_monotonic", clock, raising=False)
-    request_timeouts: list[float | None] = []
+    wait_for_timeouts = _observe_wait_for_timeouts(monkeypatch)
 
-    async def request(
-        payload: dict[str, object], *, timeout: float | None = None
-    ) -> openai_compat._HttpResponse:
+    async def request(payload: dict[str, object]) -> openai_compat._HttpResponse:
         del payload
-        request_timeouts.append(timeout)
         clock.advance(2.0)
         return openai_compat._HttpResponse(
             200, json.dumps(_chat_completion('{"answer":1}')).encode()
@@ -329,7 +363,7 @@ def test_strict_retry_shares_operation_deadline_and_stops_at_two_requests(
     with pytest.raises(ModelAdapterError, match="invalid structured response"):
         asyncio.run(adapter.structured(system="system", user="user", schema=_Answer))
 
-    assert request_timeouts == [10.0, 8.0]
+    assert wait_for_timeouts == [10.0, 8.0]
 
 
 @pytest.mark.parametrize(
