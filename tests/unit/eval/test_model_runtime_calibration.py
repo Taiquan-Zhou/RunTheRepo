@@ -26,7 +26,11 @@ _specification = importlib.util.spec_from_file_location(
 assert _specification is not None and _specification.loader is not None
 calibration = importlib.util.module_from_spec(_specification)
 sys.modules[_CALIBRATION_MODULE_NAME] = calibration
-_specification.loader.exec_module(calibration)
+try:
+    _specification.loader.exec_module(calibration)
+finally:
+    sys.modules.pop(_CALIBRATION_MODULE_NAME, None)
+assert _CALIBRATION_MODULE_NAME not in sys.modules
 
 RAW_SENTINEL = "RAW_MODEL_OUTPUT_MUST_NOT_APPEAR"
 METRIC_FIELDS = {
