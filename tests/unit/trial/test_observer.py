@@ -47,6 +47,8 @@ OVERLAY_DISCOVERY_ARGV = (
     "--format",
     "json",
 )
+TOP_FORMAT = "pid,ppid,user,comm"
+TOP_HEADER = "PID PPID USER COMMAND"
 
 
 class ScriptedProvider(SandboxProvider):
@@ -121,9 +123,9 @@ def _scripts_for(
                 "top",
                 container_id,
                 "-eo",
-                "pid=,ppid=,user=,comm=",
+                TOP_FORMAT,
             )
-        ] = _result()
+        ] = _result(TOP_HEADER + "\n")
     return scripts
 
 
@@ -211,19 +213,15 @@ def test_collects_two_containers_in_sorted_order_with_exact_commands_and_audit(
         separators=(",", ":"),
     )
     api_diff_stdout = "A /tmp/created\nC /app/config\nD /tmp/removed\n"
-    api_top_stdout = "1 0 root api-server\n22 1 app worker\n"
+    api_top_stdout = TOP_HEADER + "\n1 0 root api-server\n22 1 app worker\n"
     web_diff_stdout = "C /var/cache/web\n"
-    web_top_stdout = "7 1 nginx nginx\n"
+    web_top_stdout = TOP_HEADER + "\n7 1 nginx nginx\n"
     scripts[("docker", "inspect", CONTAINER_A)] = _result(api_inspect_stdout)
     scripts[("docker", "diff", CONTAINER_A)] = _result(api_diff_stdout)
-    scripts[("docker", "top", CONTAINER_A, "-eo", "pid=,ppid=,user=,comm=")] = _result(
-        api_top_stdout
-    )
+    scripts[("docker", "top", CONTAINER_A, "-eo", TOP_FORMAT)] = _result(api_top_stdout)
     scripts[("docker", "inspect", CONTAINER_B)] = _result(web_inspect_stdout)
     scripts[("docker", "diff", CONTAINER_B)] = _result(web_diff_stdout)
-    scripts[("docker", "top", CONTAINER_B, "-eo", "pid=,ppid=,user=,comm=")] = _result(
-        web_top_stdout
-    )
+    scripts[("docker", "top", CONTAINER_B, "-eo", TOP_FORMAT)] = _result(web_top_stdout)
     network_events = [
         {"protocol": "tcp", "destination": "db:5432", "bytes": 42},
         {"protocol": "udp", "destination": "dns:53", "meta": {"ok": True}},
@@ -327,7 +325,7 @@ def test_collects_two_containers_in_sorted_order_with_exact_commands_and_audit(
                 "top",
                 CONTAINER_A,
                 "-eo",
-                "pid=,ppid=,user=,comm=",
+                TOP_FORMAT,
             ),
             30,
         ),
@@ -341,7 +339,7 @@ def test_collects_two_containers_in_sorted_order_with_exact_commands_and_audit(
                 "top",
                 CONTAINER_B,
                 "-eo",
-                "pid=,ppid=,user=,comm=",
+                TOP_FORMAT,
             ),
             30,
         ),
@@ -396,7 +394,7 @@ def test_collects_two_containers_in_sorted_order_with_exact_commands_and_audit(
                     "top",
                     CONTAINER_A,
                     "-eo",
-                    "pid=,ppid=,user=,comm=",
+                    TOP_FORMAT,
                 ],
                 "stdout_sha256": hashlib.sha256(api_top_stdout.encode()).hexdigest(),
                 "parsed": [
@@ -649,9 +647,48 @@ def test_unknown_or_malformed_top_output_fails_closed(
     tmp_path: Path, top_stdout: str
 ) -> None:
     scripts = _scripts_for([("api", CONTAINER_A)])
-    scripts[("docker", "top", CONTAINER_A, "-eo", "pid=,ppid=,user=,comm=")] = _result(
-        top_stdout
+    scripts[("docker", "top", CONTAINER_A, "-eo", TOP_FORMAT)] = _result(
+        TOP_HEADER + "\n" + top_stdout
     )
+
+    _assert_parse_failure(tmp_path, scripts)
+
+
+def test_top_uses_header_format_and_parses_standard_output(tmp_path: Path) -> None:
+    scripts = _scripts_for([("api", CONTAINER_A)])
+    scripts[("docker", "top", CONTAINER_A, "-eo", TOP_FORMAT)] = _result(
+        TOP_HEADER + "\n1 0 root app\n"
+    )
+
+    snapshot = _collect(ScriptedProvider(scripts), tmp_path / "observation.json")
+
+    assert snapshot.process_events == [
+        {
+            "service": "api",
+            "container_id": CONTAINER_A,
+            "pid": 1,
+            "ppid": 0,
+            "user": "root",
+            "command": "app",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "top_stdout",
+    [
+        "",
+        "1 0 root app\n",
+        "PID PPID USER CMD\n1 0 root app\n",
+        "PID PPID USER COMMAND EXTRA\n1 0 root app\n",
+        TOP_HEADER + "\n" + TOP_HEADER + "\n1 0 root app\n",
+    ],
+)
+def test_missing_wrong_or_duplicate_top_header_fails_closed(
+    tmp_path: Path, top_stdout: str
+) -> None:
+    scripts = _scripts_for([("api", CONTAINER_A)])
+    scripts[("docker", "top", CONTAINER_A, "-eo", TOP_FORMAT)] = _result(top_stdout)
 
     _assert_parse_failure(tmp_path, scripts)
 
@@ -665,8 +702,8 @@ def test_oversized_decimal_process_id_fails_as_context_free_parse_error(
         "ppid": ["1", "9" * 5_000, "root", "app"],
     }[oversized_field]
     scripts = _scripts_for([("api", CONTAINER_A)])
-    scripts[("docker", "top", CONTAINER_A, "-eo", "pid=,ppid=,user=,comm=")] = _result(
-        " ".join(fields) + "\n"
+    scripts[("docker", "top", CONTAINER_A, "-eo", TOP_FORMAT)] = _result(
+        TOP_HEADER + "\n" + " ".join(fields) + "\n"
     )
     artifact_path = tmp_path / "observation.json"
 
@@ -692,7 +729,7 @@ def test_nonzero_collector_command_raises_without_output_leakage(
             "top",
             CONTAINER_A,
             "-eo",
-            "pid=,ppid=,user=,comm=",
+            TOP_FORMAT,
         ),
     }
     scripts[keys[failing_command]] = _result(
@@ -786,7 +823,7 @@ def test_total_stdout_limit_is_checked_before_later_output_parsing(
                 "top",
                 container_id,
                 "-eo",
-                "pid=,ppid=,user=,comm=",
+                TOP_FORMAT,
             )
         ] = _result(blank_limit)
 
@@ -811,8 +848,8 @@ def test_per_container_row_limits_fail_closed(tmp_path: Path, collector: str) ->
     if collector == "diff":
         scripts[("docker", "diff", CONTAINER_A)] = _result("A /path\n" * 4_097)
     else:
-        scripts[("docker", "top", CONTAINER_A, "-eo", "pid=,ppid=,user=,comm=")] = (
-            _result("1 0 root app\n" * 4_097)
+        scripts[("docker", "top", CONTAINER_A, "-eo", TOP_FORMAT)] = _result(
+            TOP_HEADER + "\n" + "1 0 root app\n" * 4_097
         )
 
     _assert_parse_failure(tmp_path, scripts)

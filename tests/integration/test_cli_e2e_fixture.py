@@ -128,8 +128,12 @@ class FixtureProvider(FakeSandboxProvider):
             )
         if command == ("docker", "diff", CONTAINER_ID):
             return ExecResult(exit_code=0, stdout="", stderr="")
-        if command == ("docker", "top", CONTAINER_ID, "-eo", "pid=,ppid=,user=,comm="):
-            return ExecResult(exit_code=0, stdout="", stderr="")
+        if command == ("docker", "top", CONTAINER_ID, "-eo", "pid,ppid,user,comm"):
+            return ExecResult(
+                exit_code=0,
+                stdout="PID PPID USER COMMAND\n",
+                stderr="",
+            )
         raise AssertionError(f"unexpected provider command: {command!r}")
 
 

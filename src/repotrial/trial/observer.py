@@ -32,6 +32,7 @@ _MAX_ARTIFACT_BYTES = 24 * 1024 * 1024
 _REDACTION = "[REDACTED]"
 _CONTAINER_ID_PATTERN = re.compile(r"(?:[0-9a-f]{12}|[0-9a-f]{64})\Z")
 _DIFF_OPERATIONS = {"A": "added", "C": "changed", "D": "deleted"}
+_TOP_HEADER = ("PID", "PPID", "USER", "COMMAND")
 
 type JsonScalar = None | bool | int | float | str
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
@@ -246,7 +247,7 @@ async def _collect_observation(
             "top",
             container_id,
             "-eo",
-            "pid=,ppid=,user=,comm=",
+            "pid,ppid,user,comm",
         ]
         inspect_result, inspect_data = await _collect_exec_operation(
             provider,
@@ -720,10 +721,11 @@ def _parse_diff(stdout: str, budget: _CollectionBudget) -> list[dict[str, JsonVa
 
 
 def _parse_top(stdout: str, budget: _CollectionBudget) -> list[dict[str, JsonValue]]:
+    lines = stdout.splitlines()
+    if not lines or tuple(lines[0].split()) != _TOP_HEADER:
+        raise ObservationParseError("top output contains an invalid header")
     rows: list[dict[str, JsonValue]] = []
-    for line in stdout.splitlines():
-        if not line.strip():
-            continue
+    for line in lines[1:]:
         parts = line.split()
         if len(parts) != 4 or not parts[0].isascii() or not parts[0].isdecimal():
             raise ObservationParseError("top output contains a malformed row")

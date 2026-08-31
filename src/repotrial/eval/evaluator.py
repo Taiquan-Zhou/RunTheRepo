@@ -80,7 +80,7 @@ _COMPOSE_ROUTES: dict[tuple[str, ...], _FixtureCommandRoute] = {
     ): "compose_observer_ps",
     ("logs", "--no-color", "--tail", "200"): "compose_logs",
 }
-_TOP_FORMAT = "pid=,ppid=,user=,comm="
+_TOP_FORMAT = "pid,ppid,user,comm"
 
 
 class _StrictModel(BaseModel):
@@ -270,7 +270,7 @@ class _FixtureProvider(SandboxProvider):
         if command.route == "top":
             return ExecResult(
                 exit_code=0,
-                stdout="1 0 65532 fixture-app\n",
+                stdout="PID PPID USER COMMAND\n1 0 65532 fixture-app\n",
                 stderr="",
             )
         raise RuntimeError("fixture command route is unsupported")

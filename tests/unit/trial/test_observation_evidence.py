@@ -109,8 +109,8 @@ def _scripts(*, discovery: object | None = None) -> dict[tuple[str, ...], object
             "top",
             CONTAINER_ID,
             "-eo",
-            "pid=,ppid=,user=,comm=",
-        ): _result("1 0 root credential-secret\n"),
+            "pid,ppid,user,comm",
+        ): _result("PID PPID USER COMMAND\n1 0 root credential-secret\n"),
     }
 
 
@@ -205,9 +205,9 @@ def test_maximum_container_run_records_bounded_390_event_ledger(
                 "top",
                 container_id,
                 "-eo",
-                "pid=,ppid=,user=,comm=",
+                "pid,ppid,user,comm",
             )
-        ] = _result()
+        ] = _result("PID PPID USER COMMAND\n")
     evidence = tmp_path / "observer-boundary.jsonl"
 
     _collect(_Provider(scripts), tmp_path / "observation.json", evidence)
