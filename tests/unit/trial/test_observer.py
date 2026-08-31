@@ -636,7 +636,7 @@ def test_unknown_or_malformed_diff_output_fails_closed(
     "top_stdout",
     [
         "1 0 root\n",
-        "1 0 root app extra\n",
+        "1 0 root app \x01extra\n",
         "-1 0 root app\n",
         "one 0 root app\n",
         "1 -2 root app\n",
@@ -670,6 +670,26 @@ def test_top_uses_header_format_and_parses_standard_output(tmp_path: Path) -> No
             "ppid": 0,
             "user": "root",
             "command": "app",
+        }
+    ]
+
+
+def test_top_preserves_spaces_in_command_field(tmp_path: Path) -> None:
+    scripts = _scripts_for([("api", CONTAINER_A)])
+    scripts[("docker", "top", CONTAINER_A, "-eo", TOP_FORMAT)] = _result(
+        TOP_HEADER + "\n551 527 1001 next-server (v\n"
+    )
+
+    snapshot = _collect(ScriptedProvider(scripts), tmp_path / "observation.json")
+
+    assert snapshot.process_events == [
+        {
+            "service": "api",
+            "container_id": CONTAINER_A,
+            "pid": 551,
+            "ppid": 527,
+            "user": "1001",
+            "command": "next-server (v",
         }
     ]
 

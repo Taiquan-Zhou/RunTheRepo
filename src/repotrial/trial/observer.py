@@ -726,7 +726,7 @@ def _parse_top(stdout: str, budget: _CollectionBudget) -> list[dict[str, JsonVal
         raise ObservationParseError("top output contains an invalid header")
     rows: list[dict[str, JsonValue]] = []
     for line in lines[1:]:
-        parts = line.split()
+        parts = line.split(maxsplit=3)
         if len(parts) != 4 or not parts[0].isascii() or not parts[0].isdecimal():
             raise ObservationParseError("top output contains a malformed row")
         if not parts[1].isascii() or not parts[1].isdecimal():
