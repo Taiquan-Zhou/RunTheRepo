@@ -17,6 +17,24 @@ _GENERIC_REQUEST_ERROR_TYPES: Final = (
     "bad_request",
     "request_error",
 )
+_FORBIDDEN_FALLBACK_MARKERS: Final = frozenset(
+    {
+        "authentication",
+        "authorization",
+        "unauthorized",
+        "forbidden",
+        "api_key",
+        "api key",
+        "invalid_model",
+        "model_not_found",
+        "insufficient_quota",
+        "quota",
+        "rate_limit",
+        "rate limit",
+        "context_length",
+        "context limit",
+    }
+)
 _MODEL_ADAPTER_FAILURE_CODES: Final = frozenset(
     {
         "transport_error",
@@ -242,18 +260,8 @@ def _explicitly_unsupported_schema(response: _HttpResponse) -> bool:
     if error is None:
         return False
     message, error_type, error_code, error_param = error
-    if not _has_exclusive_schema_capability_details(
-        error_type, error_code, error_param
-    ):
-        return False
-    lowered = message.lower()
-    return (
-        "response_format" in lowered
-        and "json_schema" in lowered
-        and any(
-            marker in lowered
-            for marker in ("unsupported", "not support", "unknown parameter")
-        )
+    return _is_response_format_capability_rejection(
+        message, error_type, error_code, error_param
     )
 
 
@@ -281,21 +289,37 @@ def _optional_error_field(error: dict[object, object], name: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _has_exclusive_schema_capability_details(
-    error_type: str | None, error_code: str | None, error_param: str | None
+def _is_response_format_capability_rejection(
+    message: str,
+    error_type: str | None,
+    error_code: str | None,
+    error_param: str | None,
 ) -> bool:
-    if error_code is not None and not _is_schema_capability_discriminator(error_code):
-        return False
-    if error_param is not None and not _is_schema_capability_discriminator(error_param):
-        return False
-    if error_type is not None and not (
-        _is_schema_capability_discriminator(error_type)
-        or error_type.lower() in _GENERIC_REQUEST_ERROR_TYPES
+    normalized = tuple(
+        value.lower()
+        for value in (message, error_type, error_code, error_param)
+        if value is not None
+    )
+    if any(
+        marker in value
+        for value in normalized
+        for marker in _FORBIDDEN_FALLBACK_MARKERS
     ):
         return False
-    return any(
-        _is_schema_capability_discriminator(value)
-        for value in (error_code, error_param)
+    if "response_format" not in message.lower():
+        return False
+    if not _is_generic_or_schema_capability(error_type):
+        return False
+    if not _is_generic_or_schema_capability(error_code):
+        return False
+    return error_param is None or _is_schema_capability_discriminator(error_param)
+
+
+def _is_generic_or_schema_capability(value: str | None) -> bool:
+    return (
+        value is None
+        or value.lower() in _GENERIC_REQUEST_ERROR_TYPES
+        or _is_schema_capability_discriminator(value)
     )
 
 

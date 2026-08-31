@@ -201,6 +201,106 @@ def test_explicit_json_schema_unsupported_response_uses_one_json_only_fallback()
     assert "valid JSON" in fallback_system
 
 
+def test_generic_response_format_rejection_uses_one_json_only_fallback() -> None:
+    with _ResponseServer(
+        [
+            (
+                400,
+                {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "invalid_request_error",
+                        "message": "response_format is unavailable for this request",
+                    }
+                },
+            ),
+            (200, _chat_completion('{"answer":"portable"}')),
+        ]
+    ) as server:
+        adapter = OpenAICompatibleModelAdapter(server.endpoint, "local-model")
+
+        result = asyncio.run(
+            adapter.structured(system="system", user="user", schema=_Answer)
+        )
+
+    assert result == _Answer(answer="portable")
+    assert len(server.requests) == 2
+    assert "response_format" in server.requests[0][1]
+    assert "response_format" not in server.requests[1][1]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {
+            "type": "invalid_request_error",
+            "message": "invalid API key for response_format",
+        },
+        {"code": "model_not_found", "message": "model cannot use response_format"},
+        {"code": "insufficient_quota", "message": "quota blocks response_format"},
+        {"type": "rate_limit_error", "message": "rate limit for response_format"},
+        {
+            "code": "context_length_exceeded",
+            "message": "context limit in response_format request",
+        },
+    ],
+)
+def test_generic_non_capability_classification_never_falls_back(
+    error: dict[str, str],
+) -> None:
+    with _ResponseServer([(400, {"error": error})]) as server:
+        adapter = OpenAICompatibleModelAdapter(server.endpoint, "local-model")
+        with pytest.raises(ModelAdapterError, match="model request failed"):
+            asyncio.run(
+                adapter.structured(system="system", user="user", schema=_Answer)
+            )
+    assert len(server.requests) == 1
+
+
+def test_invalid_portable_fallback_stops_after_two_requests() -> None:
+    responses = [
+        (
+            400,
+            {
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "response_format unavailable",
+                }
+            },
+        ),
+        (200, _chat_completion('{"answer":1}')),
+    ]
+    with _ResponseServer(responses) as server:
+        adapter = OpenAICompatibleModelAdapter(server.endpoint, "local-model")
+        with pytest.raises(ModelAdapterError, match="invalid structured response"):
+            asyncio.run(
+                adapter.structured(system="system", user="user", schema=_Answer)
+            )
+    assert len(server.requests) == 2
+
+
+def test_strict_retry_cannot_turn_into_a_third_fallback_request() -> None:
+    responses = [
+        (200, _chat_completion('{"answer":1}')),
+        (
+            400,
+            {
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "response_format unavailable",
+                }
+            },
+        ),
+    ]
+    with _ResponseServer(responses) as server:
+        adapter = OpenAICompatibleModelAdapter(server.endpoint, "local-model")
+        with pytest.raises(ModelAdapterError, match="model request failed"):
+            asyncio.run(
+                adapter.structured(system="system", user="user", schema=_Answer)
+            )
+    assert len(server.requests) == 2
+
+
 @pytest.mark.parametrize(
     "code", ["invalid_api_key", "invalid_model", "insufficient_quota"]
 )
