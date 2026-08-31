@@ -55,9 +55,18 @@ _MAX_JSON_NODES = 256
 _MAX_JSON_CONTAINER_ITEMS = 64
 _MAX_JSON_AGGREGATE_CONTENT = 16_384
 _MARKDOWN_LINK = re.compile(r"(?<!!)\[[^\]\r\n]*\]\(([^()\s]+)\)")
-_PLAIN_URL_TOKEN = re.compile(r"(?<![A-Za-z0-9_])https?://[^\s<>()]+", re.IGNORECASE)
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_MARKDOWN_IMAGE_DESTINATION = re.compile(
+    r"!\[[^\]\r\n]*\]\((?P<destination>[^()\s]+)\)"
+)
+_PLAIN_URL_TOKEN = re.compile(
+    r"""(?P<prefix>^|[\s(<\[{\'"`])(?P<url>https?://[^\s]+)""",
+    re.IGNORECASE,
+)
 _PLAIN_URL_TRAILING_PUNCTUATION = frozenset(".,;!，。；！、'\"`")
+_PLAIN_URL_CLOSING_DELIMITERS = frozenset(")]}>")
+_LOOPBACK_AUTHORITY = re.compile(
+    r"(?:localhost|127\.0\.0\.1|\[::1\])(?::([0-9]+))?\Z", re.IGNORECASE
+)
 _DOTTED_PATH = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*$")
 _SAFE_ROUTE_SEGMENT = re.compile(r"[A-Za-z0-9._~@=+,-]*\Z")
 _SAFE_QUERY = re.compile(r"[A-Za-z0-9._~=&,-]*\Z")
@@ -363,14 +372,23 @@ def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
 
 def _journeys_from_readme(readme_excerpt: str) -> list[Journey]:
     candidates: list[tuple[int, str]] = []
+    image_destination_spans = [
+        (match.start("destination"), match.end("destination"))
+        for match in _MARKDOWN_IMAGE_DESTINATION.finditer(readme_excerpt)
+    ]
     for match in _MARKDOWN_LINK.finditer(readme_excerpt):
         path = match.group(1)
         if _valid_root_relative_path(path):
             candidates.append((match.start(), path))
     for match in _PLAIN_URL_TOKEN.finditer(readme_excerpt):
-        path = _loopback_root_path(match.group(0))
+        url_start = match.start("url")
+        if any(start <= url_start < end for start, end in image_destination_spans):
+            continue
+        path = _loopback_root_path(
+            match.group("url"), opening_delimiter=match.group("prefix")
+        )
         if path is not None:
-            candidates.append((match.start(), path))
+            candidates.append((url_start, path))
 
     paths: list[str] = []
     seen: set[str] = set()
@@ -384,70 +402,104 @@ def _journeys_from_readme(readme_excerpt: str) -> list[Journey]:
     return [_minimal_get_journey(index, path) for index, path in enumerate(paths, 1)]
 
 
-def _loopback_root_path(token: str) -> str | None:
-    normalized = token
-    separator = normalized.find("://")
-    if separator == -1:
-        return None
-    remainder = normalized[separator + 3 :]
-    query_start = remainder.find("?")
-    fragment_start = remainder.find("#")
-    path_end = min(
-        (index for index in (query_start, fragment_start) if index != -1),
-        default=len(remainder),
-    )
-    path_start = remainder.find("/", 0, path_end)
-    raw_path = remainder[path_start:path_end] if path_start != -1 else ""
-    if raw_path not in {"", "/"}:
-        if (
-            path_end == len(remainder)
-            and len(raw_path) == 2
-            and raw_path[1] in _PLAIN_URL_TRAILING_PUNCTUATION
-        ):
-            normalized = normalized[:-1]
-        else:
-            return None
-    elif not raw_path:
-        while normalized:
-            if normalized[-1] in _PLAIN_URL_TRAILING_PUNCTUATION:
-                normalized = normalized[:-1]
-                continue
-            if normalized[-1] == "]" and normalized.count("]") > normalized.count("["):
-                normalized = normalized[:-1]
-                continue
-            if normalized[-1] == "}" and normalized.count("}") > normalized.count("{"):
-                normalized = normalized[:-1]
-                continue
-            break
-
+def _loopback_root_path(token: str, *, opening_delimiter: str = "") -> str | None:
+    normalized = _strip_plain_url_delimiters(token, opening_delimiter=opening_delimiter)
     try:
         parsed = urlsplit(normalized)
     except ValueError:
         return None
     if parsed.path not in {"", "/"}:
         return None
-
-    try:
-        hostname = parsed.hostname
-        username = parsed.username
-        password = parsed.password
-        port = parsed.port
-    except ValueError:
-        return None
     if (
         parsed.scheme.lower() not in {"http", "https"}
-        or hostname not in _LOOPBACK_HOSTS
-        or username is not None
-        or password is not None
         or "?" in normalized
         or "#" in normalized
-        or parsed.netloc.endswith(":")
     ):
         return None
-    if port is not None and not 1 <= port <= 65_535:
+    authority = _LOOPBACK_AUTHORITY.fullmatch(parsed.netloc)
+    if authority is None:
         return None
+    port_text = authority.group(1)
+    if port_text is not None:
+        try:
+            if not 1 <= int(port_text) <= 65_535:
+                return None
+        except ValueError:
+            return None
     path = parsed.path or "/"
     return path if _valid_root_relative_path(path) else None
+
+
+def _strip_plain_url_delimiters(token: str, *, opening_delimiter: str = "") -> str:
+    separator = token.find("://")
+    if separator == -1:
+        return token
+    remainder = token[separator + 3 :]
+    query_or_fragment = [
+        index for index in (remainder.find("?"), remainder.find("#")) if index != -1
+    ]
+    path_end = min(query_or_fragment, default=len(remainder))
+    path_start = remainder.find("/", 0, path_end)
+    if path_start != -1:
+        raw_path = remainder[path_start:path_end]
+        suffix = raw_path[1:] if raw_path.startswith("/") else ""
+        if raw_path != "/" and not _safe_root_delimiter_suffix(
+            suffix, token, opening_delimiter=opening_delimiter
+        ):
+            return token
+        if suffix:
+            return token[: -len(suffix)]
+        return token
+
+    normalized = token
+    while normalized:
+        if normalized[-1] in _PLAIN_URL_TRAILING_PUNCTUATION:
+            normalized = normalized[:-1]
+            continue
+        if _is_unmatched_closing_delimiter(
+            normalized, opening_delimiter=opening_delimiter
+        ):
+            normalized = normalized[:-1]
+            continue
+        break
+    return normalized
+
+
+def _safe_root_delimiter_suffix(
+    suffix: str, token: str, *, opening_delimiter: str = ""
+) -> bool:
+    if not suffix or len(suffix) > 2:
+        return False
+    sentence_punctuation = [
+        character
+        for character in suffix
+        if character in _PLAIN_URL_TRAILING_PUNCTUATION
+    ]
+    closing_delimiters = [
+        character for character in suffix if character in _PLAIN_URL_CLOSING_DELIMITERS
+    ]
+    if (
+        len(sentence_punctuation) > 1
+        or len(closing_delimiters) > 1
+        or len(sentence_punctuation) + len(closing_delimiters) != len(suffix)
+    ):
+        return False
+    return not closing_delimiters or _is_unmatched_closing_delimiter(
+        token, opening_delimiter=opening_delimiter
+    )
+
+
+def _is_unmatched_closing_delimiter(value: str, *, opening_delimiter: str = "") -> bool:
+    delimiter = value[-1]
+    if delimiter not in _PLAIN_URL_CLOSING_DELIMITERS:
+        return False
+    if delimiter == ")":
+        return value.count(")") > value.count("(")
+    if delimiter == "]":
+        return value.count("]") > value.count("[")
+    if delimiter == ">":
+        return opening_delimiter == "<"
+    return value.count("}") > value.count("{")
 
 
 def _minimal_get_journey(index: int, path: str) -> Journey:

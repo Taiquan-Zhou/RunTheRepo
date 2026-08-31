@@ -329,6 +329,149 @@ def test_declared_journeys_precede_documented_loopback_url(
     assert model.calls == 0
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://[::1]evil",
+        "http://[::1].evil",
+        "http://[::1]evil:8080",
+        "http://localhost(foo)",
+        "http://localhost(evil.example)",
+    ],
+)
+def test_loopback_authority_suffixes_do_not_prefix_match(
+    tmp_path: Path, url: str
+) -> None:
+    model = FakeModelAdapter([_http_journey("/from-model")])
+
+    journeys = _plan(tmp_path, url, model)
+
+    assert [journey.steps[0].params["path"] for journey in journeys] == ["/from-model"]
+    assert model.calls == 1
+
+
+@pytest.mark.parametrize(
+    "readme",
+    [
+        "git+http://localhost",
+        "ssh+http://localhost",
+        "javascript:http://localhost",
+        "tcp://http://localhost",
+        "prefix/http://localhost",
+        "key=http://localhost",
+    ],
+)
+def test_nested_http_tokens_do_not_expose_loopback_url(
+    tmp_path: Path, readme: str
+) -> None:
+    model = FakeModelAdapter([_http_journey("/from-model")])
+
+    journeys = _plan(tmp_path, readme, model)
+
+    assert [journey.steps[0].params["path"] for journey in journeys] == ["/from-model"]
+    assert model.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("prefix", "suffix"),
+    [
+        ("(", ")"),
+        ("<", ">"),
+        ("[", "]"),
+        ("{", "}"),
+        ('"', '"'),
+        ("'", "'"),
+        ("`", "`"),
+    ],
+)
+def test_plain_loopback_url_accepts_explicit_opening_delimiter(
+    tmp_path: Path, prefix: str, suffix: str
+) -> None:
+    model = FakeModelAdapter([_http_journey("/from-model")])
+
+    journeys = _plan(tmp_path, f"{prefix}http://localhost{suffix}", model)
+
+    assert [journey.steps[0].params["path"] for journey in journeys] == ["/"]
+    assert model.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("readme", "expected_path"),
+    [
+        ("<http://localhost>", "/"),
+        ("<http://localhost/>", "/"),
+    ],
+)
+def test_markdown_autolink_loopback_root_urls_are_supported(
+    tmp_path: Path, readme: str, expected_path: str
+) -> None:
+    model = FakeModelAdapter([_http_journey("/from-model")])
+
+    journeys = _plan(tmp_path, readme, model)
+
+    assert [journey.steps[0].params["path"] for journey in journeys] == [expected_path]
+    assert model.calls == 0
+
+
+@pytest.mark.parametrize(
+    "readme",
+    [
+        "![Screenshot](http://localhost)",
+        "![Screenshot](http://localhost/)",
+    ],
+)
+def test_markdown_image_destinations_do_not_become_plain_loopback_journeys(
+    tmp_path: Path, readme: str
+) -> None:
+    model = FakeModelAdapter([_http_journey("/from-model")])
+
+    journeys = _plan(tmp_path, readme, model)
+
+    assert [journey.steps[0].params["path"] for journey in journeys] == ["/from-model"]
+    assert model.calls == 1
+
+
+def test_readme_candidates_are_capped_after_mixed_source_dedupe(
+    tmp_path: Path,
+) -> None:
+    model = FakeModelAdapter([_http_journey("/from-model")])
+
+    journeys = _plan(
+        tmp_path,
+        "[One](/one) http://localhost [Two](/two) [Three](/three) "
+        "[Four](/four) [Five](/five) [Six](/six)",
+        model,
+    )
+
+    assert [journey.steps[0].params["path"] for journey in journeys] == [
+        "/one",
+        "/",
+        "/two",
+        "/three",
+        "/four",
+    ]
+    assert model.calls == 0
+
+
+@pytest.mark.parametrize(
+    "readme",
+    [
+        "[App](http://localhost).",
+        'Use "http://127.0.0.1:8080",',
+        "Use https://[::1]:65535/.",
+    ],
+)
+def test_loopback_root_urls_strip_only_safe_trailing_delimiters(
+    tmp_path: Path, readme: str
+) -> None:
+    model = FakeModelAdapter([_http_journey("/from-model")])
+
+    journeys = _plan(tmp_path, readme, model)
+
+    assert [journey.steps[0].params["path"] for journey in journeys] == ["/"]
+    assert model.calls == 0
+
+
 def test_valid_model_output_is_materialized_only_when_other_sources_are_empty(
     tmp_path: Path,
 ) -> None:
