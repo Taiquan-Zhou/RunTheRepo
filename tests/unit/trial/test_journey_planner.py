@@ -289,6 +289,10 @@ def test_model_response_after_former_planner_deadline_is_accepted(
     ]
 
 
+def test_planner_outer_model_deadline_includes_adapter_cleanup_margin() -> None:
+    assert planner_module._MODEL_TIMEOUT_S == 185.0
+
+
 def test_model_prompt_describes_only_the_existing_journey_dsl(tmp_path: Path) -> None:
     model = FakeModelAdapter([])
 

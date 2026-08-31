@@ -77,6 +77,17 @@ def _chat_completion(content: str) -> dict[str, object]:
     return {"choices": [{"message": {"content": content}}]}
 
 
+class _ControlledClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
 def test_structured_returns_the_requested_pydantic_type_from_json_schema_response() -> (
     None
 ):
@@ -227,6 +238,98 @@ def test_generic_response_format_rejection_uses_one_json_only_fallback() -> None
     assert len(server.requests) == 2
     assert "response_format" in server.requests[0][1]
     assert "response_format" not in server.requests[1][1]
+
+
+def test_strict_request_consumption_reduces_fallback_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _ControlledClock()
+    monkeypatch.setattr(openai_compat, "_OPERATION_TIMEOUT_S", 10.0, raising=False)
+    monkeypatch.setattr(openai_compat, "_monotonic", clock, raising=False)
+    request_timeouts: list[float | None] = []
+
+    async def request(
+        payload: dict[str, object], *, timeout: float | None = None
+    ) -> openai_compat._HttpResponse:
+        del payload
+        request_timeouts.append(timeout)
+        if len(request_timeouts) == 1:
+            clock.advance(3.0)
+            return openai_compat._HttpResponse(
+                400,
+                b'{"error":{"param":"response_format","message":"response_format json_schema unsupported"}}',
+            )
+        return openai_compat._HttpResponse(
+            200, json.dumps(_chat_completion('{"answer":"ok"}')).encode()
+        )
+
+    adapter = OpenAICompatibleModelAdapter("http://127.0.0.1", "model")
+    monkeypatch.setattr(adapter, "_request", request)
+
+    assert asyncio.run(
+        adapter.structured(system="system", user="user", schema=_Answer)
+    ) == _Answer(answer="ok")
+    assert request_timeouts == [10.0, 7.0]
+
+
+def test_expired_operation_deadline_does_not_start_fallback_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _ControlledClock()
+    monkeypatch.setattr(openai_compat, "_OPERATION_TIMEOUT_S", 5.0, raising=False)
+    monkeypatch.setattr(openai_compat, "_monotonic", clock, raising=False)
+    request_count = 0
+
+    async def request(
+        payload: dict[str, object], *, timeout: float | None = None
+    ) -> openai_compat._HttpResponse:
+        nonlocal request_count
+        del payload, timeout
+        request_count += 1
+        clock.advance(5.0)
+        if request_count == 1:
+            return openai_compat._HttpResponse(
+                400,
+                b'{"error":{"param":"response_format","message":"response_format json_schema unsupported"}}',
+            )
+        return openai_compat._HttpResponse(
+            200, json.dumps(_chat_completion('{"answer":"unexpected"}')).encode()
+        )
+
+    adapter = OpenAICompatibleModelAdapter("http://127.0.0.1", "model")
+    monkeypatch.setattr(adapter, "_request", request)
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        asyncio.run(adapter.structured(system="system", user="user", schema=_Answer))
+
+    assert request_count == 1
+
+
+def test_strict_retry_shares_operation_deadline_and_stops_at_two_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _ControlledClock()
+    monkeypatch.setattr(openai_compat, "_OPERATION_TIMEOUT_S", 10.0, raising=False)
+    monkeypatch.setattr(openai_compat, "_monotonic", clock, raising=False)
+    request_timeouts: list[float | None] = []
+
+    async def request(
+        payload: dict[str, object], *, timeout: float | None = None
+    ) -> openai_compat._HttpResponse:
+        del payload
+        request_timeouts.append(timeout)
+        clock.advance(2.0)
+        return openai_compat._HttpResponse(
+            200, json.dumps(_chat_completion('{"answer":1}')).encode()
+        )
+
+    adapter = OpenAICompatibleModelAdapter("http://127.0.0.1", "model")
+    monkeypatch.setattr(adapter, "_request", request)
+
+    with pytest.raises(ModelAdapterError, match="invalid structured response"):
+        asyncio.run(adapter.structured(system="system", user="user", schema=_Answer))
+
+    assert request_timeouts == [10.0, 8.0]
 
 
 @pytest.mark.parametrize(

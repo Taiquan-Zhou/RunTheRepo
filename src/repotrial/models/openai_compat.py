@@ -1,4 +1,6 @@
+import asyncio
 import json
+import time
 from dataclasses import dataclass
 from typing import Final, Literal, TypeVar
 from urllib.parse import urlsplit, urlunsplit
@@ -9,6 +11,7 @@ from pydantic import BaseModel, ValidationError
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 _REQUEST_TIMEOUT: Final = httpx.Timeout(90.0, connect=3.0)
+_OPERATION_TIMEOUT_S: Final = 180.0
 _MAX_PROMPT_CHARS: Final = 16_384
 _MAX_SCHEMA_BYTES: Final = 65_536
 _MAX_RESPONSE_BYTES: Final = 1_048_576
@@ -52,6 +55,8 @@ type ModelAdapterFailureCode = Literal[
     "structured_response_invalid",
 ]
 
+_monotonic = time.monotonic
+
 
 class ModelAdapterError(RuntimeError):
     """Credential-free failure returned by the OpenAI-compatible boundary."""
@@ -84,13 +89,16 @@ class OpenAICompatibleModelAdapter:
     async def structured(
         self, *, system: str, user: str, schema: type[ModelT]
     ) -> ModelT:
+        operation_deadline = _monotonic() + _OPERATION_TIMEOUT_S
         bounded_system = _bounded_prompt(system)
         bounded_user = _bounded_prompt(user)
         schema_json = _bounded_schema(schema)
         first_payload = _json_schema_payload(
             self._model_name, bounded_system, bounded_user, schema, schema_json
         )
-        first_response = await self._request(first_payload)
+        first_response = await self._request_within_deadline(
+            first_payload, operation_deadline
+        )
 
         if _explicitly_unsupported_schema(first_response):
             fallback_payload = _json_only_payload(
@@ -100,7 +108,8 @@ class OpenAICompatibleModelAdapter:
                 schema_json,
             )
             return _validated_result(
-                schema, await self._successful_response(fallback_payload)
+                schema,
+                await self._successful_response(fallback_payload, operation_deadline),
             )
 
         if not _is_success(first_response.status_code):
@@ -109,23 +118,46 @@ class OpenAICompatibleModelAdapter:
             return _validated_result(schema, first_response.body)
         except ModelAdapterError:
             return _validated_result(
-                schema, await self._successful_response(first_payload)
+                schema,
+                await self._successful_response(first_payload, operation_deadline),
             )
 
-    async def _successful_response(self, payload: dict[str, object]) -> bytes:
-        response = await self._request(payload)
+    async def _successful_response(
+        self, payload: dict[str, object], operation_deadline: float
+    ) -> bytes:
+        response = await self._request_within_deadline(payload, operation_deadline)
         if not _is_success(response.status_code):
             raise ModelAdapterError("model request failed", reason_code="http_error")
         return response.body
 
-    async def _request(self, payload: dict[str, object]) -> _HttpResponse:
+    async def _request_within_deadline(
+        self, payload: dict[str, object], operation_deadline: float
+    ) -> _HttpResponse:
+        remaining = operation_deadline - _monotonic()
+        if remaining <= 0:
+            raise TimeoutError("model operation deadline exceeded")
+        try:
+            response = await asyncio.wait_for(
+                self._request(payload, timeout=_request_timeout_budget(remaining)),
+                timeout=remaining,
+            )
+        except TimeoutError:
+            raise TimeoutError("model operation deadline exceeded") from None
+        if operation_deadline - _monotonic() <= 0:
+            raise TimeoutError("model operation deadline exceeded")
+        return response
+
+    async def _request(
+        self, payload: dict[str, object], *, timeout: float | None = None
+    ) -> _HttpResponse:
         headers = {"Content-Type": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
+        request_timeout = _bounded_http_timeout(timeout)
         try:
             async with (
                 httpx.AsyncClient(
-                    timeout=_REQUEST_TIMEOUT,
+                    timeout=request_timeout,
                     follow_redirects=False,
                     trust_env=False,
                 ) as client,
@@ -148,6 +180,28 @@ class OpenAICompatibleModelAdapter:
             raise ModelAdapterError(
                 "model request failed", reason_code="transport_error"
             ) from None
+
+
+def _request_timeout_budget(remaining: float) -> float:
+    read_timeout = _REQUEST_TIMEOUT.read
+    if read_timeout is None:
+        return remaining
+    return min(read_timeout, remaining)
+
+
+def _bounded_http_timeout(budget: float | None) -> httpx.Timeout:
+    if budget is None:
+        return _REQUEST_TIMEOUT
+
+    def bounded(value: float | None) -> float | None:
+        return None if value is None else min(value, budget)
+
+    return httpx.Timeout(
+        connect=bounded(_REQUEST_TIMEOUT.connect),
+        read=bounded(_REQUEST_TIMEOUT.read),
+        write=bounded(_REQUEST_TIMEOUT.write),
+        pool=bounded(_REQUEST_TIMEOUT.pool),
+    )
 
 
 def _normalize_endpoint(endpoint: str) -> str:
