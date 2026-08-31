@@ -354,3 +354,51 @@ were not authorized.
   independent review PASS.
 
 **M7.5 DEEPSEEK CANARY — FAIL (`0/3 < 2/3`)**
+
+## M7.5 final unified DeepSeek cohort — current status
+
+- Final execution HEAD:
+  `7f1f401bc749f9bcce8e4bbc9287071ccc3a758c`; Linux manifest SHA-256:
+  `4a963f0ee730ddf4be7243ad31cc2899ce19cdbfed3c4570498ff7d1c617551a`.
+  The Windows checkout byte hash `b050f849...` differs only by CRLF/LF checkout
+  normalization.
+- Model: public OpenAI-compatible `deepseek-v4-flash`; no credential is recorded.
+- Fresh gates: planner focused `103 passed`; Linux full suite `1423 passed, 6
+  skipped`; coverage `87.05%`; Ruff lint/format, mypy, pre-commit, diff-check,
+  and scoped independent review PASS; SBX diagnose `12/12` PASS.
+- Audit-only pre-workload Umami run
+  `66ea294d-00b9-4713-b4c1-733cbb41db85` retained a client-proxy/JWKS
+  infrastructure invalidation and `internal:cleanuperror`. Explicit client
+  proxy probes and the trusted real SBX smoke then passed before the authorized
+  replacement.
+- Final canary metric runs: Umami
+  `d2318902-3810-4f13-aca1-1faa2e099615` (`1/1` Journey PASS), Listmonk
+  `974b0f7a-b4da-4f2b-8fe0-7f9ccc4b6ecd` (`1/1` PASS), and
+  changedetection.io `05ea56c3-3ebf-4127-800f-287e60787def` (`0/3` PASS).
+  These frozen repositories #1-#3 were the entire canary denominator; Dockge
+  and repositories #4-#10 were not canary entries. The compatibility canary
+  was `2/3 PASS`, authorizing repositories #4-#10 on the unchanged HEAD.
+- Complete-cohort autonomous success is `1/10`: only Dockge
+  `f60e15f4-7171-4edb-b641-33ad209ff9c0` completed with exit `0`, a non-empty
+  all-PASS Journey set, report, exact SHA, and successful cleanup.
+- Meaningful convergence is `0/10`; no experiment produced KEEP. P50/P95 are
+  `UNKNOWN` because Wakapi ended at `intake:clone` before a metric-bearing
+  target workload and therefore has no repository duration under the frozen
+  rule.
+- Dominant observed limitations: three frozen Docker-disk exhaustion failures
+  (Uptime Kuma, n8n-hosting, NetBox Docker); Linkding's documented but unapplied
+  `.env` setup; changedetection.io guest-loopback publication; Paperless-ngx
+  guest clone status mismatch; Wakapi clone intake; and later experiment
+  sandbox failures for Umami/Listmonk.
+- Metric-attempt sandbox cleanup obligations were `13/13` successful and final
+  inventory was empty after every metric attempt. The final-HEAD chain aggregate
+  is nevertheless `13/14 = 92.86%`, below the required `100%`, because the
+  audit-only pre-workload lifecycle contains `cleanup_retry_failure`; later
+  empty inventory does not override the frozen lifecycle rule. Paperless-ngx
+  is `N/A` under that same rule because its lifecycle ends at `create_failure`
+  without an owned sandbox ID; it is not omitted from the denominator.
+- Autonomous success `1/10 < 7/10`, convergence `0/10 < 5/10`, and aggregate
+  cleanup `92.86% < 100%`; the M7.5 release gate fails. README was not changed.
+  PID hard bound remains unsupported and disclosed; no host fallback was used.
+
+**M7.5 PILOT COMPLETE — MVP LIMITATIONS IDENTIFIED**

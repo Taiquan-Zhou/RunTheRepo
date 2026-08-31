@@ -690,3 +690,110 @@ sandbox remained after cleanup. The current uncommitted changes are limited to
 this report and the status document. No README update was made.
 
 **M7.5 DEEPSEEK CANARY — FAIL (`0/3 < 2/3`)**
+
+## Final unified DeepSeek cohort at HEAD `7f1f401bc749f9bcce8e4bbc9287071ccc3a758c`
+
+This append-only section supersedes earlier canary summaries only for current
+status. It does not delete, relabel, or overwrite any historical attempt. The
+execution build was frozen at
+`7f1f401bc749f9bcce8e4bbc9287071ccc3a758c`; the Linux checkout manifest
+SHA-256 was
+`4a963f0ee730ddf4be7243ad31cc2899ce19cdbfed3c4570498ff7d1c617551a`.
+The corresponding Windows checkout byte hash was
+`b050f849802fcf5cb8d035f12d32a063b56b93d080cb580a4ebae852c7b075fd`;
+the difference is CRLF/LF checkout normalization, not a manifest content or Git
+identity change. The model endpoint class/name was public OpenAI-compatible /
+`deepseek-v4-flash`; no credential value is retained.
+
+Fresh pre-execution evidence on the frozen HEAD was: Journey planner focused
+tests `103 passed`; Linux full suite `1423 passed, 6 skipped`; branch coverage
+`87.05%` against the required `85%`; Ruff lint and format, strict mypy,
+pre-commit, and diff-check PASS. The scoped Journey planner review had no open
+Critical, Important, or Minor finding. Official Linux SBX v0.39.0 diagnose was
+`12/12` PASS and initial inventory was empty. PID hard bound remained the
+Owner-accepted `pid_hard_bound_unsupported` limitation, and no host fallback was
+used.
+
+The first invocation on this HEAD, Umami run
+`66ea294d-00b9-4713-b4c1-733cbb41db85`, was invalidated before sandbox creation
+because the trusted client process did not receive the calibrated WSL proxy
+environment. The SBX client log retained a Docker JWKS timeout, daemon requests
+for the generated sandbox ID returned `404`, and inventory was empty. The run is
+retained as `audit-only` with exact stop reason `internal:cleanuperror`. Its
+lifecycle nevertheless contains `create_cleanup_unsafe` followed by
+`cleanup_retry_failure`; the frozen cleanup rule therefore records one failed
+cleanup obligation even though later inventory was empty. The standing Owner
+authorization to continue in-scope M7.5 repairs, together with verified
+pre-workload invalidation, permitted one replacement. Before replacement, the
+explicit calibrated proxy route passed Docker JWKS and GitHub probes, and the
+trusted real SBX create/exec/destroy smoke passed `1` test in `49.83 s` with
+empty final inventory.
+
+The replacement Umami attempt and repositories #2-#10 below are the single
+metric-bearing outcomes for this final unified cohort. No repository, SHA,
+Compose path, order, verifier, or frozen threshold was changed. The frozen
+compatibility-canary subset was exactly repositories #1 Umami, #2 Listmonk,
+and #3 changedetection.io; later cohort successes such as #10 Dockge do not
+enter that three-repository denominator.
+
+| # | Repository | Metric run ID | Exact SHA | Duration | Terminal outcome / exact stop reason | Required Journeys | Experiments | Report | Cleanup |
+|---:|---|---|---|---:|---|---|---:|---|---|
+| 1 | Umami | `d2318902-3810-4f13-aca1-1faa2e099615` | PASS | `307.684s` | `execution_unsupported` / `experiment:sandbox_failed` | `1/1 PASS` (`GET /`) | `3`: 2 rollback, 1 stop | JSON/HTML | `3/3` destroy success; inventory empty |
+| 2 | Listmonk | `974b0f7a-b4da-4f2b-8fe0-7f9ccc4b6ecd` | PASS | `308.565s` | `execution_unsupported` / `experiment:sandbox_failed` | `1/1 PASS` (`GET /`) | `1`: stop | JSON/HTML | `1/1` destroy success; inventory empty |
+| 3 | changedetection.io | `05ea56c3-3ebf-4127-800f-287e60787def` | PASS | `327.762s` | `trial_failed` / `insufficient_coverage` | `0/3 PASS` | `0` | JSON/HTML | `1/1` destroy success; inventory empty |
+| 4 | Uptime Kuma | `469f5f58-e442-4d8d-9fe8-79c8e9ad7c7e` | PASS | `190.618s` | `trial_failed` / `boot_recovery_stopped` | `0/1`, untested | `0` | JSON/HTML | `1/1` destroy success; inventory empty |
+| 5 | Wakapi | `e6043e1c-472b-44e6-9e69-041b3a75f5a4` | not verified | `18.144s` attempt only | `exception` / `intake:clone` | none | `0` | none | N/A; no owned sandbox; inventory empty |
+| 6 | Linkding | `9a1cfcb8-a5cf-4de8-b8a9-a5190a09322e` | PASS | `61.167s` | `trial_failed` / `boot_recovery_stopped` | `0/1`, untested | `0` | JSON/HTML | `1/1` destroy success; inventory empty |
+| 7 | Paperless-ngx | `5e98128b-c487-4571-a5bd-4741a4f58e6d` | PASS | `244.647s` | `exception` / `sandbox:clone_verification:guest_status_not_clean` | none | `0` | none | provider partial-create cleanup completed; managed lifecycle N/A; inventory empty |
+| 8 | n8n-hosting | `7d571f1f-1735-4ade-b630-f48c53c44af8` | PASS | `268.273s` | `trial_failed` / `boot_recovery_stopped` | `0/5`, untested | `0` | JSON/HTML | `1/1` destroy success; inventory empty |
+| 9 | NetBox Docker | `9a321240-3ba6-4e8e-9976-f51f72f3c7e5` | PASS | `287.026s` | `trial_failed` / `boot_recovery_stopped` | `0/3`, untested | `0` | JSON/HTML | `1/1` destroy success; inventory empty |
+| 10 | Dockge | `f60e15f4-7171-4edb-b641-33ad209ff9c0` | PASS | `229.539s` | `completed` / `consecutive_failures` | `1/1 PASS` (`GET /`) | `3`: all rollback | JSON/HTML | `4/4` destroy success; inventory empty |
+
+The corrected deterministic README-root grounding made Umami and Listmonk pass
+the strict three-repository compatibility criterion together with exact SHA,
+non-empty all-PASS required Journeys, completed reports, exact stop reasons, and
+cleanup. changedetection.io failed all three model-proposed Journeys. The
+compatibility canary was therefore `2/3 PASS`, which authorized repositories
+#4-#10 on the same unchanged HEAD. This compatibility gate is not the M7.5
+autonomous-success release metric.
+
+The complete cohort findings are heterogeneous rather than one dominant Boot
+defect:
+
+- Uptime Kuma, n8n-hosting, and NetBox Docker exhausted the frozen SBX Docker
+  disk allocation while pulling or extracting image layers; each retained an
+  exact `no space left on device` signature.
+- Linkding's checked-in Compose references a workspace `.env` that does not
+  exist until the documented `.env.sample` setup is performed. The current
+  generic intake does not execute repository setup instructions.
+- changedetection.io retained the known guest-loopback publication mismatch and
+  failed Journey coverage.
+- Paperless-ngx had a clean retained host checkout but failed the trusted guest
+  clone status check. The current evidence records
+  `guest_status_not_clean` but not the exact changed tracked path.
+- Wakapi failed during clone intake; the current terminal evidence records
+  `intake:clone` but does not retain a more specific clone stderr reason.
+- Umami and Listmonk passed their required baseline Journeys, then stopped in
+  later hardening experiments. No experiment produced a KEEP result.
+
+Under the frozen release definitions, autonomous success is `1/10` (Dockge;
+required `>=7/10`) and meaningful regression-passing convergence is `0/10`
+(required `>=5/10`). Wakapi never crossed the target-workload boundary, so its
+repository duration is missing and P50/P95 remain `UNKNOWN` under the frozen
+timing rule. All ten metric attempts, plus the audit-only infrastructure
+attempt, retained an exact terminal stop reason. Metric-attempt cleanup
+obligations were `13/13` successful, but the final-HEAD chain aggregate is
+`13/14 = 92.86%` because the audit-only pre-workload lifecycle failure must
+remain in the all-attempt denominator; the required cleanup target is `100%`.
+Paperless-ngx is `N/A`, not an omitted cleanup obligation: its lifecycle has
+only `create_attempt -> create_failure`, with no owned sandbox ID. This follows
+the frozen rule recorded earlier in this report. By contrast, the audit-only
+Umami lifecycle records an owned ID plus `create_cleanup_unsafe` and therefore
+does create the fourteenth obligation.
+
+The release gate therefore fails without weakening any verifier, safety rule,
+or denominator. README was not changed. Production code, tests, manifest,
+frozen architecture, Disk Bound, whole-trial duration, and PID disclosure
+remained unchanged throughout metric execution.
+
+**M7.5 PILOT COMPLETE — MVP LIMITATIONS IDENTIFIED**
