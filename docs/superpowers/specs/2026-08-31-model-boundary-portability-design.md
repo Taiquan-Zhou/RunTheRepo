@@ -60,7 +60,7 @@ Replace the generic model-facing step schema with private strict variants for
 the existing, frozen action set:
 
 - `http/request`: required `method` (`GET`, `POST`, or `DELETE`) and `path`;
-  optional bounded JSON body; typed assertion variants.
+  optional JSON body; typed assertion variants.
 - `browser/goto`: exactly `path`.
 - `browser/fill_by_label`: exactly `label` and `value`.
 - `browser/click_by_role`: exactly an allowed `role` and `name`.
@@ -77,6 +77,12 @@ unchanged public `Journey`, `JourneyStep`, and `JourneyAssertion` models. The
 existing domain parser and policy remain a second, authoritative validation
 layer; the transport schema does not replace them.
 
+The private schema must encode field presence, literal action/method/role
+values, exact parameter shapes, and directly portable string constraints. The
+existing domain validator remains authoritative for custom path safety and JSON
+depth, node-count, collection-size, and aggregate-content limits that are not
+reliably portable across provider JSON Schema implementations.
+
 Cross-step rules that are unsuitable for portable JSON Schema remain in the
 domain validator, including non-empty Journeys, one tool type per Journey, and
 at least one assertion for an HTTP Journey.
@@ -88,11 +94,13 @@ the existing portable JSON-prompt payload only when all of these hold:
 
 - HTTP status is 400 or 422;
 - the parsed response has the recognized error-envelope shape;
-- the message identifies `response_format` as the rejected request component;
+- the message contains the case-insensitive token `response_format`;
 - available type/code/param fields are generic request metadata or structured
   output capability metadata;
-- no available field classifies authentication, authorization, model access,
-  quota, rate limit, context limit, or another non-capability failure.
+- neither the message nor type/code/param fields classify authentication,
+  authorization, model access, quota, rate limit, context limit, or another
+  non-capability failure. The message may be inspected in memory for this
+  classification but must never be logged or persisted.
 
 Never fallback for 401/403/404/408/409/429, transport failures, timeouts,
 response-size failures, redirects, or 5xx responses. Do not branch on endpoint,
@@ -104,11 +112,15 @@ strict Pydantic validation. Do not strip Markdown fences, extract JSON
 substrings, repair fields, insert defaults, or convert values. Invalid output
 fails closed.
 
-The request budget remains bounded: one strict request plus at most one
-portable fallback. Existing same-mode retry behavior for a successful strict
-response with invalid structured content is preserved unless a RED test proves
-that doing so violates the two-request maximum; implementation must make the
-overall maximum explicit and tested.
+The complete `structured()` call has a hard maximum of two HTTP requests:
+
+- first strict response is a qualifying capability rejection -> make one
+  portable fallback; invalid fallback output terminates without retry;
+- first strict response is successful but structurally invalid -> make one
+  same-mode strict retry; the retry cannot trigger a portable fallback;
+- every other first response terminates immediately.
+
+No path may make a third request.
 
 ### 3. Error and evidence semantics
 
@@ -157,7 +169,7 @@ RED tests must prove at least:
 4. Authentication, authorization, invalid model, quota, rate limit, context,
    timeout, transport, redirect, and 5xx failures never fallback.
 5. Fallback output that is malformed, schema-invalid, or policy-invalid remains
-   fail-closed, with a hard request-count ceiling.
+   fail-closed, and every branch observes the two-request hard ceiling.
 6. No provider or model-name conditional is introduced.
 
 After GREEN:
