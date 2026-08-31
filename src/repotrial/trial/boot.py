@@ -25,6 +25,7 @@ _BEARER_PATTERN = re.compile(r"(?i)\bbearer[ \t]+[^\s,;]+")
 _REDACTION = "[REDACTED]"
 _MARKER_OVERFLOW_REDACTION = "[REDACTED: excessive truncation markers]"
 _LOG_LIMIT = 65_536
+_COMPOSE_UP_TIMEOUT_S = 240
 _TRUNCATION_MARKER = "\n...[truncated]"
 _PEM_BEGIN = "-----BEGIN "
 _PEM_END = "-----END "
@@ -96,7 +97,7 @@ async def _boot_compose_with_evidence(
                 "--wait-timeout",
                 "60",
             ],
-            timeout_s=120,
+            timeout_s=_COMPOSE_UP_TIMEOUT_S,
         )
     except BaseException as error:
         if evidence is not None:

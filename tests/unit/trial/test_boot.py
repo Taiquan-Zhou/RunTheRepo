@@ -205,7 +205,9 @@ def test_private_boot_logs_retain_stderr_error_after_saturated_stdout(
     assert error in result.logs["logs"]
 
 
-def test_empty_env_uses_direct_fixed_commands_and_returns_healthy_pass() -> None:
+def test_compose_up_uses_extended_timeout_without_changing_readiness_or_evidence_timeouts() -> (
+    None
+):
     provider = FakeSandboxProvider(
         scripts={
             UP_ARGV: _result(stdout="created"),
@@ -237,7 +239,7 @@ def test_empty_env_uses_direct_fixed_commands_and_returns_healthy_pass() -> None
     }
     assert provider.calls == [
         ("create", Path("missing-workspace"), "trial"),
-        ("exec", "sandbox-1", UP_ARGV, 120),
+        ("exec", "sandbox-1", UP_ARGV, 240),
         ("exec", "sandbox-1", PS_ARGV, 30),
         ("exec", "sandbox-1", LOGS_ARGV, 30),
     ]
@@ -267,7 +269,7 @@ def test_candidate_overlay_is_applied_after_base_for_every_compose_command() -> 
 
     assert result.verdict is Verdict.PASS
     assert provider.calls[1:] == [
-        ("exec", "sandbox-1", OVERLAY_UP_ARGV, 120),
+        ("exec", "sandbox-1", OVERLAY_UP_ARGV, 240),
         ("exec", "sandbox-1", OVERLAY_PS_ARGV, 30),
         ("exec", "sandbox-1", OVERLAY_LOGS_ARGV, 30),
     ]
@@ -313,7 +315,7 @@ def test_nonempty_env_is_sorted_prefixed_and_not_mutated() -> None:
     assert env == original
     assert provider.calls == [
         ("create", Path("missing-workspace"), "trial"),
-        ("exec", "sandbox-1", up_argv, 120),
+        ("exec", "sandbox-1", up_argv, 240),
         ("exec", "sandbox-1", ps_argv, 30),
         ("exec", "sandbox-1", logs_argv, 30),
     ]
@@ -426,7 +428,7 @@ def test_any_nonzero_command_fails_but_all_evidence_calls_still_run(
     assert result.verdict is Verdict.FAIL
     assert result.service_states == {"web": "running/healthy"}
     assert provider.calls[1:] == [
-        ("exec", "sandbox-1", UP_ARGV, 120),
+        ("exec", "sandbox-1", UP_ARGV, 240),
         ("exec", "sandbox-1", PS_ARGV, 30),
         ("exec", "sandbox-1", LOGS_ARGV, 30),
     ]
@@ -885,5 +887,5 @@ def test_provider_exception_propagates_without_becoming_a_false_result() -> None
 
     assert provider.calls == [
         ("create", Path("missing-workspace"), "trial"),
-        ("exec", "sandbox-1", UP_ARGV, 120),
+        ("exec", "sandbox-1", UP_ARGV, 240),
     ]
