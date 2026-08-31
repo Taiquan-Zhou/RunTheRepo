@@ -217,7 +217,10 @@ class DockerSbxProvider(SandboxProvider):
     """Run Docker Sandboxes only after an exact capability probe succeeds."""
 
     def __init__(
-        self, policy: DockerSbxPolicy, *, command_timeout_s: float = 30
+        self,
+        policy: DockerSbxPolicy,
+        *,
+        command_timeout_s: float = 120,
     ) -> None:
         if (
             isinstance(command_timeout_s, bool)

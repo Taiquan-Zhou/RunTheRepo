@@ -2945,6 +2945,39 @@ def test_create_deadline_starts_before_probes_and_limits_create_subprocess(
     assert provider._sandbox_deadlines == {sandbox_id: 20.0}
 
 
+@pytest.mark.parametrize(
+    ("command_timeout_s", "total_duration_s", "expected_timeout_s"),
+    [
+        (None, 300, 120.0),
+        (7, 300, 7.0),
+        (None, 60, 60.0),
+    ],
+)
+def test_create_timeout_uses_default_or_override_bounded_by_trial_duration(
+    command_timeout_s: float | None,
+    total_duration_s: int,
+    expected_timeout_s: float,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _Clock()
+    recorder = _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawner)
+    provider_kwargs = (
+        {} if command_timeout_s is None else {"command_timeout_s": command_timeout_s}
+    )
+    provider = DockerSbxProvider(
+        _policy(total_duration_s=total_duration_s), **provider_kwargs
+    )
+
+    _create(provider, tmp_path)
+
+    create_call = _actual_create_call(spawner)
+    create_timeout = dict(_timeouts_by_command(spawner, recorder))[create_call]
+    assert create_timeout == expected_timeout_s
+
+
 def test_policy_allow_runs_before_active_state_and_deadline_are_saved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
