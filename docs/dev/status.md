@@ -238,3 +238,53 @@
   known `pid_hard_bound_unsupported` limitation were not changed.
 
 **M7.5 COMPATIBILITY CANARY FAILED**
+
+## M7.5 recovered metric-bearing canary — latest status
+
+This section supersedes the older `M7.5 environment recovery — WSL2 Linux Docker
+Sandboxes` wording that described WSL as active and native Windows as blocked, and
+supersedes the old final-canary status only for current status reporting. All
+preceding M7.5 recovery and canary records remain historical evidence and are
+retained.
+
+- Unified execution HEAD: `ddea7444f3f5ab8fbdcfc4ed93a41a433f6f48b3`.
+- Manifest SHA-256: `b050f849802fcf5cb8d035f12d32a063b56b93d080cb580a4ebae852c7b075fd`.
+- Current topology: Windows-hosted official `sbx.exe` CLI/daemon v0.39.0 at
+  `C:\Users\zztq\AppData\Local\DockerSandboxes\bin\sbx.exe`, invoked as
+  `sbx.exe daemon start`; `sbx diagnose` was `12/12` PASS and
+  `WHvCapabilityCodeHypervisorPresent=true`. Target workloads ran in disposable
+  Linux sandboxes. The WSL2 setup is historical/alternative evidence, not a
+  current canary prerequisite.
+- Model: `qwen3:4b-instruct`, digest
+  `0edcdef34593eac1aa2be9c7d06c432dcf81945adca5eca2f27662c18f168ba0`.
+- Pre-fix Umami run: `d8afc2ad-8c22-43eb-b25f-8d502baa5749` was a
+  `superseded metric-bearing attempt on the previous HEAD, retained as audit
+  evidence`. It completed Boot and entered observer before the generic observer
+  fix `ddea7444f3f5ab8fbdcfc4ed93a41a433f6f48b3`, which preserves multi-word
+  `docker top` command fields. It remains history and is not included in the
+  current metric-bearing set.
+- Current metric runs: Umami
+  `1bb45765-2501-4091-be35-16f1a4fd2aa0`, Listmonk
+  `ed8d3db3-950b-4321-96c2-ade4e3eef241`, and changedetection.io
+  `54b05ce1-1e86-4726-8a0a-4a93c755cead`.
+- Umami: exact SHA, Boot, observer, JSON/HTML report, and cleanup PASS; model
+  `policy_rejected`; `0/0` Journeys; final `insufficient_coverage`.
+- Listmonk: exact SHA, Boot, observer, JSON/HTML report, and cleanup PASS;
+  observer recorded 9 processes; model `policy_rejected`; `0/0` Journeys; final
+  `insufficient_coverage`.
+- changedetection.io: exact SHA, create, and cleanup PASS; model call succeeded
+  with an accepted empty Journey set (`0` Journeys); Compose `up` timed out, Boot
+  final verdict was `null`, and observer/report did not run; stop reason
+  `sandbox:exec:timeout`.
+- Canary result: `0/3 < 2/3`; repositories #4–#10 were not run. Runtime progress
+  was `2/3` healthy Boot + observer + report and `3/3` exact SHA + cleanup.
+  Product functionality remains below the M7.5 release gate.
+- Gates: observer WSL `89 passed`; full coverage run `1362 passed, 2
+  coverage-instrumentation timeout failures, 6 skipped`, branch coverage
+  `86.97%`; the exact two timeout tests passed without coverage instrumentation;
+  pre-commit PASS; independent review APPROVED. The full coverage run is not
+  described as fully green.
+- Docker Sandboxes v0.39.0 remains `pid_hard_bound_unsupported`; no PID hard
+  protection is claimed. No host fallback was used.
+
+**M7.5 PILOT COMPLETE — MVP LIMITATIONS IDENTIFIED**

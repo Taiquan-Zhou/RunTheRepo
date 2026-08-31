@@ -579,3 +579,49 @@ evidence, and it does not claim PID hard-bound support. Repositories #4-#10
 were not run and README was not changed.
 
 **M7.5 COMPATIBILITY CANARY FAILED**
+
+## 18. Recovered metric-bearing canary after the observer fix
+
+This section is the latest canary status and supersedes the preceding canary
+summary for current status reporting. The preceding sections and their attempt
+records remain historical evidence and are not deleted or overwritten.
+
+The recovered canary ran at unified execution HEAD
+`ddea7444f3f5ab8fbdcfc4ed93a41a433f6f48b3` with the unchanged manifest
+SHA-256 `b050f849802fcf5cb8d035f12d32a063b56b93d080cb580a4ebae852c7b075fd`.
+The local model runtime was Ollama `v0.33.2`, model `qwen3:4b-instruct`, with
+digest
+`0edcdef34593eac1aa2be9c7d06c432dcf81945adca5eca2f27662c18f168ba0`.
+
+The pre-fix Umami attempt
+`d8afc2ad-8c22-43eb-b25f-8d502baa5749` ran before the generic observer fix and
+was a `superseded metric-bearing attempt on the previous HEAD, retained as audit
+evidence`. It completed Boot and entered observer before its
+`ObservationParseError` was reproduced with a trusted SBX format diagnostic: the
+`docker top` `COMMAND` field can contain spaces, while the parser used an
+unbounded whitespace split. Commit
+`ddea7444f3f5ab8fbdcfc4ed93a41a433f6f48b3` applied the generic bounded
+`split(maxsplit=3)` fix and was independently reviewed as approved. The new
+Umami attempt below is the metric-bearing primary attempt on that fixed HEAD;
+the pre-fix attempt is not counted in the current metric set.
+
+Pre-canary gates were recorded as follows: observer WSL focused tests `89 passed`;
+the full coverage run reported `1362 passed, 2 coverage-instrumentation timeout
+failures, 6 skipped`, with branch coverage `86.97%`; the two timeout tests passed
+when rerun without coverage instrumentation; pre-commit passed; and independent
+review approved. The coverage run is not represented as a fully green full suite.
+
+| Repository | Metric run ID | Frozen SHA / verified SHA | Boot | Observer | Model / Journeys | Report | Stop reason | Cleanup |
+|---|---|---|---|---|---|---|---|---|
+| Umami | `1bb45765-2501-4091-be35-16f1a4fd2aa0` | `ca661c7057984aa98ed4f7083d84dae2f65bfcb0` / exact PASS | PASS | PASS; multi-word `next-server` command persisted | `policy_rejected`; `0/0` persisted Journeys | JSON + HTML PASS | `insufficient_coverage` | `destroy_success`; inventory empty |
+| Listmonk | `ed8d3db3-950b-4321-96c2-ade4e3eef241` | `670c01717d48647093335cc23a6be6f4b79c3b6b` / exact PASS | PASS | PASS; 9 processes | `policy_rejected`; `0/0` persisted Journeys | JSON + HTML PASS | `insufficient_coverage` | `destroy_success`; inventory empty |
+| changedetection.io | `54b05ce1-1e86-4726-8a0a-4a93c755cead` | `5d9c7c6da76340597243e8163c4f2439237fa0e8` / exact PASS; create PASS | Compose `up` timeout; final `null` | Not run | Model success; accepted empty set; `0` Journeys | Not produced | `sandbox:exec:timeout` | `destroy_success`; inventory empty |
+
+The canary result was `0/3`, below the required `2/3`; repositories #4–#10 were
+not run. Runtime progress was `2/3` healthy Boot + observer + report and `3/3`
+exact SHA + cleanup. Product functionality still failed the canary: no repository
+produced a non-empty accepted Journey set, so there was no autonomous success or
+meaningful convergence. Docker Sandboxes v0.39.0 remains explicitly documented
+as lacking the frozen PID hard bound; no PID protection is claimed or emulated.
+
+**M7.5 PILOT COMPLETE — MVP LIMITATIONS IDENTIFIED**
