@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
+import sys
 from contextlib import AbstractContextManager
 from dataclasses import replace
 from pathlib import Path
@@ -10,10 +12,21 @@ from typing import TypeVar
 import pytest
 from pydantic import BaseModel
 
-from eval import model_runtime_calibration as calibration
 from repotrial.domain.models import Journey, JourneyAssertion, JourneyStep
 from repotrial.models.base import ModelAdapter, RecoveryAction
 from repotrial.trial.planner import propose_recovery
+
+_CALIBRATION_MODULE_NAME = "_repotrial_model_runtime_calibration"
+_CALIBRATION_PATH = (
+    Path(__file__).resolve().parents[3] / "eval" / "model_runtime_calibration.py"
+)
+_specification = importlib.util.spec_from_file_location(
+    _CALIBRATION_MODULE_NAME, _CALIBRATION_PATH
+)
+assert _specification is not None and _specification.loader is not None
+calibration = importlib.util.module_from_spec(_specification)
+sys.modules[_CALIBRATION_MODULE_NAME] = calibration
+_specification.loader.exec_module(calibration)
 
 RAW_SENTINEL = "RAW_MODEL_OUTPUT_MUST_NOT_APPEAR"
 METRIC_FIELDS = {
