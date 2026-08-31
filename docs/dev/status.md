@@ -288,3 +288,30 @@ retained.
   protection is claimed. No host fallback was used.
 
 **M7.5 PILOT COMPLETE — MVP LIMITATIONS IDENTIFIED**
+
+## DeepSeek portable fallback canary — latest status
+
+This section supersedes only the current status. Historical Qwen and other
+canary records remain retained and are not deleted or overwritten.
+
+- Unified execution HEAD: `5f7faa3949c74d3458e8651b9f399d5741e556c0`.
+- Manifest SHA-256: `b050f849802fcf5cb8d035f12d32a063b56b93d080cb580a4ebae852c7b075fd`.
+- DeepSeek endpoint class/model: public OpenAI-compatible / `deepseek-v4-flash`.
+  No account or API key is recorded in this evidence.
+- Strict/portable calibration evidence remains in
+  [`pilot-evidence/m7.5-deepseek-portability-calibration.md`](pilot-evidence/m7.5-deepseek-portability-calibration.md).
+- Qwen and private Journey schema work remain deferred. Docker Sandboxes PID
+  hard bound remains unsupported. No host fallback was used.
+
+| Repository | Run ID | Exact SHA | Duration | Outcome | Stop reason | Journeys | Experiments | Report | Cleanup / inventory |
+|---|---|---|---:|---|---|---|---|---|---|
+| Umami | `3467cef1-fdbf-4897-bf67-acd2d8e95fc8` | `ca661c7057984aa98ed4f7083d84dae2f65bfcb0` exact | `404.375s` | `execution_unsupported` | `experiment:sandbox_failed` | `4` (`3 PASS` / `1 UNSUPPORTED`) | `3` (`2 boot_regression` rollback, `1 sandbox_failed` stop) | JSON/HTML present | all created sandboxes `destroy_success`; final inventory empty |
+| Listmonk | `26f65e30-74db-446e-a92f-e9d81aacea4b` | `670c01717d48647093335cc23a6be6f4b79c3b6b` exact | `207.484s` | `trial_failed` | `insufficient_coverage` | `0/0` | `0` | JSON/HTML present | `destroy_success`; inventory empty |
+| changedetection.io | `5055f71a-af13-4b29-9d3c-caaaa76f4734` | `5d9c7c6da76340597243e8163c4f2439237fa0e8` exact | `218.125s` | `execution_unsupported` | `insufficient_coverage` | `5` (`0 PASS` / `3 FAIL` / `2 UNSUPPORTED`) | `0` | JSON/HTML present | `destroy_success`; inventory empty |
+
+Listmonk model terminal outcome was `planner_timeout`; changedetection.io model
+terminal outcome was `success`. Production code, tests, manifest, and frozen
+contracts are unchanged. The canary result is `0/3 < 2/3`; repositories #4–#10
+were not authorized.
+
+**M7.5 DEEPSEEK CANARY — FAIL**
