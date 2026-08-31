@@ -591,7 +591,7 @@ def _materialize_journey_proposal(proposal: _JourneyProposal) -> list[Journey] |
 
 
 def _model_journeys_are_executable(journeys: list[Journey]) -> bool:
-    return all(
+    return bool(journeys) and all(
         step.tool in _MODEL_SUPPORTED_TOOLS
         for journey in journeys
         for step in journey.steps

@@ -378,6 +378,63 @@ def test_model_journey_policy_rejection_is_recorded_without_raw_model_output(
     assert "secret-value" not in content
 
 
+def test_empty_model_journey_proposal_is_policy_rejected_with_evidence(
+    tmp_path: Path,
+) -> None:
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+
+    journeys = asyncio.run(
+        planner_module._plan_journeys_with_evidence(
+            tmp_path,
+            "no safe markdown links",
+            FakeModelAdapter([]),
+            evidence_dir=evidence_dir,
+        )
+    )
+
+    assert journeys == []
+    evidence_path = next(evidence_dir.glob("baseline-model-attempt-*.jsonl"))
+    rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    assert rows[-1]["phase"] == "terminal"
+    assert rows[-1]["outcome"] == "policy_rejected"
+
+
+def test_model_proposal_with_http_and_browser_journeys_is_rejected_as_a_whole(
+    tmp_path: Path,
+) -> None:
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    browser_journey = {
+        "journey_id": "browser-model",
+        "name": "Browser model proposal",
+        "steps": [
+            {
+                "step_id": "goto",
+                "tool": "browser",
+                "action": "goto",
+                "params": {"path": "/"},
+                "assertions": [],
+            }
+        ],
+    }
+
+    journeys = asyncio.run(
+        planner_module._plan_journeys_with_evidence(
+            tmp_path,
+            "no safe markdown links",
+            FakeModelAdapter([_http_journey(), browser_journey]),
+            evidence_dir=evidence_dir,
+        )
+    )
+
+    assert journeys == []
+    evidence_path = next(evidence_dir.glob("baseline-model-attempt-*.jsonl"))
+    rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    assert rows[-1]["phase"] == "terminal"
+    assert rows[-1]["outcome"] == "policy_rejected"
+
+
 @pytest.mark.parametrize("error", [RuntimeError("boom"), ValueError("bad adapter")])
 def test_unknown_adapter_exception_records_terminal_adapter_error_and_fails_closed(
     tmp_path: Path, error: Exception
