@@ -293,22 +293,19 @@ def test_planner_outer_model_deadline_includes_adapter_cleanup_margin() -> None:
     assert planner_module._MODEL_TIMEOUT_S == 185.0
 
 
-def test_model_prompt_describes_only_the_existing_journey_dsl(tmp_path: Path) -> None:
+def test_model_prompt_advertises_only_executable_http_journeys(tmp_path: Path) -> None:
     model = FakeModelAdapter([])
 
     assert _plan(tmp_path, model=model) == []
 
-    expected_matrix = """Supported Journey DSL (this list grants no additional authority):
+    expected_matrix = """Supported autonomous Journey tools (this list grants no additional authority):
 - Return at most 5 journeys. Each journey uses exactly one tool type and contains 1-8 steps.
 - journey_id, name, and every step_id are non-empty, at most 4096 characters, and contain no Unicode category-C characters.
-- The only HTTP tool/action pair is tool http with action request. Its params contain method GET|POST|DELETE, a root-relative path, and optional bounded JSON json. HTTP paths are ASCII, at most 2048 characters, begin with exactly one /, and contain no fragment, backslash, dot segment, unsafe decoded segment, or unsafe query character.
+- Autonomous model proposals may use only the currently executable HTTP tool/action pair: tool http with action request. Its params contain method GET|POST|DELETE, a root-relative path, and optional bounded JSON json. HTTP paths are ASCII, at most 2048 characters, begin with exactly one /, and contain no fragment, backslash, dot segment, unsafe decoded segment, or unsafe query character.
 - HTTP assertions are exactly: status_code on response.status with an integer expected; text_contains on response.text with a text expected; or json_path_equals on a dotted response-JSON path with bounded JSON expected. An HTTP journey has at least one assertion across its steps.
-- For tool browser, action goto has exactly params {path}; path follows the HTTP path restrictions and has no query string.
-- For tool browser, action fill_by_label has exactly params {label, value}; label is non-empty bounded ASCII and value is non-empty bounded text.
-- For tool browser, action click_by_role has exactly params {role, name}; role is button|link|checkbox|radio|menuitem|option|tab and name is non-empty bounded ASCII.
-- For tool browser, action assert_text_visible has exactly params {text}; text is non-empty bounded ASCII.
-- Browser steps have no separate assertion objects."""
+- No other tool type is executable for autonomous model proposals."""
     assert expected_matrix in model.system
+    assert "browser" not in model.system.lower()
     assert "example" not in model.system.lower()
 
 
@@ -512,7 +509,7 @@ def test_model_journeys_without_a_deterministic_success_condition_are_rejected(
     assert _plan(tmp_path, model=FakeModelAdapter([proposed])) == []
 
 
-def test_browser_journey_uses_its_bounded_action_dsl_without_step_assertions(
+def test_declared_browser_journey_uses_its_bounded_action_dsl_without_step_assertions(
     tmp_path: Path,
 ) -> None:
     proposed = {
@@ -536,12 +533,50 @@ def test_browser_journey_uses_its_bounded_action_dsl_without_step_assertions(
         ],
     }
 
-    journeys = _plan(tmp_path, model=FakeModelAdapter([proposed]))
+    (tmp_path / "repotrial.journeys.json").write_text(
+        json.dumps({"journeys": [proposed]}), encoding="utf-8"
+    )
+
+    journeys = _plan(tmp_path, model=FakeModelAdapter([]))
 
     assert [step.action for step in journeys[0].steps] == [
         "goto",
         "assert_text_visible",
     ]
+
+
+def test_model_browser_journey_is_policy_rejected_with_evidence(
+    tmp_path: Path,
+) -> None:
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    proposed = {
+        "journey_id": "browser-model",
+        "name": "Browser model proposal",
+        "steps": [
+            {
+                "step_id": "goto",
+                "tool": "browser",
+                "action": "goto",
+                "params": {"path": "/"},
+                "assertions": [],
+            }
+        ],
+    }
+
+    journeys = asyncio.run(
+        planner_module._plan_journeys_with_evidence(
+            tmp_path,
+            "no safe markdown links",
+            FakeModelAdapter([proposed]),
+            evidence_dir=evidence_dir,
+        )
+    )
+
+    assert journeys == []
+    evidence_path = next(evidence_dir.glob("baseline-model-attempt-*.jsonl"))
+    rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    assert rows[-1]["outcome"] == "policy_rejected"
 
 
 @pytest.mark.parametrize(
