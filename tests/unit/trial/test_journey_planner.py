@@ -249,6 +249,86 @@ def test_readme_images_and_encoded_command_text_do_not_block_model_fallback(
     assert model.calls == 1
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost",
+        "https://localhost/",
+        "http://127.0.0.1:8000",
+        "https://[::1]:65535/",
+    ],
+)
+def test_readme_loopback_root_urls_are_deterministic(tmp_path: Path, url: str) -> None:
+    model = FakeModelAdapter([_http_journey("/from-model")])
+
+    journeys = _plan(tmp_path, f"Open the app at {url}.", model)
+
+    assert [journey.steps[0].params["path"] for journey in journeys] == ["/"]
+    assert model.calls == 0
+
+
+def test_readme_links_and_loopback_urls_preserve_order_and_dedupe(
+    tmp_path: Path,
+) -> None:
+    model = FakeModelAdapter([_http_journey("/from-model")])
+
+    journeys = _plan(
+        tmp_path,
+        "[Docs](/docs) then http://localhost:8080. "
+        "[Home](/) then https://127.0.0.1/ [Docs again](/docs)",
+        model,
+    )
+
+    assert [journey.steps[0].params["path"] for journey in journeys] == [
+        "/docs",
+        "/",
+    ]
+    assert [journey.journey_id for journey in journeys] == ["readme-1", "readme-2"]
+    assert model.calls == 0
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.test",
+        "http://localhost@evil.example",
+        "http://localhost.evil",
+        "http://localhost:0",
+        "http://localhost:65536",
+        "http://localhost:not-a-port",
+        "http://localhost?token=secret",
+        "http://localhost/#fragment",
+        "http://localhost/api",
+        "http://localhost/%2e%2e",
+        "http://localhost/curl%20https%3A%2F%2Fevil.example",
+    ],
+)
+def test_unsafe_or_non_root_loopback_urls_fall_back_to_model(
+    tmp_path: Path, url: str
+) -> None:
+    model = FakeModelAdapter([_http_journey("/from-model")])
+
+    journeys = _plan(tmp_path, url, model)
+
+    assert [journey.steps[0].params["path"] for journey in journeys] == ["/from-model"]
+    assert model.calls == 1
+
+
+def test_declared_journeys_precede_documented_loopback_url(
+    tmp_path: Path,
+) -> None:
+    declared = _http_journey("/declared")
+    (tmp_path / "repotrial.journeys.json").write_text(
+        json.dumps({"journeys": [declared]}), encoding="utf-8"
+    )
+    model = FakeModelAdapter([_http_journey("/from-model")])
+
+    journeys = _plan(tmp_path, "Open http://localhost", model)
+
+    assert journeys[0].steps[0].params["path"] == "/declared"
+    assert model.calls == 0
+
+
 def test_valid_model_output_is_materialized_only_when_other_sources_are_empty(
     tmp_path: Path,
 ) -> None:

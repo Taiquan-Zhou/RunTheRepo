@@ -55,6 +55,9 @@ _MAX_JSON_NODES = 256
 _MAX_JSON_CONTAINER_ITEMS = 64
 _MAX_JSON_AGGREGATE_CONTENT = 16_384
 _MARKDOWN_LINK = re.compile(r"(?<!!)\[[^\]\r\n]*\]\(([^()\s]+)\)")
+_PLAIN_URL_TOKEN = re.compile(r"(?<![A-Za-z0-9_])https?://[^\s<>()]+", re.IGNORECASE)
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_PLAIN_URL_TRAILING_PUNCTUATION = frozenset(".,;!，。；！、'\"`")
 _DOTTED_PATH = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*$")
 _SAFE_ROUTE_SEGMENT = re.compile(r"[A-Za-z0-9._~@=+,-]*\Z")
 _SAFE_QUERY = re.compile(r"[A-Za-z0-9._~=&,-]*\Z")
@@ -359,17 +362,92 @@ def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
 
 
 def _journeys_from_readme(readme_excerpt: str) -> list[Journey]:
-    paths: list[str] = []
-    seen: set[str] = set()
+    candidates: list[tuple[int, str]] = []
     for match in _MARKDOWN_LINK.finditer(readme_excerpt):
         path = match.group(1)
-        if path in seen or not _valid_root_relative_path(path):
+        if _valid_root_relative_path(path):
+            candidates.append((match.start(), path))
+    for match in _PLAIN_URL_TOKEN.finditer(readme_excerpt):
+        path = _loopback_root_path(match.group(0))
+        if path is not None:
+            candidates.append((match.start(), path))
+
+    paths: list[str] = []
+    seen: set[str] = set()
+    for _, path in sorted(candidates, key=lambda candidate: candidate[0]):
+        if path in seen:
             continue
         seen.add(path)
         paths.append(path)
         if len(paths) == _MAX_JOURNEYS:
             break
     return [_minimal_get_journey(index, path) for index, path in enumerate(paths, 1)]
+
+
+def _loopback_root_path(token: str) -> str | None:
+    normalized = token
+    separator = normalized.find("://")
+    if separator == -1:
+        return None
+    remainder = normalized[separator + 3 :]
+    query_start = remainder.find("?")
+    fragment_start = remainder.find("#")
+    path_end = min(
+        (index for index in (query_start, fragment_start) if index != -1),
+        default=len(remainder),
+    )
+    path_start = remainder.find("/", 0, path_end)
+    raw_path = remainder[path_start:path_end] if path_start != -1 else ""
+    if raw_path not in {"", "/"}:
+        if (
+            path_end == len(remainder)
+            and len(raw_path) == 2
+            and raw_path[1] in _PLAIN_URL_TRAILING_PUNCTUATION
+        ):
+            normalized = normalized[:-1]
+        else:
+            return None
+    elif not raw_path:
+        while normalized:
+            if normalized[-1] in _PLAIN_URL_TRAILING_PUNCTUATION:
+                normalized = normalized[:-1]
+                continue
+            if normalized[-1] == "]" and normalized.count("]") > normalized.count("["):
+                normalized = normalized[:-1]
+                continue
+            if normalized[-1] == "}" and normalized.count("}") > normalized.count("{"):
+                normalized = normalized[:-1]
+                continue
+            break
+
+    try:
+        parsed = urlsplit(normalized)
+    except ValueError:
+        return None
+    if parsed.path not in {"", "/"}:
+        return None
+
+    try:
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or hostname not in _LOOPBACK_HOSTS
+        or username is not None
+        or password is not None
+        or "?" in normalized
+        or "#" in normalized
+        or parsed.netloc.endswith(":")
+    ):
+        return None
+    if port is not None and not 1 <= port <= 65_535:
+        return None
+    path = parsed.path or "/"
+    return path if _valid_root_relative_path(path) else None
 
 
 def _minimal_get_journey(index: int, path: str) -> Journey:
