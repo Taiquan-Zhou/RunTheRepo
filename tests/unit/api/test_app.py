@@ -117,7 +117,7 @@ def test_healthz_reports_ready_without_probing_sandbox() -> None:
     assert provider_calls == []
 
 
-def test_api_default_provider_uses_a_supported_integer_cpu(
+def test_api_default_provider_uses_supported_resource_minimums(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import repotrial.api.app as app_module
@@ -135,6 +135,7 @@ def test_api_default_provider_uses_a_supported_integer_cpu(
     assert len(captured_policies) == 1
     assert captured_policies[0].cpus == 1
     assert isinstance(captured_policies[0].cpus, int)
+    assert captured_policies[0].memory_mb == 1024
 
 
 def test_healthz_is_unavailable_without_ready_registry() -> None:
