@@ -315,3 +315,42 @@ contracts are unchanged. The canary result is `0/3 < 2/3`; repositories #4–#10
 were not authorized.
 
 **M7.5 DEEPSEEK CANARY — FAIL**
+
+## M7.5 DeepSeek canary at frozen HEAD `e2ce00222380d06834075481e7c67f026b91af55`
+
+- Latest metric-bearing canary HEAD: `e2ce00222380d06834075481e7c67f026b91af55`.
+- Manifest SHA-256: `b050f849802fcf5cb8d035f12d32a063b56b93d080cb580a4ebae852c7b075fd`.
+- Model: `deepseek-v4-flash`.
+- Earlier attempts remain retained as superseded, audit-only evidence; the
+  three runs below are the current metric-bearing set.
+- Umami `1b05caa6-c7df-48c3-9a8c-510cd1dd8a00`: exact SHA
+  `ca661c7057984aa98ed4f7083d84dae2f65bfcb0`; `339.984s`; exit `4`,
+  `exception` (`DockerSbxError`); model success in `129.313s`; 5 persisted
+  HTTP Journeys; Boot `up` timed out; no report; stop reason
+  `sandbox:exec:timeout`; `destroy_success`; final inventory empty.
+- Listmonk `697ebd1f-303b-47e2-9f3e-0318886454ee`: exact SHA
+  `670c01717d48647093335cc23a6be6f4b79c3b6b`; `265.641s`; exit `4`,
+  `exception` (`DockerSbxError`); model success in `89.657s`; 1 persisted
+  HTTP Journey; Boot `up` timed out; no report; stop reason
+  `sandbox:exec:timeout`; `destroy_success`; final inventory empty.
+- changedetection.io `ed91fab9-53d9-4d48-b477-78c979385236`: exact SHA
+  `5d9c7c6da76340597243e8163c4f2439237fa0e8`; `284.391s`; exit `3`,
+  `trial_failed`; model success in `108.172s`; 5 persisted HTTP Journeys, all
+  failed with `network_error`; Boot PASS and service running; JSON/HTML report
+  produced; stop reason `insufficient_coverage`; `destroy_success`; final
+  inventory empty.
+- The changedetection.io Compose file binds `127.0.0.1:5000:5000`, and the
+  current SBX publish path could not reach that loopback-bound service. This is
+  an evidence-supported compatibility-topology finding for this run, not a
+  general Compose/SBX theorem.
+- Canary result: `0/3 < 2/3`; repositories #4–#10 were not authorized or run.
+- PID hard bound remains unsupported; no host fallback was used. HEAD and
+  manifest remained unchanged, and the source/tests/manifest were clean before
+  this documentation-only append; no sandbox remained. The current
+  uncommitted changes are limited to these two documents. README was not
+  updated.
+- Pre-canary gates: 60 focused passed; Linux full suite `1380 passed, 6
+  skipped`; coverage `86.92%`; Ruff/format, mypy, pre-commit, diff-check, and
+  independent review PASS.
+
+**M7.5 DEEPSEEK CANARY — FAIL (`0/3 < 2/3`)**

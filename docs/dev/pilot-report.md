@@ -652,3 +652,41 @@ contracts are unchanged. The canary result is `0/3 < 2/3`; repositories #4–#10
 were not authorized.
 
 **M7.5 DEEPSEEK CANARY — FAIL**
+
+## DeepSeek canary at frozen HEAD `e2ce00222380d06834075481e7c67f026b91af55`
+
+This append-only section records the latest DeepSeek metric-bearing canary at
+the frozen execution HEAD `e2ce00222380d06834075481e7c67f026b91af55`. The
+manifest was unchanged and its SHA-256 was
+`b050f849802fcf5cb8d035f12d32a063b56b93d080cb580a4ebae852c7b075fd`. The model
+was `deepseek-v4-flash`. Earlier attempts remain retained as superseded,
+audit-only evidence and are not mixed into this current three-repository
+metric set.
+
+| Repository | Run ID | Exact SHA | Duration | Exit / outcome | Model / Journeys | Boot / report | Stop reason | Cleanup / inventory |
+|---|---|---|---:|---|---|---|---|---|
+| Umami | `1b05caa6-c7df-48c3-9a8c-510cd1dd8a00` | `ca661c7057984aa98ed4f7083d84dae2f65bfcb0` exact | `339.984s` | `4` / `exception` (`DockerSbxError`) | model success in `129.313s`; `5` persisted HTTP Journeys | Boot `up` timed out; no report | `sandbox:exec:timeout` | `destroy_success`; final inventory empty |
+| Listmonk | `697ebd1f-303b-47e2-9f3e-0318886454ee` | `670c01717d48647093335cc23a6be6f4b79c3b6b` exact | `265.641s` | `4` / `exception` (`DockerSbxError`) | model success in `89.657s`; `1` persisted HTTP Journey | Boot `up` timed out; no report | `sandbox:exec:timeout` | `destroy_success`; final inventory empty |
+| changedetection.io | `ed91fab9-53d9-4d48-b477-78c979385236` | `5d9c7c6da76340597243e8163c4f2439237fa0e8` exact | `284.391s` | `3` / `trial_failed` | model success in `108.172s`; `5` persisted HTTP Journeys, all `FAIL` with `network_error` | Boot PASS; service running; JSON/HTML report produced | `insufficient_coverage` | `destroy_success`; final inventory empty |
+
+The canary result was `0/3`, below the frozen `2/3` threshold. Repositories
+4–10 were not authorized or executed. Umami and Listmonk both reached model
+success and persisted non-empty HTTP Journey proposals, but their baseline
+Compose `up` operation ended in the same `DockerSbxError` timeout before a
+report was produced. changedetection.io reached a running service and produced
+a report, but all five persisted HTTP Journeys failed with `network_error`.
+Its Compose configuration binds `127.0.0.1:5000:5000`; the current SBX publish
+path could not reach that loopback-bound service. This is an
+evidence-supported compatibility-topology finding for this run, not a general
+claim about all Compose applications or all SBX environments.
+
+Docker Sandboxes v0.39.0 still has the known unsupported PID hard bound; no PID
+protection was claimed or emulated. No host fallback was used. The pre-canary
+gates remained passing: 60 focused tests; Linux full suite `1380 passed,
+6 skipped`; branch coverage `86.92%`; Ruff lint/format, mypy, pre-commit,
+diff-check, and independent review PASS. Before this documentation-only
+append, the source, tests, and manifest were clean at the frozen HEAD; no
+sandbox remained after cleanup. The current uncommitted changes are limited to
+this report and the status document. No README update was made.
+
+**M7.5 DEEPSEEK CANARY — FAIL (`0/3 < 2/3`)**
