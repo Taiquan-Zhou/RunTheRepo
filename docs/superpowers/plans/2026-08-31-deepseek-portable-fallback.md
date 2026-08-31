@@ -96,11 +96,17 @@ Add parametrized cases in which the status remains 400/422 and the message also 
 @pytest.mark.parametrize(
     "error",
     [
-        {"type": "invalid_request_error", "message": "invalid API key for response_format"},
+        {
+            "type": "invalid_request_error",
+            "message": "invalid API key for response_format",
+        },
         {"code": "model_not_found", "message": "model cannot use response_format"},
         {"code": "insufficient_quota", "message": "quota blocks response_format"},
         {"type": "rate_limit_error", "message": "rate limit for response_format"},
-        {"code": "context_length_exceeded", "message": "context limit in response_format request"},
+        {
+            "code": "context_length_exceeded",
+            "message": "context limit in response_format request",
+        },
     ],
 )
 def test_generic_non_capability_classification_never_falls_back(
@@ -120,25 +126,45 @@ Add both request-ceiling branches:
 ```python
 def test_invalid_portable_fallback_stops_after_two_requests() -> None:
     responses = [
-        (400, {"error": {"type": "invalid_request_error", "message": "response_format unavailable"}}),
+        (
+            400,
+            {
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "response_format unavailable",
+                }
+            },
+        ),
         (200, _chat_completion('{"answer":1}')),
     ]
     with _ResponseServer(responses) as server:
         adapter = OpenAICompatibleModelAdapter(server.endpoint, "local-model")
         with pytest.raises(ModelAdapterError, match="invalid structured response"):
-            asyncio.run(adapter.structured(system="system", user="user", schema=_Answer))
+            asyncio.run(
+                adapter.structured(system="system", user="user", schema=_Answer)
+            )
     assert len(server.requests) == 2
 
 
 def test_strict_retry_cannot_turn_into_a_third_fallback_request() -> None:
     responses = [
         (200, _chat_completion('{"answer":1}')),
-        (400, {"error": {"type": "invalid_request_error", "message": "response_format unavailable"}}),
+        (
+            400,
+            {
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "response_format unavailable",
+                }
+            },
+        ),
     ]
     with _ResponseServer(responses) as server:
         adapter = OpenAICompatibleModelAdapter(server.endpoint, "local-model")
         with pytest.raises(ModelAdapterError, match="model request failed"):
-            asyncio.run(adapter.structured(system="system", user="user", schema=_Answer))
+            asyncio.run(
+                adapter.structured(system="system", user="user", schema=_Answer)
+            )
     assert len(server.requests) == 2
 ```
 
