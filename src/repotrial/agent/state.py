@@ -1,4 +1,3 @@
-import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,12 +29,7 @@ type StageName = Literal[
     "decide",
     "report_or_next",
 ]
-type RecoverySleep = Callable[[float], Awaitable[None]]
 type RepositoryPinner = Callable[[str, Path, str | None], Awaitable[PinnedRepo]]
-
-
-async def _default_sleep(seconds: float) -> None:
-    await asyncio.sleep(seconds)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,7 +45,6 @@ class GraphContext:
     container_port: int
     model: ModelAdapter | None = None
     repository_pinner: RepositoryPinner = pin_repository
-    sleep: RecoverySleep = _default_sleep
 
 
 class GraphState(BaseModel):

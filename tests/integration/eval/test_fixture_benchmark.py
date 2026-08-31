@@ -638,7 +638,17 @@ def test_fixture_provider_binds_observer_commands_to_discovered_identity_and_for
         try:
             up = await provider.exec(
                 sandbox_id,
-                ["docker", "compose", "-f", "compose.yml", "up", "-d"],
+                [
+                    "docker",
+                    "compose",
+                    "-f",
+                    "compose.yml",
+                    "up",
+                    "-d",
+                    "--wait",
+                    "--wait-timeout",
+                    "60",
+                ],
             )
             assert up.exit_code == 0
             discovery = await provider.exec(

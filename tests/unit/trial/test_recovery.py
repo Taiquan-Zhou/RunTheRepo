@@ -461,11 +461,11 @@ def test_none_model_falls_back_to_stop_without_model_access() -> None:
     )
 
 
-def test_recognizable_startup_delay_proposes_a_bounded_wait() -> None:
-    action = _propose(logs={"ps": "app is not ready yet"})
+def test_generic_starting_evidence_does_not_propose_wait() -> None:
+    action = _propose(logs={"ps": "app is starting"})
 
     assert action == RecoveryAction(
-        action="wait", params={"seconds": 10}, reason="recognizable startup delay"
+        action="stop", params={}, reason="no recovery action"
     )
 
 

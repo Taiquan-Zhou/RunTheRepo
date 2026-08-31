@@ -11,7 +11,17 @@ from repotrial.sandbox.fake import FakeSandboxProvider
 from repotrial.trial.boot import BootResult, _boot_compose_with_evidence, boot_compose
 
 COMPOSE_PATH = "/workspace/compose.yml"
-UP_ARGV = ("docker", "compose", "-f", COMPOSE_PATH, "up", "-d")
+UP_ARGV = (
+    "docker",
+    "compose",
+    "-f",
+    COMPOSE_PATH,
+    "up",
+    "-d",
+    "--wait",
+    "--wait-timeout",
+    "60",
+)
 PS_ARGV = (
     "docker",
     "compose",
@@ -42,6 +52,9 @@ OVERLAY_UP_ARGV = (
     OVERLAY_PATH,
     "up",
     "-d",
+    "--wait",
+    "--wait-timeout",
+    "60",
 )
 OVERLAY_PS_ARGV = (
     "docker",
@@ -230,7 +243,7 @@ def test_empty_env_uses_direct_fixed_commands_and_returns_healthy_pass() -> None
     ]
 
 
-def test_overlay_is_applied_after_base_for_every_compose_command() -> None:
+def test_candidate_overlay_is_applied_after_base_for_every_compose_command() -> None:
     provider = FakeSandboxProvider(
         scripts={
             OVERLAY_UP_ARGV: _result(),

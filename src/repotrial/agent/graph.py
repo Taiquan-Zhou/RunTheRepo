@@ -337,7 +337,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
         )
     update["boot_error_hash"] = fingerprint
     update["repeated_error_count"] = repeated
-    await _apply_recovery(state, update, recovery, runtime.context)
+    await _apply_recovery(state, update, recovery)
     updated_run = update.get("run")
     stop_reason = updated_run.stop_reason if isinstance(updated_run, RunState) else None
     recovery_reason = recovery.reason
@@ -348,10 +348,15 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
         recovery_reason = recovery_reason.replace(value, "[REDACTED]")
     evidence_recovery = recovery.model_copy(update={"reason": recovery_reason})
     if evidence_enabled:
+        disposition: Literal["applied", "stopped", "unsupported"] = "applied"
+        if recovery.action == "stop":
+            disposition = "stopped"
+        elif recovery.action == "wait":
+            disposition = "unsupported"
         record_recovery_evidence(
             evidence_artifact,
             evidence_recovery,
-            disposition="stopped" if recovery.action == "stop" else "applied",
+            disposition=disposition,
             stop_reason=stop_reason,
         )
     return update
@@ -361,20 +366,13 @@ async def _apply_recovery(
     state: GraphState,
     update: NodeUpdate,
     recovery: RecoveryAction,
-    context: GraphContext,
 ) -> None:
-    if recovery.action == "stop":
+    if recovery.action in {"stop", "wait"}:
         update["run"] = state.run.model_copy(
             update={"stop_reason": "boot_recovery_stopped"}
         )
         return
     if recovery.action == "retry":
-        return
-    if recovery.action == "wait":
-        seconds = recovery.params.get("seconds")
-        if type(seconds) is not int:
-            raise ValueError("validated wait action is malformed")
-        await context.sleep(seconds)
         return
     if recovery.action == "set_env":
         key = recovery.params.get("key")

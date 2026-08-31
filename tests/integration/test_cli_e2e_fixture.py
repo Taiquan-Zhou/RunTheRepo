@@ -86,11 +86,11 @@ class FixtureProvider(FakeSandboxProvider):
         if (
             self.roles[sandbox_id] == "candidate"
             and self.candidate_boot_unavailable
-            and command[-2:] == ("up", "-d")
+            and command[-5:] == ("up", "-d", "--wait", "--wait-timeout", "60")
         ):
             raise KeyError("candidate backend capability is unavailable")
         healthy = self.baseline_healthy or self.roles[sandbox_id] == "candidate"
-        if command[-2:] == ("up", "-d"):
+        if command[-5:] == ("up", "-d", "--wait", "--wait-timeout", "60"):
             return ExecResult(exit_code=0 if healthy else 1, stdout="", stderr="")
         if command[-4:] == ("ps", "--all", "--format", "json"):
             return ExecResult(

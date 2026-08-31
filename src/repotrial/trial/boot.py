@@ -87,7 +87,15 @@ async def _boot_compose_with_evidence(
     try:
         up = await provider.exec(
             sandbox_id,
-            [*prefix, *docker_compose, "up", "-d"],
+            [
+                *prefix,
+                *docker_compose,
+                "up",
+                "-d",
+                "--wait",
+                "--wait-timeout",
+                "60",
+            ],
             timeout_s=120,
         )
     except BaseException as error:

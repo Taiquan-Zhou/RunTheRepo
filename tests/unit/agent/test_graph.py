@@ -2,7 +2,6 @@ import asyncio
 import hashlib
 import json
 import threading
-from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -143,7 +142,7 @@ class GraphProvider(FakeSandboxProvider):
         snapshot = tuple(argv)
         self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
         healthy = self._healthy[sandbox_id]
-        if snapshot[-2:] == ("up", "-d"):
+        if snapshot[-5:] == ("up", "-d", "--wait", "--wait-timeout", "60"):
             return ExecResult(exit_code=0 if healthy else 1, stdout="", stderr="")
         if snapshot[-4:] == ("ps", "--all", "--format", "json"):
             return ExecResult(
@@ -233,7 +232,6 @@ def _context(
     risks: tuple[str, ...] = (),
     journeys: list[Journey] | None = None,
     model: FakeModelAdapter | None = None,
-    sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> tuple[GraphContext, Path]:
     workspace = tmp_path / "workspace"
     artifact_dir = tmp_path / "artifacts"
@@ -264,7 +262,6 @@ def _context(
             allowed_env_keys=frozenset({"APP_REQUIRED_TOKEN"}),
             readme_excerpt="",
             container_port=8080,
-            sleep=sleeper,
         ),
         source,
     )
@@ -318,7 +315,8 @@ def test_boot_failure_uses_bounded_recovery_then_returns_to_boot(
     boot_commands = [
         call[2]
         for call in provider.calls
-        if call[0] == "exec" and call[2][-2:] == ("up", "-d")
+        if call[0] == "exec"
+        and call[2][-5:] == ("up", "-d", "--wait", "--wait-timeout", "60")
     ]
     assert boot_commands[0][0] == "docker"
     assert boot_commands[1][0:2] == (
@@ -362,7 +360,8 @@ def test_boot_derives_declared_environment_after_intake_without_readme_expansion
     up_commands = [
         call[2]
         for call in provider.calls
-        if call[0] == "exec" and call[2][-2:] == ("up", "-d")
+        if call[0] == "exec"
+        and call[2][-5:] == ("up", "-d", "--wait", "--wait-timeout", "60")
     ]
     assert up_commands[1][:2] == (
         "env",
@@ -460,43 +459,42 @@ def test_recovery_evidence_redacts_every_runtime_env_value_before_persistence(
     assert secret not in evidence_path.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize(
-    ("action", "expected_sleeps"),
-    [
-        (RecoveryAction(action="retry", params={}, reason="retry"), []),
-        (
-            RecoveryAction(action="wait", params={"seconds": 1}, reason="wait"),
-            [1.0],
-        ),
-    ],
-)
-def test_validated_retry_and_wait_actions_return_to_boot_without_real_sleep(
-    tmp_path: Path,
-    action: RecoveryAction,
-    expected_sleeps: list[float],
-) -> None:
+def test_validated_retry_action_returns_to_boot(tmp_path: Path) -> None:
     provider = GraphProvider(
         baseline_boots=[(False, "unclassified failure"), (True, "")]
     )
-    model = FakeModelAdapter(action)
-    sleeps: list[float] = []
-
-    async def fake_sleep(seconds: float) -> None:
-        sleeps.append(seconds)
-
-    context, source = _context(
-        tmp_path,
-        provider,
-        journeys=[],
-        model=model,
-        sleeper=fake_sleep,
-    )
+    model = FakeModelAdapter(RecoveryAction(action="retry", params={}, reason="retry"))
+    context, source = _context(tmp_path, provider, journeys=[], model=model)
 
     result = _run(_state(source.parent), context)
 
     assert len([call for call in provider.calls if call[0] == "create"]) == 2
-    assert sleeps == expected_sleeps
     assert result.run.stop_reason == "insufficient_coverage"
+
+
+def test_schema_valid_wait_stops_without_host_sleep_or_retry(tmp_path: Path) -> None:
+    provider = GraphProvider(
+        baseline_boots=[(False, "unclassified failure"), (True, "")]
+    )
+    model = FakeModelAdapter(
+        RecoveryAction(action="wait", params={"seconds": 1}, reason="wait")
+    )
+    context, source = _context(tmp_path, provider, journeys=[], model=model)
+
+    result = _run(_state(source.parent), context)
+
+    assert len([call for call in provider.calls if call[0] == "create"]) == 1
+    assert result.run.stop_reason == "boot_recovery_stopped"
+    evidence_path = next(
+        context.artifact_dir.glob("baseline-*/baseline-boot-attempt.json")
+    )
+    payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert payload["recovery"] == {
+        "action": "wait",
+        "disposition": "unsupported",
+        "reason": "wait",
+        "stop_reason": "boot_recovery_stopped",
+    }
 
 
 def test_total_boot_attempt_cap_stops_alternating_retry_errors(
@@ -1207,7 +1205,8 @@ def test_pinned_intake_derives_declared_environment_once_before_boot(
     up_commands = [
         call[2]
         for call in provider.calls
-        if call[0] == "exec" and call[2][-2:] == ("up", "-d")
+        if call[0] == "exec"
+        and call[2][-5:] == ("up", "-d", "--wait", "--wait-timeout", "60")
     ]
     assert pinner_calls == 1
     assert result.run.commit_sha == "c" * 40

@@ -25,10 +25,6 @@ _MISSING_ENV = re.compile(
     r"\b([A-Za-z_][A-Za-z0-9_]*)\s+(?:is\s+)?(?:required|missing)\b",
     re.IGNORECASE,
 )
-_STARTUP_WAIT = re.compile(
-    r"\b(?:not ready|starting(?: up)?|initiali[sz](?:ing|ation))\b",
-    re.IGNORECASE,
-)
 _CONTROL_ENV_KEYS = {
     "HOME",
     "PATH",
@@ -38,7 +34,6 @@ _CONTROL_ENV_KEYS = {
 }
 _CONTROL_ENV_PREFIXES = ("COMPOSE_", "DOCKER_", "DYLD_", "LD_")
 _SYNTHETIC_VALUE = "repotrial-synthetic-value"
-_WAIT_SECONDS = 10
 _MAX_REASON_LENGTH = 1_024
 _MAX_LOG_ENTRIES = 32
 _MAX_LOG_KEY_LENGTH = 128
@@ -991,12 +986,6 @@ def _deterministic_action(
                 params={"key": key, "value": _SYNTHETIC_VALUE},
                 reason="missing allowlisted environment variable",
             )
-    if _STARTUP_WAIT.search(evidence) is not None:
-        return RecoveryAction(
-            action="wait",
-            params={"seconds": _WAIT_SECONDS},
-            reason="recognizable startup delay",
-        )
     return None
 
 

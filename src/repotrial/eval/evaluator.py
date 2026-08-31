@@ -68,7 +68,7 @@ _MAX_README_BYTES = 64 * 1024
 _MAX_MANIFESTS = 64
 _ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=(.*)\Z")
 _COMPOSE_ROUTES: dict[tuple[str, ...], _FixtureCommandRoute] = {
-    ("up", "-d"): "compose_up",
+    ("up", "-d", "--wait", "--wait-timeout", "60"): "compose_up",
     ("ps", "--all", "--format", "json"): "compose_boot_ps",
     (
         "ps",

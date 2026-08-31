@@ -157,7 +157,7 @@ def _compose_argv(
         prefix = ("env", *(f"{key}={value}" for key, value in sorted(env.items())))
     base = ("docker", "compose", "-f", "compose.yaml", "-f", context.overlay_path.name)
     return (
-        (*prefix, *base, "up", "-d"),
+        (*prefix, *base, "up", "-d", "--wait", "--wait-timeout", "60"),
         (*prefix, *base, "ps", "--all", "--format", "json"),
         (*prefix, *base, "logs", "--no-color", "--tail", "200"),
         (
