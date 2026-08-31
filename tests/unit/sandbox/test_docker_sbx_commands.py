@@ -420,7 +420,12 @@ def test_policy_is_immutable_and_mandatory_denies_cannot_be_removed() -> None:
 
 @pytest.mark.parametrize(
     ("disk_mb", "expected_docker_mb", "expected_workspace_mb"),
-    [(7, 1, 5), (512, 447, 64), (2048, 1791, 256)],
+    [
+        (7, 1, 5),
+        (512, 447, 64),
+        (2048, 1919, 128),
+        (4096, 3839, 256),
+    ],
 )
 def test_disk_allocation_preserves_budget_and_uses_calibrated_floors(
     disk_mb: int, expected_docker_mb: int, expected_workspace_mb: int
@@ -435,6 +440,14 @@ def test_disk_allocation_preserves_budget_and_uses_calibrated_floors(
     assert allocation.workspace_mb == expected_workspace_mb
     assert (
         allocation.root_mb + allocation.docker_mb + allocation.workspace_mb == disk_mb
+    )
+    assert not all(
+        value == disk_mb
+        for value in (
+            allocation.root_mb,
+            allocation.docker_mb,
+            allocation.workspace_mb,
+        )
     )
 
 
@@ -1299,8 +1312,8 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
     assert all("shell" not in kwargs for kwargs in spawner.kwargs)
     create_env = cast(dict[str, str], spawner.kwargs[create_index].get("env"))
     assert create_env["DOCKER_SANDBOXES_ROOT_SIZE"] == "1m"
-    assert create_env["DOCKER_SANDBOXES_DOCKER_SIZE"] == "1791m"
-    assert create_env["DOCKER_SANDBOXES_CLONED_WORKSPACE_SIZE"] == "256m"
+    assert create_env["DOCKER_SANDBOXES_DOCKER_SIZE"] == "1919m"
+    assert create_env["DOCKER_SANDBOXES_CLONED_WORKSPACE_SIZE"] == "128m"
     assert create_env["REPOTRIAL_TEST_SENTINEL"] == "preserved"
     for index, kwargs in enumerate(spawner.kwargs):
         if index == create_index:

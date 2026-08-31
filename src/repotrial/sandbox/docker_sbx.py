@@ -25,11 +25,13 @@ REAP_TIMEOUT_SECONDS = 5
 _TRUNCATION_MARKER = b"\n...[truncated]"
 # Calibrated against Docker Sandboxes v0.39.0 on Windows. Root and Docker
 # filesystems work at the smallest positive integer MiB policy value. The
-# cloned-workspace floor is the minimum compatible allocation; larger policies
-# reserve one eighth of the total budget for the cloned workspace.
+# cloned-workspace floor is the minimum compatible allocation. Keep the
+# calibrated one-eighth allocation through a stable platform plateau, then
+# grow the workspace allocation for larger policies.
 ROOT_FLOOR_MB = 1
 DOCKER_FLOOR_MB = 1
 WORKSPACE_FLOOR_MB = 5
+_WORKSPACE_ALLOCATION_PLATEAU_MB = 128
 _REPARSE_POINT_ATTRIBUTE = 0x400
 _COMMIT_SHA_LINE = re.compile(rb"[0-9a-f]{40}\r?\n\Z")
 _DISK_SIZE_ENVIRONMENT_VARIABLES = (
@@ -142,7 +144,11 @@ def calculate_disk_allocation(disk_mb: int) -> DiskAllocation:
     """Allocate the policy disk budget across Docker Sandboxes filesystems."""
     if isinstance(disk_mb, bool) or not isinstance(disk_mb, int) or disk_mb <= 0:
         raise ValueError("disk_mb must be a positive integer")
-    workspace_mb = max(WORKSPACE_FLOOR_MB, disk_mb // 8)
+    workspace_mb = max(
+        WORKSPACE_FLOOR_MB,
+        min(disk_mb // 8, _WORKSPACE_ALLOCATION_PLATEAU_MB),
+        disk_mb // 16,
+    )
     docker_mb = disk_mb - ROOT_FLOOR_MB - workspace_mb
     if docker_mb < DOCKER_FLOOR_MB:
         raise DockerSbxUnsupportedError("disk_budget_insufficient")
