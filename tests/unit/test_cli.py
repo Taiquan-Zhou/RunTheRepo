@@ -11,12 +11,44 @@ from repotrial.cli import create_app
 from repotrial.config import create_run_layout
 from repotrial.domain.enums import Verdict
 from repotrial.domain.models import JourneyResult, RunState
+from repotrial.intake import github
 from repotrial.intake.github import RepoIntakeError
 from repotrial.run_outcome import TerminalOutcome, classify_terminal_outcome
 from repotrial.sandbox.base import SandboxProvider
 from repotrial.sandbox.fake import FakeSandboxProvider
 
 FIXED_RUN_ID = "11111111-1111-4111-8111-111111111111"
+
+
+class _CredentialBearingStream:
+    def __init__(self, content: bytes) -> None:
+        self._content = content
+        self.read_calls = 0
+        self.requested_sizes: list[int] = []
+
+    async def read(self, size: int = -1) -> bytes:
+        self.read_calls += 1
+        self.requested_sizes.append(size)
+        if not self._content:
+            return b""
+        if size < 0:
+            size = len(self._content)
+        content, self._content = self._content[:size], self._content[size:]
+        return content
+
+
+class _CredentialBearingProcess:
+    def __init__(self, stderr: bytes) -> None:
+        self.stdout = _CredentialBearingStream(b"")
+        self.stderr = _CredentialBearingStream(stderr)
+        self.returncode: int | None = None
+
+    async def wait(self) -> int:
+        self.returncode = 128
+        return self.returncode
+
+    def kill(self) -> None:
+        self.returncode = -9
 
 
 def fixed_run_id() -> str:
@@ -281,6 +313,67 @@ def test_exact_sha_intake_failure_writes_private_sanitized_artifact(
     assert attempt["exit_code"] == 4
 
 
+def test_git_credential_stderr_is_redacted_across_cli_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts_root = tmp_path / "artifacts"
+    secret = "credential=do-not-persist-this-token"
+    process = _CredentialBearingProcess(
+        f"fatal: Authentication failed for {secret}\n".encode()
+        + b"x" * (github._MAX_GIT_OUTPUT_BYTES + 1)
+    )
+    observed_exception_text: list[str] = []
+
+    async def fake_create_subprocess_exec(
+        *_arguments: object, **_keywords: object
+    ) -> _CredentialBearingProcess:
+        return process
+
+    async def failing_pinner(
+        _url: str, _destination: Path, _requested_ref: str | None
+    ) -> object:
+        try:
+            await github._run_git("clone")
+        except RepoIntakeError as error:
+            observed_exception_text.append(str(error))
+            raise
+        raise AssertionError("fake Git process unexpectedly succeeded")
+
+    monkeypatch.setattr(
+        github.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+    monkeypatch.setattr(cli, "pin_repository", failing_pinner)
+    app = create_app(
+        artifacts_root=artifacts_root,
+        run_id_generator=lambda: "run-fixed",
+        provider_factory=lambda _name: FakeSandboxProvider(),
+    )
+
+    result = _invoke_intake_failure(app)
+
+    run_path = artifacts_root / "run-fixed"
+    intake_text = (run_path / "intake-failure.json").read_text(encoding="utf-8")
+    attempt_text = (run_path / "attempt-result.json").read_text(encoding="utf-8")
+    assert observed_exception_text == [
+        "repository intake failed: clone (returncode=128)"
+    ]
+    for output in (
+        intake_text,
+        attempt_text,
+        result.stdout,
+        result.stderr,
+        result.output,
+    ):
+        assert secret not in output
+    assert json.loads(intake_text)["failure_class"] == "authentication"
+    assert json.loads(attempt_text)["stop_reason"] == "intake:clone"
+    assert process.stderr.read_calls > 1
+    assert all(
+        size <= github._GIT_READ_CHUNK_BYTES for size in process.stderr.requested_sizes
+    )
+    assert result.exit_code == 4
+
+
 def test_intake_failure_artifact_collision_is_secondary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -334,7 +427,9 @@ class _FlushFailingFile:
         return 0
 
 
-@pytest.mark.parametrize("failure_mode", ["open", "write", "flush"])
+@pytest.mark.parametrize(
+    "failure_mode", ["open", "write", "partial_write", "flush", "fsync"]
+)
 def test_intake_failure_evidence_writer_failure_is_secondary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -367,6 +462,22 @@ def test_intake_failure_evidence_writer_failure_is_secondary(
             return original_dump(value, stream, *args, **kwargs)
 
         monkeypatch.setattr(cli.json, "dump", fail_intake_dump)
+    elif failure_mode == "partial_write":
+
+        def partial_intake_dump(
+            _value: object, stream: object, *args: object, **kwargs: object
+        ) -> object:
+            del args, kwargs
+            stream.write('{"partial":"SECRET partial write')
+            raise OSError("SECRET partial write failure")
+
+        monkeypatch.setattr(cli.json, "dump", partial_intake_dump)
+    elif failure_mode == "fsync":
+
+        def fail_intake_fsync(_file_descriptor: int) -> None:
+            raise OSError("SECRET fsync failure")
+
+        monkeypatch.setattr(cli.os, "fsync", fail_intake_fsync)
     else:
         original_open = Path.open
 
@@ -381,6 +492,49 @@ def test_intake_failure_evidence_writer_failure_is_secondary(
 
     assert result.exit_code == 4
     run_path = artifacts_root / "run-fixed"
+    attempt = json.loads((run_path / "attempt-result.json").read_text(encoding="utf-8"))
+    assert attempt["private_intake_evidence_status"] == "write_failed"
+    assert attempt["stop_reason"] == "intake:clone"
+    assert attempt["exit_code"] == 4
+    assert not (run_path / "intake-failure.json").exists()
+
+
+def test_intake_failure_partial_cleanup_error_is_secondary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts_root = tmp_path / "artifacts"
+    app = _make_intake_failure_app(
+        artifacts_root,
+        monkeypatch,
+        error=RepoIntakeError("clone", 128, failure_class="dns"),
+    )
+
+    def partial_intake_dump(
+        _value: object, stream: object, *args: object, **kwargs: object
+    ) -> object:
+        del args, kwargs
+        stream.write('{"partial":"incomplete evidence')
+        raise OSError("SECRET partial write failure")
+
+    original_unlink = Path.unlink
+
+    def fail_intake_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path.name == "intake-failure.json":
+            raise OSError("SECRET unlink failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(cli.json, "dump", partial_intake_dump)
+    monkeypatch.setattr(Path, "unlink", fail_intake_unlink)
+
+    result = _invoke_intake_failure(app)
+
+    assert result.exit_code == 4
+    run_path = artifacts_root / "run-fixed"
+    intake_failure = run_path / "intake-failure.json"
+    assert intake_failure.exists()
+    assert intake_failure.read_text(encoding="utf-8") == (
+        '{"partial":"incomplete evidence'
+    )
     attempt = json.loads((run_path / "attempt-result.json").read_text(encoding="utf-8"))
     assert attempt["private_intake_evidence_status"] == "write_failed"
     assert attempt["stop_reason"] == "intake:clone"

@@ -25,6 +25,45 @@ def test_git_failure_classification_is_sanitized(stderr: bytes, expected: str) -
     assert github._classify_git_failure(stderr) == expected
 
 
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        (
+            (
+                b"could not resolve host; authentication failed; "
+                b"requested URL returned error: 503; couldn't find remote ref; "
+                b"failed to connect"
+            ),
+            "dns",
+        ),
+        (
+            (
+                b"authentication failed; requested URL returned error: 503; "
+                b"couldn't find remote ref; failed to connect"
+            ),
+            "authentication",
+        ),
+        (
+            (
+                b"requested URL returned error: 503; couldn't find remote ref; "
+                b"failed to connect"
+            ),
+            "http",
+        ),
+        (
+            b"couldn't find remote ref; failed to connect",
+            "missing_ref",
+        ),
+        (b"failed to connect; unrelated token", "transport"),
+        (b"unrecognized secret text", "unknown"),
+    ],
+)
+def test_git_failure_classification_obeys_fixed_priority(
+    stderr: bytes, expected: str
+) -> None:
+    assert github._classify_git_failure(stderr) == expected
+
+
 def test_parse_github_url_canonicalizes_case_and_literal_git_suffix() -> None:
     assert callable(getattr(github, "parse_github_url", None))
 

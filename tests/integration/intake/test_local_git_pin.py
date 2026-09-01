@@ -292,11 +292,11 @@ class _FakeProcess:
         self._expected_returncode = returncode
         self._wait_error = wait_error
         self.returncode: int | None = None
-        self.waited = False
+        self.wait_calls = 0
         self.killed = False
 
     async def wait(self) -> int:
-        self.waited = True
+        self.wait_calls += 1
         if self._wait_error is not None:
             raise self._wait_error
         if self.returncode is None:
@@ -341,7 +341,7 @@ def test_git_stderr_reader_is_bounded_and_process_is_reaped(
 
     assert raised.value.failure_class == "unknown"
     assert secret.decode() not in str(raised.value)
-    assert process.waited is True
+    assert process.wait_calls >= 1
     assert process.killed is False
     assert process.stderr.read_calls >= 2
     assert all(
@@ -362,7 +362,7 @@ def test_git_readers_bound_simultaneous_oversized_stdout_and_stderr(
     stdout = asyncio.run(github._run_git("resolve"))
 
     assert stdout == b"o" * github._MAX_GIT_OUTPUT_BYTES
-    assert process.waited is True
+    assert process.wait_calls >= 1
     assert process.killed is False
 
 
@@ -381,7 +381,7 @@ def test_git_reader_timeout_kills_and_reaps_process(
 
     assert raised.value.operation == "clone_timeout"
     assert process.killed is True
-    assert process.waited is True
+    assert process.wait_calls >= 1
 
 
 def test_git_reader_cancellation_kills_and_reaps_process(
@@ -408,7 +408,7 @@ def test_git_reader_cancellation_kills_and_reaps_process(
     asyncio.run(cancel_run())
 
     assert process.killed is True
-    assert process.waited is True
+    assert process.wait_calls >= 1
 
 
 @pytest.mark.parametrize("failed_stream", ["stdout", "stderr"])
@@ -429,7 +429,7 @@ def test_git_reader_oserror_is_local_io_and_reaped(
     assert raised.value.failure_class == "local_io"
     assert secret not in str(raised.value)
     assert process.killed is True
-    assert process.waited is True
+    assert process.wait_calls >= 1
 
 
 def test_git_wait_oserror_is_local_io_and_reaped(
@@ -449,7 +449,7 @@ def test_git_wait_oserror_is_local_io_and_reaped(
     assert raised.value.failure_class == "local_io"
     assert "SECRET" not in str(raised.value)
     assert process.killed is True
-    assert process.waited is True
+    assert process.wait_calls >= 2
 
 
 def test_git_nonzero_stderr_uses_sanitized_class_not_local_io(
@@ -468,7 +468,7 @@ def test_git_nonzero_stderr_uses_sanitized_class_not_local_io(
     assert raised.value.operation == "clone"
     assert raised.value.returncode == 128
     assert raised.value.failure_class == "transport"
-    assert process.waited is True
+    assert process.wait_calls >= 1
     assert process.killed is False
 
 
@@ -1010,7 +1010,7 @@ def test_clone_sanitizes_communicate_file_not_found_and_cleans_destination(
     assert raised.value.__context__ is None
     assert raised.value.__suppress_context__ is True
     assert process.killed is True
-    assert process.waited is True
+    assert process.wait_calls >= 1
     _assert_normal_clone_cleanup_result(destination)
 
 

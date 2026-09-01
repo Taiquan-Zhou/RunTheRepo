@@ -679,15 +679,28 @@ def _persist_intake_failure_evidence(
         "run_id": run_id,
         "schema_version": _INTAKE_FAILURE_EVIDENCE_SCHEMA_VERSION,
     }
+    created = False
     try:
         with path.open("x", encoding="utf-8") as output:
+            created = True
             json.dump(evidence, output, ensure_ascii=False, sort_keys=True)
             output.write("\n")
             output.flush()
             os.fsync(output.fileno())
     except FileExistsError:
-        return "collision"
+        if not created:
+            return "collision"
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return "write_failed"
     except (OSError, TypeError, UnicodeError, ValueError):
+        if created:
+            try:
+                path.unlink()
+            except OSError:
+                pass
         return "write_failed"
     return "written"
 
