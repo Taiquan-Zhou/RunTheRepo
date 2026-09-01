@@ -3214,6 +3214,127 @@ def test_in_flight_deadline_timeout_records_subprocess_started(
     assert spawner.processes[-1].waited is True
 
 
+def test_create_exhausted_deadline_keeps_sandbox_id_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider = _provider(
+        monkeypatch,
+        spawner,
+        command_timeout_s=30,
+        total_duration_s=10,
+    )
+    provider._trial_deadline = 10.0
+    host_head_calls = 0
+
+    def exhaust_before_create(command: tuple[str, ...]) -> None:
+        nonlocal host_head_calls
+        if command[:1] == ("git",):
+            host_head_calls += 1
+            if host_head_calls == 2:
+                clock.value = 10.0
+
+    spawner.before_spawn = exhaust_before_create
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    cleanup_call = next(
+        call for call in spawner.calls if call[:3] == ("sbx", "rm", "--force")
+    )
+    sandbox_id = cleanup_call[-1]
+    assert (raised.value.operation, raised.value.reason) == (
+        "create",
+        "total_duration_exhausted",
+    )
+    assert raised.value.sandbox_id is None
+    assert str(raised.value) == (
+        "docker sandboxes create failed: total_duration_exhausted"
+    )
+    assert sandbox_id not in str(raised.value)
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.operation == "create"
+    assert evidence.reason == "total_duration_exhausted"
+    assert evidence.sandbox_id == sandbox_id
+    assert evidence.deadline_limited is True
+    assert evidence.subprocess_started is False
+    assert evidence.trial_remaining_s == 0.0
+    assert not any(
+        call[:2] == ("sbx", "create") and call[-1] != "--help" for call in spawner.calls
+    )
+
+
+def test_create_in_flight_deadline_timeout_keeps_sandbox_id_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider = _provider(
+        monkeypatch,
+        spawner,
+        command_timeout_s=30,
+        total_duration_s=10,
+    )
+    provider._trial_deadline = 10.0
+    host_head_calls = 0
+    process_created = asyncio.Event()
+
+    def prepare_create_timeout(command: tuple[str, ...]) -> None:
+        nonlocal host_head_calls
+        if command[:1] == ("git",):
+            host_head_calls += 1
+            if host_head_calls == 2:
+                clock.value = 9.0
+        elif command[:2] == ("sbx", "create") and command[-1] != "--help":
+            clock.value = 10.0
+            process_created.set()
+
+    def outcome(command: tuple[str, ...]) -> _Outcome:
+        if command[:2] == ("sbx", "create") and command[-1] != "--help":
+            return _Outcome(hang=True)
+        return _Outcome()
+
+    def timeout(value: float) -> _RecordedTimeout | _TimeoutAfterProcessCreation:
+        if value == 1.0:
+            return _TimeoutAfterProcessCreation(process_created)
+        return _RecordedTimeout()
+
+    spawner.before_spawn = prepare_create_timeout
+    spawner.handler = outcome
+    monkeypatch.setattr(docker_sbx.asyncio, "timeout", timeout)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    create_call = _actual_create_call(spawner)
+    sandbox_id = create_call[create_call.index("--name") + 1]
+    create_process = spawner.processes[spawner.calls.index(create_call)]
+    assert (raised.value.operation, raised.value.reason) == (
+        "create",
+        "total_duration_exhausted",
+    )
+    assert raised.value.sandbox_id is None
+    assert str(raised.value) == (
+        "docker sandboxes create failed: total_duration_exhausted"
+    )
+    assert sandbox_id not in str(raised.value)
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.operation == "create"
+    assert evidence.reason == "total_duration_exhausted"
+    assert evidence.sandbox_id == sandbox_id
+    assert evidence.deadline_limited is True
+    assert evidence.subprocess_started is True
+    assert evidence.trial_remaining_s == 0.0
+    assert process_created.is_set()
+    assert create_process.killed is True
+    assert create_process.waited is True
+
+
 def test_nonzero_exit_records_execution_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -434,6 +434,7 @@ class DockerSbxProvider(SandboxProvider):
             self._command_timeout_s,
             deadline=deadline,
             sandbox_id=sandbox_id,
+            public_sandbox_id=sandbox_id,
         )
         _require_success("clone_verification", result)
         return result.stdout
@@ -473,6 +474,7 @@ class DockerSbxProvider(SandboxProvider):
             float(timeout_s),
             deadline=self._require_deadline(sandbox_id),
             sandbox_id=sandbox_id,
+            public_sandbox_id=sandbox_id,
         )
         return ExecResult(
             exit_code=result.returncode,
@@ -495,6 +497,7 @@ class DockerSbxProvider(SandboxProvider):
                 self._command_timeout_s,
                 deadline=self._require_deadline(sandbox_id),
                 sandbox_id=sandbox_id,
+                public_sandbox_id=sandbox_id,
             )
             _require_success("publish_port", published)
             listed = await self._run(
@@ -503,6 +506,7 @@ class DockerSbxProvider(SandboxProvider):
                 self._command_timeout_s,
                 deadline=self._require_deadline(sandbox_id),
                 sandbox_id=sandbox_id,
+                public_sandbox_id=sandbox_id,
             )
             _require_success("publish_port", listed)
             return _parse_published_port(listed.stdout, container_port)
@@ -519,6 +523,7 @@ class DockerSbxProvider(SandboxProvider):
             self._command_timeout_s,
             deadline=self._require_deadline(sandbox_id),
             sandbox_id=sandbox_id,
+            public_sandbox_id=sandbox_id,
         )
         _require_success("copy", result)
 
@@ -540,6 +545,7 @@ class DockerSbxProvider(SandboxProvider):
                 self._command_timeout_s,
                 deadline=self._require_deadline(sandbox_id),
                 sandbox_id=sandbox_id,
+                public_sandbox_id=sandbox_id,
             )
         except DockerSbxError as error:
             if error.reason in {
@@ -744,6 +750,7 @@ class DockerSbxProvider(SandboxProvider):
         env: dict[str, str] | None = None,
         deadline: float | None = None,
         sandbox_id: str | None = None,
+        public_sandbox_id: str | None = None,
     ) -> _CommandResult:
         return await self._run_command(
             "sbx",
@@ -753,6 +760,7 @@ class DockerSbxProvider(SandboxProvider):
             env=env,
             deadline=deadline,
             sandbox_id=sandbox_id,
+            public_sandbox_id=public_sandbox_id,
         )
 
     async def _run_command(
@@ -765,6 +773,7 @@ class DockerSbxProvider(SandboxProvider):
         env: dict[str, str] | None = None,
         deadline: float | None = None,
         sandbox_id: str | None = None,
+        public_sandbox_id: str | None = None,
     ) -> _CommandResult:
         process: asyncio.subprocess.Process | None = None
         try:
@@ -772,7 +781,8 @@ class DockerSbxProvider(SandboxProvider):
                 operation,
                 timeout_s,
                 deadline=deadline,
-                sandbox_id=sandbox_id,
+                public_sandbox_id=public_sandbox_id,
+                evidence_sandbox_id=sandbox_id,
             )
             async with asyncio.timeout(effective_timeout_s):
                 spawn_kwargs: dict[str, Any] = {
@@ -811,13 +821,13 @@ class DockerSbxProvider(SandboxProvider):
                     timeout_reason,
                     process,
                     error,
-                    sandbox_id=sandbox_id if deadline_limited else None,
+                    sandbox_id=public_sandbox_id if deadline_limited else None,
                     failure_evidence=failure_evidence,
                 )
             raise DockerSbxError(
                 operation,
                 timeout_reason,
-                sandbox_id=sandbox_id if deadline_limited else None,
+                sandbox_id=public_sandbox_id if deadline_limited else None,
                 failure_evidence=failure_evidence,
             ) from error
         except asyncio.CancelledError as error:
@@ -897,7 +907,8 @@ class DockerSbxProvider(SandboxProvider):
         timeout_s: float,
         *,
         deadline: float | None,
-        sandbox_id: str | None,
+        public_sandbox_id: str | None,
+        evidence_sandbox_id: str | None,
     ) -> tuple[float, bool]:
         if deadline is None:
             return timeout_s, False
@@ -907,14 +918,14 @@ class DockerSbxProvider(SandboxProvider):
             raise DockerSbxError(
                 operation,
                 "total_duration_exhausted",
-                sandbox_id=sandbox_id,
+                sandbox_id=public_sandbox_id,
                 failure_evidence=self._command_failure_evidence_at(
                     operation,
                     "total_duration_exhausted",
                     deadline=deadline,
                     deadline_limited=True,
                     subprocess_started=False,
-                    sandbox_id=sandbox_id,
+                    sandbox_id=evidence_sandbox_id,
                     now=now,
                 ),
             )
