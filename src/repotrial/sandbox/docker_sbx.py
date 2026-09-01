@@ -163,8 +163,8 @@ class DiskAllocation:
 @dataclass(frozen=True, slots=True)
 class _GitStatusEntry:
     porcelain_status: str
-    path: str
-    path2: str | None
+    path: bytes
+    path2: bytes | None
     raw: bytes
 
 
@@ -175,8 +175,8 @@ class _GitDiffEntry:
     new_mode: str
     old_blob: str
     new_blob: str
-    path: str
-    path2: str | None
+    path: bytes
+    path2: bytes | None
     raw: bytes
 
 
@@ -188,8 +188,8 @@ class _GitChange:
     new_mode: str
     old_blob: str
     new_blob: str
-    path: str
-    path2: str | None
+    path: bytes
+    path2: bytes | None
     raw_status: bytes
     raw_diff: bytes
 
@@ -1522,7 +1522,7 @@ def _parse_git_status_output(
             ):
                 return (), True
             path = _normalize_git_path(entry[3:])
-            path2: str | None = None
+            path2: bytes | None = None
             raw = entry + b"\0"
             if "R" in status or "C" in status:
                 if index >= len(fields) - 1:
@@ -1568,7 +1568,7 @@ def _parse_git_diff_output(
             new_blob = _normalize_git_token(match.group("new_blob"))
         except ValueError:
             return (), True
-        path2: str | None = None
+        path2: bytes | None = None
         raw = header + b"\0" + path_bytes + b"\0"
         if diff_status.startswith(("R", "C")):
             if index >= len(fields) - 1:
@@ -1633,7 +1633,7 @@ def _merge_git_changes(
     return tuple(changes), False
 
 
-def _normalize_git_path(raw: bytes) -> str:
+def _normalize_git_path(raw: bytes) -> bytes:
     path = raw.decode("utf-8", errors="backslashreplace")
     windows_path = PureWindowsPath(path)
     if (
@@ -1646,7 +1646,11 @@ def _normalize_git_path(raw: bytes) -> str:
         or len(path.encode("utf-8")) > _MAX_CLONE_DIAGNOSTIC_VALUE_BYTES
     ):
         raise ValueError("unsafe Git path")
-    return path
+    return raw
+
+
+def _display_git_path(raw: bytes) -> str:
+    return raw.decode("utf-8", errors="backslashreplace")
 
 
 def _normalize_git_token(raw: bytes) -> str:
@@ -1697,10 +1701,10 @@ def _clone_diagnostic_details(
             "new_mode": change.new_mode,
             "old_blob": change.old_blob,
             "new_blob": change.new_blob,
-            "path": change.path,
+            "path": _display_git_path(change.path),
         }
         if change.path2 is not None:
-            record["path2"] = change.path2
+            record["path2"] = _display_git_path(change.path2)
         records.append(record)
     details: dict[str, FailureEvidenceValue] = {
         "captured_bytes_sha256": hashlib.sha256(captured).hexdigest(),

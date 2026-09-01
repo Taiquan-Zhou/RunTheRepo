@@ -4120,6 +4120,47 @@ def test_dirty_guest_clone_retains_rename_gitlink_and_special_paths_separately(
     assert records[2].get("path2", True)
 
 
+def test_dirty_guest_clone_matches_non_utf8_paths_by_raw_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    non_utf8_path = b"safe/\xff"
+    escaped_path = b"safe/\\xff"
+    status = b"M  " + non_utf8_path + b"\0 M " + escaped_path + b"\0"
+    diff = (
+        b":100755 100644 <escaped-old> <escaped-new> M\0" + escaped_path + b"\0"
+        b":100644 100755 <non-utf8-old> <non-utf8-new> M\0" + non_utf8_path + b"\0"
+    )
+    spawner = _dirty_clone_spawner(status=status, diff=diff)
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    records = evidence.details["tracked_changes"]
+    assert records == [
+        {
+            "porcelain_status": "M ",
+            "diff_status": "M",
+            "old_mode": "100644",
+            "new_mode": "100755",
+            "old_blob": "<non-utf8-old>",
+            "new_blob": "<non-utf8-new>",
+            "path": r"safe/\xff",
+        },
+        {
+            "porcelain_status": " M",
+            "diff_status": "M",
+            "old_mode": "100755",
+            "new_mode": "100644",
+            "old_blob": "<escaped-old>",
+            "new_blob": "<escaped-new>",
+            "path": r"safe/\xff",
+        },
+    ]
+
+
 def test_dirty_guest_clone_diagnostics_truncate_by_entry_and_byte_limits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
