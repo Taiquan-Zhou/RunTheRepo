@@ -18,6 +18,7 @@ from repotrial.sandbox.base import (
     get_sandbox_failure_evidence,
     serialize_sandbox_failure_evidence,
 )
+from repotrial.sandbox.docker_sbx import DockerSbxError
 from repotrial.sandbox.lifecycle import CleanupError, managed_sandbox
 
 
@@ -190,6 +191,63 @@ def test_create_failure_records_bounded_structured_provider_evidence(
         "trial_remaining_s": 0.0,
     }
     assert "secret" not in artifact.read_text(encoding="utf-8")
+
+
+def test_docker_sbx_error_evidence_survives_managed_create_failure(
+    tmp_path: Path,
+) -> None:
+    evidence = SandboxFailureEvidence(
+        operation="create",
+        reason="io_error",
+        sandbox_id="sandbox-17",
+        trial_elapsed_s=1.25,
+        trial_remaining_s=298.75,
+        deadline_limited=False,
+        subprocess_started=False,
+    )
+    failure = DockerSbxError(
+        "create",
+        "io_error",
+        stderr="raw create stderr",
+        sandbox_id="sandbox-17",
+        failure_evidence=evidence,
+    )
+
+    class DockerSbxCreateFailingProvider(_Provider):
+        async def create(self, workspace: Path, name: str) -> str:
+            self.calls.append(("create", workspace, name))
+            raise failure
+
+    provider = DockerSbxCreateFailingProvider()
+    artifact = tmp_path / "lifecycle.jsonl"
+
+    async def exercise() -> None:
+        async with managed_sandbox(
+            provider,
+            tmp_path / "workspace",
+            "trial",
+            lifecycle_artifact=artifact,
+        ):
+            raise AssertionError("body must not run")
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(exercise())
+
+    assert raised.value is failure
+    assert str(raised.value) == (
+        "docker sandboxes create failed: io_error: raw create stderr "
+        "(sandbox_id=sandbox-17)"
+    )
+    assert _read_events(artifact)[-1]["failure"] == {
+        "deadline_limited": False,
+        "operation": "create",
+        "reason": "io_error",
+        "sandbox_id": "sandbox-17",
+        "subprocess_started": False,
+        "trial_elapsed_s": 1.25,
+        "trial_remaining_s": 298.75,
+    }
+    assert "raw create stderr" not in artifact.read_text(encoding="utf-8")
 
 
 def test_provider_failure_and_cleanup_terminal_events_remain_separate(

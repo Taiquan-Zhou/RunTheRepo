@@ -11,7 +11,11 @@ from typing import cast
 import pytest
 
 from repotrial.sandbox import docker_sbx
-from repotrial.sandbox.base import ExecResult, NetworkLogResult
+from repotrial.sandbox.base import (
+    ExecResult,
+    NetworkLogResult,
+    get_sandbox_failure_evidence,
+)
 from repotrial.sandbox.docker_sbx import (
     DOCKER_FLOOR_MB,
     MANDATORY_DENY_NETWORK,
@@ -299,6 +303,26 @@ def _provider(
         command_timeout_s=command_timeout_s,
     )
     return provider
+
+
+def _active_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    spawner: _SbxSpawner,
+    *,
+    sandbox_id: str = "sandbox-17",
+    deadline: float = 300.0,
+    command_timeout_s: float = 5,
+    total_duration_s: int = 300,
+) -> tuple[DockerSbxProvider, str]:
+    provider = _provider(
+        monkeypatch,
+        spawner,
+        command_timeout_s=command_timeout_s,
+        total_duration_s=total_duration_s,
+    )
+    provider._sandbox_states[sandbox_id] = docker_sbx._SandboxState.ACTIVE
+    provider._sandbox_deadlines[sandbox_id] = deadline
+    return provider, sandbox_id
 
 
 def _create(provider: DockerSbxProvider, workspace: Path) -> str:
@@ -1519,6 +1543,27 @@ def test_failed_create_cleanup_failure_is_visible_and_retained_for_retry(
     assert context.create_failure is raised.value
     assert context.sandbox_id == sandbox_id
     assert "cleanup failed" in str(context.cleanup_failure)
+    primary_evidence = get_sandbox_failure_evidence(raised.value)
+    assert primary_evidence is not None
+    assert primary_evidence.operation == "create"
+    assert primary_evidence.reason == "nonzero_exit"
+    assert primary_evidence.returncode == 7
+    assert primary_evidence.sandbox_id == sandbox_id
+    assert primary_evidence.deadline_limited is False
+    assert primary_evidence.subprocess_started is True
+    assert primary_evidence.trial_elapsed_s is not None
+    assert primary_evidence.trial_remaining_s is not None
+    cleanup_evidence = get_sandbox_failure_evidence(context.cleanup_failure)
+    assert cleanup_evidence is not None
+    assert cleanup_evidence.operation == "cleanup"
+    assert cleanup_evidence.reason == "nonzero_exit"
+    assert cleanup_evidence.returncode == 8
+    assert cleanup_evidence.sandbox_id == sandbox_id
+    assert cleanup_evidence.deadline_limited is False
+    assert cleanup_evidence.subprocess_started is True
+    assert cleanup_evidence.trial_elapsed_s is None
+    assert cleanup_evidence.trial_remaining_s is None
+    assert cleanup_evidence is not primary_evidence
 
     spawner.handler = lambda command: _Outcome()
     asyncio.run(provider.destroy(sandbox_id))
@@ -1649,14 +1694,35 @@ def test_managed_sandbox_retries_partial_create_cleanup_and_preserves_failure(
     assert context.cleanup_failure.operation == "cleanup"
     assert remove_attempts == 2
     events = [json.loads(line) for line in artifact.read_text().splitlines()]
-    assert events[1:] == [
-        {
-            "cleanup_exception_type": "DockerSbxError",
-            "event": "create_cleanup_unsafe",
-            "exception_type": "DockerSbxError",
-            "sandbox_id": sandbox_id,
-            "state": "cleanup_unsafe",
-        },
+    assert {key: value for key, value in events[1].items() if key != "failure"} == {
+        "cleanup_exception_type": "DockerSbxError",
+        "event": "create_cleanup_unsafe",
+        "exception_type": "DockerSbxError",
+        "sandbox_id": sandbox_id,
+        "state": "cleanup_unsafe",
+    }
+    failure_evidence = cast(dict[str, object], events[1]["failure"])
+    assert {
+        key: failure_evidence[key]
+        for key in (
+            "deadline_limited",
+            "operation",
+            "reason",
+            "returncode",
+            "sandbox_id",
+            "subprocess_started",
+        )
+    } == {
+        "deadline_limited": False,
+        "operation": "create",
+        "reason": "nonzero_exit",
+        "returncode": 7,
+        "sandbox_id": sandbox_id,
+        "subprocess_started": True,
+    }
+    assert isinstance(failure_evidence["trial_elapsed_s"], float)
+    assert isinstance(failure_evidence["trial_remaining_s"], float)
+    assert events[2:] == [
         {"event": "cleanup_retry_attempt", "sandbox_id": sandbox_id},
         {"event": "cleanup_retry_success", "sandbox_id": sandbox_id},
     ]
@@ -1755,11 +1821,32 @@ def test_managed_sandbox_partial_create_retry_failure_retains_all_failures(
     assert cleanup_error.secondary_failures == ()
     sandbox_id = cleanup_error.sandbox_id
     events = [json.loads(line) for line in artifact.read_text().splitlines()]
-    assert events[-1] == {
+    assert {key: value for key, value in events[-1].items() if key != "failure"} == {
         "event": "cleanup_retry_failure",
         "exception_type": "DockerSbxError",
         "sandbox_id": sandbox_id,
     }
+    failure_evidence = cast(dict[str, object], events[-1]["failure"])
+    assert {
+        key: failure_evidence[key]
+        for key in (
+            "deadline_limited",
+            "operation",
+            "reason",
+            "returncode",
+            "sandbox_id",
+            "subprocess_started",
+        )
+    } == {
+        "deadline_limited": False,
+        "operation": "destroy",
+        "reason": "nonzero_exit",
+        "returncode": 8,
+        "sandbox_id": sandbox_id,
+        "subprocess_started": True,
+    }
+    assert "trial_elapsed_s" not in failure_evidence
+    assert "trial_remaining_s" not in failure_evidence
     spawner.handler = lambda command: _Outcome()
     asyncio.run(provider.destroy(sandbox_id))
     assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
@@ -3032,6 +3119,358 @@ def test_trial_exhaustion_before_first_probe_prevents_subprocess(
     assert raised.value.operation == "clone_verification"
     assert raised.value.reason == "total_duration_exhausted"
     assert spawner.calls == []
+
+
+def test_exhausted_deadline_records_no_subprocess_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock(10.0)
+    _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch,
+        spawner,
+        deadline=clock.value,
+        total_duration_s=300,
+    )
+    provider._trial_deadline = clock.value
+    command = ("sbx", "exec", sandbox_id, "--", "echo", "never-started")
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(provider.exec(sandbox_id, ["echo", "never-started"]))
+
+    assert (raised.value.operation, raised.value.reason) == (
+        "exec",
+        "total_duration_exhausted",
+    )
+    assert str(raised.value) == (
+        "docker sandboxes exec failed: total_duration_exhausted "
+        f"(sandbox_id={sandbox_id})"
+    )
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.operation == "exec"
+    assert evidence.reason == "total_duration_exhausted"
+    assert evidence.sandbox_id == sandbox_id
+    assert evidence.deadline_limited is True
+    assert evidence.subprocess_started is False
+    assert evidence.trial_elapsed_s == 300.0
+    assert evidence.trial_remaining_s == 0.0
+    assert command not in spawner.calls
+    assert spawner.processes == []
+
+
+def test_in_flight_deadline_timeout_records_subprocess_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch,
+        spawner,
+        deadline=10.0,
+        command_timeout_s=30,
+        total_duration_s=10,
+    )
+    command = ("sbx", "exec", sandbox_id, "--", "sleep", "forever")
+    spawner.overrides[command] = _Outcome(hang=True)
+    process_created = asyncio.Event()
+
+    def signal_spawn(spawned_command: tuple[str, ...]) -> None:
+        if spawned_command == command:
+            clock.value = 10.0
+            process_created.set()
+
+    spawner.before_spawn = signal_spawn
+    monkeypatch.setattr(
+        docker_sbx.asyncio,
+        "timeout",
+        lambda _: _TimeoutAfterProcessCreation(process_created),
+    )
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(provider.exec(sandbox_id, ["sleep", "forever"]))
+
+    assert (raised.value.operation, raised.value.reason) == (
+        "exec",
+        "total_duration_exhausted",
+    )
+    assert str(raised.value) == (
+        "docker sandboxes exec failed: total_duration_exhausted "
+        f"(sandbox_id={sandbox_id})"
+    )
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.operation == "exec"
+    assert evidence.reason == "total_duration_exhausted"
+    assert evidence.sandbox_id == sandbox_id
+    assert evidence.deadline_limited is True
+    assert evidence.subprocess_started is True
+    assert evidence.trial_elapsed_s == 10.0
+    assert evidence.trial_remaining_s == 0.0
+    assert process_created.is_set()
+    assert spawner.processes[-1].killed is True
+    assert spawner.processes[-1].waited is True
+
+
+def test_nonzero_exit_records_execution_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(monkeypatch, spawner)
+    local_path = tmp_path / "result"
+    command = ("sbx", "cp", f"{sandbox_id}:/result", str(local_path))
+    spawner.overrides[command] = _Outcome(returncode=7, stderr=b"copy failed")
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(provider.copy(sandbox_id, "/result", local_path))
+
+    assert (raised.value.operation, raised.value.reason) == (
+        "copy",
+        "nonzero_exit",
+    )
+    assert str(raised.value) == (
+        "docker sandboxes copy failed: nonzero_exit (returncode=7): copy failed"
+    )
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.operation == "copy"
+    assert evidence.reason == "nonzero_exit"
+    assert evidence.returncode == 7
+    assert evidence.sandbox_id == sandbox_id
+    assert evidence.deadline_limited is False
+    assert evidence.subprocess_started is True
+    assert evidence.trial_elapsed_s == 0.0
+    assert evidence.trial_remaining_s == 300.0
+    assert spawner.processes[-1].killed is False
+    assert spawner.processes[-1].waited is True
+
+
+def test_missing_executable_records_pre_spawn_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(monkeypatch, spawner)
+    local_path = tmp_path / "result"
+    command = ("sbx", "cp", f"{sandbox_id}:/result", str(local_path))
+    missing = FileNotFoundError("sbx executable missing")
+    spawner.overrides[command] = missing
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(provider.copy(sandbox_id, "/result", local_path))
+
+    assert (raised.value.operation, raised.value.reason) == (
+        "copy",
+        "executable_unavailable",
+    )
+    assert str(raised.value) == "docker sandboxes copy failed: executable_unavailable"
+    assert raised.value.__cause__ is missing
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.operation == "copy"
+    assert evidence.reason == "executable_unavailable"
+    assert evidence.returncode is None
+    assert evidence.sandbox_id == sandbox_id
+    assert evidence.deadline_limited is False
+    assert evidence.subprocess_started is False
+    assert evidence.trial_elapsed_s == 0.0
+    assert evidence.trial_remaining_s == 300.0
+    assert spawner.processes == []
+
+
+def test_pre_spawn_oserror_records_no_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(monkeypatch, spawner)
+    local_path = tmp_path / "result"
+    command = ("sbx", "cp", f"{sandbox_id}:/result", str(local_path))
+    spawn_failure = OSError("spawn I/O failed")
+    spawner.overrides[command] = spawn_failure
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(provider.copy(sandbox_id, "/result", local_path))
+
+    assert (raised.value.operation, raised.value.reason) == ("copy", "io_error")
+    assert str(raised.value) == "docker sandboxes copy failed: io_error"
+    assert raised.value.__cause__ is spawn_failure
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.operation == "copy"
+    assert evidence.reason == "io_error"
+    assert evidence.sandbox_id == sandbox_id
+    assert evidence.deadline_limited is False
+    assert evidence.subprocess_started is False
+    assert evidence.trial_elapsed_s == 0.0
+    assert evidence.trial_remaining_s == 300.0
+    assert spawner.processes == []
+
+
+def test_post_spawn_oserror_records_started_process_and_reaps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(monkeypatch, spawner)
+    local_path = tmp_path / "result"
+    command = ("sbx", "cp", f"{sandbox_id}:/result", str(local_path))
+    spawner.overrides[command] = _Outcome(hang=True)
+
+    async def fail_read(_: object) -> bytes:
+        raise OSError("post-spawn I/O failed")
+
+    monkeypatch.setattr(docker_sbx, "_read_bounded", fail_read)
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(provider.copy(sandbox_id, "/result", local_path))
+
+    assert (raised.value.operation, raised.value.reason) == ("copy", "io_error")
+    assert str(raised.value) == "docker sandboxes copy failed: io_error"
+    assert isinstance(raised.value.__cause__, OSError)
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.operation == "copy"
+    assert evidence.reason == "io_error"
+    assert evidence.sandbox_id == sandbox_id
+    assert evidence.deadline_limited is False
+    assert evidence.subprocess_started is True
+    assert evidence.trial_elapsed_s == 0.0
+    assert evidence.trial_remaining_s == 300.0
+    assert spawner.processes[-1].killed is True
+    assert spawner.processes[-1].waited is True
+
+
+def test_process_cleanup_failure_preserves_original_provider_evidence_as_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    monkeypatch.setattr(docker_sbx, "REAP_TIMEOUT_SECONDS", 0.01)
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(monkeypatch, spawner)
+    local_path = tmp_path / "result"
+    command = ("sbx", "cp", f"{sandbox_id}:/result", str(local_path))
+    spawner.overrides[command] = _Outcome(
+        hang=True,
+        kill_error=OSError("kill denied"),
+        reap_hang=True,
+    )
+    process_created = asyncio.Event()
+    spawner.before_spawn = lambda spawned_command: process_created.set()
+    monkeypatch.setattr(
+        docker_sbx.asyncio,
+        "timeout",
+        lambda _: _TimeoutAfterProcessCreation(process_created),
+    )
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(
+            provider._run(
+                "copy",
+                ["cp", f"{sandbox_id}:/result", str(local_path)],
+                5.0,
+                sandbox_id=sandbox_id,
+            )
+        )
+
+    assert raised.value.reason == "process_cleanup_unconfirmed"
+    assert str(raised.value) == (
+        "docker sandboxes copy failed: process_cleanup_unconfirmed; "
+        "cleanup: kill_failed: kill denied; reap_timeout"
+    )
+    cause = raised.value.__cause__
+    assert isinstance(cause, DockerSbxError)
+    assert (cause.operation, cause.reason) == ("copy", "timeout")
+    assert str(cause) == "docker sandboxes copy failed: timeout"
+    cause_evidence = get_sandbox_failure_evidence(cause)
+    assert cause_evidence is not None
+    assert cause_evidence.operation == "copy"
+    assert cause_evidence.reason == "timeout"
+    assert cause_evidence.sandbox_id == sandbox_id
+    assert cause_evidence.deadline_limited is False
+    assert cause_evidence.subprocess_started is True
+    cleanup_evidence = get_sandbox_failure_evidence(raised.value)
+    assert cleanup_evidence is not None
+    assert cleanup_evidence.operation == "copy"
+    assert cleanup_evidence.reason == "process_cleanup_unconfirmed"
+    assert cleanup_evidence.sandbox_id == sandbox_id
+    assert cleanup_evidence.deadline_limited is False
+    assert cleanup_evidence.subprocess_started is True
+    assert cleanup_evidence is not cause_evidence
+    assert spawner.processes[-1].killed is True
+    assert spawner.processes[-1].waited is False
+
+
+def test_sandbox_cleanup_failure_has_cleanup_evidence_and_original_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(monkeypatch, spawner)
+    publish_command = (
+        "sbx",
+        "ports",
+        sandbox_id,
+        "--publish",
+        "8080/tcp4",
+    )
+    cleanup_command = ("sbx", "rm", "--force", sandbox_id)
+    spawner.overrides[publish_command] = _Outcome(
+        returncode=7,
+        stderr=b"publish failed",
+    )
+    spawner.overrides[cleanup_command] = _Outcome(
+        returncode=8,
+        stderr=b"cleanup failed",
+    )
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(provider.publish_port(sandbox_id, 8080))
+
+    assert (raised.value.operation, raised.value.reason) == (
+        "publish_port",
+        "cleanup_unconfirmed",
+    )
+    assert str(raised.value) == (
+        "docker sandboxes publish_port failed: cleanup_unconfirmed "
+        f"(sandbox_id={sandbox_id}); cleanup: "
+        "docker sandboxes cleanup failed: nonzero_exit "
+        "(returncode=8): cleanup failed"
+    )
+    cause = raised.value.__cause__
+    assert isinstance(cause, DockerSbxError)
+    assert (cause.operation, cause.reason) == ("publish_port", "nonzero_exit")
+    assert str(cause) == (
+        "docker sandboxes publish_port failed: nonzero_exit "
+        "(returncode=7): publish failed"
+    )
+    cause_evidence = get_sandbox_failure_evidence(cause)
+    assert cause_evidence is not None
+    assert cause_evidence.operation == "publish_port"
+    assert cause_evidence.reason == "nonzero_exit"
+    assert cause_evidence.returncode == 7
+    assert cause_evidence.sandbox_id == sandbox_id
+    assert cause_evidence.deadline_limited is False
+    assert cause_evidence.subprocess_started is True
+    cleanup_evidence = get_sandbox_failure_evidence(raised.value)
+    assert cleanup_evidence is not None
+    assert cleanup_evidence.operation == "publish_port"
+    assert cleanup_evidence.reason == "cleanup_unconfirmed"
+    assert cleanup_evidence.sandbox_id == sandbox_id
+    assert cleanup_evidence.deadline_limited is False
+    assert cleanup_evidence.subprocess_started is True
+    assert cleanup_evidence is not cause_evidence
+    assert spawner.processes[-2].waited is True
+    assert spawner.processes[-1].waited is True
 
 
 def test_workload_operations_share_one_deadline_and_elapsed_time_reduces_timeout(

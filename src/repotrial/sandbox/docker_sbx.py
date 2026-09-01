@@ -14,9 +14,13 @@ from typing import Any, NoReturn
 
 from .base import (
     ExecResult,
+    FailureEvidenceValue,
     NetworkLogResult,
+    SandboxFailureEvidence,
     SandboxProvider,
     attach_partial_create_cleanup_context,
+    attach_sandbox_failure_evidence,
+    get_sandbox_failure_evidence,
 )
 
 MAX_OUTPUT_BYTES = 65_536
@@ -114,6 +118,7 @@ class DockerSbxError(RuntimeError):
         stderr: str = "",
         sandbox_id: str | None = None,
         cleanup_error: str = "",
+        failure_evidence: SandboxFailureEvidence | None = None,
     ) -> None:
         self.operation = operation
         self.reason = reason
@@ -131,6 +136,8 @@ class DockerSbxError(RuntimeError):
         if cleanup_error:
             message = f"{message}; cleanup: {cleanup_error}"
         super().__init__(message)
+        if failure_evidence is not None:
+            attach_sandbox_failure_evidence(self, failure_evidence)
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,10 +205,21 @@ class DockerSbxPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class _CommandExecutionContext:
+    operation: str
+    sandbox_id: str | None
+    deadline_limited: bool
+    subprocess_started: bool
+    trial_elapsed_s: float | None
+    trial_remaining_s: float | None
+
+
+@dataclass(frozen=True, slots=True)
 class _CommandResult:
     returncode: int
     stdout: bytes
     stderr: bytes
+    _execution_context: _CommandExecutionContext
 
 
 class _SandboxState(Enum):
@@ -281,6 +299,7 @@ class DockerSbxProvider(SandboxProvider):
                 self._command_timeout_s,
                 env=self._disk_environment(allocation),
                 deadline=deadline,
+                sandbox_id=sandbox_id,
             )
             _require_success("create", result)
             await self._verify_guest_clone(sandbox_id, host_head, deadline)
@@ -553,6 +572,7 @@ class DockerSbxProvider(SandboxProvider):
             operation,
             ["rm", "--force", sandbox_id],
             self._command_timeout_s,
+            sandbox_id=sandbox_id,
         )
         _require_success(operation, result)
         self._sandbox_states[sandbox_id] = _SandboxState.CLEANED
@@ -604,10 +624,41 @@ class DockerSbxProvider(SandboxProvider):
                 "cleanup_unconfirmed",
                 sandbox_id=sandbox_id,
                 cleanup_error=detail,
+                failure_evidence=self._sandbox_cleanup_failure_evidence(
+                    primary_error,
+                    sandbox_id,
+                    cleanup_error,
+                ),
             ) from primary_error
         if cancellation is not None:
             raise cancellation
         raise primary_error
+
+    def _sandbox_cleanup_failure_evidence(
+        self,
+        primary_error: DockerSbxError,
+        sandbox_id: str,
+        cleanup_error: BaseException,
+    ) -> SandboxFailureEvidence:
+        cleanup_evidence = get_sandbox_failure_evidence(cleanup_error)
+        if cleanup_evidence is None:
+            return self._command_failure_evidence(
+                primary_error.operation,
+                "cleanup_unconfirmed",
+                deadline=None,
+                deadline_limited=False,
+                subprocess_started=False,
+                sandbox_id=sandbox_id,
+            )
+        return SandboxFailureEvidence(
+            operation=primary_error.operation,
+            reason="cleanup_unconfirmed",
+            sandbox_id=sandbox_id,
+            trial_elapsed_s=cleanup_evidence.trial_elapsed_s,
+            trial_remaining_s=cleanup_evidence.trial_remaining_s,
+            deadline_limited=cleanup_evidence.deadline_limited,
+            subprocess_started=cleanup_evidence.subprocess_started,
+        )
 
     async def _probe(self, deadline: float) -> bool:
         version = await self._probe_call("version", ["version"], deadline)
@@ -746,6 +797,14 @@ class DockerSbxProvider(SandboxProvider):
             timeout_reason = (
                 "total_duration_exhausted" if deadline_limited else "timeout"
             )
+            failure_evidence = self._command_failure_evidence(
+                operation,
+                timeout_reason,
+                deadline=deadline,
+                deadline_limited=deadline_limited,
+                subprocess_started=process is not None,
+                sandbox_id=sandbox_id,
+            )
             if process is not None:
                 await _raise_after_process_cleanup(
                     operation,
@@ -753,11 +812,13 @@ class DockerSbxProvider(SandboxProvider):
                     process,
                     error,
                     sandbox_id=sandbox_id if deadline_limited else None,
+                    failure_evidence=failure_evidence,
                 )
             raise DockerSbxError(
                 operation,
                 timeout_reason,
                 sandbox_id=sandbox_id if deadline_limited else None,
+                failure_evidence=failure_evidence,
             ) from error
         except asyncio.CancelledError as error:
             if process is not None:
@@ -766,16 +827,61 @@ class DockerSbxProvider(SandboxProvider):
                 )
             raise
         except FileNotFoundError as error:
-            raise DockerSbxError(operation, "executable_unavailable") from error
+            failure_evidence = self._command_failure_evidence(
+                operation,
+                "executable_unavailable",
+                deadline=deadline,
+                deadline_limited=deadline_limited,
+                subprocess_started=False,
+                sandbox_id=sandbox_id,
+            )
+            raise DockerSbxError(
+                operation,
+                "executable_unavailable",
+                failure_evidence=failure_evidence,
+            ) from error
         except OSError as error:
+            failure_evidence = self._command_failure_evidence(
+                operation,
+                "io_error",
+                deadline=deadline,
+                deadline_limited=deadline_limited,
+                subprocess_started=process is not None,
+                sandbox_id=sandbox_id,
+            )
             if process is not None:
                 await _raise_after_process_cleanup(
-                    operation, "io_error", process, error
+                    operation,
+                    "io_error",
+                    process,
+                    error,
+                    failure_evidence=failure_evidence,
                 )
-            raise DockerSbxError(operation, "io_error") from error
+            raise DockerSbxError(
+                operation,
+                "io_error",
+                failure_evidence=failure_evidence,
+            ) from error
 
+        now = time.monotonic()
+        remaining_s = None if deadline is None else max(0.0, deadline - now)
+        elapsed_s = (
+            None
+            if deadline is None
+            else max(0.0, self._policy.total_duration_s - (deadline - now))
+        )
         return _CommandResult(
-            returncode=returncode, stdout=stdout_bytes, stderr=stderr_bytes
+            returncode=returncode,
+            stdout=stdout_bytes,
+            stderr=stderr_bytes,
+            _execution_context=_CommandExecutionContext(
+                operation=operation,
+                sandbox_id=sandbox_id,
+                deadline_limited=deadline_limited,
+                subprocess_started=True,
+                trial_elapsed_s=elapsed_s,
+                trial_remaining_s=remaining_s,
+            ),
         )
 
     def _require_active(self, sandbox_id: str) -> None:
@@ -795,16 +901,81 @@ class DockerSbxProvider(SandboxProvider):
     ) -> tuple[float, bool]:
         if deadline is None:
             return timeout_s, False
-        remaining_s = deadline - time.monotonic()
+        now = time.monotonic()
+        remaining_s = deadline - now
         if remaining_s <= 0:
             raise DockerSbxError(
                 operation,
                 "total_duration_exhausted",
                 sandbox_id=sandbox_id,
+                failure_evidence=self._command_failure_evidence_at(
+                    operation,
+                    "total_duration_exhausted",
+                    deadline=deadline,
+                    deadline_limited=True,
+                    subprocess_started=False,
+                    sandbox_id=sandbox_id,
+                    now=now,
+                ),
             )
         if remaining_s <= timeout_s:
             return remaining_s, True
         return timeout_s, False
+
+    def _command_failure_evidence(
+        self,
+        operation: str,
+        reason: str,
+        *,
+        deadline: float | None,
+        deadline_limited: bool,
+        subprocess_started: bool,
+        sandbox_id: str | None,
+        returncode: int | None = None,
+        details: dict[str, FailureEvidenceValue] | None = None,
+    ) -> SandboxFailureEvidence:
+        return self._command_failure_evidence_at(
+            operation,
+            reason,
+            deadline=deadline,
+            deadline_limited=deadline_limited,
+            subprocess_started=subprocess_started,
+            sandbox_id=sandbox_id,
+            returncode=returncode,
+            details=details,
+            now=time.monotonic(),
+        )
+
+    def _command_failure_evidence_at(
+        self,
+        operation: str,
+        reason: str,
+        *,
+        deadline: float | None,
+        deadline_limited: bool,
+        subprocess_started: bool,
+        sandbox_id: str | None,
+        returncode: int | None = None,
+        details: dict[str, FailureEvidenceValue] | None = None,
+        now: float,
+    ) -> SandboxFailureEvidence:
+        remaining_s = None if deadline is None else max(0.0, deadline - now)
+        elapsed_s = (
+            None
+            if deadline is None
+            else max(0.0, self._policy.total_duration_s - (deadline - now))
+        )
+        return SandboxFailureEvidence(
+            operation=operation,
+            reason=reason,
+            returncode=returncode,
+            sandbox_id=sandbox_id,
+            trial_elapsed_s=elapsed_s,
+            trial_remaining_s=remaining_s,
+            deadline_limited=deadline_limited,
+            subprocess_started=subprocess_started,
+            details=dict(details or {}),
+        )
 
 
 async def _read_bounded(stream: asyncio.StreamReader) -> bytes:
@@ -862,6 +1033,7 @@ async def _raise_after_process_cleanup(
     primary_error: BaseException,
     *,
     sandbox_id: str | None = None,
+    failure_evidence: SandboxFailureEvidence | None = None,
 ) -> NoReturn:
     cleanup_task = asyncio.create_task(_kill_and_reap(process))
     cancellation = (
@@ -886,12 +1058,34 @@ async def _raise_after_process_cleanup(
             cancellation.add_note(f"process cleanup unconfirmed: {cleanup_error}")
         raise cancellation
     if cleanup_error is not None:
+        assert failure_evidence is not None
+        cleanup_evidence = SandboxFailureEvidence(
+            operation=operation,
+            reason="process_cleanup_unconfirmed",
+            sandbox_id=failure_evidence.sandbox_id,
+            trial_elapsed_s=failure_evidence.trial_elapsed_s,
+            trial_remaining_s=failure_evidence.trial_remaining_s,
+            deadline_limited=failure_evidence.deadline_limited,
+            subprocess_started=failure_evidence.subprocess_started,
+        )
+        provider_error = DockerSbxError(
+            operation,
+            reason,
+            sandbox_id=sandbox_id,
+            failure_evidence=failure_evidence,
+        )
         raise DockerSbxError(
             operation,
             "process_cleanup_unconfirmed",
             cleanup_error=str(cleanup_error),
-        ) from primary_error
-    raise DockerSbxError(operation, reason, sandbox_id=sandbox_id) from primary_error
+            failure_evidence=cleanup_evidence,
+        ) from provider_error
+    raise DockerSbxError(
+        operation,
+        reason,
+        sandbox_id=sandbox_id,
+        failure_evidence=failure_evidence,
+    ) from primary_error
 
 
 def _decode_human_output(output: bytes) -> str:
@@ -921,11 +1115,23 @@ def _decode_human_output(output: bytes) -> str:
 
 def _require_success(operation: str, result: _CommandResult) -> None:
     if result.returncode != 0:
+        context = result._execution_context
+        failure_evidence = SandboxFailureEvidence(
+            operation=context.operation,
+            reason="nonzero_exit",
+            returncode=result.returncode,
+            sandbox_id=context.sandbox_id,
+            trial_elapsed_s=context.trial_elapsed_s,
+            trial_remaining_s=context.trial_remaining_s,
+            deadline_limited=context.deadline_limited,
+            subprocess_started=context.subprocess_started,
+        )
         raise DockerSbxError(
             operation,
             "nonzero_exit",
             returncode=result.returncode,
             stderr=_decode_human_output(result.stderr),
+            failure_evidence=failure_evidence,
         )
 
 
