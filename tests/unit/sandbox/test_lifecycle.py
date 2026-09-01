@@ -405,6 +405,26 @@ def test_failure_serializer_rejects_runtime_boundaries(
         serialize_sandbox_failure_evidence(evidence)
 
 
+@pytest.mark.parametrize(
+    "details",
+    [
+        pytest.param({"value": int("9" * 600)}, id="scalar"),
+        pytest.param({"values": [int("9" * 600)]}, id="list-item"),
+    ],
+)
+def test_failure_serializer_rejects_integer_scalars_over_512_bytes(
+    details: dict[str, FailureEvidenceValue],
+) -> None:
+    evidence = SandboxFailureEvidence(
+        operation="create",
+        reason="io_error",
+        details=details,
+    )
+
+    with pytest.raises(ValueError, match="failure evidence"):
+        serialize_sandbox_failure_evidence(evidence)
+
+
 def test_failure_serializer_rounds_finite_floats_at_serialization() -> None:
     evidence = SandboxFailureEvidence(
         operation="create",
@@ -480,6 +500,16 @@ def test_find_sandbox_failure_evidence_has_exact_depth_eight_cap(
     result = find_sandbox_failure_evidence(chain[0])
 
     assert (result is evidence) is found
+
+
+def test_find_sandbox_failure_evidence_hard_caps_explicit_depth_above_eight() -> None:
+    chain = [RuntimeError(f"chain-{index} secret") for index in range(9)]
+    for current, next_error in pairwise(chain):
+        current.__cause__ = next_error
+    evidence = SandboxFailureEvidence(operation="chain", reason="depth_cap")
+    attach_sandbox_failure_evidence(chain[8], evidence)
+
+    assert find_sandbox_failure_evidence(chain[0], max_depth=9) is None
 
 
 def test_lifecycle_records_cause_carried_evidence_without_raw_message(

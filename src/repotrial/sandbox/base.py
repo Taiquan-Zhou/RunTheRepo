@@ -35,6 +35,7 @@ _MAX_FAILURE_DETAIL_KEYS = 16
 _MAX_FAILURE_LIST_ITEMS = 32
 _MAX_FAILURE_VALUE_BYTES = 512
 _MAX_FAILURE_JSON_BYTES = 16_384
+_MAX_FAILURE_CAUSE_DEPTH = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +78,7 @@ def find_sandbox_failure_evidence(
 ) -> SandboxFailureEvidence | None:
     current: BaseException | None = failure
     seen: set[int] = set()
-    for _depth in range(max_depth):
+    for _depth in range(min(max_depth, _MAX_FAILURE_CAUSE_DEPTH)):
         if current is None or id(current) in seen:
             return None
         seen.add(id(current))
@@ -103,15 +104,24 @@ def serialize_sandbox_failure_evidence(
         return ValueError("failure evidence list shape is invalid")
 
     def scalar(value: FailureEvidenceScalar) -> FailureEvidenceScalar:
+        normalized: FailureEvidenceScalar
         if isinstance(value, float):
             if not math.isfinite(value):
                 raise ValueError("failure evidence float must be finite")
-            return round(value, 6)
-        if isinstance(value, str):
-            return bounded_text(value, _MAX_FAILURE_VALUE_BYTES)
-        if value is None or type(value) in {bool, int}:
-            return value
-        raise ValueError("failure evidence scalar is invalid")
+            normalized = round(value, 6)
+        elif isinstance(value, str) or value is None or type(value) in {bool, int}:
+            normalized = value
+        else:
+            raise ValueError("failure evidence scalar is invalid")
+        try:
+            encoded = json.dumps(
+                normalized, allow_nan=False, separators=(",", ":")
+            ).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise ValueError("failure evidence scalar is invalid") from error
+        if len(encoded) > _MAX_FAILURE_VALUE_BYTES:
+            raise ValueError("failure evidence scalar exceeds limit")
+        return normalized
 
     if len(evidence.details) > _MAX_FAILURE_DETAIL_KEYS:
         raise ValueError("failure evidence has too many details")
