@@ -21,7 +21,7 @@ _MUTATION_BY_FINDING_KIND = {
     "privileged": MutationType.DROP_PRIVILEGED,
     "docker_socket_rw": MutationType.REMOVE_DOCKER_SOCKET,
     "root_user": MutationType.SET_NON_ROOT,
-    "root_user_possible": MutationType.SET_NON_ROOT,
+    "root_user_possible": MutationType.DROP_ALL_CAPS,
     "cap_add": MutationType.DROP_ALL_CAPS,
     "writable_rootfs": MutationType.SET_READ_ONLY,
     "host_network": MutationType.BRIDGE_NETWORK,

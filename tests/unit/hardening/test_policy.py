@@ -108,6 +108,27 @@ def test_propose_mutation_requires_an_explicit_baseline_pass(
     assert decision.stop_reason == "insufficient_coverage"
 
 
+@pytest.mark.parametrize(
+    ("finding_kind", "expected_type"),
+    [
+        ("root_user", MutationType.SET_NON_ROOT),
+        ("root_user_possible", MutationType.DROP_ALL_CAPS),
+        ("cap_add", MutationType.DROP_ALL_CAPS),
+    ],
+)
+def test_propose_mutation_maps_root_and_capability_findings_to_expected_types(
+    finding_kind: str, expected_type: MutationType
+) -> None:
+    state = _state(risk_findings=[_finding(finding_kind, "web")])
+
+    _assert_mutation(
+        state,
+        expected_type,
+        "web",
+        f"policy:{expected_type.value}:web",
+    )
+
+
 def test_propose_mutation_uses_the_exact_normal_type_priority() -> None:
     findings = [
         _finding("host_network", "network"),
@@ -122,9 +143,9 @@ def test_propose_mutation_uses_the_exact_normal_type_priority() -> None:
     expected = [
         (MutationType.DROP_PRIVILEGED, "privileged"),
         (MutationType.REMOVE_DOCKER_SOCKET, "socket"),
-        (MutationType.SET_NON_ROOT, "possible-root"),
         (MutationType.SET_NON_ROOT, "root"),
         (MutationType.DROP_ALL_CAPS, "caps"),
+        (MutationType.DROP_ALL_CAPS, "possible-root"),
         (MutationType.SET_READ_ONLY, "rootfs"),
         (MutationType.BRIDGE_NETWORK, "network"),
     ]
@@ -149,31 +170,43 @@ def test_propose_mutation_orders_same_type_by_severity_then_service_and_deduplic
 ):
     state = _state(
         risk_findings=[
-            _finding("privileged", "zebra", 10),
-            _finding("privileged", "alpha", 10),
-            _finding("privileged", "middle", 90),
-            _finding("privileged", "middle", 20),
+            _finding("root_user_possible", "zebra", 10),
+            _finding("cap_add", "alpha", 10),
+            _finding("root_user_possible", "middle", 90),
+            _finding("cap_add", "middle", 20),
             _finding("unrecognised", "ignored", 100),
         ]
     )
 
     _assert_mutation(
         state,
-        MutationType.DROP_PRIVILEGED,
+        MutationType.DROP_ALL_CAPS,
         "middle",
-        "policy:drop_privileged:middle",
+        "policy:drop_all_caps:middle",
     )
     state.experiments.append(
         _record(
-            _mutation(MutationType.DROP_PRIVILEGED, "middle", "caller-id"),
+            _mutation(MutationType.DROP_ALL_CAPS, "middle", "caller-id"),
             ExperimentVerdict.KEEP,
         )
     )
     _assert_mutation(
         state,
-        MutationType.DROP_PRIVILEGED,
+        MutationType.DROP_ALL_CAPS,
         "alpha",
-        "policy:drop_privileged:alpha",
+        "policy:drop_all_caps:alpha",
+    )
+    state.experiments.append(
+        _record(
+            _mutation(MutationType.DROP_ALL_CAPS, "alpha", "caller-alpha"),
+            ExperimentVerdict.KEEP,
+        )
+    )
+    _assert_mutation(
+        state,
+        MutationType.DROP_ALL_CAPS,
+        "zebra",
+        "policy:drop_all_caps:zebra",
     )
 
 
