@@ -267,6 +267,14 @@ async def managed_sandbox(
             yield sandbox_id
         except _BOUNDARY_FAILURES as body_failure:
             outcome.body_failure = body_failure
+            if find_sandbox_failure_evidence(body_failure) is not None:
+                _record_event(
+                    outcome,
+                    artifact,
+                    "provider_failure",
+                    sandbox_id,
+                    body_failure,
+                )
 
     _record_event(outcome, artifact, "destroy_attempt", sandbox_id)
     cleanup_task = asyncio.create_task(_destroy_boundary(provider, sandbox_id))

@@ -22,12 +22,29 @@ from repotrial.hardening.policy import ExperimentDecision, decide_candidate
 from repotrial.journey.http_runner import run_http_journey
 from repotrial.journey.playwright_runner import run_playwright_journey
 from repotrial.sandbox.base import SandboxProvider
+from repotrial.sandbox.docker_sbx import DockerSbxError
 from repotrial.sandbox.lifecycle import CleanupError, managed_sandbox
 from repotrial.trial.boot import _validated_env_prefix, boot_compose
 from repotrial.trial.observer import collect_observation
 
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
 _ORDINARY_STAGE_ERRORS = (RuntimeError, OSError, ValueError, TypeError, KeyError)
+
+
+class _ExperimentSandboxFailure(RuntimeError):
+    def __init__(
+        self,
+        public_reason: str,
+        *,
+        boot: Verdict,
+        journeys: tuple[JourneyResult, ...] = (),
+        after: ObservationSnapshot | None = None,
+    ) -> None:
+        super().__init__(public_reason)
+        self.public_reason = public_reason
+        self.boot = boot
+        self.journeys = journeys
+        self.after = after
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +135,17 @@ async def run_experiment(
             )
     except CleanupError:
         raise
+    except _ExperimentSandboxFailure as failure:
+        return _record(
+            state,
+            mutation,
+            prepared,
+            boot=failure.boot,
+            journeys=failure.journeys,
+            after=failure.after,
+            verdict=ExperimentVerdict.STOP,
+            reason=failure.public_reason,
+        )
     except _ORDINARY_STAGE_ERRORS:
         return _record(
             state,
@@ -304,6 +332,11 @@ async def _run_candidate(
             attempt=1,
             overlay_path=prepared.overlay_relative,
         )
+    except DockerSbxError as error:
+        raise _ExperimentSandboxFailure(
+            "boot_failed",
+            boot=Verdict.UNSUPPORTED,
+        ) from error
     except CleanupError:
         raise
     except _ORDINARY_STAGE_ERRORS:
@@ -333,6 +366,11 @@ async def _run_candidate(
         )
     except CleanupError:
         raise
+    except DockerSbxError as error:
+        raise _ExperimentSandboxFailure(
+            "observation_failed",
+            boot=boot.verdict,
+        ) from error
     except _ORDINARY_STAGE_ERRORS:
         return _record(
             state,
@@ -347,6 +385,12 @@ async def _run_candidate(
         host_port = await provider.publish_port(sandbox_id, context.container_port)
     except CleanupError:
         raise
+    except DockerSbxError as error:
+        raise _ExperimentSandboxFailure(
+            "publish_failed",
+            boot=boot.verdict,
+            after=after,
+        ) from error
     except _ORDINARY_STAGE_ERRORS:
         return _record(
             state,

@@ -628,6 +628,57 @@ def test_lifecycle_records_cause_carried_evidence_without_raw_message(
     assert "secret" not in artifact.read_text(encoding="utf-8")
 
 
+def test_body_provider_failure_evidence_is_flushed_before_destroy_and_wrapper_preserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = SandboxFailureEvidence(
+        operation="observation",
+        reason="total_duration_exhausted",
+        deadline_limited=True,
+        subprocess_started=False,
+    )
+    provider_error = DockerSbxError(
+        "observation",
+        "total_duration_exhausted",
+        failure_evidence=evidence,
+    )
+    body_failure = RuntimeError("wrapper raw secret")
+    body_failure.__cause__ = provider_error
+    provider = _Provider()
+    artifact_path = tmp_path / "lifecycle.jsonl"
+    artifact = _ScriptedArtifact(("never", None), AssertionError("must not fail"))
+    _patch_artifact_open(monkeypatch, artifact)
+
+    async def exercise() -> None:
+        async with managed_sandbox(
+            provider,
+            tmp_path / "workspace",
+            "trial",
+            lifecycle_artifact=artifact_path,
+        ):
+            raise body_failure
+
+    with pytest.raises(RuntimeError) as raised:
+        asyncio.run(exercise())
+
+    assert raised.value is body_failure
+    assert artifact.operations == [
+        ("write", "create_attempt"),
+        ("flush", "create_attempt"),
+        ("write", "create_success"),
+        ("flush", "create_success"),
+        ("write", "provider_failure"),
+        ("flush", "provider_failure"),
+        ("write", "destroy_attempt"),
+        ("flush", "destroy_attempt"),
+        ("write", "destroy_success"),
+        ("flush", "destroy_success"),
+        ("close", None),
+    ]
+    assert provider.calls[-1] == ("destroy", "sandbox-17")
+
+
 def test_success_creates_yields_and_destroys_once_with_ordered_audit(
     tmp_path: Path,
 ) -> None:
@@ -785,6 +836,58 @@ def test_body_and_destroy_failures_are_both_retained(tmp_path: Path) -> None:
     assert raised.value.destroy_failure is destroy_failure
     assert raised.value.__cause__ is destroy_failure
     assert provider.calls[-1] == ("destroy", "sandbox-17")
+
+
+def test_body_provider_failure_and_destroy_failure_preserve_both_precedence_chains(
+    tmp_path: Path,
+) -> None:
+    evidence = SandboxFailureEvidence(
+        operation="publish",
+        reason="total_duration_exhausted",
+        deadline_limited=True,
+        subprocess_started=False,
+    )
+    provider_error = DockerSbxError(
+        "publish",
+        "total_duration_exhausted",
+        failure_evidence=evidence,
+    )
+    body_failure = RuntimeError("wrapper raw secret")
+    body_failure.__cause__ = provider_error
+    destroy_failure = OSError("destroy raw secret")
+
+    class DestroyFailingProvider(_Provider):
+        async def destroy(self, sandbox_id: str) -> None:
+            self.calls.append(("destroy", sandbox_id))
+            raise destroy_failure
+
+    provider = DestroyFailingProvider()
+    artifact = tmp_path / "lifecycle.jsonl"
+
+    async def exercise() -> None:
+        async with managed_sandbox(
+            provider,
+            tmp_path / "workspace",
+            "trial",
+            lifecycle_artifact=artifact,
+        ):
+            raise body_failure
+
+    with pytest.raises(CleanupError) as raised:
+        asyncio.run(exercise())
+
+    assert raised.value.body_failure is body_failure
+    assert raised.value.destroy_failure is destroy_failure
+    assert raised.value.__cause__ is destroy_failure
+    assert find_sandbox_failure_evidence(raised.value.body_failure) is evidence
+    events = _read_events(artifact)
+    assert [event["event"] for event in events] == [
+        "create_attempt",
+        "create_success",
+        "provider_failure",
+        "destroy_attempt",
+        "destroy_failure",
+    ]
 
 
 @pytest.mark.parametrize("extra_cancellations", [0, 2])
@@ -1033,6 +1136,55 @@ def test_artifact_failure_after_create_still_destroys_sandbox(
         ("create", tmp_path / "workspace", "trial"),
         ("destroy", "sandbox-17"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("audit_point", "audit_failure"),
+    [
+        ("open", OSError("audit open raw secret")),
+        ("write", ValueError("audit write raw secret")),
+        ("flush", RuntimeError("audit flush raw secret")),
+    ],
+)
+def test_audit_open_write_flush_failure_remains_primary_and_cleanup_runs(
+    audit_point: str,
+    audit_failure: BaseException,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_path = tmp_path / "lifecycle.jsonl"
+    if audit_point == "open":
+
+        def fail_open(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise audit_failure
+
+        monkeypatch.setattr(Path, "open", fail_open)
+    else:
+        artifact = _ScriptedArtifact((audit_point, "create_success"), audit_failure)
+        _patch_artifact_open(monkeypatch, artifact)
+    provider = _Provider()
+
+    async def exercise() -> None:
+        async with managed_sandbox(
+            provider,
+            tmp_path / "workspace",
+            "trial",
+            lifecycle_artifact=artifact_path,
+        ):
+            pass
+
+    with pytest.raises(type(audit_failure)) as raised:
+        asyncio.run(exercise())
+
+    assert raised.value is audit_failure
+    if audit_point == "open":
+        assert provider.calls == []
+    else:
+        assert provider.calls == [
+            ("create", tmp_path / "workspace", "trial"),
+            ("destroy", "sandbox-17"),
+        ]
 
 
 def test_create_failure_is_preserved_when_failure_audit_cannot_be_written(

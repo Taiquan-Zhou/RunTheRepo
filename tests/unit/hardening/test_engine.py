@@ -20,7 +20,12 @@ from repotrial.domain.models import (
 )
 from repotrial.hardening import engine as engine_module
 from repotrial.hardening.engine import ExperimentContext, run_experiment
-from repotrial.sandbox.base import ExecResult, NetworkLogResult
+from repotrial.sandbox.base import (
+    ExecResult,
+    NetworkLogResult,
+    SandboxFailureEvidence,
+)
+from repotrial.sandbox.docker_sbx import DockerSbxError
 from repotrial.sandbox.fake import FakeSandboxProvider
 from repotrial.sandbox.lifecycle import CleanupError
 from repotrial.trial.boot import BootResult
@@ -229,6 +234,10 @@ def _run(
     return asyncio.run(run_experiment(state, mutation, provider, context=context))
 
 
+def _read_jsonl(path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
 def test_no_baseline_pass_stops_before_overlay_provider_or_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -417,6 +426,22 @@ def _patch_boot(
     return calls
 
 
+def _patch_boot_error(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
+    async def fake_boot(
+        provider: FakeSandboxProvider,
+        sandbox_id: str,
+        compose_path: str,
+        env: dict[str, str],
+        attempt: int,
+        *,
+        overlay_path: str | None = None,
+    ) -> BootResult:
+        del provider, sandbox_id, compose_path, env, attempt, overlay_path
+        raise error
+
+    monkeypatch.setattr(engine_module, "boot_compose", fake_boot)
+
+
 def _patch_observer(
     monkeypatch: pytest.MonkeyPatch,
     snapshot: ObservationSnapshot | BaseException,
@@ -494,6 +519,90 @@ def test_observation_failure_stops_with_boot_pass_and_cleanup(
     assert record.after is None
     assert "secret" not in record.reason
     assert provider.calls[-1] == ("destroy", "sandbox-1")
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_reason"),
+    [
+        ("boot", "boot_failed"),
+        ("observation", "observation_failed"),
+        ("publish", "publish_failed"),
+    ],
+)
+def test_candidate_provider_failure_reaches_lifecycle_and_keeps_public_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    expected_reason: str,
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    provider_error = DockerSbxError(
+        stage,
+        "total_duration_exhausted",
+        failure_evidence=SandboxFailureEvidence(
+            operation=stage,
+            reason="total_duration_exhausted",
+            deadline_limited=True,
+            subprocess_started=False,
+        ),
+    )
+    provider = RecordingProvider()
+    if stage == "boot":
+        _patch_boot_error(monkeypatch, provider_error)
+    elif stage == "observation":
+        _patch_boot(monkeypatch, Verdict.PASS)
+        _patch_observer(monkeypatch, provider_error)
+    else:
+        _patch_boot(monkeypatch, Verdict.PASS)
+        _patch_observer(monkeypatch, ObservationSnapshot())
+        provider.publish_failure = provider_error
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.reason == expected_reason
+    assert record.boot is (Verdict.UNSUPPORTED if stage == "boot" else Verdict.PASS)
+    assert record.journeys == []
+    if stage == "publish":
+        assert record.after is not None
+    else:
+        assert record.after is None
+    events = _read_jsonl(next(context.artifact_dir.glob("candidate-*-lifecycle.jsonl")))
+    provider_event = next(
+        event for event in events if event["event"] == "provider_failure"
+    )
+    assert provider_event["failure"]["reason"] == "total_duration_exhausted"
+    assert events[-1]["event"] == "destroy_success"
+
+
+def test_create_provider_failure_keeps_public_reason_and_private_lifecycle_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    provider_error = DockerSbxError(
+        "create",
+        "total_duration_exhausted",
+        failure_evidence=SandboxFailureEvidence(
+            operation="create",
+            reason="total_duration_exhausted",
+            deadline_limited=True,
+            subprocess_started=False,
+        ),
+    )
+    provider = RecordingProvider()
+
+    async def fail_create(workspace: Path, name: str) -> str:
+        provider.calls.append(("create", workspace, name))
+        raise provider_error
+
+    monkeypatch.setattr(provider, "create", fail_create)
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.reason == "sandbox_failed"
+    events = _read_jsonl(next(context.artifact_dir.glob("candidate-*-lifecycle.jsonl")))
+    create_event = next(event for event in events if event["event"] == "create_failure")
+    assert create_event["failure"]["reason"] == "total_duration_exhausted"
 
 
 @pytest.mark.parametrize(
