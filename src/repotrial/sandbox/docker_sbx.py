@@ -316,6 +316,7 @@ class DockerSbxProvider(SandboxProvider):
                 self._command_timeout_s,
                 deadline=deadline,
                 sandbox_id=sandbox_id,
+                public_sandbox_id=sandbox_id,
             )
             _require_success("allow_network", allow_network)
         except (DockerSbxError, asyncio.CancelledError) as error:

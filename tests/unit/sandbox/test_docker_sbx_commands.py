@@ -3335,6 +3335,142 @@ def test_create_in_flight_deadline_timeout_keeps_sandbox_id_private(
     assert create_process.waited is True
 
 
+def test_create_allow_network_exhausted_deadline_preserves_public_sandbox_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider = _provider(
+        monkeypatch,
+        spawner,
+        command_timeout_s=30,
+        total_duration_s=10,
+    )
+    guest_status = (
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=no",
+    )
+
+    def exhaust_before_allow_network(command: tuple[str, ...]) -> None:
+        if command[:2] == ("sbx", "exec") and command[4:] == guest_status:
+            clock.value = 10.0
+
+    spawner.before_spawn = exhaust_before_allow_network
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    create_call = _actual_create_call(spawner)
+    sandbox_id = create_call[create_call.index("--name") + 1]
+    allow_network_call = (
+        "sbx",
+        "policy",
+        "allow",
+        "network",
+        "--sandbox",
+        sandbox_id,
+        "**",
+    )
+    assert (raised.value.operation, raised.value.reason) == (
+        "allow_network",
+        "total_duration_exhausted",
+    )
+    assert raised.value.sandbox_id == sandbox_id
+    assert str(raised.value) == (
+        "docker sandboxes allow_network failed: total_duration_exhausted "
+        f"(sandbox_id={sandbox_id})"
+    )
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.operation == "allow_network"
+    assert evidence.reason == "total_duration_exhausted"
+    assert evidence.sandbox_id == sandbox_id
+    assert evidence.deadline_limited is True
+    assert evidence.subprocess_started is False
+    assert evidence.trial_remaining_s == 0.0
+    assert allow_network_call not in spawner.calls
+
+
+def test_create_allow_network_in_flight_deadline_preserves_public_sandbox_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    spawner = _SbxSpawner()
+    provider = _provider(
+        monkeypatch,
+        spawner,
+        command_timeout_s=30,
+        total_duration_s=10,
+    )
+    guest_status = (
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=no",
+    )
+    process_created = asyncio.Event()
+
+    def prepare_allow_network_timeout(command: tuple[str, ...]) -> None:
+        if command[:2] == ("sbx", "exec") and command[4:] == guest_status:
+            clock.value = 9.0
+        elif command[:5] == ("sbx", "policy", "allow", "network", "--sandbox"):
+            clock.value = 10.0
+            process_created.set()
+
+    def outcome(command: tuple[str, ...]) -> _Outcome:
+        if command[:5] == ("sbx", "policy", "allow", "network", "--sandbox"):
+            return _Outcome(hang=True)
+        return _Outcome()
+
+    def timeout(value: float) -> _RecordedTimeout | _TimeoutAfterProcessCreation:
+        if value == 1.0:
+            return _TimeoutAfterProcessCreation(process_created)
+        return _RecordedTimeout()
+
+    spawner.before_spawn = prepare_allow_network_timeout
+    spawner.handler = outcome
+    monkeypatch.setattr(docker_sbx.asyncio, "timeout", timeout)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    allow_network_call = next(
+        call
+        for call in spawner.calls
+        if call[:5] == ("sbx", "policy", "allow", "network", "--sandbox")
+    )
+    sandbox_id = allow_network_call[-2]
+    allow_network_process = spawner.processes[spawner.calls.index(allow_network_call)]
+    assert (raised.value.operation, raised.value.reason) == (
+        "allow_network",
+        "total_duration_exhausted",
+    )
+    assert raised.value.sandbox_id == sandbox_id
+    assert str(raised.value) == (
+        "docker sandboxes allow_network failed: total_duration_exhausted "
+        f"(sandbox_id={sandbox_id})"
+    )
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.operation == "allow_network"
+    assert evidence.reason == "total_duration_exhausted"
+    assert evidence.sandbox_id == sandbox_id
+    assert evidence.deadline_limited is True
+    assert evidence.subprocess_started is True
+    assert evidence.trial_remaining_s == 0.0
+    assert process_created.is_set()
+    assert allow_network_process.killed is True
+    assert allow_network_process.waited is True
+
+
 def test_nonzero_exit_records_execution_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
