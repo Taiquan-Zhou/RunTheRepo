@@ -626,6 +626,94 @@ as lacking the frozen PID hard bound; no PID protection is claimed or emulated.
 
 **M7.5 PILOT COMPLETE — MVP LIMITATIONS IDENTIFIED**
 
+## Final 900-second mutation-grounding cohort at HEAD `9f5d503b83da4818335228539c5de1fe40b759df`
+
+This append-only section supersedes earlier cohort summaries only for current
+status reporting. Historical attempts and conclusions above remain unchanged.
+The final execution checkout was clean and frozen at
+`9f5d503b83da4818335228539c5de1fe40b759df`; the frozen manifest SHA-256 was
+`4a963f0ee730ddf4be7243ad31cc2899ce19cdbfed3c4570498ff7d1c617551a`.
+The build includes the verified 900-second host monotonic whole-trial default
+and the generic `root_user_possible -> DROP_ALL_CAPS` mutation grounding. It
+does not change the manifest, verifier, SandboxProvider architecture, Disk
+Bound, PID disclosure, or no-host-fallback rule.
+
+Fresh pre-execution evidence on this build was: Linux full suite `1519 passed,
+6 skipped`; branch coverage `87.30%` against the required `85%`; Ruff lint and
+format, strict mypy, pre-commit, diff-check, focused mutation tests, and
+independent mutation review PASS. SBX v0.39.0 diagnose was `12/12` PASS and the
+initial inventory was empty. All ten repositories then ran strictly serially.
+
+| # | Repository | Final run ID | Exact SHA | Duration | Terminal outcome / exact stop reason | Required Journeys | Experiments | Cleanup |
+|---:|---|---|---|---:|---|---|---:|---|
+| 1 | Umami | `dfc8e110-fdd0-4cc3-a3fa-d37a2e241954` | PASS | `372.705s` | `completed` / `consecutive_failures` | `1/1 PASS` (`GET /`) | `3`, all rollback | `4/4` destroy success; inventory empty |
+| 2 | Listmonk | `3c564561-5acf-428a-b5b8-76a0ddad40b6` | PASS | `301.557s` | `completed` / `consecutive_failures` | `1/1 PASS` (`GET /`) | `3`, all rollback | `4/4` destroy success; inventory empty |
+| 3 | changedetection.io | `2630f55c-bf7a-4ce5-adfe-f559eadf5d20` | PASS | `340.636s` | `trial_failed` / `insufficient_coverage` | `0/5 PASS`; every step `network_error` | `0` | `1/1` destroy success; inventory empty |
+| 4 | Uptime Kuma | `61895df4-499d-42c4-90ba-76ed3a926f27` | PASS | `206.882s` | `trial_failed` / `boot_recovery_stopped` | `0/1`, untested | `0` | `1/1` destroy success; inventory empty |
+| 5 | Wakapi | `09f3e963-d0da-4194-a8ab-cac3de171ddc` | PASS | `347.571s` | `exception` / `sandbox:exec:timeout` | none | `0` | `1/1` destroy success; inventory empty |
+| 6 | Linkding | `05b68207-1475-48f5-8f9e-ad89e954cea4` | PASS | `149.290s` | `trial_failed` / `boot_recovery_stopped` | `0/1`, untested | `0` | `1/1` destroy success; inventory empty |
+| 7 | Paperless-ngx | `8c888a75-1613-4a03-857c-cf0d82f32665` | PASS | `298.287s` attempt only | `exception` / `sandbox:clone_verification:guest_status_not_clean` | none | `0` | partial create failed with no retained sandbox; inventory empty |
+| 8 | n8n-hosting | `51382cd9-f96e-48bc-8ebd-3fbb8d2f19f0` | PASS | `487.848s` | `trial_failed` / `boot_recovery_stopped` | none | `0` | `2/2` destroy success; inventory empty |
+| 9 | NetBox Docker | `8ee6ab4c-51a0-4424-95fe-68f5bec3b419` | PASS | `341.885s` | `trial_failed` / `boot_recovery_stopped` | `0/5`, untested | `0` | `1/1` destroy success; inventory empty |
+| 10 | Dockge | `87bd771f-0c80-418e-b224-1048650d466c` | PASS | `298.770s` | `completed` / `consecutive_failures` | `1/1 PASS` (`GET /`) | `3`, all rollback | `4/4` destroy success; inventory empty |
+
+For each of the three autonomous successes (Umami, Listmonk, and Dockge), the
+captured process exit code was `0`, terminal outcome was `completed`, and the
+completed `report/trial-report.json` exists. These are independent required
+conditions in addition to the all-PASS Journey, exact SHA, stop-reason, and
+cleanup evidence shown above.
+
+The frozen compatibility canary was repositories #1-#3. Umami and Listmonk
+met exact SHA, non-empty all-PASS Journey, completed report, exact stop reason,
+and cleanup requirements; changedetection.io failed all five retained Journeys.
+The canary was therefore `2/3 PASS`, authorizing repositories #4-#10 on the
+same unchanged HEAD. The failed changedetection result was retained and was not
+replaced.
+
+The final-epoch limitations are evidence-based and heterogeneous:
+
+- Uptime Kuma failed while extracting an image layer with exact `no space left
+  on device` Docker-data evidence.
+- n8n-hosting failed two image-pull attempts with exact `no space left on
+  device`; one bounded retry was applied before recovery stopped.
+- Linkding's Compose references the documented workspace `.env`, which was not
+  present; generic intake does not yet apply repository setup instructions.
+- NetBox started its dependency stack, but the web service exited while
+  PostgreSQL reported `the database system is in recovery mode`; the proposed
+  recovery was rejected as unsafe.
+- changedetection.io booted, but all five required Journey requests retained
+  `network_error` with no response status.
+- Wakapi reached a provider `exec` per-command timeout with `612.934s` still
+  remaining in the whole-trial budget. This is not a 900-second deadline
+  exhaustion.
+- Paperless-ngx failed closed during trusted guest clone verification. The
+  retained diagnostic is `malformed`, truncated, and contains no trustworthy
+  changed-path list, so no narrower cause is claimed.
+- Umami, Listmonk, and Dockge passed their baseline Journeys. Their nine
+  hardening experiments all rolled back on boot regression; none produced
+  KEEP.
+
+Under the frozen release definitions, autonomous success is `3/10` (required
+`>=7/10`) and meaningful regression-passing convergence is `0/10` (required
+`>=5/10`). Experiment count is `9 / 10 = 0.9`. All `10/10` attempts retained
+an exact stop reason; failed-attempt stop-reason coverage is `7/7 = 100%`.
+Final-epoch cleanup obligations are `19/19 = 100%`, every post-run official
+inventory was exactly empty, and inventory stderr was empty. Paperless-ngx
+creates no cleanup obligation because its lifecycle ends at
+`create_attempt -> create_failure` without a retained sandbox.
+
+P50/P95 repository duration remain `UNKNOWN` under the frozen rule because
+Paperless-ngx never crossed the target-workload boundary and therefore has no
+metric-bearing repository duration. No attempt ended with
+`total_duration_exhausted`. PID hard bound remains the disclosed unsupported
+limitation, and no host fallback occurred.
+
+The M7.5 release gate fails on autonomous success and meaningful convergence,
+not on cleanup, identity, or whole-trial enforcement. README remains unchanged
+because the frozen release threshold was not met.
+
+**M7.5 PILOT COMPLETE — MVP LIMITATIONS IDENTIFIED**
+
 ## DeepSeek portable fallback canary — latest status
 
 This section supersedes only the current status. Historical Qwen and other
@@ -795,5 +883,22 @@ The release gate therefore fails without weakening any verifier, safety rule,
 or denominator. README was not changed. Production code, tests, manifest,
 frozen architecture, Disk Bound, whole-trial duration, and PID disclosure
 remained unchanged throughout metric execution.
+
+**M7.5 PILOT COMPLETE — MVP LIMITATIONS IDENTIFIED**
+
+## Current final ruling
+
+This final ruling supersedes every preceding section only for current status;
+all preceding attempt ledgers remain append-only audit evidence. The latest
+complete cohort is the 900-second mutation-grounding epoch at HEAD
+`9f5d503b83da4818335228539c5de1fe40b759df`, documented in the dedicated
+section above. Its release metrics are autonomous success `3/10`, meaningful
+convergence `0/10`, exact failed stop-reason coverage `7/7`, and final-epoch
+cleanup `19/19`. Exact SHA verification passed `10/10`; no sandbox remained,
+no total-duration exhaustion occurred, and no host fallback was used. The three
+autonomous successes each retained exit code `0`, terminal `completed`, and a
+completed JSON report.
+
+The frozen M7.5 release thresholds are not met.
 
 **M7.5 PILOT COMPLETE — MVP LIMITATIONS IDENTIFIED**

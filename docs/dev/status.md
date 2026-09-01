@@ -431,3 +431,47 @@ were not authorized.
   results. Existing M7.5 history remains retained.
 
 **M7.5 RECOVERY — TOTAL-DURATION CALIBRATION PROVEN**
+
+## M7.5 final 900-second mutation-grounding cohort — current status
+
+- Current execution HEAD:
+  `9f5d503b83da4818335228539c5de1fe40b759df`; manifest SHA-256:
+  `4a963f0ee730ddf4be7243ad31cc2899ce19cdbfed3c4570498ff7d1c617551a`.
+- The build includes the verified 900-second host monotonic whole-trial default
+  and generic `root_user_possible -> DROP_ALL_CAPS` mutation grounding. Frozen
+  architecture, manifest, Disk Bound, PID disclosure, and no-host-fallback
+  semantics were unchanged.
+- Fresh gates before execution: Linux full suite `1519 passed, 6 skipped`;
+  coverage `87.30%`; Ruff lint/format, strict mypy, pre-commit, diff-check,
+  focused mutation tests, and independent review PASS; SBX diagnose `12/12`
+  PASS with exact empty inventory.
+- The frozen three-repository canary passed `2/3`: Umami
+  `dfc8e110-fdd0-4cc3-a3fa-d37a2e241954` and Listmonk
+  `3c564561-5acf-428a-b5b8-76a0ddad40b6` had non-empty all-PASS required
+  Journeys; changedetection.io
+  `2630f55c-bf7a-4ce5-adfe-f559eadf5d20` retained five `network_error`
+  Journey failures. The failed result remained in the denominator.
+- Repositories #4-#10 then ran serially on the same unchanged HEAD. The final
+  cohort autonomous-success result is `3/10`: Umami, Listmonk, and Dockge
+  `87bd771f-0c80-418e-b224-1048650d466c`. Meaningful convergence is `0/10`;
+  all nine experiments rolled back and none produced KEEP. Each of the three
+  autonomous successes retained process exit code `0`, terminal `completed`,
+  and an existing completed JSON report.
+- Other exact terminal causes: Uptime Kuma and n8n-hosting Docker-data disk
+  exhaustion; Linkding missing documented `.env`; NetBox PostgreSQL recovery
+  timing; Wakapi per-command `sandbox:exec:timeout`; Paperless-ngx fail-closed
+  malformed/truncated guest clone-status verification.
+- Exact SHA verification passed `10/10`. Every attempt retained an exact stop
+  reason; failed-attempt coverage is `7/7 = 100%`. Final-epoch cleanup was
+  `19/19 = 100%`; every final inventory was exactly empty with empty stderr.
+- P50/P95 remain `UNKNOWN` because Paperless-ngx did not cross the target
+  workload boundary. No run exhausted the 900-second whole-trial deadline.
+- Release thresholds fail: autonomous success `3/10 < 7/10` and meaningful
+  convergence `0/10 < 5/10`. README was not changed. PID hard bound remains
+  unsupported and disclosed; no host fallback was used.
+
+Full current-epoch evidence and run IDs are recorded in
+[`pilot-report.md`](pilot-report.md) and
+[`pilot-evidence/m7.5-compatibility-diagnostic.md`](pilot-evidence/m7.5-compatibility-diagnostic.md).
+
+**M7.5 PILOT COMPLETE — MVP LIMITATIONS IDENTIFIED**
