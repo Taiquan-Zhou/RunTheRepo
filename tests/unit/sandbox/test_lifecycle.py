@@ -425,6 +425,26 @@ def test_failure_serializer_rejects_integer_scalars_over_512_bytes(
         serialize_sandbox_failure_evidence(evidence)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("x" * 512, id="ascii-512-bytes"),
+        pytest.param("é" * 256, id="utf8-512-bytes"),
+    ],
+)
+def test_failure_serializer_accepts_scalar_at_512_utf8_bytes(value: str) -> None:
+    evidence = SandboxFailureEvidence(
+        operation="create",
+        reason="io_error",
+        details={"value": value},
+    )
+
+    serialized = serialize_sandbox_failure_evidence(evidence)
+
+    assert len(value.encode("utf-8")) == 512
+    assert cast(dict[str, object], serialized["details"])["value"] == value
+
+
 def test_failure_serializer_rounds_finite_floats_at_serialization() -> None:
     evidence = SandboxFailureEvidence(
         operation="create",

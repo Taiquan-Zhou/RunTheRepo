@@ -109,7 +109,9 @@ def serialize_sandbox_failure_evidence(
             if not math.isfinite(value):
                 raise ValueError("failure evidence float must be finite")
             normalized = round(value, 6)
-        elif isinstance(value, str) or value is None or type(value) in {bool, int}:
+        elif isinstance(value, str):
+            return bounded_text(value, _MAX_FAILURE_VALUE_BYTES)
+        elif value is None or type(value) in {bool, int}:
             normalized = value
         else:
             raise ValueError("failure evidence scalar is invalid")
