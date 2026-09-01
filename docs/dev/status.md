@@ -402,3 +402,32 @@ were not authorized.
   PID hard bound remains unsupported and disclosed; no host fallback was used.
 
 **M7.5 PILOT COMPLETE — MVP LIMITATIONS IDENTIFIED**
+
+## M7.5 post-pilot failure diagnostic — current recovery status
+
+- Diagnostic execution HEAD:
+  `8d6982f45a0ddcb4dbe68c89e51ba3d77eb1c6a0`; manifest SHA-256:
+  `4a963f0ee730ddf4be7243ad31cc2899ce19cdbfed3c4570498ff7d1c617551a`.
+- Four fixed, strictly serial diagnostic attempts completed: Umami
+  `34c99596-e85b-468e-83ff-cebe5c47ba2d`, Listmonk
+  `d080dc08-6eb9-4ddf-b9ce-941d8777db4d`, Paperless-ngx
+  `da95f905-5019-4c04-a1de-f7a534343fbf`, and Wakapi
+  `6f5c6a71-5740-4e35-aa00-23b4af821a24`.
+- Umami and Listmonk independently exhausted the shared monotonic 300-second
+  total-duration budget. Enforcement passed. Provider-internal,
+  deadline-independent force-remove semantics plus the queue controller's exact
+  post-run `sbx list` captures prove cleanup and empty inventory; total-duration
+  resource calibration is the next bounded task.
+- Fixed-UID correction is not yet proven across two repositories. Paperless-ngx
+  clone diagnostics were truncated/malformed, so a generic clone correction is
+  also not yet proven. Wakapi ended at a separate per-command Boot exec timeout.
+- All four attempts used their exact manifest SHA, retained their failure
+  outcomes, and ended with exact-empty official sandbox inventory. Every command
+  explicitly selected `docker-sbx`; the CLI has no host Docker provider/fallback
+  branch. PID hard bound remains unsupported and disclosed.
+- Full evidence and gate rulings are recorded in
+  [`pilot-evidence/m7.5-post-pilot-failure-diagnostic.md`](pilot-evidence/m7.5-post-pilot-failure-diagnostic.md).
+- These attempts are audit diagnostics, not replacement metric-bearing cohort
+  results. Existing M7.5 history remains retained.
+
+**M7.5 RECOVERY — TOTAL-DURATION CALIBRATION PROVEN**
