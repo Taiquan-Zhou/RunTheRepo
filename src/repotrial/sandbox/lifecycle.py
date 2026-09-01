@@ -9,7 +9,9 @@ from typing import NoReturn, TextIO
 from repotrial.sandbox.base import (
     PartialCreateCleanupContext,
     SandboxProvider,
+    find_sandbox_failure_evidence,
     get_partial_create_cleanup_context,
+    serialize_sandbox_failure_evidence,
 )
 
 # Audit and provider boundaries must retain process-control failures until cleanup.
@@ -55,11 +57,14 @@ def _write_event(
     state: str | None = None,
     cleanup_exception: BaseException | None = None,
 ) -> None:
-    record = {"event": event}
+    record: dict[str, object] = {"event": event}
     if sandbox_id is not None:
         record["sandbox_id"] = sandbox_id
     if exception is not None:
         record["exception_type"] = type(exception).__name__
+        failure_evidence = find_sandbox_failure_evidence(exception)
+        if failure_evidence is not None:
+            record["failure"] = serialize_sandbox_failure_evidence(failure_evidence)
     if state is not None:
         record["state"] = state
     if cleanup_exception is not None:

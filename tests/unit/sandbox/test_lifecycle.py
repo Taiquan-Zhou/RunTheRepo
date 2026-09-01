@@ -1,11 +1,23 @@
 import asyncio
 import json
+from itertools import pairwise
 from pathlib import Path
-from typing import Self
+from typing import Self, cast
 
 import pytest
 
-from repotrial.sandbox.base import ExecResult, NetworkLogResult, SandboxProvider
+from repotrial.sandbox.base import (
+    ExecResult,
+    FailureEvidenceValue,
+    NetworkLogResult,
+    SandboxFailureEvidence,
+    SandboxProvider,
+    attach_partial_create_cleanup_context,
+    attach_sandbox_failure_evidence,
+    find_sandbox_failure_evidence,
+    get_sandbox_failure_evidence,
+    serialize_sandbox_failure_evidence,
+)
 from repotrial.sandbox.lifecycle import CleanupError, managed_sandbox
 
 
@@ -115,8 +127,397 @@ def _patch_artifact_open(
     monkeypatch.setattr(Path, "open", lambda *args, **kwargs: artifact)
 
 
-def _read_events(path: Path) -> list[dict[str, str]]:
+def _read_events(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_failure_evidence_carrier_round_trips_on_the_same_exception() -> None:
+    failure = RuntimeError("secret must remain private")
+    evidence = SandboxFailureEvidence(operation="create", reason="io_error")
+
+    assert attach_sandbox_failure_evidence(failure, evidence) is evidence
+    assert get_sandbox_failure_evidence(failure) is evidence
+    assert get_sandbox_failure_evidence(RuntimeError("unrelated")) is None
+
+
+def test_create_failure_records_bounded_structured_provider_evidence(
+    tmp_path: Path,
+) -> None:
+    failure = RuntimeError("raw secret must not be serialized")
+    attach_sandbox_failure_evidence(
+        failure,
+        SandboxFailureEvidence(
+            operation="create",
+            reason="total_duration_exhausted",
+            returncode=None,
+            sandbox_id="sandbox-17",
+            trial_elapsed_s=300.0,
+            trial_remaining_s=0.0,
+            deadline_limited=True,
+            subprocess_started=False,
+        ),
+    )
+
+    class CreateFailingProvider(_Provider):
+        async def create(self, workspace: Path, name: str) -> str:
+            self.calls.append(("create", workspace, name))
+            raise failure
+
+    provider = CreateFailingProvider()
+    artifact = tmp_path / "lifecycle.jsonl"
+
+    async def exercise() -> None:
+        async with managed_sandbox(
+            provider,
+            tmp_path / "workspace",
+            "trial",
+            lifecycle_artifact=artifact,
+        ):
+            raise AssertionError("body must not run")
+
+    with pytest.raises(RuntimeError) as raised:
+        asyncio.run(exercise())
+
+    assert raised.value is failure
+    event = _read_events(artifact)[-1]
+    assert event["failure"] == {
+        "deadline_limited": True,
+        "operation": "create",
+        "reason": "total_duration_exhausted",
+        "sandbox_id": "sandbox-17",
+        "subprocess_started": False,
+        "trial_elapsed_s": 300.0,
+        "trial_remaining_s": 0.0,
+    }
+    assert "secret" not in artifact.read_text(encoding="utf-8")
+
+
+def test_provider_failure_and_cleanup_terminal_events_remain_separate(
+    tmp_path: Path,
+) -> None:
+    create_failure = RuntimeError("partial create raw secret")
+    attach_sandbox_failure_evidence(
+        create_failure,
+        SandboxFailureEvidence(operation="create", reason="partial_create"),
+    )
+    initial_cleanup_failure = OSError("initial cleanup raw secret")
+    attach_partial_create_cleanup_context(
+        create_failure,
+        "sandbox-17",
+        initial_cleanup_failure,
+    )
+
+    class PartialCreateProvider(_Provider):
+        async def create(self, workspace: Path, name: str) -> str:
+            self.calls.append(("create", workspace, name))
+            raise create_failure
+
+    provider = PartialCreateProvider()
+    artifact = tmp_path / "lifecycle.jsonl"
+
+    async def exercise() -> None:
+        async with managed_sandbox(
+            provider,
+            tmp_path / "workspace",
+            "trial",
+            lifecycle_artifact=artifact,
+        ):
+            raise AssertionError("body must not run")
+
+    with pytest.raises(RuntimeError) as raised:
+        asyncio.run(exercise())
+
+    assert raised.value is create_failure
+    events = _read_events(artifact)
+    assert [event["event"] for event in events] == [
+        "create_attempt",
+        "create_cleanup_unsafe",
+        "cleanup_retry_attempt",
+        "cleanup_retry_success",
+    ]
+    assert "failure" in events[1]
+    assert "failure" not in events[-1]
+
+
+def test_partial_create_cleanup_retry_failure_keeps_both_evidence_chains(
+    tmp_path: Path,
+) -> None:
+    create_failure = RuntimeError("primary create raw secret")
+    attach_sandbox_failure_evidence(
+        create_failure,
+        SandboxFailureEvidence(operation="create", reason="partial_create"),
+    )
+    initial_cleanup_failure = OSError("initial cleanup raw secret")
+    attach_partial_create_cleanup_context(
+        create_failure,
+        "sandbox-17",
+        initial_cleanup_failure,
+    )
+    retry_failure = RuntimeError("retry destroy raw secret")
+    attach_sandbox_failure_evidence(
+        retry_failure,
+        SandboxFailureEvidence(operation="destroy", reason="io_error"),
+    )
+
+    class PartialCreateRetryFailProvider(_Provider):
+        async def create(self, workspace: Path, name: str) -> str:
+            self.calls.append(("create", workspace, name))
+            raise create_failure
+
+        async def destroy(self, sandbox_id: str) -> None:
+            self.calls.append(("destroy", sandbox_id))
+            raise retry_failure
+
+    provider = PartialCreateRetryFailProvider()
+    artifact = tmp_path / "lifecycle.jsonl"
+
+    async def exercise() -> None:
+        async with managed_sandbox(
+            provider,
+            tmp_path / "workspace",
+            "trial",
+            lifecycle_artifact=artifact,
+        ):
+            raise AssertionError("body must not run")
+
+    with pytest.raises(CleanupError) as raised:
+        asyncio.run(exercise())
+
+    assert raised.value.create_failure is create_failure
+    assert raised.value.__cause__ is retry_failure
+    events = _read_events(artifact)
+    assert [event["event"] for event in events] == [
+        "create_attempt",
+        "create_cleanup_unsafe",
+        "cleanup_retry_attempt",
+        "cleanup_retry_failure",
+    ]
+    assert cast(dict[str, object], events[1]["failure"])["operation"] == "create"
+    assert cast(dict[str, object], events[-1]["failure"])["operation"] == "destroy"
+    assert "secret" not in artifact.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [float("nan"), float("inf"), {"nested": {"too": "deep"}}],
+)
+def test_failure_serializer_rejects_non_json_or_non_finite_values(
+    invalid: object,
+) -> None:
+    evidence = SandboxFailureEvidence(
+        operation="create",
+        reason="io_error",
+        details={"invalid": cast(FailureEvidenceValue, invalid)},
+    )
+    with pytest.raises(ValueError, match="failure evidence"):
+        serialize_sandbox_failure_evidence(evidence)
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        pytest.param(
+            SandboxFailureEvidence(operation="x" * 65, reason="io_error"),
+            id="operation-65-bytes",
+        ),
+        pytest.param(
+            SandboxFailureEvidence(operation="create", reason="x" * 65),
+            id="reason-65-bytes",
+        ),
+        pytest.param(
+            SandboxFailureEvidence(
+                operation="create",
+                reason="io_error",
+                details={"x" * 65: "value"},
+            ),
+            id="detail-key-65-bytes",
+        ),
+        pytest.param(
+            SandboxFailureEvidence(
+                operation="create",
+                reason="io_error",
+                details={f"key-{index}": index for index in range(17)},
+            ),
+            id="17-detail-keys",
+        ),
+        pytest.param(
+            SandboxFailureEvidence(
+                operation="create",
+                reason="io_error",
+                details={"payload": "x" * 513},
+            ),
+            id="scalar-513-bytes",
+        ),
+        pytest.param(
+            SandboxFailureEvidence(
+                operation="create",
+                reason="io_error",
+                details={"items": list(range(33))},
+            ),
+            id="33-list-items",
+        ),
+        pytest.param(
+            SandboxFailureEvidence(
+                operation="create",
+                reason="io_error",
+                details={"records": [{f"key-{index}": index for index in range(17)}]},
+            ),
+            id="17-field-record",
+        ),
+        pytest.param(
+            SandboxFailureEvidence(
+                operation="create",
+                reason="io_error",
+                details={"mixed": [1, {"field": "value"}]},
+            ),
+            id="mixed-scalar-record-list",
+        ),
+        pytest.param(
+            SandboxFailureEvidence(
+                operation="create",
+                reason="io_error",
+                details={
+                    "nested": cast(
+                        FailureEvidenceValue,
+                        {"outer": {"inner": "value"}},
+                    )
+                },
+            ),
+            id="nested-mapping",
+        ),
+        pytest.param(
+            SandboxFailureEvidence(
+                operation="create",
+                reason="io_error",
+                details={
+                    f"detail-{index}": ["x" * 512 for _item in range(32)]
+                    for index in range(16)
+                },
+            ),
+            id="serialized-over-16384-bytes",
+        ),
+    ],
+)
+def test_failure_serializer_rejects_runtime_boundaries(
+    evidence: SandboxFailureEvidence,
+) -> None:
+    with pytest.raises(ValueError, match="failure evidence"):
+        serialize_sandbox_failure_evidence(evidence)
+
+
+def test_failure_serializer_rounds_finite_floats_at_serialization() -> None:
+    evidence = SandboxFailureEvidence(
+        operation="create",
+        reason="io_error",
+        trial_elapsed_s=1.1234567,
+        trial_remaining_s=-2.76543219,
+        details={"ratio": 9.87654321},
+    )
+
+    serialized = serialize_sandbox_failure_evidence(evidence)
+
+    assert serialized["trial_elapsed_s"] == 1.123457
+    assert serialized["trial_remaining_s"] == -2.765432
+    assert cast(dict[str, object], serialized["details"])["ratio"] == 9.876543
+    assert evidence.trial_elapsed_s == 1.1234567
+    assert evidence.trial_remaining_s == -2.76543219
+    assert evidence.details["ratio"] == 9.87654321
+
+
+def test_find_sandbox_failure_evidence_follows_cause_before_context() -> None:
+    cause = RuntimeError("cause secret")
+    cause_evidence = SandboxFailureEvidence(operation="cause", reason="cause_reason")
+    attach_sandbox_failure_evidence(cause, cause_evidence)
+    context = RuntimeError("context secret")
+    context_evidence = SandboxFailureEvidence(
+        operation="context", reason="context_reason"
+    )
+    attach_sandbox_failure_evidence(context, context_evidence)
+    failure = RuntimeError("wrapper secret")
+    failure.__cause__ = cause
+    failure.__context__ = context
+
+    assert find_sandbox_failure_evidence(failure) is cause_evidence
+
+
+def test_find_sandbox_failure_evidence_ignores_suppressed_context() -> None:
+    context = RuntimeError("suppressed context secret")
+    attach_sandbox_failure_evidence(
+        context,
+        SandboxFailureEvidence(operation="context", reason="context_reason"),
+    )
+    failure = RuntimeError("wrapper secret")
+    failure.__context__ = context
+    failure.__suppress_context__ = True
+
+    assert find_sandbox_failure_evidence(failure) is None
+
+
+def test_find_sandbox_failure_evidence_stops_on_cycles() -> None:
+    first = RuntimeError("first secret")
+    second = RuntimeError("second secret")
+    first.__cause__ = second
+    second.__cause__ = first
+
+    assert find_sandbox_failure_evidence(first) is None
+
+
+@pytest.mark.parametrize(
+    ("evidence_index", "found"),
+    [(7, True), (8, False)],
+    ids=["eighth-exception-is-included", "ninth-exception-is-capped"],
+)
+def test_find_sandbox_failure_evidence_has_exact_depth_eight_cap(
+    evidence_index: int,
+    found: bool,
+) -> None:
+    chain = [RuntimeError(f"chain-{index} secret") for index in range(9)]
+    for current, next_error in pairwise(chain):
+        current.__cause__ = next_error
+    evidence = SandboxFailureEvidence(operation="chain", reason="depth_cap")
+    attach_sandbox_failure_evidence(chain[evidence_index], evidence)
+
+    result = find_sandbox_failure_evidence(chain[0])
+
+    assert (result is evidence) is found
+
+
+def test_lifecycle_records_cause_carried_evidence_without_raw_message(
+    tmp_path: Path,
+) -> None:
+    cause = RuntimeError("cause raw secret")
+    evidence = SandboxFailureEvidence(operation="create", reason="wrapped_io_error")
+    attach_sandbox_failure_evidence(cause, evidence)
+    failure = RuntimeError("wrapper raw secret")
+    failure.__cause__ = cause
+
+    class WrappedCreateFailingProvider(_Provider):
+        async def create(self, workspace: Path, name: str) -> str:
+            self.calls.append(("create", workspace, name))
+            raise failure
+
+    provider = WrappedCreateFailingProvider()
+    artifact = tmp_path / "lifecycle.jsonl"
+
+    async def exercise() -> None:
+        async with managed_sandbox(
+            provider,
+            tmp_path / "workspace",
+            "trial",
+            lifecycle_artifact=artifact,
+        ):
+            raise AssertionError("body must not run")
+
+    with pytest.raises(RuntimeError) as raised:
+        asyncio.run(exercise())
+
+    assert raised.value is failure
+    event = _read_events(artifact)[-1]
+    assert event["failure"] == {
+        "operation": "create",
+        "reason": "wrapped_io_error",
+    }
+    assert "secret" not in artifact.read_text(encoding="utf-8")
 
 
 def test_success_creates_yields_and_destroys_once_with_ordered_audit(
