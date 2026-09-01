@@ -7,24 +7,44 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 from string import ascii_letters, digits
+from typing import Literal
 from urllib.parse import SplitResult, urlsplit
 
 from repotrial.domain.models import PinnedRepo, RepoRef
 
 COMMAND_TIMEOUT_SECONDS = 120
 REAP_TIMEOUT_SECONDS = 5
+_MAX_GIT_OUTPUT_BYTES = 65_536
+_GIT_READ_CHUNK_BYTES = 8_192
 _FULL_COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
 _RAW_URI_CHARACTERS = frozenset(ascii_letters + digits + "-._~:/?#[]@!$&'()*+,;=%")
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
+type GitFailureClass = Literal[
+    "dns",
+    "transport",
+    "http",
+    "authentication",
+    "missing_ref",
+    "local_io",
+    "unknown",
+]
+
 
 class RepoIntakeError(RuntimeError):
     """A sanitized repository-intake failure."""
 
-    def __init__(self, operation: str, returncode: int | None = None) -> None:
+    def __init__(
+        self,
+        operation: str,
+        returncode: int | None = None,
+        *,
+        failure_class: GitFailureClass | None = None,
+    ) -> None:
         self.operation = operation
         self.returncode = returncode
+        self.failure_class = failure_class
         message = f"repository intake failed: {operation}"
         if returncode is not None:
             message = f"{message} (returncode={returncode})"
@@ -308,44 +328,104 @@ def _git_environment() -> dict[str, str]:
     return environment
 
 
+def _classify_git_failure(stderr: bytes) -> GitFailureClass:
+    normalized = stderr.decode("utf-8", "ignore").casefold()
+    if "could not resolve host" in normalized:
+        return "dns"
+    if "authentication failed" in normalized or "permission denied" in normalized:
+        return "authentication"
+    if "requested url returned error" in normalized:
+        return "http"
+    if "couldn't find remote ref" in normalized or "not our ref" in normalized:
+        return "missing_ref"
+    if "failed to connect" in normalized or "tls" in normalized:
+        return "transport"
+    return "unknown"
+
+
+async def _read_bounded_git_stream(stream: asyncio.StreamReader) -> bytes:
+    retained = bytearray()
+    while True:
+        chunk = await stream.read(_GIT_READ_CHUNK_BYTES)
+        if not chunk:
+            return bytes(retained)
+        remaining = _MAX_GIT_OUTPUT_BYTES - len(retained)
+        if remaining > 0:
+            retained.extend(chunk[:remaining])
+
+
+async def _collect_git_output(
+    process: asyncio.subprocess.Process,
+) -> tuple[bytes, bytes, int]:
+    stdout_stream = process.stdout
+    stderr_stream = process.stderr
+    if stdout_stream is None or stderr_stream is None:
+        raise OSError("git subprocess pipes are unavailable")
+
+    stdout_task = asyncio.create_task(_read_bounded_git_stream(stdout_stream))
+    stderr_task = asyncio.create_task(_read_bounded_git_stream(stderr_stream))
+    try:
+        stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
+        returncode = await process.wait()
+        return stdout, stderr, returncode
+    finally:
+        for task in (stdout_task, stderr_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+
+
 async def _run_git(operation: str, *arguments: str) -> bytes:
     process: asyncio.subprocess.Process | None = None
-    communicate_failed = False
+    stdout = b""
+    stderr = b""
+    returncode: int | None = None
+    failure_operation: str | None = None
+    failure_class: GitFailureClass | None = None
     try:
         async with asyncio.timeout(COMMAND_TIMEOUT_SECONDS):
-            process = await asyncio.create_subprocess_exec(
-                "git",
-                *arguments,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_git_environment(),
-            )
             try:
-                stdout, _stderr = await process.communicate()
+                process = await asyncio.create_subprocess_exec(
+                    "git",
+                    *arguments,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=_git_environment(),
+                )
+            except FileNotFoundError:
+                failure_operation = "git_unavailable"
+                failure_class = "local_io"
             except OSError:
-                communicate_failed = True
-    except TimeoutError as error:
+                failure_operation = f"{operation}_io"
+                failure_class = "local_io"
+            if process is not None:
+                try:
+                    stdout, stderr, returncode = await _collect_git_output(process)
+                except OSError:
+                    failure_operation = f"{operation}_io"
+                    failure_class = "local_io"
+    except TimeoutError:
         if process is not None:
             await _kill_and_reap(process)
-        raise RepoIntakeError(f"{operation}_timeout") from error
+        raise RepoIntakeError(f"{operation}_timeout") from None
     except asyncio.CancelledError:
         if process is not None:
             await _kill_and_reap(process)
         raise
-    except FileNotFoundError as error:
-        raise RepoIntakeError("git_unavailable") from error
-    except OSError:
+
+    if failure_operation is not None:
         if process is not None:
             await _kill_and_reap(process)
-        raise RepoIntakeError(f"{operation}_io") from None
-
+        raise RepoIntakeError(failure_operation, failure_class=failure_class) from None
     assert process is not None
-    if communicate_failed:
-        await _kill_and_reap(process)
-        raise RepoIntakeError(f"{operation}_io") from None
-    if process.returncode != 0:
-        raise RepoIntakeError(operation, process.returncode) from None
+    assert returncode is not None
+    if returncode != 0:
+        raise RepoIntakeError(
+            operation,
+            returncode,
+            failure_class=_classify_git_failure(stderr),
+        ) from None
     return stdout
 
 
@@ -356,8 +436,8 @@ async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
         except (OSError, ProcessLookupError):
             pass
     try:
-        await asyncio.wait_for(process.communicate(), timeout=REAP_TIMEOUT_SECONDS)
-    except (OSError, TimeoutError):
+        await asyncio.wait_for(process.wait(), timeout=REAP_TIMEOUT_SECONDS)
+    except (OSError, ProcessLookupError, TimeoutError):
         pass
 
 

@@ -7,6 +7,24 @@ from repotrial.domain.models import RepoRef
 from repotrial.intake import github
 
 
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        (b"fatal: unable to access: Could not resolve host", "dns"),
+        (b"fatal: unable to access: Failed to connect", "transport"),
+        (
+            b"fatal: unable to access: The requested URL returned error: 503",
+            "http",
+        ),
+        (b"fatal: Authentication failed", "authentication"),
+        (b"fatal: couldn't find remote ref pinned", "missing_ref"),
+        (b"unrecognized secret text", "unknown"),
+    ],
+)
+def test_git_failure_classification_is_sanitized(stderr: bytes, expected: str) -> None:
+    assert github._classify_git_failure(stderr) == expected
+
+
 def test_parse_github_url_canonicalizes_case_and_literal_git_suffix() -> None:
     assert callable(getattr(github, "parse_github_url", None))
 

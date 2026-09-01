@@ -234,20 +234,258 @@ def test_pin_repository_builds_a_canonical_pinned_repo(
 
 class _HangingProcess:
     def __init__(self) -> None:
-        self.communicate_calls = 0
         self.killed = False
         self.returncode: int | None = None
+        self.waited = False
+        self.stdout = _FakeStream(block=True)
+        self.stderr = _FakeStream(block=True)
 
-    async def communicate(self) -> tuple[bytes, bytes]:
-        self.communicate_calls += 1
-        if self.killed:
-            return b"", b""
-        await asyncio.Event().wait()
-        raise AssertionError("unreachable")
+    async def wait(self) -> int:
+        self.waited = True
+        assert self.returncode is not None
+        return self.returncode
 
     def kill(self) -> None:
         self.killed = True
         self.returncode = -9
+
+
+class _FakeStream:
+    def __init__(
+        self,
+        chunks: list[bytes] | None = None,
+        *,
+        error: OSError | None = None,
+        block: bool = False,
+    ) -> None:
+        self._chunks = list(chunks or [])
+        self._error = error
+        self._block = block
+        self.started = asyncio.Event()
+        self.read_calls = 0
+        self.requested_sizes: list[int] = []
+
+    async def read(self, size: int = -1) -> bytes:
+        self.read_calls += 1
+        self.requested_sizes.append(size)
+        self.started.set()
+        if self._block:
+            await asyncio.Event().wait()
+        if self._error is not None:
+            raise self._error
+        if self._chunks:
+            return self._chunks.pop(0)
+        return b""
+
+
+class _FakeProcess:
+    def __init__(
+        self,
+        *,
+        stdout: _FakeStream,
+        stderr: _FakeStream,
+        returncode: int | None = 0,
+        wait_error: OSError | None = None,
+    ) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self._expected_returncode = returncode
+        self._wait_error = wait_error
+        self.returncode: int | None = None
+        self.waited = False
+        self.killed = False
+
+    async def wait(self) -> int:
+        self.waited = True
+        if self._wait_error is not None:
+            raise self._wait_error
+        if self.returncode is None:
+            self.returncode = self._expected_returncode
+        assert self.returncode is not None
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+        if self.returncode is None:
+            self.returncode = -9
+
+
+def _patch_fake_git_process(
+    monkeypatch: pytest.MonkeyPatch, process: _FakeProcess
+) -> None:
+    async def fake_create_subprocess_exec(
+        *_arguments: object, **_keywords: object
+    ) -> _FakeProcess:
+        return process
+
+    monkeypatch.setattr(
+        github.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+
+
+def test_git_stderr_reader_is_bounded_and_process_is_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = b"credential=do-not-persist"
+    process = _FakeProcess(
+        stdout=_FakeStream(),
+        stderr=_FakeStream(
+            [secret + b"x" * github._MAX_GIT_OUTPUT_BYTES, b"tail-after-limit"]
+        ),
+        returncode=128,
+    )
+    _patch_fake_git_process(monkeypatch, process)
+
+    with pytest.raises(github.RepoIntakeError) as raised:
+        asyncio.run(github._run_git("clone"))
+
+    assert raised.value.failure_class == "unknown"
+    assert secret.decode() not in str(raised.value)
+    assert process.waited is True
+    assert process.killed is False
+    assert process.stderr.read_calls >= 2
+    assert all(
+        size <= github._GIT_READ_CHUNK_BYTES for size in process.stderr.requested_sizes
+    )
+
+
+def test_git_readers_bound_simultaneous_oversized_stdout_and_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(
+        stdout=_FakeStream([b"o" * (github._MAX_GIT_OUTPUT_BYTES + 1)]),
+        stderr=_FakeStream([b"e" * (github._MAX_GIT_OUTPUT_BYTES + 1)]),
+        returncode=0,
+    )
+    _patch_fake_git_process(monkeypatch, process)
+
+    stdout = asyncio.run(github._run_git("resolve"))
+
+    assert stdout == b"o" * github._MAX_GIT_OUTPUT_BYTES
+    assert process.waited is True
+    assert process.killed is False
+
+
+def test_git_reader_timeout_kills_and_reaps_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(
+        stdout=_FakeStream(block=True),
+        stderr=_FakeStream(block=True),
+    )
+    _patch_fake_git_process(monkeypatch, process)
+    monkeypatch.setattr(github, "COMMAND_TIMEOUT_SECONDS", 0.001)
+
+    with pytest.raises(github.RepoIntakeError) as raised:
+        asyncio.run(github._run_git("clone"))
+
+    assert raised.value.operation == "clone_timeout"
+    assert process.killed is True
+    assert process.waited is True
+
+
+def test_git_reader_cancellation_kills_and_reaps_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(
+        stdout=_FakeStream(block=True),
+        stderr=_FakeStream(block=True),
+    )
+    _patch_fake_git_process(monkeypatch, process)
+
+    async def cancel_run() -> None:
+        task = asyncio.create_task(github._run_git("clone"))
+        try:
+            await asyncio.wait_for(process.stdout.started.wait(), timeout=0.1)
+        except TimeoutError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_run())
+
+    assert process.killed is True
+    assert process.waited is True
+
+
+@pytest.mark.parametrize("failed_stream", ["stdout", "stderr"])
+def test_git_reader_oserror_is_local_io_and_reaped(
+    monkeypatch: pytest.MonkeyPatch, failed_stream: str
+) -> None:
+    secret = "SECRET reader failure"
+    failure = OSError(secret)
+    stdout = _FakeStream(error=failure) if failed_stream == "stdout" else _FakeStream()
+    stderr = _FakeStream(error=failure) if failed_stream == "stderr" else _FakeStream()
+    process = _FakeProcess(stdout=stdout, stderr=stderr)
+    _patch_fake_git_process(monkeypatch, process)
+
+    with pytest.raises(github.RepoIntakeError) as raised:
+        asyncio.run(github._run_git("clone"))
+
+    assert raised.value.operation == "clone_io"
+    assert raised.value.failure_class == "local_io"
+    assert secret not in str(raised.value)
+    assert process.killed is True
+    assert process.waited is True
+
+
+def test_git_wait_oserror_is_local_io_and_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(
+        stdout=_FakeStream(),
+        stderr=_FakeStream(),
+        wait_error=OSError("SECRET wait failure"),
+    )
+    _patch_fake_git_process(monkeypatch, process)
+
+    with pytest.raises(github.RepoIntakeError) as raised:
+        asyncio.run(github._run_git("clone"))
+
+    assert raised.value.operation == "clone_io"
+    assert raised.value.failure_class == "local_io"
+    assert "SECRET" not in str(raised.value)
+    assert process.killed is True
+    assert process.waited is True
+
+
+def test_git_nonzero_stderr_uses_sanitized_class_not_local_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(
+        stdout=_FakeStream(),
+        stderr=_FakeStream([b"fatal: unable to access: Failed to connect"]),
+        returncode=128,
+    )
+    _patch_fake_git_process(monkeypatch, process)
+
+    with pytest.raises(github.RepoIntakeError) as raised:
+        asyncio.run(github._run_git("clone"))
+
+    assert raised.value.operation == "clone"
+    assert raised.value.returncode == 128
+    assert raised.value.failure_class == "transport"
+    assert process.waited is True
+    assert process.killed is False
+
+
+def test_git_spawn_oserror_is_local_io_without_raw_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def raise_spawn_error(*_arguments: object, **_keywords: object) -> None:
+        raise OSError("SECRET spawn failure")
+
+    monkeypatch.setattr(github.asyncio, "create_subprocess_exec", raise_spawn_error)
+
+    with pytest.raises(github.RepoIntakeError) as raised:
+        asyncio.run(github._run_git("clone"))
+
+    assert raised.value.operation == "clone_io"
+    assert raised.value.failure_class == "local_io"
+    assert "SECRET" not in str(raised.value)
 
 
 def _assert_clone_invocation(
@@ -310,7 +548,7 @@ def test_clone_timeout_kills_and_reaps_direct_child(
         asyncio.run(github.clone_and_resolve(str(source), destination))
 
     assert process.killed is True
-    assert process.communicate_calls == 2
+    assert process.waited is True
     _assert_normal_clone_cleanup_result(destination)
 
 
@@ -336,7 +574,7 @@ def test_clone_cancellation_kills_and_reaps_direct_child(
 
     async def cancel_clone() -> None:
         task = asyncio.create_task(github.clone_and_resolve(str(source), destination))
-        while process.communicate_calls == 0:
+        while not process.stdout.started.is_set():
             await asyncio.sleep(0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -349,7 +587,7 @@ def test_clone_cancellation_kills_and_reaps_direct_child(
     asyncio.run(cancel_clone())
 
     assert process.killed is True
-    assert process.communicate_calls == 2
+    assert process.waited is True
     _assert_normal_clone_cleanup_result(destination)
 
 
@@ -703,32 +941,22 @@ def test_clone_times_out_when_subprocess_spawn_hangs(
     _assert_normal_clone_cleanup_result(destination)
 
 
-class _CommunicateOSErrorProcess:
+class _CommunicateOSErrorProcess(_FakeProcess):
     def __init__(self) -> None:
-        self.killed = False
-        self.returncode: int | None = None
-
-    async def communicate(self) -> tuple[bytes, bytes]:
-        raise OSError("SECRET communicate failure")
-
-    def kill(self) -> None:
-        self.killed = True
-        self.returncode = -9
+        super().__init__(
+            stdout=_FakeStream(error=OSError("SECRET communicate failure")),
+            stderr=_FakeStream(),
+        )
 
 
-class _CommunicateFileNotFoundErrorProcess:
+class _CommunicateFileNotFoundErrorProcess(_FakeProcess):
     def __init__(self) -> None:
-        self.communicate_calls = 0
-        self.killed = False
-        self.returncode: int | None = None
-
-    async def communicate(self) -> tuple[bytes, bytes]:
-        self.communicate_calls += 1
-        raise FileNotFoundError("SECRET communicate file-not-found failure")
-
-    def kill(self) -> None:
-        self.killed = True
-        self.returncode = -9
+        super().__init__(
+            stdout=_FakeStream(
+                error=FileNotFoundError("SECRET communicate file-not-found failure")
+            ),
+            stderr=_FakeStream(),
+        )
 
 
 def test_clone_sanitizes_communicate_oserror_and_cleans_destination(
@@ -782,17 +1010,18 @@ def test_clone_sanitizes_communicate_file_not_found_and_cleans_destination(
     assert raised.value.__context__ is None
     assert raised.value.__suppress_context__ is True
     assert process.killed is True
-    assert process.communicate_calls == 2
+    assert process.waited is True
     _assert_normal_clone_cleanup_result(destination)
 
 
 class _KillOSErrorProcess:
     def __init__(self) -> None:
-        self.communicate_started = asyncio.Event()
+        self.stdout = _FakeStream(block=True)
+        self.stderr = _FakeStream(block=True)
+        self.communicate_started = self.stdout.started
         self.returncode: int | None = None
 
-    async def communicate(self) -> tuple[bytes, bytes]:
-        self.communicate_started.set()
+    async def wait(self) -> int:
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
 

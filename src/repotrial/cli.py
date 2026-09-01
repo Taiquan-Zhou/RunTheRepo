@@ -43,6 +43,19 @@ _FROZEN_MAX_EXPERIMENTS = 8
 _DEFAULT_CONTAINER_PORT = 8080
 _FULL_COMMIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
 _ATTEMPT_EVIDENCE_SCHEMA_VERSION = 1
+_INTAKE_FAILURE_EVIDENCE_SCHEMA_VERSION = 1
+type _IntakeEvidenceStatus = Literal["written", "collision", "write_failed"]
+_INTAKE_FAILURE_CLASSES = frozenset(
+    {
+        "dns",
+        "transport",
+        "http",
+        "authentication",
+        "missing_ref",
+        "local_io",
+        "unknown",
+    }
+)
 _DEFAULT_DOCKER_SBX_POLICY = DockerSbxPolicy(
     cpus=1,
     memory_mb=1024,
@@ -250,19 +263,29 @@ def create_app(
                 typer.echo(f"inspect failed: {type(error).__name__}", err=True)
                 raise typer.Exit(4) from None
             timing = _complete_attempt_timing(attempt_start)
+            evidence = _exception_evidence(
+                error,
+                repo_url=url,
+                expected_sha=commit_sha,
+                actual_verified_sha=actual_verified_sha,
+                container_port=container_port,
+                compose_path=compose_path,
+                exit_code=4,
+                timing=timing,
+            )
+            if isinstance(error, RepoIntakeError):
+                assert run_id is not None
+                evidence["private_intake_evidence_status"] = (
+                    _persist_intake_failure_evidence(
+                        run_path,
+                        run_id=run_id,
+                        error=error,
+                    )
+                )
             _exit_after_terminal_evidence(
                 run_id,
                 run_path,
-                _exception_evidence(
-                    error,
-                    repo_url=url,
-                    expected_sha=commit_sha,
-                    actual_verified_sha=actual_verified_sha,
-                    container_port=container_port,
-                    compose_path=compose_path,
-                    exit_code=4,
-                    timing=timing,
-                ),
+                evidence,
                 4,
             )
         typer.echo(f"report_json={report_paths.json_path}")
@@ -637,6 +660,36 @@ def _control_flow_exit_code(error: BaseException) -> int:
             return int(error.code)
         return 1
     return 130
+
+
+def _persist_intake_failure_evidence(
+    run_path: Path,
+    *,
+    run_id: str,
+    error: RepoIntakeError,
+) -> _IntakeEvidenceStatus:
+    path = run_path / "intake-failure.json"
+    failure_class = error.failure_class
+    if failure_class is None or failure_class not in _INTAKE_FAILURE_CLASSES:
+        failure_class = "unknown"
+    evidence = {
+        "failure_class": failure_class,
+        "operation": error.operation,
+        "returncode": error.returncode,
+        "run_id": run_id,
+        "schema_version": _INTAKE_FAILURE_EVIDENCE_SCHEMA_VERSION,
+    }
+    try:
+        with path.open("x", encoding="utf-8") as output:
+            json.dump(evidence, output, ensure_ascii=False, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+    except FileExistsError:
+        return "collision"
+    except (OSError, TypeError, UnicodeError, ValueError):
+        return "write_failed"
+    return "written"
 
 
 def _persist_attempt_evidence(run_path: Path, evidence: dict[str, object]) -> Path:

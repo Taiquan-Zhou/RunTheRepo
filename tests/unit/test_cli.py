@@ -1,4 +1,6 @@
+import json
 from pathlib import Path
+from typing import Self
 
 import pytest
 from typer import Typer
@@ -9,8 +11,10 @@ from repotrial.cli import create_app
 from repotrial.config import create_run_layout
 from repotrial.domain.enums import Verdict
 from repotrial.domain.models import JourneyResult, RunState
+from repotrial.intake.github import RepoIntakeError
 from repotrial.run_outcome import TerminalOutcome, classify_terminal_outcome
 from repotrial.sandbox.base import SandboxProvider
+from repotrial.sandbox.fake import FakeSandboxProvider
 
 FIXED_RUN_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -212,6 +216,196 @@ def test_run_layout_rejects_a_colliding_run_id(tmp_path: Path) -> None:
     assert run_path == artifacts_root / FIXED_RUN_ID
     with pytest.raises(FileExistsError):
         create_run_layout(artifacts_root, fixed_run_id)
+
+
+def _make_intake_failure_app(
+    artifacts_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    error: BaseException,
+    run_id: str = "run-fixed",
+):
+    async def failing_pinner(
+        _url: str, _destination: Path, _requested_ref: str | None
+    ) -> object:
+        raise error
+
+    monkeypatch.setattr(cli, "pin_repository", failing_pinner)
+    return create_app(
+        artifacts_root=artifacts_root,
+        run_id_generator=lambda: run_id,
+        provider_factory=lambda _name: FakeSandboxProvider(),
+    )
+
+
+def _invoke_intake_failure(app: Typer, *, commit_sha: str = "a" * 40):
+    return CliRunner().invoke(
+        app,
+        [
+            "inspect",
+            "--provider",
+            "fake",
+            "--commit-sha",
+            commit_sha,
+            "https://github.com/owner/repository",
+        ],
+    )
+
+
+def test_exact_sha_intake_failure_writes_private_sanitized_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts_root = tmp_path / "artifacts"
+    app = _make_intake_failure_app(
+        artifacts_root,
+        monkeypatch,
+        error=RepoIntakeError("clone", 128, failure_class="dns"),
+    )
+
+    result = _invoke_intake_failure(app)
+
+    assert result.exit_code == 4
+    run_path = artifacts_root / "run-fixed"
+    intake_failure = run_path / "intake-failure.json"
+    assert json.loads(intake_failure.read_text(encoding="utf-8")) == {
+        "failure_class": "dns",
+        "operation": "clone",
+        "returncode": 128,
+        "run_id": "run-fixed",
+        "schema_version": 1,
+    }
+    assert "raw" not in intake_failure.read_text(encoding="utf-8")
+    attempt = json.loads((run_path / "attempt-result.json").read_text(encoding="utf-8"))
+    assert attempt["private_intake_evidence_status"] == "written"
+    assert attempt["stop_reason"] == "intake:clone"
+    assert attempt["exit_code"] == 4
+
+
+def test_intake_failure_artifact_collision_is_secondary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts_root = tmp_path / "artifacts"
+    existing_text = "existing private evidence"
+
+    async def failing_pinner(
+        _url: str, destination: Path, _requested_ref: str | None
+    ) -> object:
+        (destination.parent / "intake-failure.json").write_text(
+            existing_text, encoding="utf-8"
+        )
+        raise RepoIntakeError("clone", 128, failure_class="dns")
+
+    monkeypatch.setattr(cli, "pin_repository", failing_pinner)
+    app = create_app(
+        artifacts_root=artifacts_root,
+        run_id_generator=lambda: "run-fixed",
+        provider_factory=lambda _name: FakeSandboxProvider(),
+    )
+
+    result = _invoke_intake_failure(app)
+
+    assert result.exit_code == 4
+    run_path = artifacts_root / "run-fixed"
+    assert (run_path / "intake-failure.json").read_text(encoding="utf-8") == (
+        existing_text
+    )
+    attempt = json.loads((run_path / "attempt-result.json").read_text(encoding="utf-8"))
+    assert attempt["private_intake_evidence_status"] == "collision"
+    assert attempt["stop_reason"] == "intake:clone"
+    assert attempt["exit_code"] == 4
+
+
+class _FlushFailingFile:
+    name = "intake-failure.json"
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def write(self, _value: str) -> int:
+        return 0
+
+    def flush(self) -> None:
+        raise OSError("SECRET flush failure")
+
+    def fileno(self) -> int:
+        return 0
+
+
+@pytest.mark.parametrize("failure_mode", ["open", "write", "flush"])
+def test_intake_failure_evidence_writer_failure_is_secondary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    artifacts_root = tmp_path / "artifacts"
+    app = _make_intake_failure_app(
+        artifacts_root,
+        monkeypatch,
+        error=RepoIntakeError("clone", 128, failure_class="dns"),
+    )
+
+    if failure_mode == "open":
+        original_open = Path.open
+
+        def fail_intake_open(path: Path, *args: object, **kwargs: object) -> object:
+            if path.name == "intake-failure.json":
+                raise OSError("SECRET open failure")
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", fail_intake_open)
+    elif failure_mode == "write":
+        original_dump = cli.json.dump
+
+        def fail_intake_dump(
+            value: object, stream: object, *args: object, **kwargs: object
+        ) -> object:
+            if Path(str(getattr(stream, "name", ""))).name == "intake-failure.json":
+                raise OSError("SECRET write failure")
+            return original_dump(value, stream, *args, **kwargs)
+
+        monkeypatch.setattr(cli.json, "dump", fail_intake_dump)
+    else:
+        original_open = Path.open
+
+        def flush_failure_open(path: Path, *args: object, **kwargs: object) -> object:
+            if path.name == "intake-failure.json":
+                return _FlushFailingFile()
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", flush_failure_open)
+
+    result = _invoke_intake_failure(app)
+
+    assert result.exit_code == 4
+    run_path = artifacts_root / "run-fixed"
+    attempt = json.loads((run_path / "attempt-result.json").read_text(encoding="utf-8"))
+    assert attempt["private_intake_evidence_status"] == "write_failed"
+    assert attempt["stop_reason"] == "intake:clone"
+    assert attempt["exit_code"] == 4
+
+
+def test_ordinary_exception_does_not_create_private_intake_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts_root = tmp_path / "artifacts"
+    app = _make_intake_failure_app(
+        artifacts_root,
+        monkeypatch,
+        error=ValueError("SECRET ordinary failure"),
+    )
+
+    result = _invoke_intake_failure(app)
+
+    assert result.exit_code == 4
+    run_path = artifacts_root / "run-fixed"
+    assert not (run_path / "intake-failure.json").exists()
+    attempt = json.loads((run_path / "attempt-result.json").read_text(encoding="utf-8"))
+    assert "private_intake_evidence_status" not in attempt
+    assert attempt["stop_reason"] == "internal:valueerror"
+    assert attempt["exit_code"] == 4
 
 
 def test_shared_terminal_classifier_preserves_success_exit_semantics() -> None:
