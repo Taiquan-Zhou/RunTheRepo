@@ -61,7 +61,7 @@ _DEFAULT_DOCKER_SBX_POLICY = DockerSbxPolicy(
     memory_mb=1024,
     pids_limit=64,
     disk_mb=2048,
-    total_duration_s=300,
+    total_duration_s=900,
 )
 
 

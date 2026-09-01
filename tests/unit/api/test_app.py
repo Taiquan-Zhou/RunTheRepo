@@ -136,6 +136,9 @@ def test_api_default_provider_uses_supported_resource_minimums(
     assert captured_policies[0].cpus == 1
     assert isinstance(captured_policies[0].cpus, int)
     assert captured_policies[0].memory_mb == 1024
+    assert captured_policies[0].pids_limit == 64
+    assert captured_policies[0].disk_mb == 2048
+    assert captured_policies[0].total_duration_s == 900
 
 
 def test_healthz_is_unavailable_without_ready_registry() -> None:

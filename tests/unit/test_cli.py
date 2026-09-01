@@ -15,6 +15,7 @@ from repotrial.intake import github
 from repotrial.intake.github import RepoIntakeError
 from repotrial.run_outcome import TerminalOutcome, classify_terminal_outcome
 from repotrial.sandbox.base import SandboxProvider
+from repotrial.sandbox.docker_sbx import DockerSbxPolicy
 from repotrial.sandbox.fake import FakeSandboxProvider
 
 FIXED_RUN_ID = "11111111-1111-4111-8111-111111111111"
@@ -183,10 +184,27 @@ def test_docker_sbx_inspect_requires_a_full_lowercase_commit_sha_before_artifact
     assert not artifacts_root.exists()
 
 
-def test_cli_docker_sbx_default_uses_supported_cpu_and_keeps_memory_bound() -> None:
-    assert cli._DEFAULT_DOCKER_SBX_POLICY.cpus == 1
-    assert isinstance(cli._DEFAULT_DOCKER_SBX_POLICY.cpus, int)
-    assert cli._DEFAULT_DOCKER_SBX_POLICY.memory_mb == 1024
+def test_cli_docker_sbx_default_uses_supported_cpu_and_keeps_memory_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_policies: list[DockerSbxPolicy] = []
+    provider = FakeSandboxProvider()
+
+    def recording_provider(policy: DockerSbxPolicy) -> SandboxProvider:
+        captured_policies.append(policy)
+        return provider
+
+    monkeypatch.setattr(cli, "DockerSbxProvider", recording_provider)
+
+    assert cli._make_provider("docker-sbx", None) is provider
+    assert len(captured_policies) == 1
+    policy = captured_policies[0]
+    assert policy.cpus == 1
+    assert isinstance(policy.cpus, int)
+    assert policy.memory_mb == 1024
+    assert policy.pids_limit == 64
+    assert policy.disk_mb == 2048
+    assert policy.total_duration_s == 900
 
 
 @pytest.mark.parametrize("commit_sha", ["A" * 40, "a" * 39, "g" * 40])
