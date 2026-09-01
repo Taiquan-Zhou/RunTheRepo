@@ -1,6 +1,7 @@
 """Fail-closed Docker Sandboxes provider."""
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -9,11 +10,12 @@ import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, NoReturn
 
 from .base import (
     ExecResult,
+    FailureEvidenceRecord,
     FailureEvidenceValue,
     NetworkLogResult,
     SandboxFailureEvidence,
@@ -21,6 +23,7 @@ from .base import (
     attach_partial_create_cleanup_context,
     attach_sandbox_failure_evidence,
     get_sandbox_failure_evidence,
+    serialize_sandbox_failure_evidence,
 )
 
 MAX_OUTPUT_BYTES = 65_536
@@ -42,6 +45,16 @@ _DISK_SIZE_ENVIRONMENT_VARIABLES = (
     "DOCKER_SANDBOXES_ROOT_SIZE",
     "DOCKER_SANDBOXES_DOCKER_SIZE",
     "DOCKER_SANDBOXES_CLONED_WORKSPACE_SIZE",
+)
+_MAX_CLONE_DIAGNOSTIC_ENTRIES = 32
+_MAX_CLONE_DIAGNOSTIC_BYTES = 16_384
+_MAX_CLONE_DIAGNOSTIC_VALUE_BYTES = 512
+_GIT_CONFIG_KEYS = ("core.autocrlf", "core.filemode", "core.symlinks")
+_GIT_STATUS_CODES = frozenset(" MARDTUC?!")
+_GIT_DIFF_HEADER = re.compile(
+    rb":(?P<old_mode>[0-7]{6}) (?P<new_mode>[0-7]{6}) "
+    rb"(?P<old_blob>\S+) (?P<new_blob>\S+) "
+    rb"(?P<status>[A-Z][0-9]{0,3})\Z"
 )
 _CREATE_FLAGS = (
     "--name",
@@ -145,6 +158,50 @@ class DiskAllocation:
     root_mb: int
     docker_mb: int
     workspace_mb: int
+
+
+@dataclass(frozen=True, slots=True)
+class _GitStatusEntry:
+    porcelain_status: str
+    path: str
+    path2: str | None
+    raw: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _GitDiffEntry:
+    diff_status: str
+    old_mode: str
+    new_mode: str
+    old_blob: str
+    new_blob: str
+    path: str
+    path2: str | None
+    raw: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _GitChange:
+    porcelain_status: str
+    diff_status: str
+    old_mode: str
+    new_mode: str
+    old_blob: str
+    new_blob: str
+    path: str
+    path2: str | None
+    raw_status: bytes
+    raw_diff: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _CloneDiagnostics:
+    changes: tuple[_GitChange, ...]
+    host_git_config: dict[str, str]
+    guest_git_config: dict[str, str]
+    captured_parts: tuple[bytes, ...]
+    truncated: bool = False
+    diagnostic_status: str | None = None
 
 
 def calculate_disk_allocation(disk_mb: int) -> DiskAllocation:
@@ -302,7 +359,12 @@ class DockerSbxProvider(SandboxProvider):
                 sandbox_id=sandbox_id,
             )
             _require_success("create", result)
-            await self._verify_guest_clone(sandbox_id, host_head, deadline)
+            await self._verify_guest_clone(
+                sandbox_id,
+                host_head,
+                resolved_workspace,
+                deadline,
+            )
             allow_network = await self._run(
                 "allow_network",
                 [
@@ -374,7 +436,11 @@ class DockerSbxProvider(SandboxProvider):
         return environment
 
     async def _verify_guest_clone(
-        self, sandbox_id: str, host_head: str, deadline: float
+        self,
+        sandbox_id: str,
+        host_head: str,
+        host_workspace: Path,
+        deadline: float,
     ) -> None:
         guest_workspace = _parse_guest_path(
             await self._guest_clone_command(sandbox_id, ["pwd"], deadline),
@@ -419,12 +485,228 @@ class DockerSbxProvider(SandboxProvider):
                 "core.fsmonitor=false",
                 "status",
                 "--porcelain=v1",
+                "-z",
                 "--untracked-files=no",
             ],
             deadline,
         )
         if status:
-            raise DockerSbxError("clone_verification", "guest_status_not_clean")
+            diagnostics = await self._collect_clone_diagnostics(
+                sandbox_id,
+                host_workspace,
+                status,
+                deadline,
+            )
+            failure_evidence = self._clone_failure_evidence(
+                sandbox_id,
+                deadline,
+                diagnostics,
+            )
+            raise DockerSbxError(
+                "clone_verification",
+                "guest_status_not_clean",
+                failure_evidence=failure_evidence,
+            )
+
+    async def _collect_clone_diagnostics(
+        self,
+        sandbox_id: str,
+        host_workspace: Path,
+        status_output: bytes,
+        deadline: float,
+    ) -> _CloneDiagnostics:
+        status_entries, status_malformed = _parse_git_status_output(status_output)
+        if status_malformed or not status_entries:
+            return _CloneDiagnostics(
+                changes=(),
+                host_git_config={},
+                guest_git_config={},
+                captured_parts=(_bounded_clone_capture(status_output),),
+                truncated=len(status_output) > _MAX_CLONE_DIAGNOSTIC_BYTES,
+                diagnostic_status="malformed",
+            )
+
+        try:
+            diff_output = await self._guest_clone_command(
+                sandbox_id,
+                ["git", "diff", "--raw", "-z", "--no-ext-diff", "HEAD", "--"],
+                deadline,
+            )
+            diff_entries, diff_malformed = _parse_git_diff_output(diff_output)
+            changes, merge_malformed = _merge_git_changes(
+                status_entries,
+                diff_entries,
+            )
+            if diff_malformed or merge_malformed:
+                return _CloneDiagnostics(
+                    changes=(),
+                    host_git_config={},
+                    guest_git_config={},
+                    captured_parts=(_bounded_clone_capture(status_output),),
+                    truncated=(
+                        len(status_output) > _MAX_CLONE_DIAGNOSTIC_BYTES
+                        or len(diff_output) > _MAX_CLONE_DIAGNOSTIC_BYTES
+                    ),
+                    diagnostic_status="malformed",
+                )
+            host_config, host_config_parts = await self._collect_host_git_config(
+                host_workspace,
+                deadline,
+            )
+            guest_config, guest_config_parts = await self._collect_guest_git_config(
+                sandbox_id,
+                deadline,
+            )
+        except DockerSbxError as error:
+            if error.reason in {
+                "process_cleanup_unconfirmed",
+                "total_duration_exhausted",
+            }:
+                raise
+            return _CloneDiagnostics(
+                changes=(),
+                host_git_config={},
+                guest_git_config={},
+                captured_parts=(_bounded_clone_capture(status_output),),
+                truncated=len(status_output) > _MAX_CLONE_DIAGNOSTIC_BYTES,
+                diagnostic_status="unavailable",
+            )
+        except ValueError:
+            return _CloneDiagnostics(
+                changes=(),
+                host_git_config={},
+                guest_git_config={},
+                captured_parts=(_bounded_clone_capture(status_output),),
+                truncated=len(status_output) > _MAX_CLONE_DIAGNOSTIC_BYTES,
+                diagnostic_status="malformed",
+            )
+
+        return _CloneDiagnostics(
+            changes=tuple(changes),
+            host_git_config=host_config,
+            guest_git_config=guest_config,
+            captured_parts=(
+                *(_bounded_clone_capture(part) for part in host_config_parts),
+                *(_bounded_clone_capture(part) for part in guest_config_parts),
+            ),
+            truncated=(
+                len(status_entries) > _MAX_CLONE_DIAGNOSTIC_ENTRIES
+                or len(diff_entries) > _MAX_CLONE_DIAGNOSTIC_ENTRIES
+                or len(status_output) > _MAX_CLONE_DIAGNOSTIC_BYTES
+                or len(diff_output) > _MAX_CLONE_DIAGNOSTIC_BYTES
+            ),
+        )
+
+    async def _collect_host_git_config(
+        self,
+        host_workspace: Path,
+        deadline: float,
+    ) -> tuple[dict[str, str], tuple[bytes, ...]]:
+        values: dict[str, str] = {}
+        outputs: list[bytes] = []
+        for key in _GIT_CONFIG_KEYS:
+            result = await self._run_command(
+                "git",
+                "clone_verification",
+                [
+                    "-C",
+                    str(host_workspace),
+                    "config",
+                    "--default",
+                    "unset",
+                    "--get",
+                    key,
+                ],
+                self._command_timeout_s,
+                env=self._host_git_environment(),
+                deadline=deadline,
+            )
+            _require_success("clone_verification", result)
+            values[key] = _parse_git_config_value(result.stdout)
+            outputs.append(result.stdout)
+        return values, tuple(outputs)
+
+    async def _collect_guest_git_config(
+        self,
+        sandbox_id: str,
+        deadline: float,
+    ) -> tuple[dict[str, str], tuple[bytes, ...]]:
+        values: dict[str, str] = {}
+        outputs: list[bytes] = []
+        for key in _GIT_CONFIG_KEYS:
+            output = await self._guest_clone_command(
+                sandbox_id,
+                ["git", "config", "--default", "unset", "--get", key],
+                deadline,
+            )
+            values[key] = _parse_git_config_value(output)
+            outputs.append(output)
+        return values, tuple(outputs)
+
+    def _clone_failure_evidence(
+        self,
+        sandbox_id: str,
+        deadline: float,
+        diagnostics: _CloneDiagnostics,
+    ) -> SandboxFailureEvidence:
+        max_records = min(
+            len(diagnostics.changes),
+            _MAX_CLONE_DIAGNOSTIC_ENTRIES,
+        )
+        for record_count in range(max_records, -1, -1):
+            selected = diagnostics.changes[:record_count]
+            captured_parts = (
+                tuple(
+                    part
+                    for change in selected
+                    for part in (change.raw_status, change.raw_diff)
+                )
+                + diagnostics.captured_parts
+            )
+            captured = b"".join(captured_parts)
+            if len(captured) > _MAX_CLONE_DIAGNOSTIC_BYTES:
+                continue
+            truncated = diagnostics.truncated or record_count < len(diagnostics.changes)
+            details = _clone_diagnostic_details(
+                selected,
+                diagnostics.host_git_config,
+                diagnostics.guest_git_config,
+                captured,
+                truncated=truncated,
+                diagnostic_status=diagnostics.diagnostic_status,
+            )
+            evidence = self._command_failure_evidence(
+                "clone_verification",
+                "guest_status_not_clean",
+                deadline=deadline,
+                deadline_limited=False,
+                subprocess_started=True,
+                sandbox_id=sandbox_id,
+                details=details,
+            )
+            try:
+                serialize_sandbox_failure_evidence(evidence)
+            except ValueError:
+                continue
+            return evidence
+
+        details = _clone_diagnostic_details(
+            (),
+            {},
+            {},
+            b"",
+            truncated=True,
+            diagnostic_status=diagnostics.diagnostic_status,
+        )
+        return self._command_failure_evidence(
+            "clone_verification",
+            "guest_status_not_clean",
+            deadline=deadline,
+            deadline_limited=False,
+            subprocess_started=True,
+            sandbox_id=sandbox_id,
+            details=details,
+        )
 
     async def _guest_clone_command(
         self, sandbox_id: str, argv: list[str], deadline: float
@@ -1214,6 +1496,222 @@ def _parse_guest_path(output: bytes, reason: str) -> str:
     if not path.startswith("/") or "\r" in path or "\n" in path:
         raise DockerSbxError("clone_verification", reason)
     return path
+
+
+def _parse_git_status_output(
+    output: bytes,
+) -> tuple[tuple[_GitStatusEntry, ...], bool]:
+    if not output:
+        return (), False
+    fields = output.split(b"\0")
+    if fields[-1] != b"":
+        return (), True
+    entries: list[_GitStatusEntry] = []
+    try:
+        index = 0
+        while index < len(fields) - 1:
+            entry = fields[index]
+            index += 1
+            if len(entry) < 4 or entry[2:3] != b" ":
+                return (), True
+            status = entry[:2].decode("ascii")
+            if (
+                status == "  "
+                or status in {"??", "!!"}
+                or any(character not in _GIT_STATUS_CODES for character in status)
+            ):
+                return (), True
+            path = _normalize_git_path(entry[3:])
+            path2: str | None = None
+            raw = entry + b"\0"
+            if "R" in status or "C" in status:
+                if index >= len(fields) - 1:
+                    return (), True
+                path2 = _normalize_git_path(fields[index])
+                index += 1
+                raw += fields[index - 1] + b"\0"
+            entries.append(
+                _GitStatusEntry(
+                    porcelain_status=status,
+                    path=path,
+                    path2=path2,
+                    raw=raw,
+                )
+            )
+    except (UnicodeDecodeError, ValueError):
+        return (), True
+    return tuple(entries), False
+
+
+def _parse_git_diff_output(
+    output: bytes,
+) -> tuple[tuple[_GitDiffEntry, ...], bool]:
+    if not output:
+        return (), False
+    fields = output.split(b"\0")
+    if fields[-1] != b"":
+        return (), True
+    entries: list[_GitDiffEntry] = []
+    index = 0
+    while index < len(fields) - 1:
+        header = fields[index]
+        index += 1
+        match = _GIT_DIFF_HEADER.fullmatch(header)
+        if match is None or index >= len(fields) - 1:
+            return (), True
+        path_bytes = fields[index]
+        index += 1
+        try:
+            path = _normalize_git_path(path_bytes)
+            diff_status = _normalize_git_token(match.group("status"))
+            old_blob = _normalize_git_token(match.group("old_blob"))
+            new_blob = _normalize_git_token(match.group("new_blob"))
+        except ValueError:
+            return (), True
+        path2: str | None = None
+        raw = header + b"\0" + path_bytes + b"\0"
+        if diff_status.startswith(("R", "C")):
+            if index >= len(fields) - 1:
+                return (), True
+            try:
+                path2 = _normalize_git_path(fields[index])
+            except ValueError:
+                return (), True
+            index += 1
+            raw += fields[index - 1] + b"\0"
+        entries.append(
+            _GitDiffEntry(
+                diff_status=diff_status,
+                old_mode=match.group("old_mode").decode("ascii"),
+                new_mode=match.group("new_mode").decode("ascii"),
+                old_blob=old_blob,
+                new_blob=new_blob,
+                path=path,
+                path2=path2,
+                raw=raw,
+            )
+        )
+    return tuple(entries), False
+
+
+def _merge_git_changes(
+    status_entries: tuple[_GitStatusEntry, ...],
+    diff_entries: tuple[_GitDiffEntry, ...],
+) -> tuple[tuple[_GitChange, ...], bool]:
+    if not status_entries or len(status_entries) != len(diff_entries):
+        return (), True
+    remaining = list(diff_entries)
+    changes: list[_GitChange] = []
+    for status in status_entries:
+        match_index: int | None = None
+        for index, diff in enumerate(remaining):
+            exact = (status.path, status.path2) == (diff.path, diff.path2)
+            reversed_paths = status.path2 is not None and (
+                status.path,
+                status.path2,
+            ) == (diff.path2, diff.path)
+            if exact or reversed_paths:
+                match_index = index
+                break
+        if match_index is None:
+            return (), True
+        diff = remaining.pop(match_index)
+        changes.append(
+            _GitChange(
+                porcelain_status=status.porcelain_status,
+                diff_status=diff.diff_status,
+                old_mode=diff.old_mode,
+                new_mode=diff.new_mode,
+                old_blob=diff.old_blob,
+                new_blob=diff.new_blob,
+                path=status.path,
+                path2=status.path2,
+                raw_status=status.raw,
+                raw_diff=diff.raw,
+            )
+        )
+    return tuple(changes), False
+
+
+def _normalize_git_path(raw: bytes) -> str:
+    path = raw.decode("utf-8", errors="backslashreplace")
+    windows_path = PureWindowsPath(path)
+    if (
+        not path
+        or PurePosixPath(path).is_absolute()
+        or windows_path.is_absolute()
+        or windows_path.drive
+        or path.startswith(("/", "\\"))
+        or any(part == ".." for part in path.replace("\\", "/").split("/"))
+        or len(path.encode("utf-8")) > _MAX_CLONE_DIAGNOSTIC_VALUE_BYTES
+    ):
+        raise ValueError("unsafe Git path")
+    return path
+
+
+def _normalize_git_token(raw: bytes) -> str:
+    token = raw.decode("utf-8", errors="backslashreplace")
+    if (
+        not token
+        or any(character.isspace() for character in token)
+        or len(token.encode("utf-8")) > _MAX_CLONE_DIAGNOSTIC_VALUE_BYTES
+    ):
+        raise ValueError("invalid Git metadata token")
+    return token
+
+
+def _parse_git_config_value(output: bytes) -> str:
+    if output.endswith(b"\r\n"):
+        value_bytes = output[:-2]
+    elif output.endswith(b"\n"):
+        value_bytes = output[:-1]
+    else:
+        raise ValueError("Git config output is not line terminated")
+    value = value_bytes.decode("utf-8", errors="backslashreplace")
+    if "\r" in value or "\n" in value:
+        raise ValueError("Git config output contains multiple lines")
+    if len(value.encode("utf-8")) > _MAX_CLONE_DIAGNOSTIC_VALUE_BYTES:
+        raise ValueError("Git config output is too large")
+    return value
+
+
+def _bounded_clone_capture(output: bytes) -> bytes:
+    return output[:_MAX_CLONE_DIAGNOSTIC_BYTES]
+
+
+def _clone_diagnostic_details(
+    changes: tuple[_GitChange, ...],
+    host_git_config: dict[str, str],
+    guest_git_config: dict[str, str],
+    captured: bytes,
+    *,
+    truncated: bool,
+    diagnostic_status: str | None,
+) -> dict[str, FailureEvidenceValue]:
+    records: list[FailureEvidenceRecord] = []
+    for change in changes:
+        record: FailureEvidenceRecord = {
+            "porcelain_status": change.porcelain_status,
+            "diff_status": change.diff_status,
+            "old_mode": change.old_mode,
+            "new_mode": change.new_mode,
+            "old_blob": change.old_blob,
+            "new_blob": change.new_blob,
+            "path": change.path,
+        }
+        if change.path2 is not None:
+            record["path2"] = change.path2
+        records.append(record)
+    details: dict[str, FailureEvidenceValue] = {
+        "captured_bytes_sha256": hashlib.sha256(captured).hexdigest(),
+        "tracked_changes": records,
+        "host_git_config": dict(host_git_config),
+        "guest_git_config": dict(guest_git_config),
+        "truncated": truncated,
+    }
+    if diagnostic_status is not None:
+        details["diagnostic_status"] = diagnostic_status
+    return details
 
 
 def _new_sandbox_id(name: str) -> str:

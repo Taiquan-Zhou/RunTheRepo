@@ -15,6 +15,7 @@ from repotrial.sandbox.base import (
     ExecResult,
     NetworkLogResult,
     get_sandbox_failure_evidence,
+    serialize_sandbox_failure_evidence,
 )
 from repotrial.sandbox.docker_sbx import (
     DOCKER_FLOOR_MB,
@@ -353,6 +354,7 @@ def _guest_verification_outcome(command: tuple[str, ...]) -> _Outcome:
         "core.fsmonitor=false",
         "status",
         "--porcelain=v1",
+        "-z",
         "--untracked-files=no",
     ):
         return _Outcome()
@@ -371,6 +373,7 @@ def _is_guest_verification_call(command: tuple[str, ...]) -> bool:
             "core.fsmonitor=false",
             "status",
             "--porcelain=v1",
+            "-z",
             "--untracked-files=no",
         ),
     }
@@ -572,6 +575,7 @@ def test_create_binds_resolved_host_head_and_guest_clone_before_network(
             "core.fsmonitor=false",
             "status",
             "--porcelain=v1",
+            "-z",
             "--untracked-files=no",
         ),
     ]
@@ -750,6 +754,7 @@ def test_create_rejects_second_host_head_change_before_sbx_create(
                 "core.fsmonitor=false",
                 "status",
                 "--porcelain=v1",
+                "-z",
                 "--untracked-files=no",
             ),
             _Outcome(stdout=b"?? unexpected\n"),
@@ -1328,6 +1333,7 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
             "core.fsmonitor=false",
             "status",
             "--porcelain=v1",
+            "-z",
             "--untracked-files=no",
         ),
     ]
@@ -3038,6 +3044,7 @@ def test_create_deadline_starts_before_probes_and_limits_create_subprocess(
             "core.fsmonitor=false",
             "status",
             "--porcelain=v1",
+            "-z",
             "--untracked-files=no",
         ),
         ("sbx", "policy", "allow", "network", "--sandbox", sandbox_id, "**"),
@@ -3353,6 +3360,7 @@ def test_create_allow_network_exhausted_deadline_preserves_public_sandbox_id(
         "core.fsmonitor=false",
         "status",
         "--porcelain=v1",
+        "-z",
         "--untracked-files=no",
     )
 
@@ -3414,6 +3422,7 @@ def test_create_allow_network_in_flight_deadline_preserves_public_sandbox_id(
         "core.fsmonitor=false",
         "status",
         "--porcelain=v1",
+        "-z",
         "--untracked-files=no",
     )
     process_created = asyncio.Event()
@@ -3981,3 +3990,292 @@ def test_publish_recomputes_timeout_for_each_subprocess_from_one_deadline(
         (("sbx", "ports", sandbox_id, "--publish", "8080/tcp4"), 10.0),
         (("sbx", "ports", sandbox_id, "--json"), 8.0),
     ]
+
+
+def test_dirty_guest_clone_retains_bounded_tracked_metadata_without_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox_id = "unused-until-create"
+    spawner = _dirty_clone_spawner(
+        status=b" M docker/script.sh\0",
+        diff=b":100755 100644 <old-blob> <new-blob> M\0docker/script.sh\0",
+        host_config={
+            "core.autocrlf": b"false\n",
+            "core.filemode": b"true\n",
+            "core.symlinks": b"true\n",
+        },
+        guest_config={
+            "core.autocrlf": b"false\n",
+            "core.filemode": b"false\n",
+            "core.symlinks": b"true\n",
+        },
+    )
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    create_call = _actual_create_call(spawner)
+    sandbox_id = create_call[create_call.index("--name") + 1]
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.reason == "guest_status_not_clean"
+    assert evidence.details["tracked_changes"] == [
+        {
+            "porcelain_status": " M",
+            "diff_status": "M",
+            "old_mode": "100755",
+            "new_mode": "100644",
+            "old_blob": "<old-blob>",
+            "new_blob": "<new-blob>",
+            "path": "docker/script.sh",
+        }
+    ]
+    assert evidence.details["host_git_config"] == {
+        "core.autocrlf": "false",
+        "core.filemode": "true",
+        "core.symlinks": "true",
+    }
+    assert evidence.details["guest_git_config"]["core.filemode"] == "false"
+    assert evidence.details["truncated"] is False
+    assert len(evidence.details["captured_bytes_sha256"]) == 64
+    assert "file body secret" not in json.dumps(evidence.details)
+    resolved_workspace = tmp_path.resolve(strict=True)
+    assert all(
+        command[0:3] == ("git", "-C", str(resolved_workspace))
+        for command in spawner.calls
+        if command[:1] == ("git",) and "config" in command
+    )
+    assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_porcelain"),
+    [
+        (b"M  docker/script.sh\0", "M "),
+        (b" M docker/script.sh\0", " M"),
+    ],
+)
+def test_dirty_guest_clone_preserves_staged_and_unstaged_porcelain_status(
+    status: bytes,
+    expected_porcelain: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _dirty_clone_spawner(
+        status=status,
+        diff=b":100644 100644 <old> <new> M\0docker/script.sh\0",
+    )
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.details["tracked_changes"][0]["porcelain_status"] == (
+        expected_porcelain
+    )
+    assert evidence.details["tracked_changes"][0]["diff_status"] == "M"
+
+
+def test_dirty_guest_clone_retains_rename_gitlink_and_special_paths_separately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    special_path = "dir/\tline\nname.txt"
+    status = (
+        b"R  new-name.txt\0old-name.txt\0"
+        + b" M submodule\0"
+        + b" M "
+        + special_path.encode()
+        + b"\0"
+    )
+    diff = (
+        b":100644 100644 <old-rename> <new-rename> R100\0"
+        b"old-name.txt\0new-name.txt\0"
+        b":160000 160000 <old-gitlink> <new-gitlink> M\0submodule\0"
+        b":100644 100644 <old-special> <new-special> M\0"
+        + special_path.encode()
+        + b"\0"
+    )
+    spawner = _dirty_clone_spawner(status=status, diff=diff)
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    records = evidence.details["tracked_changes"]
+    assert records[0]["porcelain_status"] == "R  "[:2]
+    assert records[0]["diff_status"] == "R100"
+    assert {records[0]["path"], records[0]["path2"]} == {
+        "old-name.txt",
+        "new-name.txt",
+    }
+    assert records[1]["old_mode"] == "160000"
+    assert records[1]["new_mode"] == "160000"
+    assert records[1]["path"] == "submodule"
+    assert records[2]["path"] == special_path
+    assert records[2].get("path2", True)
+
+
+def test_dirty_guest_clone_diagnostics_truncate_by_entry_and_byte_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    status_parts: list[bytes] = []
+    diff_parts: list[bytes] = []
+    for index in range(40):
+        path = f"tracked/{index:02d}/" + ("x" * 300) + ".txt"
+        path_bytes = path.encode()
+        status_parts.append(b" M " + path_bytes + b"\0")
+        diff_parts.append(b":100644 100644 <old> <new> M\0" + path_bytes + b"\0")
+    spawner = _dirty_clone_spawner(
+        status=b"".join(status_parts),
+        diff=b"".join(diff_parts),
+    )
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.details["truncated"] is True
+    assert 0 < len(evidence.details["tracked_changes"]) < 32
+    serialized = serialize_sandbox_failure_evidence(evidence)
+    assert len(
+        json.dumps(serialized, separators=(",", ":"), sort_keys=True).encode()
+    ) <= (16_384)
+
+
+def test_dirty_guest_clone_rejects_malformed_porcelain_without_relaxing_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _dirty_clone_spawner(
+        status=b" M tracked.txt\0unterminated",
+        diff=b":100644 100644 <old> <new> M\0tracked.txt\0",
+    )
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    create_call = _actual_create_call(spawner)
+    sandbox_id = create_call[create_call.index("--name") + 1]
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.reason == "guest_status_not_clean"
+    assert evidence.details["diagnostic_status"] == "malformed"
+    assert "unterminated" not in json.dumps(evidence.details)
+    assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
+
+
+@pytest.mark.parametrize(
+    "unsafe_path", [b"../outside.txt", b"/absolute.txt", b"C:/host.txt"]
+)
+def test_dirty_guest_clone_rejects_unsafe_paths_fail_closed(
+    unsafe_path: bytes,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _dirty_clone_spawner(
+        status=b" M " + unsafe_path + b"\0",
+        diff=b":100644 100644 <old> <new> M\0" + unsafe_path + b"\0",
+    )
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.reason == "guest_status_not_clean"
+    assert evidence.details["diagnostic_status"] == "malformed"
+    assert unsafe_path.decode() not in json.dumps(evidence.details)
+    assert spawner.calls[-1][0:3] == ("sbx", "rm", "--force")
+
+
+def test_clean_guest_clone_does_not_run_diagnostic_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+
+    _create(provider, tmp_path)
+
+    create_call = _actual_create_call(spawner)
+    sandbox_id = create_call[create_call.index("--name") + 1]
+    guest_commands = [
+        call[4:]
+        for call in spawner.calls
+        if call[:4] == ("sbx", "exec", sandbox_id, "--")
+    ]
+    assert guest_commands == [
+        ("pwd",),
+        ("git", "rev-parse", "--show-toplevel"),
+        ("git", "rev-parse", "--is-inside-work-tree"),
+        ("git", "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"),
+        (
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=no",
+        ),
+    ]
+
+
+def _dirty_clone_spawner(
+    *,
+    status: bytes,
+    diff: bytes,
+    host_config: dict[str, bytes] | None = None,
+    guest_config: dict[str, bytes] | None = None,
+) -> _SbxSpawner:
+    host_values = host_config or {
+        "core.autocrlf": b"unset\n",
+        "core.filemode": b"unset\n",
+        "core.symlinks": b"unset\n",
+    }
+    guest_values = guest_config or {
+        "core.autocrlf": b"unset\n",
+        "core.filemode": b"unset\n",
+        "core.symlinks": b"unset\n",
+    }
+    spawner = _SbxSpawner()
+    guest_status = (
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=no",
+    )
+    guest_diff = ("git", "diff", "--raw", "-z", "--no-ext-diff", "HEAD", "--")
+
+    def respond(command: tuple[str, ...]) -> _Outcome:
+        if command[:1] == ("git",):
+            if "config" in command:
+                return _Outcome(stdout=host_values.get(command[-1], b"unset\n"))
+            return _Outcome(stdout=HOST_HEAD)
+        if command == ("sbx", "version"):
+            return _Outcome(stdout=b"sbx 99.0.0\n")
+        if command in HELP_OUTPUTS:
+            return _Outcome(stdout=HELP_OUTPUTS[command].encode())
+        if command[:2] == ("sbx", "exec"):
+            argv = command[4:]
+            if argv == guest_status:
+                return _Outcome(stdout=status)
+            if argv == guest_diff:
+                return _Outcome(stdout=diff)
+            if argv[:3] == ("git", "config", "--default"):
+                return _Outcome(stdout=guest_values.get(argv[-1], b"unset\n"))
+            return _guest_verification_outcome(command)
+        return _Outcome()
+
+    spawner.intercept = respond
+    return spawner
