@@ -477,8 +477,8 @@ Full current-epoch evidence and run IDs are recorded in
 ## M7.5 release-gap closure - Task 1 status
 
 - Implementation base: `b19dd13f632255caeee7338d773f84a4b3eef97e`; clean ext4 worktree established at `/home/repotrial/src/RepoTrial-m7.5-release-gap`.
-- Result: `ENVIRONMENT_BLOCKED`. Ubuntu/WSL/ext4/SBX versions and frozen manifest hash match, and official SBX inventory is empty; the dedicated distro lacks `uv`, and `REPOTRIAL_MODEL_ENDPOINT` is unset.
-- Locked repository gates, trusted-client route probe, and real repositories were not run. No Windows `.venv`, target Compose, or production code was touched.
+- Result: `ENVIRONMENT_BLOCKED`. Ubuntu/WSL/ext4/SBX versions and frozen manifest hash match, and official SBX inventory is empty; locked quality gates pass except Ruff format on the approved plan Markdown, and trusted calibration returned `2 passed / 1 failed`.
+- `uv 0.11.5` was taken from the task-local Linux tool path; both model variables were SET. No real repositories were run, and no Windows `.venv`, target Compose, or production code was touched.
 - Exact non-secret fingerprints and the blocking command matrix are recorded in [`pilot-evidence/m7.5-release-gap-closure.md`](pilot-evidence/m7.5-release-gap-closure.md).
 
 **M7.5 PILOT COMPLETE — MVP LIMITATIONS IDENTIFIED**
