@@ -482,3 +482,42 @@ Full current-epoch evidence and run IDs are recorded in
 - Exact non-secret fingerprints and the blocking command matrix are recorded in [`pilot-evidence/m7.5-release-gap-closure.md`](pilot-evidence/m7.5-release-gap-closure.md).
 
 **M7.5 PILOT COMPLETE — MVP LIMITATIONS IDENTIFIED**
+
+## M7.5 release-gap closure - Task 1 corrected rerun/ruling (append-only)
+
+- task_id: `Task 1`; BASE_SHA:
+  `b19dd13f632255caeee7338d773f84a4b3eef97e`; HEAD_SHA:
+  `ece0b206dd42151b1c84c07a7177c3cfa92bb78b`; corrected rerun parent:
+  `ece0b206dd42151b1c84c07a7177c3cfa92bb78b`.
+- changed_files: evidence ledger, this status append, and ignored Task 1 report
+  artifact only; production source, tests, manifest, README, target Compose,
+  and real repositories unchanged.
+- Result remains `ENVIRONMENT_BLOCKED`. Python `/usr/bin/python3.12` is
+  `3.12.3`; guest Compose fingerprint is `v5.5.0`; immutable global network
+  policy fingerprint is
+  `e745ff8da1066eba64b0bbf7865ff91a308b0b216f81c5c375091e0a13b46d8b`.
+  Current `free -m` is Mem `7804/724/6794/3/480/7079`, Swap
+  `2048/0/2048`; current state-volume `df -Pm` is `/dev/sdd`, total `120380`,
+  used `7430`, available `106791`, `7%` for `/`, `/home/repotrial`, and
+  `/home/repotrial/.local/state/sandboxes`.
+- Full gates: locked sync, Ruff lint, mypy, adjusted-PATH pytest
+  (`1519 passed, 6 skipped, 1 warning`), and adjusted-PATH branch coverage
+  (`87.29%`) passed; Ruff format failed on approved plan lines `274-307`;
+  initial default-PATH pytest failed to spawn `uv` (`1518 passed, 6 skipped,
+  1 failed`, exit `1`).
+- SBX/model: `sbx version` and current read-only diagnose (`12 passed`) passed;
+  `sbx list` was exactly empty; model variables were SET with
+  `public OpenAI-compatible` / `deepseek-v4-flash`; no secrets or daemon
+  lifecycle mutation.
+- Marker ruling: brief `REPOTRIAL_RUN_REAL_SBX=1` produced `3 skipped in
+  0.03s` (exit `0`), while code marker
+  `REPOTRIAL_RUN_WSL2_SBX_CALIBRATION=1` produced `1 failed, 2 passed in
+  397.58s` (exit `1`), failing
+  `test_wsl2_linux_sbx_timeout_calibration` with
+  `clone_verification failed: total_duration_exhausted` and a Docker Hub
+  refresh-lock deadline warning.
+- Review disposition: Important evidence omissions are addressed in the
+  append-only corrected report and ledger; historical attempts remain intact.
+  Known limitations and exact controller ruling are recorded in the Task 1
+  artifacts. Controller ruling: preserve evidence and stop before real
+  repositories; no release-readiness claim.
