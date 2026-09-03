@@ -44,7 +44,7 @@ from repotrial.journey.playwright_runner import run_playwright_journey
 from repotrial.models.base import RecoveryAction
 from repotrial.sandbox.lifecycle import managed_sandbox
 from repotrial.trial import boot as boot_module
-from repotrial.trial.boot import _boot_compose_with_evidence, boot_compose
+from repotrial.trial.boot import BootResult, _boot_compose_with_evidence, boot_compose
 from repotrial.trial.boot_evidence import record_recovery_evidence
 from repotrial.trial.journey_artifact import (
     verify_baseline_journeys,
@@ -61,6 +61,15 @@ from repotrial.trial.planner import (
 from repotrial.trial.recovery_context import (
     derive_recovery_context,
     project_recovery_evidence,
+)
+from repotrial.trial.startup_inputs import (
+    _ADAPTER_SHA256,
+    StartupInputUnsupported,
+    materialize_startup_input,
+    plan_startup_input,
+    record_startup_input_rejection,
+    verify_startup_input_attempt_history,
+    write_or_verify_startup_input_identity,
 )
 
 type RunGraph = CompiledStateGraph[GraphState, GraphContext, GraphState, GraphState]
@@ -249,7 +258,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
         if recovery_context is None
         else recovery_context.allowed_env_keys
     )
-    attempt_dir, attempt_slot = _claim_attempt_directory(
+    attempt_dir, attempt_slot, prior_attempt_directories = _claim_attempt_directory(
         state.run,
         context,
         purpose="baseline",
@@ -259,10 +268,44 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
     observation_artifact = attempt_dir / "baseline-observation.json"
     observation_evidence = attempt_dir / "baseline-observation-boundary.jsonl"
     evidence_artifact = attempt_dir / "baseline-boot-attempt.json"
+    startup_input_evidence = attempt_dir / "startup-input-attempt.jsonl"
+    startup_input_identity = (
+        _run_evidence_directory(state.run, context) / "startup-input-identity.json"
+    )
     evidence_enabled = boot_compose is boot_module.boot_compose
     verify_baseline_journeys(
         _baseline_journey_artifact(state.run, context), state.run.journeys
     )
+    try:
+        startup_plan = plan_startup_input(context.workspace, compose_path)
+        if startup_plan is None:
+            if startup_input_identity.exists() or startup_input_identity.is_symlink():
+                raise StartupInputUnsupported("startup_identity_missing_plan")
+        else:
+            if state.run.current_config_hash != (
+                f"sha256:{startup_plan.compose_config_hash}"
+            ):
+                raise StartupInputUnsupported("compose_identity_mismatch")
+            write_or_verify_startup_input_identity(
+                startup_input_identity,
+                startup_plan,
+                adapter_sha256=_ADAPTER_SHA256,
+            )
+            verify_startup_input_attempt_history(
+                prior_attempt_directories, startup_plan
+            )
+    except StartupInputUnsupported as error:
+        record_startup_input_rejection(
+            startup_input_evidence,
+            compose_relative_path=compose_path,
+            reason=error.reason,
+        )
+        return {
+            "boot_attempt": attempt,
+            "boot_verdict": Verdict.UNSUPPORTED,
+            "run": state.run.model_copy(update={"stop_reason": "boot_unsupported"}),
+            "stage_history": _visit(state, "boot"),
+        }
     async with managed_sandbox(
         context.provider,
         context.workspace,
@@ -272,19 +315,60 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
         ),
         lifecycle_artifact=lifecycle_artifact,
     ) as sandbox_id:
-        if evidence_enabled:
-            result = await _boot_compose_with_evidence(
-                context.provider,
-                sandbox_id,
-                compose_path,
-                env,
-                attempt,
-                evidence_path=evidence_artifact,
+        try:
+            if startup_plan is not None:
+                await materialize_startup_input(
+                    context.provider,
+                    sandbox_id,
+                    startup_plan,
+                    compose_path=compose_path,
+                    compose_env=env,
+                    evidence_path=startup_input_evidence,
+                )
+        except StartupInputUnsupported:
+            result = BootResult(
+                verdict=Verdict.UNSUPPORTED,
+                service_states={},
+                logs={},
+                attempt=attempt,
             )
         else:
-            result = await boot_compose(
-                context.provider, sandbox_id, compose_path, env, attempt
-            )
+            if evidence_enabled:
+                if startup_plan is None:
+                    result = await _boot_compose_with_evidence(
+                        context.provider,
+                        sandbox_id,
+                        compose_path,
+                        env,
+                        attempt,
+                        evidence_path=evidence_artifact,
+                    )
+                else:
+                    result = await _boot_compose_with_evidence(
+                        context.provider,
+                        sandbox_id,
+                        compose_path,
+                        env,
+                        attempt,
+                        evidence_path=evidence_artifact,
+                        unset_env_keys=startup_plan.all_source_key_names,
+                        project_directory=".",
+                    )
+            else:
+                if startup_plan is None:
+                    result = await boot_compose(
+                        context.provider, sandbox_id, compose_path, env, attempt
+                    )
+                else:
+                    result = await boot_compose(
+                        context.provider,
+                        sandbox_id,
+                        compose_path,
+                        env,
+                        attempt,
+                        unset_env_keys=startup_plan.all_source_key_names,
+                        project_directory=".",
+                    )
         journey_results: list[JourneyResult] | None = None
         observation = None
         if result.verdict is Verdict.PASS:
@@ -294,13 +378,25 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                 sandbox_id,
                 attempt_dir,
             )
-            observation = await _collect_observation_with_evidence(
-                context.provider,
-                sandbox_id,
-                compose_path,
-                observation_artifact,
-                evidence_path=observation_evidence,
-            )
+            if startup_plan is None:
+                observation = await _collect_observation_with_evidence(
+                    context.provider,
+                    sandbox_id,
+                    compose_path,
+                    observation_artifact,
+                    evidence_path=observation_evidence,
+                )
+            else:
+                observation = await _collect_observation_with_evidence(
+                    context.provider,
+                    sandbox_id,
+                    compose_path,
+                    observation_artifact,
+                    evidence_path=observation_evidence,
+                    env=env,
+                    unset_env_keys=startup_plan.all_source_key_names,
+                    project_directory=".",
+                )
     update: NodeUpdate = {
         "boot_attempt": attempt,
         "boot_verdict": result.verdict,
@@ -446,7 +542,7 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
     context = runtime.context
     token = _run_token(state.run.run_id)
     index = len(state.run.experiments)
-    attempt_dir, attempt_slot = _claim_attempt_directory(
+    attempt_dir, attempt_slot, _ = _claim_attempt_directory(
         state.run,
         context,
         purpose="experiment",
@@ -622,12 +718,13 @@ def _claim_attempt_directory(
     *,
     purpose: Literal["baseline", "experiment"],
     index: int,
-) -> tuple[Path, int]:
+) -> tuple[Path, int, tuple[Path, ...]]:
     workspace = _real_directory(context.workspace, "workspace")
     artifact_root = _real_directory(context.artifact_dir, "artifact_dir")
     if artifact_root.is_relative_to(workspace):
         raise ValueError("artifact_dir must resolve outside workspace")
     token = _run_token(run.run_id)
+    prior_directories: list[Path] = []
     for slot in range(1, _MAX_ATTEMPT_SLOTS + 1):
         directory = artifact_root / f"{purpose}-{token}-{index:04d}-attempt-{slot:02d}"
         marker = directory / ".repotrial-attempt.json"
@@ -664,6 +761,7 @@ def _claim_attempt_directory(
                 ) from None
             if marker_bytes != expected:
                 raise ValueError("attempt directory ownership marker is invalid")
+            prior_directories.append(existing)
             continue
         try:
             directory.mkdir()
@@ -674,7 +772,7 @@ def _claim_attempt_directory(
         claimed = _real_directory(directory, "attempt directory")
         if claimed.parent != artifact_root:
             raise ValueError("attempt directory must resolve inside artifact_dir")
-        return claimed, slot
+        return claimed, slot, tuple(prior_directories)
     raise ValueError("attempt slots exhausted")
 
 

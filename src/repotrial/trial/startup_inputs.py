@@ -14,7 +14,7 @@ import stat
 import sys
 import time
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
@@ -47,6 +47,8 @@ _MAX_EVIDENCE_BYTES: Final = 32 * 1024
 _MAX_PAYLOAD_BYTES: Final = 90_000
 _MAX_BIND_SOURCES: Final = 128
 _MAX_BIND_SOURCE_BYTES: Final = 4_096
+_MAX_IDENTITY_BYTES: Final = 4_096
+_REASON_TOKEN_RE: Final = re.compile(r"[a-z0-9_]{1,64}\Z")
 
 # This is code-owned and intentionally not assembled from repository input.
 _ADAPTER_SCRIPT: Final = """\
@@ -408,6 +410,201 @@ async def materialize_startup_input(
         except OSError:
             if sys.exception() is None:
                 raise StartupInputUnsupported("evidence_persistence_failed") from None
+
+
+def write_or_verify_startup_input_identity(
+    path: Path, plan: StartupInputPlan, *, adapter_sha256: str
+) -> None:
+    """Create the immutable run identity, or verify an existing exact match."""
+    identity = _run_identity(plan, adapter_sha256)
+    payload = _canonical_record(identity)
+    if len(payload) > _MAX_IDENTITY_BYTES:
+        raise StartupInputUnsupported("startup_identity_persistence_failed")
+    try:
+        _write_exclusive_file(path, payload)
+        return
+    except FileExistsError:
+        pass
+    except OSError:
+        raise StartupInputUnsupported("startup_identity_persistence_failed") from None
+    try:
+        existing = _read_safe_file(path, _MAX_IDENTITY_BYTES)
+    except OSError:
+        raise StartupInputUnsupported("startup_identity_mismatch") from None
+    if existing != payload:
+        raise StartupInputUnsupported("startup_identity_mismatch")
+
+
+def verify_startup_input_attempt_history(
+    prior_attempt_directories: Sequence[Path], plan: StartupInputPlan
+) -> None:
+    """Require each owned prior attempt to have one complete matching record."""
+    expected = _evidence_identity(plan, _ADAPTER_SHA256)
+    for directory in prior_attempt_directories:
+        try:
+            metadata = directory.lstat()
+        except OSError:
+            raise StartupInputUnsupported("attempt_history_invalid") from None
+        if _has_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
+            raise StartupInputUnsupported("attempt_history_invalid")
+        evidence_path = directory / "startup-input-attempt.jsonl"
+        try:
+            payload = _read_safe_file(evidence_path, _MAX_EVIDENCE_BYTES)
+            rows = [
+                json.loads(
+                    line,
+                    object_pairs_hook=_json_object_without_duplicates,
+                    parse_constant=_reject_json_constant,
+                )
+                for line in payload.decode("utf-8").splitlines()
+            ]
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            raise StartupInputUnsupported("attempt_history_incomplete") from None
+        if len(rows) != 2 or not all(isinstance(row, dict) for row in rows):
+            raise StartupInputUnsupported("attempt_history_incomplete")
+        start, terminal = rows
+        if (
+            start.get("schema_version") != 1
+            or start.get("sequence") != 0
+            or start.get("outcome") != "start"
+            or terminal.get("schema_version") != 1
+            or terminal.get("sequence") != 1
+            or terminal.get("outcome") != "terminal"
+        ):
+            raise StartupInputUnsupported("attempt_history_incomplete")
+        for key, value in expected.items():
+            if start.get(key) != value or terminal.get(key) != value:
+                raise StartupInputUnsupported("attempt_history_mismatch")
+
+
+def record_startup_input_rejection(
+    evidence_path: Path, *, compose_relative_path: str, reason: str
+) -> None:
+    """Persist a bounded host-planning start/terminal pair without a sandbox."""
+    if (
+        not isinstance(compose_relative_path, str)
+        or len(compose_relative_path.encode("utf-8", errors="replace"))
+        > _MAX_BIND_SOURCE_BYTES
+    ):
+        raise StartupInputUnsupported("evidence_persistence_failed")
+    if not isinstance(reason, str) or _REASON_TOKEN_RE.fullmatch(reason) is None:
+        raise StartupInputUnsupported("evidence_persistence_failed")
+    started = time.monotonic()
+    evidence = _EvidenceWriter(evidence_path)
+    common: dict[str, object] = {
+        "compose_relative_path": compose_relative_path,
+        "purpose": "startup_input_planning",
+        "schema_version": 1,
+    }
+    try:
+        evidence.append({**common, "outcome": "start", "sequence": 0})
+        evidence.append(
+            {
+                **common,
+                "elapsed_s": max(0.0, time.monotonic() - started),
+                "guest_validation": "not_started",
+                "outcome": "terminal",
+                "reason": reason,
+                "sequence": 1,
+            }
+        )
+    finally:
+        try:
+            evidence.close()
+        except OSError:
+            if sys.exception() is None:
+                raise StartupInputUnsupported("evidence_persistence_failed") from None
+
+
+def _run_identity(plan: StartupInputPlan, adapter_sha256: str) -> dict[str, object]:
+    if (
+        not isinstance(adapter_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", adapter_sha256) is None
+    ):
+        raise StartupInputUnsupported("startup_identity_invalid")
+    return {
+        "adapter_sha256": adapter_sha256,
+        "output_sha256": plan.output_sha256,
+        "policy_id": plan.policy_id,
+        "schema_version": 1,
+        "source_relative_path": plan.source_relative_path,
+        "source_sha256": plan.source_sha256,
+        "target_relative_path": plan.target_relative_path,
+    }
+
+
+def _canonical_record(record: Mapping[str, object]) -> bytes:
+    try:
+        return (
+            json.dumps(
+                dict(record),
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (OverflowError, RecursionError, TypeError, ValueError):
+        raise StartupInputUnsupported("startup_identity_persistence_failed") from None
+
+
+def _write_exclusive_file(path: Path, payload: bytes) -> None:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise OSError("identity target is not a private regular file")
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("short identity write")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _read_safe_file(path: Path, maximum_bytes: int) -> bytes:
+    metadata = path.lstat()
+    if (
+        _has_reparse_point(metadata)
+        or not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size > maximum_bytes
+    ):
+        raise OSError("unsafe evidence file")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if opened.st_dev != metadata.st_dev or opened.st_ino != metadata.st_ino:
+            raise OSError("evidence identity changed")
+        chunks: list[bytes] = []
+        remaining = maximum_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > maximum_bytes or len(payload) != metadata.st_size:
+            raise OSError("invalid evidence size")
+        return payload
+    finally:
+        os.close(descriptor)
 
 
 def _evidence_identity(

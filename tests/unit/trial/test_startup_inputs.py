@@ -18,9 +18,13 @@ from repotrial.trial.startup_inputs import (
     StartupInputUnsupported,
     materialize_startup_input,
     plan_startup_input,
+    record_startup_input_rejection,
+    verify_startup_input_attempt_history,
+    write_or_verify_startup_input_identity,
 )
 
 _FIXTURE_ROOT = Path(__file__).parents[2] / "fixtures" / "startup_input_diagnostic"
+_ADAPTER_SHA256 = "6c183581aa20385d694faf4f00ee19331ac57dfbf98cad553637df654be45fda"
 
 
 def _copy_fixture(tmp_path: Path, case: str) -> Path:
@@ -1126,3 +1130,128 @@ def test_invalid_identity_and_environment_fail_before_evidence(tmp_path: Path) -
         )
 
     assert provider.exec_calls == []
+
+
+def test_run_identity_is_exclusive_value_free_and_stable(tmp_path: Path) -> None:
+    workspace = _copy_fixture(tmp_path, "run_identity")
+    plan = plan_startup_input(workspace, "compose.yaml")
+    assert plan is not None
+    identity_path = tmp_path / "startup-input-identity.json"
+
+    write_or_verify_startup_input_identity(
+        identity_path, plan, adapter_sha256=_ADAPTER_SHA256
+    )
+    write_or_verify_startup_input_identity(
+        identity_path, plan, adapter_sha256=_ADAPTER_SHA256
+    )
+
+    payload = json.loads(identity_path.read_text(encoding="utf-8"))
+    assert stat.S_IMODE(identity_path.stat().st_mode) == 0o600
+    assert payload == {
+        "adapter_sha256": _ADAPTER_SHA256,
+        "output_sha256": plan.output_sha256,
+        "policy_id": plan.policy_id,
+        "schema_version": 1,
+        "source_relative_path": ".env.sample",
+        "source_sha256": plan.source_sha256,
+        "target_relative_path": ".env",
+    }
+    assert "APP_PORT=8080" not in identity_path.read_text(encoding="utf-8")
+
+    with pytest.raises(StartupInputUnsupported, match="startup_identity_mismatch"):
+        write_or_verify_startup_input_identity(
+            identity_path,
+            replace(plan, output_sha256="0" * 64),
+            adapter_sha256=_ADAPTER_SHA256,
+        )
+    with pytest.raises(StartupInputUnsupported, match="startup_identity_mismatch"):
+        write_or_verify_startup_input_identity(
+            identity_path,
+            replace(plan, policy_id="different-policy"),
+            adapter_sha256=_ADAPTER_SHA256,
+        )
+    with pytest.raises(StartupInputUnsupported, match="startup_identity_mismatch"):
+        write_or_verify_startup_input_identity(
+            identity_path, plan, adapter_sha256="1" * 64
+        )
+
+
+def test_run_identity_verification_handles_short_regular_file_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _copy_fixture(tmp_path, "short_identity_read")
+    plan = plan_startup_input(workspace, "compose.yaml")
+    assert plan is not None
+    identity_path = tmp_path / "startup-input-identity.json"
+    write_or_verify_startup_input_identity(
+        identity_path, plan, adapter_sha256=_ADAPTER_SHA256
+    )
+    original_read = os.read
+
+    def short_read(descriptor: int, size: int) -> bytes:
+        return original_read(descriptor, min(size, 7))
+
+    monkeypatch.setattr(startup_inputs.os, "read", short_read)
+
+    write_or_verify_startup_input_identity(
+        identity_path, plan, adapter_sha256=_ADAPTER_SHA256
+    )
+
+
+def test_prior_attempt_requires_matching_complete_terminal_record(
+    tmp_path: Path,
+) -> None:
+    workspace = _copy_fixture(tmp_path, "attempt_history")
+    plan = plan_startup_input(workspace, "compose.yaml")
+    assert plan is not None
+    attempt_dir = tmp_path / "attempt-01"
+    attempt_dir.mkdir()
+    evidence_path = attempt_dir / "startup-input-attempt.jsonl"
+    provider = _MaterializeProvider()
+    asyncio.run(
+        materialize_startup_input(
+            provider,
+            "sandbox-1",
+            plan,
+            compose_path="compose.yaml",
+            compose_env={},
+            evidence_path=evidence_path,
+        )
+    )
+
+    verify_startup_input_attempt_history((attempt_dir,), plan)
+
+    lines = evidence_path.read_text(encoding="utf-8").splitlines()
+    evidence_path.write_text(lines[0] + "\n", encoding="utf-8")
+    with pytest.raises(StartupInputUnsupported, match="attempt_history_incomplete"):
+        verify_startup_input_attempt_history((attempt_dir,), plan)
+
+    terminal = json.loads(lines[1])
+    terminal["output_sha256"] = "0" * 64
+    evidence_path.write_text(
+        lines[0] + "\n" + json.dumps(terminal) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(StartupInputUnsupported, match="attempt_history_mismatch"):
+        verify_startup_input_attempt_history((attempt_dir,), plan)
+
+
+def test_host_planning_rejection_is_bounded_and_value_free(tmp_path: Path) -> None:
+    evidence_path = tmp_path / "startup-input-attempt.jsonl"
+
+    record_startup_input_rejection(
+        evidence_path,
+        compose_relative_path="compose.yaml",
+        reason="target_preexisting",
+    )
+
+    rows = [
+        json.loads(line)
+        for line in evidence_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [(row["outcome"], row["sequence"]) for row in rows] == [
+        ("start", 0),
+        ("terminal", 1),
+    ]
+    assert rows[1]["reason"] == "target_preexisting"
+    assert rows[1]["guest_validation"] == "not_started"
+    assert stat.S_IMODE(evidence_path.stat().st_mode) == 0o600

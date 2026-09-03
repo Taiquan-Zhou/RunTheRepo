@@ -114,11 +114,15 @@ class GraphProvider(FakeSandboxProvider):
         candidate_healthy: bool = True,
         host_port: int | None = None,
         candidate_publish: bool = True,
+        startup_adapter_result: ExecResult | None = None,
     ) -> None:
         super().__init__(ports={} if host_port is None else {8080: host_port})
         self.baseline_boots = list(baseline_boots or [(True, "")])
         self.candidate_healthy = candidate_healthy
         self.candidate_publish = candidate_publish
+        self.startup_adapter_result = startup_adapter_result or ExecResult(
+            exit_code=0, stdout="root=/workspace\nmode=600\n", stderr=""
+        )
         self._healthy: dict[str, bool] = {}
         self._logs: dict[str, str] = {}
         self._roles: dict[str, str] = {}
@@ -141,6 +145,14 @@ class GraphProvider(FakeSandboxProvider):
         self._require_active(sandbox_id)
         snapshot = tuple(argv)
         self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+        if "repotrial-startup-input" in snapshot:
+            return self.startup_adapter_result
+        if snapshot[-3:] == ("config", "--format", "json"):
+            return ExecResult(
+                exit_code=0,
+                stdout=json.dumps({"services": {"web": {"image": "example/web:1"}}}),
+                stderr="",
+            )
         healthy = self._healthy[sandbox_id]
         if snapshot[-5:] == ("up", "-d", "--wait", "--wait-timeout", "60"):
             return ExecResult(exit_code=0 if healthy else 1, stdout="", stderr="")
@@ -197,6 +209,21 @@ class AlwaysCancelCandidateProvider(GraphProvider):
     async def create(self, workspace: Path, name: str) -> str:
         if name.startswith("repotrial-candidate-"):
             raise asyncio.CancelledError
+        return await super().create(workspace, name)
+
+
+class CancelOnceBaselineProvider(GraphProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_baseline = True
+        self.baseline_create_attempts = 0
+
+    async def create(self, workspace: Path, name: str) -> str:
+        if name.startswith("repotrial-baseline-"):
+            self.baseline_create_attempts += 1
+            if self.cancel_baseline:
+                self.cancel_baseline = False
+                raise asyncio.CancelledError
         return await super().create(workspace, name)
 
 
@@ -295,6 +322,164 @@ def test_graph_contains_only_the_frozen_named_stages() -> None:
         "decide",
         "report_or_next",
     }
+
+
+def test_required_startup_input_is_materialized_before_baseline_boot(
+    tmp_path: Path,
+) -> None:
+    provider = GraphProvider()
+    context, source = _context(tmp_path, provider, journeys=[])
+    source.write_text(
+        _compose_text(()) + "    env_file:\n      - .env\n", encoding="utf-8"
+    )
+    (context.workspace / ".env.sample").write_text("APP_MODE=test\n", encoding="utf-8")
+
+    result = _run(_state(source.parent, run_id="startup-input-order"), context)
+
+    calls = provider.calls
+    create_index = next(
+        index for index, call in enumerate(calls) if call[0] == "create"
+    )
+    adapter_index = next(
+        index
+        for index, call in enumerate(calls)
+        if call[0] == "exec" and "repotrial-startup-input" in call[2]
+    )
+    config_index = next(
+        index
+        for index, call in enumerate(calls)
+        if call[0] == "exec" and call[2][-3:] == ("config", "--format", "json")
+    )
+    up_index = next(
+        index
+        for index, call in enumerate(calls)
+        if call[0] == "exec"
+        and call[2][-5:] == ("up", "-d", "--wait", "--wait-timeout", "60")
+    )
+    destroy_index = next(
+        index for index, call in enumerate(calls) if call[0] == "destroy"
+    )
+    assert create_index < adapter_index < config_index < up_index < destroy_index
+    compose_calls = [
+        call[2]
+        for call in calls
+        if call[0] == "exec" and "docker" in call[2] and "compose" in call[2]
+    ]
+    assert compose_calls
+    assert all(argv[:3] == ("env", "-u", "APP_MODE") for argv in compose_calls)
+    assert all(
+        argv[3:7] == ("docker", "compose", "--project-directory", ".")
+        for argv in compose_calls
+    )
+    run_dir = graph_module._run_evidence_directory(result.run, context)
+    assert (run_dir / "startup-input-identity.json").is_file()
+    assert (
+        len(list(context.artifact_dir.glob("baseline-*/startup-input-attempt.jsonl")))
+        == 1
+    )
+
+
+def test_guest_startup_input_failure_is_unsupported_and_still_destroys(
+    tmp_path: Path,
+) -> None:
+    provider = GraphProvider(
+        startup_adapter_result=ExecResult(exit_code=25, stdout="", stderr="")
+    )
+    context, source = _context(tmp_path, provider, journeys=[])
+    source.write_text(
+        _compose_text(()) + "    env_file:\n      - .env\n", encoding="utf-8"
+    )
+    (context.workspace / ".env.sample").write_text("APP_MODE=test\n", encoding="utf-8")
+
+    result = _run(_state(source.parent, run_id="startup-input-failure"), context)
+
+    assert result.boot_verdict is Verdict.UNSUPPORTED
+    assert result.run.stop_reason == "boot_unsupported"
+    assert len([call for call in provider.calls if call[0] == "create"]) == 1
+    assert len([call for call in provider.calls if call[0] == "destroy"]) == 1
+    assert not any(
+        call[0] == "exec"
+        and call[2][-5:] == ("up", "-d", "--wait", "--wait-timeout", "60")
+        for call in provider.calls
+    )
+
+
+def test_host_startup_input_rejection_records_evidence_without_sandbox(
+    tmp_path: Path,
+) -> None:
+    provider = GraphProvider()
+    context, source = _context(tmp_path, provider, journeys=[])
+    source.write_text(
+        _compose_text(()) + "    env_file:\n      - .env\n", encoding="utf-8"
+    )
+    (context.workspace / ".env.sample").write_text("APP_MODE=test\n", encoding="utf-8")
+    (context.workspace / ".env").write_text("APP_MODE=host\n", encoding="utf-8")
+
+    result = _run(_state(source.parent, run_id="startup-input-rejection"), context)
+
+    assert result.boot_verdict is Verdict.UNSUPPORTED
+    assert result.run.stop_reason == "boot_unsupported"
+    assert [call for call in provider.calls if call[0] == "create"] == []
+    evidence = list(context.artifact_dir.glob("baseline-*/startup-input-attempt.jsonl"))
+    assert len(evidence) == 1
+    rows = [json.loads(line) for line in evidence[0].read_text().splitlines()]
+    assert [row["outcome"] for row in rows] == ["start", "terminal"]
+    assert rows[1]["reason"] == "target_preexisting"
+
+
+def test_startup_source_change_after_cancel_fails_before_second_create(
+    tmp_path: Path,
+) -> None:
+    provider = CancelOnceBaselineProvider()
+    context, source = _context(tmp_path, provider, journeys=[])
+    source.write_text(
+        _compose_text(()) + "    env_file:\n      - .env\n", encoding="utf-8"
+    )
+    sample = context.workspace / ".env.sample"
+    sample.write_text("APP_MODE=first\n", encoding="utf-8")
+    graph = build_run_graph()
+    state = _state(source.parent, run_id="startup-source-change")
+
+    with pytest.raises(NodeCancelledError):
+        asyncio.run(ainvoke_run(graph, state, context=context))
+    sample.write_text("APP_MODE=second\n", encoding="utf-8")
+    resumed = asyncio.run(aresume_run(graph, state.run_id, context=context))
+
+    assert resumed.boot_verdict is Verdict.UNSUPPORTED
+    assert resumed.run.stop_reason == "boot_unsupported"
+    assert provider.baseline_create_attempts == 1
+    rejection = max(context.artifact_dir.glob("baseline-*/startup-input-attempt.jsonl"))
+    rows = [json.loads(line) for line in rejection.read_text().splitlines()]
+    assert rows[-1]["reason"] == "startup_identity_mismatch"
+
+
+def test_startup_compose_change_after_cancel_fails_before_second_create(
+    tmp_path: Path,
+) -> None:
+    provider = CancelOnceBaselineProvider()
+    context, source = _context(tmp_path, provider, journeys=[])
+    source.write_text(
+        _compose_text(()) + "    env_file:\n      - .env\n", encoding="utf-8"
+    )
+    (context.workspace / ".env.sample").write_text("APP_MODE=test\n", encoding="utf-8")
+    graph = build_run_graph()
+    state = _state(source.parent, run_id="startup-compose-change")
+
+    with pytest.raises(NodeCancelledError):
+        asyncio.run(ainvoke_run(graph, state, context=context))
+    source.write_text(
+        _compose_text(()).replace("example/web:1", "example/web:changed")
+        + "    env_file:\n      - .env\n",
+        encoding="utf-8",
+    )
+    resumed = asyncio.run(aresume_run(graph, state.run_id, context=context))
+
+    assert resumed.boot_verdict is Verdict.UNSUPPORTED
+    assert resumed.run.stop_reason == "boot_unsupported"
+    assert provider.baseline_create_attempts == 1
+    rejection = max(context.artifact_dir.glob("baseline-*/startup-input-attempt.jsonl"))
+    rows = [json.loads(line) for line in rejection.read_text().splitlines()]
+    assert rows[-1]["reason"] == "compose_identity_mismatch"
 
 
 def test_boot_failure_uses_bounded_recovery_then_returns_to_boot(
