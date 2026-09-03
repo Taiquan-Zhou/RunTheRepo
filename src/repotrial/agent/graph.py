@@ -566,6 +566,9 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
         env={**context.env, **state.recovery_env},
         container_port=context.container_port,
         prior_attempt_directories=prior_attempt_directories,
+        startup_input_identity_path=(
+            _run_evidence_directory(state.run, context) / "startup-input-identity.json"
+        ),
     )
     verify_baseline_journeys(
         _baseline_journey_artifact(state.run, context), state.run.journeys

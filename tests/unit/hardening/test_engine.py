@@ -30,6 +30,11 @@ from repotrial.sandbox.fake import FakeSandboxProvider
 from repotrial.sandbox.lifecycle import CleanupError
 from repotrial.trial.boot import BootResult
 from repotrial.trial.observer import ObservationCollectionError
+from repotrial.trial.startup_inputs import (
+    _ADAPTER_SHA256,
+    plan_startup_input,
+    write_or_verify_startup_input_identity,
+)
 
 
 def _exec_result(*, exit_code: int = 0, stdout: str = "") -> ExecResult:
@@ -204,6 +209,18 @@ def _case(
         container_port=8080,
     )
     return state, mutation, context
+
+
+def _establish_startup_identity(context: ExperimentContext) -> ExperimentContext:
+    plan = plan_startup_input(context.workspace, "compose.yaml")
+    assert plan is not None
+    identity_dir = context.workspace.parent / "run-evidence"
+    identity_dir.mkdir(exist_ok=True)
+    identity_path = identity_dir / "startup-input-identity.json"
+    write_or_verify_startup_input_identity(
+        identity_path, plan, adapter_sha256=_ADAPTER_SHA256
+    )
+    return replace(context, startup_input_identity_path=identity_path)
 
 
 def _compose_argv(
@@ -453,6 +470,7 @@ def test_candidate_materializes_startup_input_before_boot_with_shared_compose_sc
         "APP_MODE=sample\nAPP_TOKEN=secret-value\nLD_HOST_PORT=9090\n",
         encoding="utf-8",
     )
+    context = _establish_startup_identity(context)
     provider = StartupInputProvider()
     runner_calls: list[tuple[str, str, Path, tuple[tuple[object, ...], ...]]] = []
     _install_http_runner(monkeypatch, {"health": Verdict.PASS}, runner_calls, provider)
@@ -519,6 +537,7 @@ def test_candidate_startup_input_failure_stops_and_cleans_without_boot(
         _compose_text() + "    env_file:\n      - .env\n", encoding="utf-8"
     )
     (context.workspace / ".env.sample").write_text("APP_MODE=test\n", encoding="utf-8")
+    context = _establish_startup_identity(context)
     provider = StartupInputProvider(adapter_exit_code=25)
 
     record = _run(state, mutation, provider, context)
@@ -568,7 +587,10 @@ def test_candidate_reentry_rejects_incomplete_prior_attempt_before_create(
     (context.workspace / ".env.sample").write_text("APP_MODE=test\n", encoding="utf-8")
     prior_attempt = tmp_path / "prior-attempt"
     prior_attempt.mkdir()
-    context = replace(context, prior_attempt_directories=(prior_attempt,))
+    context = replace(
+        _establish_startup_identity(context),
+        prior_attempt_directories=(prior_attempt,),
+    )
     provider = StartupInputProvider()
 
     record = _run(state, mutation, provider, context)
@@ -581,6 +603,28 @@ def test_candidate_reentry_rejects_incomplete_prior_attempt_before_create(
     assert evidence[-1]["reason"] == "attempt_history_incomplete"
 
 
+def test_candidate_rejects_source_drift_from_baseline_identity_before_create(
+    tmp_path: Path,
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    (context.workspace / "compose.yaml").write_text(
+        _compose_text() + "    env_file:\n      - .env\n", encoding="utf-8"
+    )
+    sample = context.workspace / ".env.sample"
+    sample.write_text("APP_MODE=baseline\n", encoding="utf-8")
+    context = _establish_startup_identity(context)
+    sample.write_text("APP_MODE=changed\n", encoding="utf-8")
+    provider = StartupInputProvider()
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.verdict is ExperimentVerdict.STOP
+    assert record.reason == "startup_input_unsupported"
+    assert provider.calls == []
+    evidence = _read_jsonl(context.artifact_dir / "startup-input-attempt.jsonl")
+    assert evidence[-1]["reason"] == "startup_identity_mismatch"
+
+
 def test_later_candidate_keeps_clone_root_startup_identity_after_accepted_compose(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -591,6 +635,7 @@ def test_later_candidate_keeps_clone_root_startup_identity_after_accepted_compos
     (first_context.workspace / ".env.sample").write_text(
         "APP_MODE=test\nAPP_TOKEN=secret-value\n", encoding="utf-8"
     )
+    first_context = _establish_startup_identity(first_context)
     first_provider = StartupInputProvider()
     first_runner_calls: list[tuple[str, str, Path, tuple[tuple[object, ...], ...]]] = []
     _install_http_runner(

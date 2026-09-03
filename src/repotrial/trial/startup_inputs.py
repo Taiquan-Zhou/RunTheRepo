@@ -435,6 +435,19 @@ def write_or_verify_startup_input_identity(
         raise StartupInputUnsupported("startup_identity_mismatch")
 
 
+def verify_startup_input_identity(
+    path: Path, plan: StartupInputPlan, *, adapter_sha256: str
+) -> None:
+    """Verify an existing run identity without ever creating a replacement."""
+    expected = _canonical_record(_run_identity(plan, adapter_sha256))
+    try:
+        existing = _read_safe_file(path, _MAX_IDENTITY_BYTES)
+    except OSError:
+        raise StartupInputUnsupported("startup_identity_mismatch") from None
+    if existing != expected:
+        raise StartupInputUnsupported("startup_identity_mismatch")
+
+
 def verify_startup_input_attempt_history(
     prior_attempt_directories: Sequence[Path], plan: StartupInputPlan
 ) -> None:

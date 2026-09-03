@@ -30,12 +30,14 @@ from repotrial.trial.observer import (
     collect_observation,
 )
 from repotrial.trial.startup_inputs import (
+    _ADAPTER_SHA256,
     StartupInputPlan,
     StartupInputUnsupported,
     materialize_startup_input,
     plan_startup_input,
     record_startup_input_rejection,
     verify_startup_input_attempt_history,
+    verify_startup_input_identity,
 )
 
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
@@ -66,6 +68,7 @@ class ExperimentContext:
     env: Mapping[str, str]
     container_port: int
     prior_attempt_directories: tuple[Path, ...] = ()
+    startup_input_identity_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,9 +218,21 @@ def _prepare(
         if startup_input_plan is not None:
             if f"sha256:{startup_input_plan.compose_config_hash}" != parent_hash:
                 raise StartupInputUnsupported("compose_identity_mismatch")
+            if context.startup_input_identity_path is None:
+                raise StartupInputUnsupported("startup_identity_missing")
+            verify_startup_input_identity(
+                context.startup_input_identity_path,
+                startup_input_plan,
+                adapter_sha256=_ADAPTER_SHA256,
+            )
             verify_startup_input_attempt_history(
                 context.prior_attempt_directories, startup_input_plan
             )
+        elif context.startup_input_identity_path is not None and (
+            context.startup_input_identity_path.exists()
+            or context.startup_input_identity_path.is_symlink()
+        ):
+            raise StartupInputUnsupported("startup_identity_missing_plan")
     except StartupInputUnsupported as error:
         startup_input_error = error.reason
     journeys, baseline_error = _select_baseline_journeys(state)

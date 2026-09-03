@@ -20,6 +20,7 @@ from repotrial.trial.startup_inputs import (
     plan_startup_input,
     record_startup_input_rejection,
     verify_startup_input_attempt_history,
+    verify_startup_input_identity,
     write_or_verify_startup_input_identity,
 )
 
@@ -1196,6 +1197,22 @@ def test_run_identity_verification_handles_short_regular_file_reads(
     write_or_verify_startup_input_identity(
         identity_path, plan, adapter_sha256=_ADAPTER_SHA256
     )
+
+
+def test_read_only_identity_verification_never_recreates_missing_identity(
+    tmp_path: Path,
+) -> None:
+    workspace = _copy_fixture(tmp_path, "missing_run_identity")
+    plan = plan_startup_input(workspace, "compose.yaml")
+    assert plan is not None
+    identity_path = tmp_path / "startup-input-identity.json"
+
+    with pytest.raises(StartupInputUnsupported, match="startup_identity_mismatch"):
+        verify_startup_input_identity(
+            identity_path, plan, adapter_sha256=_ADAPTER_SHA256
+        )
+
+    assert not identity_path.exists()
 
 
 def test_prior_attempt_requires_matching_complete_terminal_record(
