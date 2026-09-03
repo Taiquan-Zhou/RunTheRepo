@@ -72,6 +72,9 @@ class _FileIdentity:
     device: int
     inode: int
     file_type: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
 
 
 def plan_startup_input(workspace: Path, compose_path: str) -> StartupInputPlan | None:
@@ -79,7 +82,7 @@ def plan_startup_input(workspace: Path, compose_path: str) -> StartupInputPlan |
     root = _resolve_workspace(workspace)
     compose_file = _resolve_compose_path(root, compose_path)
     compose = load_compose(compose_file)
-    target_relative, services = _required_env_target(root, compose_file, compose)
+    target_relative, services = _required_env_target(root, compose)
     if target_relative is None:
         return None
 
@@ -176,7 +179,7 @@ def _resolve_compose_path(root: Path, compose_path: str) -> Path:
 
 
 def _required_env_target(
-    root: Path, compose_file: Path, compose: Mapping[str, object]
+    root: Path, compose: Mapping[str, object]
 ) -> tuple[str | None, set[str]]:
     services = compose.get("services")
     if not isinstance(services, Mapping) or not services:
@@ -198,12 +201,10 @@ def _required_env_target(
             return None, set()
         valid_entries = [entry for entry in parsed_entries if entry is not None]
         required_paths = [path for path, required in valid_entries if required]
-        if len(required_paths) != 1:
-            if any(
-                path == _TARGET_NAME for path, required in valid_entries if required
-            ):
-                return None, set()
+        if not required_paths:
             continue
+        if len(required_paths) != 1:
+            return None, set()
         raw_target = required_paths[0]
         target = _resolve_env_target(root, raw_target)
         if target is None:
@@ -320,6 +321,9 @@ def _identity(stat_result: os.stat_result) -> _FileIdentity:
         device=stat_result.st_dev,
         inode=stat_result.st_ino,
         file_type=stat.S_IFMT(stat_result.st_mode),
+        size=stat_result.st_size,
+        mtime_ns=stat_result.st_mtime_ns,
+        ctime_ns=stat_result.st_ctime_ns,
     )
 
 
@@ -346,6 +350,9 @@ def _require_path_identity(path: Path, expected: _FileIdentity) -> None:
 
 
 def _parse_source(source: bytes) -> list[_Assignment]:
+    for index, byte in enumerate(source):
+        if byte == 13 and (index + 1 == len(source) or source[index + 1] != 10):
+            raise StartupInputUnsupported("unsupported_syntax")
     try:
         text = source.decode("utf-8")
     except UnicodeDecodeError:
@@ -356,14 +363,10 @@ def _parse_source(source: bytes) -> list[_Assignment]:
 
     assignments: list[_Assignment] = []
     seen_keys: set[str] = set()
-    lines = text.split("\n")
-    for index, line in enumerate(lines):
-        if len(line.encode("utf-8")) + 1 > _MAX_LINE_BYTES:
+    for line in text.split("\n"):
+        line = line.removesuffix("\r")
+        if len(line.encode("utf-8")) > _MAX_LINE_BYTES:
             raise StartupInputUnsupported("source_too_large")
-        if line.endswith("\r"):
-            if index == len(lines) - 1 and not source.endswith(b"\n"):
-                raise StartupInputUnsupported("unsupported_syntax")
-            line = line[:-1]
         if not line or line.strip(" ") == "":
             continue
         if line.lstrip(" ").startswith("#"):

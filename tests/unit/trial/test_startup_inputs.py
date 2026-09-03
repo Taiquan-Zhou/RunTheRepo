@@ -75,6 +75,54 @@ def test_omits_control_assignments_under_option_b(tmp_path: Path) -> None:
     )
 
 
+def test_option_b_control_set_is_closed_and_case_insensitive(tmp_path: Path) -> None:
+    workspace = _copy_fixture(tmp_path, "closed_control_set")
+    control_keys = (
+        "COMPOSE_FILE",
+        "compose_project_name",
+        "DOCKER_HOST",
+        "docker_context",
+        "DYLD_INSERT_LIBRARIES",
+        "dyld_library_path",
+        "LD_PRELOAD",
+        "ld_host_port",
+        "PATH",
+        "path",
+        "HOME",
+        "home",
+        "PYTHONHOME",
+        "pythonhome",
+        "PYTHONPATH",
+        "pythonpath",
+        "XDG_CONFIG_HOME",
+        "xdg_config_home",
+    )
+    source_keys = (*control_keys, "APP_MODE")
+    (workspace / ".env.sample").write_text(
+        "".join(f"{key}=safe\n" for key in source_keys), encoding="utf-8"
+    )
+
+    plan = plan_startup_input(workspace, "compose.yaml")
+
+    assert plan is not None
+    assert plan.output_bytes == b"APP_MODE=safe\n"
+    assert plan.accepted_key_names == ("APP_MODE",)
+    assert plan.omitted_control_key_names == tuple(sorted(control_keys))
+    assert plan.all_source_key_names == tuple(sorted(source_keys))
+
+
+def test_option_b_allows_an_empty_generated_file(tmp_path: Path) -> None:
+    workspace = _copy_fixture(tmp_path, "empty_control_output")
+    (workspace / ".env.sample").write_bytes(b"DOCKER_HOST=safe\n")
+
+    plan = plan_startup_input(workspace, "compose.yaml")
+
+    assert plan is not None
+    assert plan.output_bytes == b""
+    assert plan.accepted_key_names == ()
+    assert plan.omitted_control_key_names == ("DOCKER_HOST",)
+
+
 def _diagnostic_workspace(tmp_path: Path, case: str) -> Path:
     workspace = _copy_fixture(tmp_path, case)
     case_root = _FIXTURE_ROOT / case
@@ -178,6 +226,29 @@ def test_source_identity_change_is_rejected_without_source_content(
     assert "APP_PORT=8081" not in str(error.value)
 
 
+def test_same_inode_same_size_source_rewrite_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _copy_fixture(tmp_path, "same_inode_rewrite")
+    source = workspace / ".env.sample"
+    original_inode = source.stat().st_ino
+    original_read = os.read
+
+    def rewrite_after_read(descriptor: int, size: int) -> bytes:
+        data = original_read(descriptor, size)
+        source.write_bytes(data.replace(b"8080", b"8081"))
+        assert source.stat().st_ino == original_inode
+        assert source.stat().st_size == len(data)
+        return data
+
+    monkeypatch.setattr(startup_inputs.os, "read", rewrite_after_read)
+
+    with pytest.raises(StartupInputUnsupported) as error:
+        plan_startup_input(workspace, "compose.yaml")
+
+    assert error.value.reason == "source_changed"
+
+
 def test_source_missing_after_target_eligibility_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -209,6 +280,28 @@ def test_ambiguous_compose_shape_is_not_selected(tmp_path: Path) -> None:
         "    env_file:\n"
         "      - .env\n"
         "      - extra.env\n",
+        encoding="utf-8",
+    )
+
+    assert plan_startup_input(workspace, "compose.yaml") is None
+
+
+@pytest.mark.parametrize("extra_required_paths", (("extra.env",), ("a.env", "b.env")))
+def test_other_required_env_files_are_consistently_unsupported(
+    tmp_path: Path, extra_required_paths: tuple[str, ...]
+) -> None:
+    workspace = _copy_fixture(tmp_path, "other_required_env")
+    extra_lines = "".join(f"      - {path}\n" for path in extra_required_paths)
+    (workspace / "compose.yaml").write_text(
+        "services:\n"
+        "  worker:\n"
+        "    image: busybox:1.36.1\n"
+        "    env_file:\n"
+        f"{extra_lines}"
+        "  web:\n"
+        "    image: busybox:1.36.1\n"
+        "    env_file:\n"
+        "      - .env\n",
         encoding="utf-8",
     )
 
@@ -267,32 +360,156 @@ def test_linked_compose_path_is_rejected(tmp_path: Path) -> None:
     assert error.value.reason == "compose_path_invalid"
 
 
+@pytest.mark.parametrize("workspace_kind", ("missing", "file"))
+def test_invalid_workspace_is_rejected(tmp_path: Path, workspace_kind: str) -> None:
+    workspace = tmp_path / "invalid-workspace"
+    if workspace_kind == "file":
+        workspace.write_bytes(b"not a directory")
+
+    with pytest.raises(StartupInputUnsupported) as error:
+        plan_startup_input(workspace, "compose.yaml")
+
+    assert error.value.reason == "workspace_invalid"
+
+
 @pytest.mark.parametrize(
-    "env_file",
+    "compose_path", ("", "missing.yaml", "bad\\path.yaml", "bad\npath.yaml")
+)
+def test_invalid_compose_paths_are_rejected(tmp_path: Path, compose_path: str) -> None:
+    workspace = _copy_fixture(tmp_path, "invalid_compose_path")
+
+    with pytest.raises(StartupInputUnsupported) as error:
+        plan_startup_input(workspace, compose_path)
+
+    assert error.value.reason == "compose_path_invalid"
+
+
+def test_absolute_env_target_is_rejected(tmp_path: Path) -> None:
+    workspace = _copy_fixture(tmp_path, "absolute_env_target")
+    (workspace / "compose.yaml").write_text(
+        "services:\n  web:\n    image: busybox:1.36.1\n    env_file: /tmp/.env\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(StartupInputUnsupported) as error:
+        plan_startup_input(workspace, "compose.yaml")
+
+    assert error.value.reason == "target_escape"
+
+
+def test_nonregular_source_is_rejected(tmp_path: Path) -> None:
+    workspace = _copy_fixture(tmp_path, "nonregular_source")
+    source = workspace / ".env.sample"
+    source.unlink()
+    source.mkdir()
+
+    with pytest.raises(StartupInputUnsupported) as error:
+        plan_startup_input(workspace, "compose.yaml")
+
+    assert error.value.reason == "source_linked"
+
+
+@pytest.mark.parametrize(
+    "env_file_yaml",
     (
-        ".env",
-        [".env"],
-        {"path": ".env"},
-        {"path": ".env", "required": True},
-        [{"path": ".env", "required": True}],
+        "    env_file: .env\n",
+        "    env_file:\n      - .env\n",
+        "    env_file:\n      path: .env\n",
+        "    env_file:\n      path: .env\n      required: true\n",
+        "    env_file:\n      - path: .env\n        required: true\n",
     ),
 )
 def test_accepts_unambiguous_compose_env_file_forms(
-    tmp_path: Path, env_file: object
+    tmp_path: Path, env_file_yaml: str
 ) -> None:
     workspace = _copy_fixture(tmp_path, "compose_form")
-    yaml = "services:\n  web:\n    image: busybox:1.36.1\n    env_file: "
-    if isinstance(env_file, str):
-        yaml += f"{env_file}\n"
-    elif isinstance(env_file, list):
-        yaml += "\n" + "\n".join(f"      - {item}\n" for item in env_file)
-    else:
-        yaml += "\n      path: .env\n      required: true\n"
+    yaml = "services:\n  web:\n    image: busybox:1.36.1\n" + env_file_yaml
     (workspace / "compose.yaml").write_text(yaml, encoding="utf-8")
 
     plan = plan_startup_input(workspace, "compose.yaml")
 
     assert plan is not None
+
+
+@pytest.mark.parametrize(
+    "env_file_yaml",
+    (
+        "    env_file:\n      path: .env\n      required: false\n",
+        "    env_file:\n      path: .env\n      required: invalid\n",
+        "    env_file: 42\n",
+    ),
+)
+def test_rejects_optional_or_invalid_env_file_forms(
+    tmp_path: Path, env_file_yaml: str
+) -> None:
+    workspace = _copy_fixture(tmp_path, "invalid_compose_form")
+    yaml = "services:\n  web:\n    image: busybox:1.36.1\n" + env_file_yaml
+    (workspace / "compose.yaml").write_text(yaml, encoding="utf-8")
+
+    assert plan_startup_input(workspace, "compose.yaml") is None
+
+
+@pytest.mark.parametrize(
+    "source", (b"# hidden\rcontrol\nAPP_MODE=safe\n", b"APP_MODE=sa\rfe\n")
+)
+def test_bare_carriage_return_is_rejected(tmp_path: Path, source: bytes) -> None:
+    workspace = _copy_fixture(tmp_path, "bare_carriage_return")
+    (workspace / ".env.sample").write_bytes(source)
+
+    with pytest.raises(StartupInputUnsupported) as error:
+        plan_startup_input(workspace, "compose.yaml")
+
+    assert error.value.reason == "unsupported_syntax"
+
+
+def test_crlf_line_endings_are_accepted(tmp_path: Path) -> None:
+    workspace = _copy_fixture(tmp_path, "crlf")
+    (workspace / ".env.sample").write_bytes(b"APP_MODE=safe\r\n")
+
+    plan = plan_startup_input(workspace, "compose.yaml")
+
+    assert plan is not None
+    assert plan.output_bytes == b"APP_MODE=safe\n"
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        b"APP_PATH=/tmp\n",
+        b"APP_PATH=../tmp\n",
+        b"APP_PATH=./a/../../b\n",
+        b"APP_PATH=a/../b\n",
+        b"APP_PATH=./bad?name\n",
+        b"APP_MODE=safe\x00hidden\n",
+        "APP_MODE=\N{SNOWMAN}\n".encode(),
+    ),
+)
+def test_unsupported_value_forms_are_rejected(tmp_path: Path, source: bytes) -> None:
+    workspace = _copy_fixture(tmp_path, "unsupported_value")
+    (workspace / ".env.sample").write_bytes(source)
+
+    with pytest.raises(StartupInputUnsupported) as error:
+        plan_startup_input(workspace, "compose.yaml")
+
+    assert error.value.reason == "unsupported_syntax"
+
+
+@pytest.mark.parametrize(
+    ("line_size", "accepted"), ((4095, True), (4096, True), (4097, False))
+)
+def test_logical_line_length_boundary(
+    tmp_path: Path, line_size: int, accepted: bool
+) -> None:
+    workspace = _copy_fixture(tmp_path, f"line_{line_size}")
+    prefix = b"APP_VALUE="
+    (workspace / ".env.sample").write_bytes(prefix + b"A" * (line_size - len(prefix)))
+
+    if accepted:
+        assert plan_startup_input(workspace, "compose.yaml") is not None
+    else:
+        with pytest.raises(StartupInputUnsupported) as error:
+            plan_startup_input(workspace, "compose.yaml")
+        assert error.value.reason == "source_too_large"
 
 
 def test_plan_repr_and_exception_do_not_expose_values(tmp_path: Path) -> None:
