@@ -572,3 +572,35 @@ Full current-epoch evidence and run IDs are recorded in
   WSL environment; the review-service outage remains a process deviation and
   must be revisited before final integration. Continue to Task 2 without
   production code changes.
+
+## M7.5 release-gap closure - RG1 superseding status (append-only; 2026-09-03)
+
+The prior Task 2 `RG1_CAPACITY_GATE=FAIL` interpretation is superseded by
+independent review of the retained raw evidence. At `4096 MiB`, Uptime Kuma
+crossed the capacity boundary while n8n hit Docker-data `ENOSPC`. At
+`8192 MiB`, both Uptime Kuma and n8n crossed image pull/extraction; n8n
+`Boot up`, `ps`, and `logs` each exited `0`. The later n8n
+`sandbox:exec:timeout` was a post-Boot `docker diff` observation failure: it
+cannot negate capacity, but the overall n8n trial still failed and is not
+autonomous success. The final capacity verdict is `PASS`.
+
+```text
+RG1_CAPACITY_GATE=PASS common_total_mib=8192
+DISK DEFAULT CHANGE PROPOSED - OWNER DECISION REQUIRED
+current_default_mib=2048
+proven_candidate_mib=8192
+state_volume_required_mib=10426
+maximum_supported_concurrent_target_sandboxes=1
+choices=retain-2048 | approve-global-proven-candidate | retain-2048-and-request-separate-per-run-design
+```
+
+The `10426 MiB` state-volume value is a conservative admission/reserve upper
+bound, not a live peak (`2234 MiB` measured state baseline plus `8192 MiB`
+selected total). Live peak state-volume usage, guest `df`, and independent
+fixed SBX overhead remain `not_observed`.
+
+Task 1 independent review is recorded as `content APPROVE`, while its
+historical review-service/process deviation is retained. Task 2's original
+review verdict was `CHANGES REQUESTED`; this evidence-only append corrects
+the erroneous interpretation only and still requires an independent review.
+No RG1 policy plan is created, and no CLI/API default is changed.
