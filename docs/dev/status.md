@@ -694,3 +694,23 @@ No RG1 policy plan is created, and no CLI/API default is changed.
   bounded interval and has migration/data-state evidence, so the frozen gate
   does not authorize a readiness-window production change. Continue to RG2
   startup-input diagnosis.
+
+## M7.5 release-gap closure - RG2 startup-input diagnosis (2026-09-03)
+
+- Diagnostic HEAD `0ff11abb7b01ceb0bde14e423cbca1a8b0a3ff16`; no production,
+  graph/state, provider, manifest, README, or frozen identity change.
+- Ten-case content-addressed fixture corpus passed `3/3` focused tests; its
+  oversized recipe independently reconstructs 65 assignments and 65,650 bytes.
+- Production-path guest inspection proved Linkding's required service-level
+  `.env` is absent, `.env.sample` is regular/non-linked/UTF-8/2090 bytes, its
+  target is confined to the verified clone, and all retained values classify
+  as local defaults without recording values. No guest file was created;
+  cleanup and empty inventory passed.
+- Exact run `5383344b-bcb7-4b2c-9cc0-ffffb8350d01` reproduced `.env not found`,
+  then safely stopped recovery; exact SHA and cleanup passed.
+- Ruling: `RG2_DIAGNOSTIC_GATE=PASS`, but implementation is
+  `BLOCKED_PENDING_OWNER_POLICY_DECISION`: every Linkding key starts `LD_`,
+  while the frozen deferred rule rejects all `LD_*`. The separate design now
+  offers either strict whole-template rejection or closed-prefix omission from
+  a guest-only file, with Compose interpolation explicitly validated. No
+  implementation plan or RED is authorized until the Owner chooses one.
