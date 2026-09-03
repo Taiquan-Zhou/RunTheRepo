@@ -1235,6 +1235,36 @@ def test_prior_attempt_requires_matching_complete_terminal_record(
         verify_startup_input_attempt_history((attempt_dir,), plan)
 
 
+def test_prior_attempt_terminal_requires_complete_fixed_schema(tmp_path: Path) -> None:
+    workspace = _copy_fixture(tmp_path, "attempt_terminal_schema")
+    plan = plan_startup_input(workspace, "compose.yaml")
+    assert plan is not None
+    attempt_dir = tmp_path / "attempt-01"
+    attempt_dir.mkdir()
+    evidence_path = attempt_dir / "startup-input-attempt.jsonl"
+    asyncio.run(
+        materialize_startup_input(
+            _MaterializeProvider(),
+            "sandbox-1",
+            plan,
+            compose_path="compose.yaml",
+            compose_env={},
+            evidence_path=evidence_path,
+        )
+    )
+    rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+
+    for required_field in ("reason", "guest_validation", "elapsed_s"):
+        incomplete = [dict(row) for row in rows]
+        incomplete[1].pop(required_field)
+        evidence_path.write_text(
+            "".join(json.dumps(row) + "\n" for row in incomplete), encoding="utf-8"
+        )
+
+        with pytest.raises(StartupInputUnsupported, match="attempt_history_incomplete"):
+            verify_startup_input_attempt_history((attempt_dir,), plan)
+
+
 def test_host_planning_rejection_is_bounded_and_value_free(tmp_path: Path) -> None:
     evidence_path = tmp_path / "startup-input-attempt.jsonl"
 

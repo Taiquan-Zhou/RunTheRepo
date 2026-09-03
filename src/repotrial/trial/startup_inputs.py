@@ -467,11 +467,35 @@ def verify_startup_input_attempt_history(
             start.get("schema_version") != 1
             or start.get("sequence") != 0
             or start.get("outcome") != "start"
+            or start.get("purpose") != "startup_input_materialization"
             or terminal.get("schema_version") != 1
             or terminal.get("sequence") != 1
             or terminal.get("outcome") != "terminal"
+            or terminal.get("purpose") != "startup_input_materialization"
         ):
             raise StartupInputUnsupported("attempt_history_incomplete")
+        reason = terminal.get("reason")
+        guest_validation = terminal.get("guest_validation")
+        elapsed_s = terminal.get("elapsed_s")
+        if (
+            not isinstance(reason, str)
+            or _REASON_TOKEN_RE.fullmatch(reason) is None
+            or guest_validation not in {"satisfied", "failed"}
+            or isinstance(elapsed_s, bool)
+            or not isinstance(elapsed_s, (int, float))
+            or not math.isfinite(elapsed_s)
+            or elapsed_s < 0
+        ):
+            raise StartupInputUnsupported("attempt_history_incomplete")
+        if guest_validation == "satisfied":
+            resolved_hash = terminal.get("resolved_compose_sha256")
+            if (
+                reason != "materialized"
+                or terminal.get("target_mode") != "0600"
+                or not isinstance(resolved_hash, str)
+                or re.fullmatch(r"[0-9a-f]{64}", resolved_hash) is None
+            ):
+                raise StartupInputUnsupported("attempt_history_incomplete")
         for key, value in expected.items():
             if start.get(key) != value or terminal.get(key) != value:
                 raise StartupInputUnsupported("attempt_history_mismatch")
@@ -646,6 +670,7 @@ def _terminal_evidence(
             "elapsed_s": max(0.0, time.monotonic() - started),
             "guest_validation": guest_validation,
             "outcome": "terminal",
+            "purpose": "startup_input_materialization",
             "reason": reason,
             "sequence": 1,
             "schema_version": 1,
