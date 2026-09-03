@@ -629,3 +629,30 @@ No RG1 policy plan is created, and no CLI/API default is changed.
   unsupported/disclosed; no host fallback or daemon lifecycle command occurred.
 - Full append-only run facts and artifact hashes are in
   [`pilot-evidence/m7.5-release-gap-closure.md`](pilot-evidence/m7.5-release-gap-closure.md).
+
+## M7.5 release-gap closure - RG4 timeout diagnosis (append-only; 2026-09-03)
+
+- Diagnostic HEAD `22af2736dd3cf24259f83372ab1c7b2942b72505`; no production,
+  manifest, README, provider, or frozen-contract change.
+- A pinned trusted slow-Compose fixture reproducibly crossed the current
+  `240s` Boot-operation boundary; the owned host child was killed/reaped and
+  cleanup succeeded. Instrumentation asserted the exact argv, actual `240s`
+  provider argument, `240.101603s` operation elapsed, negative child return
+  code, and output-unavailable status. The same fixture completed healthy in
+  `256.528070s` with a `300s` operation budget. Strengthened real diagnostic:
+  `2 passed in 573.72s`; final inventory empty.
+- Exact Wakapi run `b14277fb-2ec9-42b3-bceb-8162e322d70c` again reached
+  `sandbox:exec:timeout` with about `632.23s` of whole-trial budget remaining;
+  exact SHA and cleanup passed.
+- A bounded non-metric diagnostic of the same fixed Wakapi Compose-up category
+  returned in `333.088104s`, after pull/build/container start, rather than
+  hanging. Compose returned nonzero with Wakapi reported `unhealthy`; the
+  immediate follow-up state showed it `starting`. That later condition is not
+  reclassified or fixed by RG4.
+- Independent review requested changes: the timed-out Wakapi attempt lacks
+  exact host argv, child kill/reap, post-timeout Compose state, and partial
+  stdout, while the single bounded probe did not return success or prove a
+  repeatable successful interval. Ruling corrected to
+  `RG4_ENTRY_GATE=NOT_PROVEN`; no production timeout plan or implementation is
+  authorized. Continue the frozen sequence to RG5. Generic provider timeouts,
+  readiness semantics, retries, and repository-specific logic remain frozen.
