@@ -239,6 +239,22 @@
 
 **M7.5 COMPATIBILITY CANARY FAILED**
 
+## M7.5 Task 2 - RG1 Docker-data capacity calibration
+
+- Controller completed the bounded RG1 diagnostic at `4096 MiB` and
+  `8192 MiB` for the exact Uptime Kuma and n8n pinned repositories, strictly
+  serially, using the reviewed diagnostic runner.
+- Uptime Kuma booted at both capacities but had insufficient Journey
+  coverage. n8n retained Docker-data `no space left on device` during 4096 MiB
+  extraction and timed out during the 8192 MiB bounded run. All four runs
+  cleaned up successfully and ended with empty sandbox inventory.
+- Evidence and runner commit: `032e4d9` (`docs: record M7.5 RG1 disk capacity
+  calibration`).
+- Gate: `RG1_CAPACITY_GATE=FAIL no_common_bounded_total_through_8192`.
+  The default `2048 MiB` policy and public CLI/API remain unchanged; no RG1
+  policy design was created. Implementer/reviewer relay failures are recorded
+  as process deviations, not as task approval.
+
 ## M7.5 recovered metric-bearing canary — latest status
 
 This section supersedes the older `M7.5 environment recovery — WSL2 Linux Docker
