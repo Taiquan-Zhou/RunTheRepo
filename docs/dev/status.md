@@ -714,3 +714,8 @@ No RG1 policy plan is created, and no CLI/API default is changed.
   offers either strict whole-template rejection or closed-prefix omission from
   a guest-only file, with Compose interpolation explicitly validated. No
   implementation plan or RED is authorized until the Owner chooses one.
+
+- Owner decision (2026-09-03): Option B approved. Proceed with a separate
+  RED-first implementation plan for closed-prefix omission in the guest file,
+  unchanged host-environment restrictions, and pre-Boot resolved-Compose
+  validation. No production implementation has yet been committed.
