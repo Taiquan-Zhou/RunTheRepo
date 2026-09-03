@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import base64
 import errno
 import hashlib
+import json
+import math
 import os
+import posixpath
 import re
 import stat
+import time
 import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -14,6 +19,7 @@ from pathlib import Path
 from typing import Final
 
 from repotrial.compose.parser import canonical_compose_json, load_compose
+from repotrial.sandbox.base import ExecResult, SandboxProvider
 
 _MAX_SOURCE_BYTES: Final = 65_536
 _MAX_LINE_BYTES: Final = 4_096
@@ -30,6 +36,65 @@ _CONTROL_EXACT: Final = frozenset(
 )
 _CONTROL_PREFIXES: Final = ("COMPOSE_", "DOCKER_", "DYLD_", "LD_")
 _SECRET_COMPONENTS: Final = frozenset({"PASSWORD", "SECRET", "TOKEN"})
+_ENV_KEY_RE: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_GUEST_CLONE_ROOT: Final = "/workspace"
+_MAX_ADAPTER_OUTPUT_BYTES: Final = 1_024
+_MAX_RESOLVED_CONFIG_BYTES: Final = 4 * 1024 * 1024
+_MAX_RESOLVED_CONFIG_NODES: Final = 100_000
+_MAX_RESOLVED_CONFIG_DEPTH: Final = 128
+_MAX_EVIDENCE_BYTES: Final = 32 * 1024
+_MAX_PAYLOAD_BYTES: Final = 90_000
+
+# This is code-owned and intentionally not assembled from repository input.
+_ADAPTER_SCRIPT: Final = """\
+set -eu
+umask 077
+set -C
+
+if [ "$#" -ne 5 ]; then
+    exit 20
+fi
+source_path=$1
+target_path=$2
+source_sha256=$3
+output_sha256=$4
+payload=$5
+
+root=$(pwd -P)
+[ "$root" = "/workspace" ] || exit 21
+[ "$source_path" = ".env.sample" ] || exit 22
+[ "$target_path" = ".env" ] || exit 22
+[ "$(dirname "$source_path")" = "." ] || exit 22
+[ "$(dirname "$target_path")" = "." ] || exit 22
+
+[ -f "$source_path" ] && [ ! -L "$source_path" ] || exit 23
+source_hash=$(sha256sum "$source_path" | cut -d ' ' -f 1)
+[ "$source_hash" = "$source_sha256" ] || exit 24
+
+if [ -e "$target_path" ] || [ -L "$target_path" ]; then
+    exit 25
+fi
+
+payload_bytes=$(printf '%s' "$payload" | wc -c)
+[ "$payload_bytes" -le 90000 ] || exit 26
+if ! printf '%s' "$payload" | base64 -d > "$target_path"; then
+    if [ -f "$target_path" ] && [ ! -L "$target_path" ]; then
+        rm -f "$target_path"
+    fi
+    exit 27
+fi
+chmod 600 "$target_path"
+[ -f "$target_path" ] && [ ! -L "$target_path" ] || exit 28
+target_mode=$(stat -c '%a' "$target_path")
+[ "$target_mode" = "600" ] || exit 29
+target_hash=$(sha256sum "$target_path" | cut -d ' ' -f 1)
+[ "$target_hash" = "$output_sha256" ] || exit 30
+
+printf 'root=%s\nmode=%s\n' "$root" "$target_mode"
+"""
+_ADAPTER_SHA256: Final = (
+    "6c183581aa20385d694faf4f00ee19331ac57dfbf98cad553637df654be45fda"
+)
 
 
 class StartupInputUnsupported(RuntimeError):
@@ -62,6 +127,17 @@ class StartupInputPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class StartupInputResult:
+    """Verified guest startup-input and resolved Compose identities."""
+
+    source_sha256: str
+    output_sha256: str
+    resolved_compose_sha256: str
+    target_mode: int
+    artifact_relative_path: str
+
+
+@dataclass(frozen=True, slots=True)
 class _Assignment:
     key: str
     value: str
@@ -75,6 +151,394 @@ class _FileIdentity:
     size: int
     mtime_ns: int
     ctime_ns: int
+
+
+class _EvidenceWriter:
+    def __init__(self, path: Path) -> None:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(path, flags, 0o600)
+            os.fchmod(descriptor, 0o600)
+            metadata = os.fstat(descriptor)
+        except FileExistsError:
+            raise StartupInputUnsupported("evidence_collision") from None
+        except OSError:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise StartupInputUnsupported("evidence_persistence_failed") from None
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            os.close(descriptor)
+            raise StartupInputUnsupported("evidence_persistence_failed")
+        self._descriptor = descriptor
+        self._size = 0
+
+    def append(self, record: Mapping[str, object]) -> None:
+        try:
+            payload = (
+                json.dumps(
+                    dict(record),
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode()
+        except (OverflowError, RecursionError, TypeError, ValueError):
+            raise StartupInputUnsupported("evidence_persistence_failed") from None
+        if self._size + len(payload) > _MAX_EVIDENCE_BYTES:
+            raise StartupInputUnsupported("evidence_persistence_failed")
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(self._descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError("short evidence write")
+                offset += written
+            os.fsync(self._descriptor)
+        except OSError:
+            raise StartupInputUnsupported("evidence_persistence_failed") from None
+        self._size += len(payload)
+
+    def close(self) -> None:
+        os.close(self._descriptor)
+
+
+async def materialize_startup_input(
+    provider: SandboxProvider,
+    sandbox_id: str,
+    plan: StartupInputPlan,
+    *,
+    compose_path: str,
+    compose_env: Mapping[str, str],
+    evidence_path: Path,
+    overlay_path: str | None = None,
+) -> StartupInputResult:
+    """Create and verify one guest-only input, then validate resolved Compose."""
+    if not isinstance(evidence_path, Path):
+        raise TypeError("startup-input evidence path must be a Path")
+    if compose_path != plan.compose_relative_path:
+        raise StartupInputUnsupported("compose_identity_mismatch")
+    prefix = _guest_environment_prefix(plan.all_source_key_names, compose_env)
+    _validate_guest_relative_path(compose_path, "compose_path")
+    if overlay_path is not None:
+        _validate_guest_relative_path(overlay_path, "overlay_path")
+    payload = base64.b64encode(plan.output_bytes).decode("ascii")
+    if len(payload) > _MAX_PAYLOAD_BYTES:
+        raise StartupInputUnsupported("payload_too_large")
+    adapter_sha256 = hashlib.sha256(_ADAPTER_SCRIPT.encode()).hexdigest()
+    if adapter_sha256 != _ADAPTER_SHA256:
+        raise RuntimeError("startup-input adapter identity mismatch")
+
+    started = time.monotonic()
+    evidence = _EvidenceWriter(evidence_path)
+    start_record = _evidence_identity(plan, adapter_sha256)
+    start_record.update(
+        {
+            "outcome": "start",
+            "purpose": "startup_input_materialization",
+            "sequence": 0,
+            "schema_version": 1,
+        }
+    )
+    try:
+        evidence.append(start_record)
+        adapter_argv = [
+            *prefix,
+            "sh",
+            "-eu",
+            "-c",
+            _ADAPTER_SCRIPT,
+            "repotrial-startup-input",
+            plan.source_relative_path,
+            plan.target_relative_path,
+            plan.source_sha256,
+            plan.output_sha256,
+            payload,
+        ]
+        adapter_result = await provider.exec(sandbox_id, adapter_argv, timeout_s=30)
+        if not isinstance(adapter_result, ExecResult):
+            raise TypeError("startup-input adapter returned a malformed result")
+        if (
+            adapter_result.exit_code != 0
+            or adapter_result.stdout != "root=/workspace\nmode=600\n"
+            or adapter_result.stderr
+        ):
+            raise StartupInputUnsupported("guest_validation_failed")
+
+        compose_argv = [
+            *prefix,
+            "docker",
+            "compose",
+            "--project-directory",
+            ".",
+            "-f",
+            compose_path,
+        ]
+        if overlay_path is not None:
+            compose_argv.extend(["-f", overlay_path])
+        compose_argv.extend(["config", "--format", "json"])
+        config_result = await provider.exec(sandbox_id, compose_argv, timeout_s=30)
+        if not isinstance(config_result, ExecResult):
+            raise TypeError("Compose config returned a malformed result")
+        if config_result.exit_code != 0 or config_result.stderr:
+            raise StartupInputUnsupported("resolved_config_failed")
+        resolved = _parse_resolved_compose(config_result.stdout)
+        _validate_resolved_compose(resolved, plan.expected_service_names)
+        resolved_material = json.dumps(
+            resolved,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        resolved_sha256 = hashlib.sha256(resolved_material).hexdigest()
+        terminal = _evidence_identity(plan, adapter_sha256)
+        terminal.update(
+            {
+                "elapsed_s": max(0.0, time.monotonic() - started),
+                "guest_validation": "satisfied",
+                "outcome": "terminal",
+                "reason": "materialized",
+                "resolved_compose_sha256": resolved_sha256,
+                "sequence": 1,
+                "schema_version": 1,
+                "target_mode": "0600",
+            }
+        )
+        evidence.append(terminal)
+        return StartupInputResult(
+            source_sha256=plan.source_sha256,
+            output_sha256=plan.output_sha256,
+            resolved_compose_sha256=resolved_sha256,
+            target_mode=0o600,
+            artifact_relative_path=plan.target_relative_path,
+        )
+    except StartupInputUnsupported as error:
+        terminal = _evidence_identity(plan, adapter_sha256)
+        terminal.update(
+            {
+                "elapsed_s": max(0.0, time.monotonic() - started),
+                "guest_validation": "failed",
+                "outcome": "terminal",
+                "reason": error.reason,
+                "sequence": 1,
+                "schema_version": 1,
+            }
+        )
+        evidence.append(terminal)
+        raise
+    except BaseException:
+        terminal = _evidence_identity(plan, adapter_sha256)
+        terminal.update(
+            {
+                "elapsed_s": max(0.0, time.monotonic() - started),
+                "guest_validation": "failed",
+                "outcome": "terminal",
+                "reason": "provider_exception",
+                "sequence": 1,
+                "schema_version": 1,
+            }
+        )
+        try:
+            evidence.append(terminal)
+        except StartupInputUnsupported:
+            pass
+        raise
+    finally:
+        evidence.close()
+
+
+def _evidence_identity(
+    plan: StartupInputPlan, adapter_sha256: str
+) -> dict[str, object]:
+    return {
+        "accepted_key_names": list(plan.accepted_key_names),
+        "adapter_sha256": adapter_sha256,
+        "all_source_key_names": list(plan.all_source_key_names),
+        "argv_category": "fixed_guest_startup_input_adapter",
+        "compose_config_hash": plan.compose_config_hash,
+        "compose_relative_path": plan.compose_relative_path,
+        "expected_service_names": list(plan.expected_service_names),
+        "omitted_control_key_names": list(plan.omitted_control_key_names),
+        "output_sha256": plan.output_sha256,
+        "policy_id": plan.policy_id,
+        "project_directory": ".",
+        "source_relative_path": plan.source_relative_path,
+        "source_sha256": plan.source_sha256,
+        "synthetic_key_names": list(plan.synthetic_key_names),
+        "target_relative_path": plan.target_relative_path,
+    }
+
+
+def _guest_environment_prefix(
+    unset_keys: tuple[str, ...], compose_env: Mapping[str, str]
+) -> list[str]:
+    prefix = ["env"]
+    for key in sorted(set(unset_keys), key=lambda item: item.encode("ascii")):
+        if _ENV_KEY_RE.fullmatch(key) is None:
+            raise StartupInputUnsupported("environment_key_invalid")
+        prefix.extend(["-u", key])
+    assignments: list[str] = []
+    for key, value in compose_env.items():
+        if not isinstance(key, str):
+            raise TypeError("environment keys must be strings")
+        if _ENV_KEY_RE.fullmatch(key) is None:
+            raise ValueError("environment key is not portable")
+        if _is_control_key(key):
+            raise ValueError("environment key controls the Compose toolchain")
+        if not isinstance(value, str):
+            raise TypeError("environment values must be strings")
+        if "\0" in value:
+            raise ValueError("environment values must not contain NUL")
+        assignments.append(f"{key}={value}")
+    prefix.extend(sorted(assignments))
+    return prefix
+
+
+def _validate_guest_relative_path(path: str, label: str) -> None:
+    if not isinstance(path, str):
+        raise TypeError(f"{label} must be a string")
+    candidate = Path(path)
+    if (
+        not path
+        or "\\" in path
+        or "\0" in path
+        or any(ord(character) < 32 for character in path)
+        or candidate.is_absolute()
+        or candidate.drive
+        or ".." in candidate.parts
+    ):
+        raise StartupInputUnsupported(f"{label}_invalid")
+
+
+def _parse_resolved_compose(stdout: str) -> dict[str, object]:
+    if not isinstance(stdout, str):
+        raise TypeError("Compose config stdout must be a string")
+    if len(stdout.encode()) > _MAX_RESOLVED_CONFIG_BYTES:
+        raise StartupInputUnsupported("resolved_config_too_large")
+    try:
+        resolved = json.loads(
+            stdout,
+            object_pairs_hook=_json_object_without_duplicates,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, RecursionError, UnicodeError, ValueError):
+        raise StartupInputUnsupported("resolved_config_invalid") from None
+    if not isinstance(resolved, dict):
+        raise StartupInputUnsupported("resolved_config_invalid")
+    _validate_json_budget(resolved, depth=1, budget=[0])
+    return resolved
+
+
+def _json_object_without_duplicates(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_: str) -> object:
+    raise ValueError("non-standard JSON constant")
+
+
+def _validate_json_budget(value: object, *, depth: int, budget: list[int]) -> None:
+    if depth > _MAX_RESOLVED_CONFIG_DEPTH:
+        raise StartupInputUnsupported("resolved_config_too_large")
+    budget[0] += 1
+    if budget[0] > _MAX_RESOLVED_CONFIG_NODES:
+        raise StartupInputUnsupported("resolved_config_too_large")
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise StartupInputUnsupported("resolved_config_invalid")
+            _validate_json_budget(item, depth=depth + 1, budget=budget)
+    elif isinstance(value, list):
+        for item in value:
+            _validate_json_budget(item, depth=depth + 1, budget=budget)
+    elif (
+        isinstance(value, float)
+        and not math.isfinite(value)
+        or value is not None
+        and not isinstance(value, (bool, int, float, str))
+    ):
+        raise StartupInputUnsupported("resolved_config_invalid")
+
+
+def _validate_resolved_compose(
+    resolved: Mapping[str, object], expected_service_names: tuple[str, ...]
+) -> None:
+    services = resolved.get("services")
+    if not isinstance(services, Mapping) or set(services) != set(
+        expected_service_names
+    ):
+        raise StartupInputUnsupported("resolved_service_mismatch")
+    for service in services.values():
+        if not isinstance(service, Mapping):
+            raise StartupInputUnsupported("resolved_config_invalid")
+        if service.get("privileged") is True:
+            raise StartupInputUnsupported("unsafe_resolved_compose")
+        if service.get("network_mode") == "host":
+            raise StartupInputUnsupported("unsafe_resolved_compose")
+        devices = service.get("devices")
+        if devices not in (None, [], {}):
+            raise StartupInputUnsupported("unsafe_resolved_compose")
+        volumes = service.get("volumes")
+        if volumes is not None:
+            _validate_resolved_volumes(volumes)
+
+
+def _validate_resolved_volumes(volumes: object) -> None:
+    if not isinstance(volumes, list):
+        raise StartupInputUnsupported("unsafe_resolved_compose")
+    for volume in volumes:
+        if not isinstance(volume, Mapping):
+            raise StartupInputUnsupported("unsafe_resolved_compose")
+        source = volume.get("source")
+        target = volume.get("target")
+        kind = volume.get("type")
+        if _is_engine_socket(source) or _is_engine_socket(target):
+            raise StartupInputUnsupported("unsafe_resolved_compose")
+        if kind == "bind":
+            if not isinstance(source, str) or not _is_inside_guest_clone(source):
+                raise StartupInputUnsupported("unsafe_resolved_compose")
+        elif kind not in {"volume", "tmpfs", "image", "cluster"}:
+            raise StartupInputUnsupported("unsafe_resolved_compose")
+
+
+def _is_engine_socket(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.lower().replace("\\", "/")
+    basename = normalized.rsplit("/", 1)[-1]
+    return basename in {
+        "containerd.sock",
+        "cri-dockerd.sock",
+        "docker.sock",
+        "docker_engine",
+        "podman.sock",
+    }
+
+
+def _is_inside_guest_clone(source: str) -> bool:
+    if "\0" in source or "\\" in source or not source.startswith("/"):
+        return False
+    normalized = posixpath.normpath(source)
+    return normalized == _GUEST_CLONE_ROOT or normalized.startswith(
+        f"{_GUEST_CLONE_ROOT}/"
+    )
 
 
 def plan_startup_input(workspace: Path, compose_path: str) -> StartupInputPlan | None:
