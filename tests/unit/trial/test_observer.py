@@ -16,6 +16,7 @@ from repotrial.sandbox.base import ExecResult, NetworkLogResult, SandboxProvider
 from repotrial.trial.observer import (
     ObservationCollectionError,
     ObservationParseError,
+    _collect_observation_with_evidence,
     collect_observation,
 )
 
@@ -157,6 +158,66 @@ def test_public_collection_without_diagnostics_creates_only_audit_artifact(
     _collect(ScriptedProvider(_scripts_for([])), artifact_path)
 
     assert list(tmp_path.iterdir()) == [artifact_path]
+
+
+def test_internal_observer_uses_startup_input_compose_prefix(tmp_path: Path) -> None:
+    prefix = (
+        "env",
+        "-u",
+        "APP_MODE",
+        "-u",
+        "LD_HOST_PORT",
+        "APP_MODE=test",
+    )
+    discovery = (
+        *prefix,
+        "docker",
+        "compose",
+        "--project-directory",
+        ".",
+        "-f",
+        "compose.yaml",
+        "ps",
+        "--all",
+        "--no-trunc",
+        "--orphans=false",
+        "--format",
+        "json",
+    )
+    provider = ScriptedProvider({discovery: _result()})
+    artifact_path = tmp_path / "observation.json"
+    evidence_path = tmp_path / "observation-evidence.jsonl"
+
+    asyncio.run(
+        _collect_observation_with_evidence(
+            provider,
+            "sandbox-1",
+            "compose.yaml",
+            artifact_path,
+            evidence_path=evidence_path,
+            env={"APP_MODE": "test"},
+            unset_env_keys=("LD_HOST_PORT", "APP_MODE"),
+            project_directory=".",
+        )
+    )
+
+    assert provider.calls[0] == ("exec", "sandbox-1", discovery, 30)
+    rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    redacted_discovery = tuple(
+        "APP_MODE=[REDACTED]" if item == "APP_MODE=test" else item for item in discovery
+    )
+    expected_hash = hashlib.sha256(
+        json.dumps(
+            list(redacted_discovery), ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    raw_hash = hashlib.sha256(
+        json.dumps(list(discovery), ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    assert rows[0]["argv_sha256"] == expected_hash
+    assert rows[0]["argv_sha256"] != raw_hash
 
 
 def _assert_parse_failure(

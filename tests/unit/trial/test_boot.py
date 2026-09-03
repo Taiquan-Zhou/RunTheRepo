@@ -321,6 +321,95 @@ def test_nonempty_env_is_sorted_prefixed_and_not_mutated() -> None:
     ]
 
 
+def test_startup_input_prefix_is_shared_by_all_boot_commands() -> None:
+    prefix = (
+        "env",
+        "-u",
+        "APP_MODE",
+        "-u",
+        "LD_HOST_PORT",
+        "-u",
+        "ld_preload",
+        "APP_MODE=test",
+    )
+    compose = (
+        "docker",
+        "compose",
+        "--project-directory",
+        ".",
+        "-f",
+        COMPOSE_PATH,
+    )
+    up_argv = (*prefix, *compose, "up", "-d", "--wait", "--wait-timeout", "60")
+    ps_argv = (*prefix, *compose, "ps", "--all", "--format", "json")
+    logs_argv = (*prefix, *compose, "logs", "--no-color", "--tail", "200")
+    provider = FakeSandboxProvider(
+        scripts={
+            up_argv: _result(),
+            ps_argv: _result(stdout=_healthy_ps()),
+            logs_argv: _result(),
+        }
+    )
+
+    async def exercise() -> BootResult:
+        sandbox_id = await provider.create(Path("missing-workspace"), "trial")
+        return await boot_compose(
+            provider,
+            sandbox_id,
+            COMPOSE_PATH,
+            {"APP_MODE": "test"},
+            attempt=1,
+            unset_env_keys=("ld_preload", "APP_MODE", "LD_HOST_PORT"),
+            project_directory=".",
+        )
+
+    result = asyncio.run(exercise())
+
+    assert result.verdict is Verdict.PASS
+    assert provider.calls[1:] == [
+        ("exec", "sandbox-1", up_argv, 240),
+        ("exec", "sandbox-1", ps_argv, 30),
+        ("exec", "sandbox-1", logs_argv, 30),
+    ]
+
+
+def test_invalid_unset_key_fails_before_boot_exec() -> None:
+    provider = FakeSandboxProvider()
+
+    with pytest.raises(ValueError, match="unset environment key is not portable"):
+        asyncio.run(
+            boot_compose(
+                provider,
+                "sandbox-1",
+                COMPOSE_PATH,
+                {},
+                attempt=1,
+                unset_env_keys=("BAD-NAME",),
+                project_directory=".",
+            )
+        )
+
+    assert provider.calls == []
+
+
+def test_startup_input_project_directory_is_fixed_to_clone_root() -> None:
+    provider = FakeSandboxProvider()
+
+    with pytest.raises(ValueError, match="project_directory must be the clone root"):
+        asyncio.run(
+            boot_compose(
+                provider,
+                "sandbox-1",
+                COMPOSE_PATH,
+                {},
+                attempt=1,
+                project_directory="/tmp",
+            )
+        )
+
+    assert provider.calls == []
+
+
 @pytest.mark.parametrize(
     ("row", "expected_state"),
     [

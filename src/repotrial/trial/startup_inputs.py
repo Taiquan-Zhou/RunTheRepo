@@ -21,6 +21,7 @@ from typing import Final
 
 from repotrial.compose.parser import canonical_compose_json, load_compose
 from repotrial.sandbox.base import ExecResult, SandboxProvider
+from repotrial.trial.boot import _validated_compose_env_prefix
 
 _MAX_SOURCE_BYTES: Final = 65_536
 _MAX_LINE_BYTES: Final = 4_096
@@ -37,7 +38,6 @@ _CONTROL_EXACT: Final = frozenset(
 )
 _CONTROL_PREFIXES: Final = ("COMPOSE_", "DOCKER_", "DYLD_", "LD_")
 _SECRET_COMPONENTS: Final = frozenset({"PASSWORD", "SECRET", "TOKEN"})
-_ENV_KEY_RE: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _GUEST_CLONE_ROOT: Final = "/workspace"
 _MAX_ADAPTER_OUTPUT_BYTES: Final = 1_024
 _MAX_RESOLVED_CONFIG_BYTES: Final = 4 * 1024 * 1024
@@ -254,7 +254,9 @@ async def materialize_startup_input(
         raise TypeError("startup-input evidence path must be a Path")
     if compose_path != plan.compose_relative_path:
         raise StartupInputUnsupported("compose_identity_mismatch")
-    prefix = _guest_environment_prefix(plan.all_source_key_names, compose_env)
+    prefix = _validated_compose_env_prefix(
+        compose_path, compose_env, plan.all_source_key_names
+    )
     _validate_guest_relative_path(compose_path, "compose_path")
     if overlay_path is not None:
         _validate_guest_relative_path(overlay_path, "overlay_path")
@@ -457,31 +459,6 @@ def _terminal_evidence(
     if target_mode is not None:
         terminal["target_mode"] = target_mode
     return terminal
-
-
-def _guest_environment_prefix(
-    unset_keys: tuple[str, ...], compose_env: Mapping[str, str]
-) -> list[str]:
-    prefix = ["env"]
-    for key in sorted(set(unset_keys), key=lambda item: item.encode("ascii")):
-        if _ENV_KEY_RE.fullmatch(key) is None:
-            raise StartupInputUnsupported("environment_key_invalid")
-        prefix.extend(["-u", key])
-    assignments: list[str] = []
-    for key, value in compose_env.items():
-        if not isinstance(key, str):
-            raise TypeError("environment keys must be strings")
-        if _ENV_KEY_RE.fullmatch(key) is None:
-            raise ValueError("environment key is not portable")
-        if _is_control_key(key):
-            raise ValueError("environment key controls the Compose toolchain")
-        if not isinstance(value, str):
-            raise TypeError("environment values must be strings")
-        if "\0" in value:
-            raise ValueError("environment values must not contain NUL")
-        assignments.append(f"{key}={value}")
-    prefix.extend(sorted(assignments))
-    return prefix
 
 
 def _validate_guest_relative_path(path: str, label: str) -> None:

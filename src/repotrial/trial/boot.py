@@ -1,5 +1,6 @@
 import json
 import re
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -48,6 +49,8 @@ async def boot_compose(
     attempt: int,
     *,
     overlay_path: str | None = None,
+    unset_env_keys: Sequence[str] = (),
+    project_directory: str | None = None,
 ) -> BootResult:
     return await _boot_compose_with_evidence(
         provider,
@@ -56,6 +59,8 @@ async def boot_compose(
         env,
         attempt,
         overlay_path=overlay_path,
+        unset_env_keys=unset_env_keys,
+        project_directory=project_directory,
     )
 
 
@@ -68,9 +73,15 @@ async def _boot_compose_with_evidence(
     *,
     evidence_path: Path | None = None,
     overlay_path: str | None = None,
+    unset_env_keys: Sequence[str] = (),
+    project_directory: str | None = None,
 ) -> BootResult:
-    prefix = _validated_env_prefix(compose_path, env)
-    docker_compose = ["docker", "compose", "-f", compose_path]
+    prefix = _validated_compose_env_prefix(compose_path, env, unset_env_keys)
+    docker_compose = ["docker", "compose"]
+    if project_directory is not None:
+        _validate_project_directory(project_directory)
+        docker_compose.extend(["--project-directory", project_directory])
+    docker_compose.extend(["-f", compose_path])
     if overlay_path is not None:
         _validate_compose_path(overlay_path, "overlay_path")
         docker_compose.extend(["-f", overlay_path])
@@ -197,11 +208,41 @@ def _validated_env_prefix(compose_path: str, env: dict[str, str]) -> list[str]:
     return ["env", *sorted(assignments)]
 
 
+def _validated_compose_env_prefix(
+    compose_path: str,
+    env: Mapping[str, str],
+    unset_env_keys: Sequence[str] = (),
+) -> list[str]:
+    """Build one deterministic Compose process environment prefix."""
+    existing = _validated_env_prefix(compose_path, dict(env))
+    validated_keys: list[str] = []
+    for key in unset_env_keys:
+        if not isinstance(key, str):
+            raise TypeError("unset environment keys must be strings")
+        if _ENV_KEY_PATTERN.fullmatch(key) is None:
+            raise ValueError("unset environment key is not portable")
+        validated_keys.append(key)
+    unset: list[str] = []
+    for key in sorted(set(validated_keys)):
+        unset.extend(["-u", key])
+    if not unset:
+        return existing
+    assignments = existing[1:] if existing else []
+    return ["env", *unset, *assignments]
+
+
 def _validate_compose_path(path: object, label: str) -> None:
     if not isinstance(path, str):
         raise TypeError(f"{label} must be a string")
     if "\0" in path:
         raise ValueError(f"{label} must not contain NUL")
+
+
+def _validate_project_directory(project_directory: object) -> None:
+    if not isinstance(project_directory, str):
+        raise TypeError("project_directory must be a string")
+    if project_directory != ".":
+        raise ValueError("project_directory must be the clone root")
 
 
 def _parse_service_states(output: str) -> tuple[dict[str, str], bool]:

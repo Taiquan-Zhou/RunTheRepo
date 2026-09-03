@@ -1100,7 +1100,7 @@ def test_invalid_identity_and_environment_fail_before_evidence(tmp_path: Path) -
             )
         )
     invalid_plan = replace(plan, all_source_key_names=("BAD-NAME",))
-    with pytest.raises(StartupInputUnsupported, match="environment_key_invalid"):
+    with pytest.raises(ValueError, match="unset environment key is not portable"):
         asyncio.run(
             materialize_startup_input(
                 provider,
