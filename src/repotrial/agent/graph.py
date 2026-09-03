@@ -542,7 +542,7 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
     context = runtime.context
     token = _run_token(state.run.run_id)
     index = len(state.run.experiments)
-    attempt_dir, attempt_slot, _ = _claim_attempt_directory(
+    attempt_dir, attempt_slot, prior_attempt_directories = _claim_attempt_directory(
         state.run,
         context,
         purpose="experiment",
@@ -565,6 +565,7 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
         artifact_dir=attempt_dir,
         env={**context.env, **state.recovery_env},
         container_port=context.container_port,
+        prior_attempt_directories=prior_attempt_directories,
     )
     verify_baseline_journeys(
         _baseline_journey_artifact(state.run, context), state.run.journeys

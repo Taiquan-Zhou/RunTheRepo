@@ -25,7 +25,18 @@ from repotrial.sandbox.base import SandboxProvider
 from repotrial.sandbox.docker_sbx import DockerSbxError
 from repotrial.sandbox.lifecycle import CleanupError, managed_sandbox
 from repotrial.trial.boot import _validated_env_prefix, boot_compose
-from repotrial.trial.observer import collect_observation
+from repotrial.trial.observer import (
+    _collect_observation_with_evidence,
+    collect_observation,
+)
+from repotrial.trial.startup_inputs import (
+    StartupInputPlan,
+    StartupInputUnsupported,
+    materialize_startup_input,
+    plan_startup_input,
+    record_startup_input_rejection,
+    verify_startup_input_attempt_history,
+)
 
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
 _ORDINARY_STAGE_ERRORS = (RuntimeError, OSError, ValueError, TypeError, KeyError)
@@ -54,6 +65,7 @@ class ExperimentContext:
     artifact_dir: Path
     env: Mapping[str, str]
     container_port: int
+    prior_attempt_directories: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +82,10 @@ class _PreparedExperiment:
     baseline_error: str | None
     lifecycle_artifact: Path
     observation_artifact: Path
+    observation_evidence: Path
+    startup_input_evidence: Path
+    startup_input_plan: StartupInputPlan | None
+    startup_input_error: str | None
     evidence_dirs: tuple[Path, ...]
     sandbox_name: str
 
@@ -103,6 +119,21 @@ async def run_experiment(
             boot=Verdict.UNSUPPORTED,
             verdict=ExperimentVerdict.STOP,
             reason="parent_hash_mismatch",
+        )
+
+    if prepared.startup_input_error is not None:
+        record_startup_input_rejection(
+            prepared.startup_input_evidence,
+            compose_relative_path=prepared.compose_path,
+            reason=prepared.startup_input_error,
+        )
+        return _record(
+            state,
+            mutation,
+            prepared,
+            boot=Verdict.UNSUPPORTED,
+            verdict=ExperimentVerdict.STOP,
+            reason="startup_input_unsupported",
         )
 
     _validate_artifact_targets(prepared)
@@ -177,6 +208,18 @@ def _prepare(
     candidate = apply_mutation(base, mutation)
     parent_hash = _compose_hash(base)
     candidate_hash = _compose_hash(candidate)
+    startup_input_plan: StartupInputPlan | None = None
+    startup_input_error: str | None = None
+    try:
+        startup_input_plan = plan_startup_input(workspace, compose_path)
+        if startup_input_plan is not None:
+            if f"sha256:{startup_input_plan.compose_config_hash}" != parent_hash:
+                raise StartupInputUnsupported("compose_identity_mismatch")
+            verify_startup_input_attempt_history(
+                context.prior_attempt_directories, startup_input_plan
+            )
+    except StartupInputUnsupported as error:
+        startup_input_error = error.reason
     journeys, baseline_error = _select_baseline_journeys(state)
     token = candidate_hash.removeprefix("sha256:")[:16]
     return _PreparedExperiment(
@@ -192,6 +235,10 @@ def _prepare(
         baseline_error=baseline_error,
         lifecycle_artifact=artifact_dir / f"candidate-{token}-lifecycle.jsonl",
         observation_artifact=artifact_dir / f"candidate-{token}-observation.json",
+        observation_evidence=(artifact_dir / "candidate-observation-boundary.jsonl"),
+        startup_input_evidence=artifact_dir / "startup-input-attempt.jsonl",
+        startup_input_plan=startup_input_plan,
+        startup_input_error=startup_input_error,
         evidence_dirs=tuple(
             artifact_dir / f"candidate-{token}-journey-{index:04d}"
             for index in range(len(journeys))
@@ -296,11 +343,14 @@ def _compose_hash(compose: dict[str, object]) -> str:
 
 
 def _validate_artifact_targets(prepared: _PreparedExperiment) -> None:
-    for target in (
+    targets = [
         prepared.lifecycle_artifact,
         prepared.observation_artifact,
         *prepared.evidence_dirs,
-    ):
+    ]
+    if prepared.startup_input_plan is not None:
+        targets.extend([prepared.startup_input_evidence, prepared.observation_evidence])
+    for target in targets:
         if target.exists() or target.is_symlink():
             raise ValueError("experiment artifact target is already in use")
 
@@ -323,15 +373,50 @@ async def _run_candidate(
     prepared: _PreparedExperiment,
     sandbox_id: str,
 ) -> ExperimentRecord:
+    startup_plan = prepared.startup_input_plan
+    if startup_plan is not None:
+        try:
+            await materialize_startup_input(
+                provider,
+                sandbox_id,
+                startup_plan,
+                compose_path=prepared.compose_path,
+                compose_env=prepared.env,
+                evidence_path=prepared.startup_input_evidence,
+                overlay_path=prepared.overlay_relative,
+            )
+        except CleanupError:
+            raise
+        except _ORDINARY_STAGE_ERRORS:
+            return _record(
+                state,
+                mutation,
+                prepared,
+                boot=Verdict.UNSUPPORTED,
+                verdict=ExperimentVerdict.STOP,
+                reason="startup_input_unsupported",
+            )
     try:
-        boot = await boot_compose(
-            provider,
-            sandbox_id,
-            prepared.compose_path,
-            prepared.env,
-            attempt=1,
-            overlay_path=prepared.overlay_relative,
-        )
+        if startup_plan is None:
+            boot = await boot_compose(
+                provider,
+                sandbox_id,
+                prepared.compose_path,
+                prepared.env,
+                attempt=1,
+                overlay_path=prepared.overlay_relative,
+            )
+        else:
+            boot = await boot_compose(
+                provider,
+                sandbox_id,
+                prepared.compose_path,
+                prepared.env,
+                attempt=1,
+                overlay_path=prepared.overlay_relative,
+                unset_env_keys=startup_plan.all_source_key_names,
+                project_directory=".",
+            )
     except DockerSbxError as error:
         raise _ExperimentSandboxFailure(
             "boot_failed",
@@ -357,13 +442,26 @@ async def _run_candidate(
         )
 
     try:
-        after = await collect_observation(
-            provider,
-            sandbox_id,
-            prepared.compose_path,
-            prepared.observation_artifact,
-            overlay_path=prepared.overlay_relative,
-        )
+        if startup_plan is None:
+            after = await collect_observation(
+                provider,
+                sandbox_id,
+                prepared.compose_path,
+                prepared.observation_artifact,
+                overlay_path=prepared.overlay_relative,
+            )
+        else:
+            after = await _collect_observation_with_evidence(
+                provider,
+                sandbox_id,
+                prepared.compose_path,
+                prepared.observation_artifact,
+                overlay_path=prepared.overlay_relative,
+                evidence_path=prepared.observation_evidence,
+                env=prepared.env,
+                unset_env_keys=startup_plan.all_source_key_names,
+                project_directory=".",
+            )
     except CleanupError:
         raise
     except DockerSbxError as error:

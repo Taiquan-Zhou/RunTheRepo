@@ -110,6 +110,58 @@ class RecordingProvider(FakeSandboxProvider):
         await super().destroy(sandbox_id)
 
 
+class StartupInputProvider(RecordingProvider):
+    def __init__(self, *, adapter_exit_code: int = 0) -> None:
+        super().__init__(ports={8080: 45123})
+        self.adapter_exit_code = adapter_exit_code
+
+    async def exec(
+        self, sandbox_id: str, argv: list[str], timeout_s: int = 60
+    ) -> ExecResult:
+        self._require_active(sandbox_id)
+        snapshot = tuple(argv)
+        self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+        if "repotrial-startup-input" in snapshot:
+            return ExecResult(
+                exit_code=self.adapter_exit_code,
+                stdout=(
+                    "root=/workspace\nmode=600\n" if self.adapter_exit_code == 0 else ""
+                ),
+                stderr="",
+            )
+        if snapshot[-3:] == ("config", "--format", "json"):
+            return _exec_result(
+                stdout=json.dumps(
+                    {"services": {"web": {"image": "example/web:1", "read_only": True}}}
+                )
+            )
+        if snapshot[-5:] == ("up", "-d", "--wait", "--wait-timeout", "60"):
+            return _exec_result()
+        if snapshot[-4:] == ("ps", "--all", "--format", "json"):
+            return _exec_result(
+                stdout=json.dumps(
+                    {
+                        "Service": "web",
+                        "State": "running",
+                        "Health": "healthy",
+                        "ExitCode": 0,
+                    }
+                )
+            )
+        if snapshot[-4:] == ("logs", "--no-color", "--tail", "200"):
+            return _exec_result()
+        if snapshot[-6:] == (
+            "ps",
+            "--all",
+            "--no-trunc",
+            "--orphans=false",
+            "--format",
+            "json",
+        ):
+            return _exec_result()
+        raise AssertionError(f"unexpected provider command: {snapshot!r}")
+
+
 def _compose_text() -> str:
     return "services:\n  web:\n    image: example/web:1\n"
 
@@ -387,6 +439,235 @@ def test_real_overlay_hashes_ordered_replay_and_environment_snapshot_yield_keep(
     )
     assert state == state_before
     assert mutation == mutation_before
+
+
+def test_candidate_materializes_startup_input_before_boot_with_shared_compose_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, mutation, context = _case(tmp_path, env={"APP_MODE": "explicit"})
+    (context.workspace / "compose.yaml").write_text(
+        "services:\n  web:\n    image: example/web:1\n    env_file:\n      - .env\n",
+        encoding="utf-8",
+    )
+    (context.workspace / ".env.sample").write_text(
+        "APP_MODE=sample\nAPP_TOKEN=secret-value\nLD_HOST_PORT=9090\n",
+        encoding="utf-8",
+    )
+    provider = StartupInputProvider()
+    runner_calls: list[tuple[str, str, Path, tuple[tuple[object, ...], ...]]] = []
+    _install_http_runner(monkeypatch, {"health": Verdict.PASS}, runner_calls, provider)
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.verdict is ExperimentVerdict.KEEP
+    calls = provider.calls
+    create_index = next(
+        index for index, call in enumerate(calls) if call[0] == "create"
+    )
+    adapter_index = next(
+        index
+        for index, call in enumerate(calls)
+        if call[0] == "exec" and "repotrial-startup-input" in call[2]
+    )
+    config_index = next(
+        index
+        for index, call in enumerate(calls)
+        if call[0] == "exec" and call[2][-3:] == ("config", "--format", "json")
+    )
+    up_index = next(
+        index
+        for index, call in enumerate(calls)
+        if call[0] == "exec"
+        and call[2][-5:] == ("up", "-d", "--wait", "--wait-timeout", "60")
+    )
+    destroy_index = next(
+        index for index, call in enumerate(calls) if call[0] == "destroy"
+    )
+    assert create_index < adapter_index < config_index < up_index < destroy_index
+    compose_calls = [
+        call[2]
+        for call in calls
+        if call[0] == "exec" and "docker" in call[2] and "compose" in call[2]
+    ]
+    expected_prefix = (
+        "env",
+        "-u",
+        "APP_MODE",
+        "-u",
+        "APP_TOKEN",
+        "-u",
+        "LD_HOST_PORT",
+        "APP_MODE=explicit",
+        "docker",
+        "compose",
+        "--project-directory",
+        ".",
+    )
+    assert compose_calls
+    assert all(
+        argv[: len(expected_prefix)] == expected_prefix for argv in compose_calls
+    )
+    assert (context.artifact_dir / "startup-input-attempt.jsonl").is_file()
+    assert (context.artifact_dir / "candidate-observation-boundary.jsonl").is_file()
+
+
+def test_candidate_startup_input_failure_stops_and_cleans_without_boot(
+    tmp_path: Path,
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    (context.workspace / "compose.yaml").write_text(
+        _compose_text() + "    env_file:\n      - .env\n", encoding="utf-8"
+    )
+    (context.workspace / ".env.sample").write_text("APP_MODE=test\n", encoding="utf-8")
+    provider = StartupInputProvider(adapter_exit_code=25)
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.verdict is ExperimentVerdict.STOP
+    assert record.boot is Verdict.UNSUPPORTED
+    assert record.reason == "startup_input_unsupported"
+    assert len([call for call in provider.calls if call[0] == "create"]) == 1
+    assert len([call for call in provider.calls if call[0] == "destroy"]) == 1
+    assert not any(
+        call[0] == "exec"
+        and call[2][-5:] == ("up", "-d", "--wait", "--wait-timeout", "60")
+        for call in provider.calls
+    )
+
+
+def test_candidate_startup_planning_rejection_stops_before_overlay_and_create(
+    tmp_path: Path,
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    (context.workspace / "compose.yaml").write_text(
+        _compose_text() + "    env_file:\n      - .env\n", encoding="utf-8"
+    )
+    (context.workspace / ".env.sample").write_text("APP_MODE=test\n", encoding="utf-8")
+    (context.workspace / ".env").write_text("APP_MODE=host\n", encoding="utf-8")
+    provider = StartupInputProvider()
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.verdict is ExperimentVerdict.STOP
+    assert record.boot is Verdict.UNSUPPORTED
+    assert record.reason == "startup_input_unsupported"
+    assert provider.calls == []
+    assert not context.overlay_path.exists()
+    evidence = _read_jsonl(context.artifact_dir / "startup-input-attempt.jsonl")
+    assert [row["outcome"] for row in evidence] == ["start", "terminal"]
+    assert evidence[-1]["reason"] == "target_preexisting"
+
+
+def test_candidate_reentry_rejects_incomplete_prior_attempt_before_create(
+    tmp_path: Path,
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    (context.workspace / "compose.yaml").write_text(
+        _compose_text() + "    env_file:\n      - .env\n", encoding="utf-8"
+    )
+    (context.workspace / ".env.sample").write_text("APP_MODE=test\n", encoding="utf-8")
+    prior_attempt = tmp_path / "prior-attempt"
+    prior_attempt.mkdir()
+    context = replace(context, prior_attempt_directories=(prior_attempt,))
+    provider = StartupInputProvider()
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.verdict is ExperimentVerdict.STOP
+    assert record.reason == "startup_input_unsupported"
+    assert provider.calls == []
+    assert not context.overlay_path.exists()
+    evidence = _read_jsonl(context.artifact_dir / "startup-input-attempt.jsonl")
+    assert evidence[-1]["reason"] == "attempt_history_incomplete"
+
+
+def test_later_candidate_keeps_clone_root_startup_identity_after_accepted_compose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, first_mutation, first_context = _case(tmp_path)
+    (first_context.workspace / "compose.yaml").write_text(
+        _compose_text() + "    env_file:\n      - .env\n", encoding="utf-8"
+    )
+    (first_context.workspace / ".env.sample").write_text(
+        "APP_MODE=test\nAPP_TOKEN=secret-value\n", encoding="utf-8"
+    )
+    first_provider = StartupInputProvider()
+    first_runner_calls: list[tuple[str, str, Path, tuple[tuple[object, ...], ...]]] = []
+    _install_http_runner(
+        monkeypatch, {"health": Verdict.PASS}, first_runner_calls, first_provider
+    )
+
+    first_record = _run(state, first_mutation, first_provider, first_context)
+    assert first_record.verdict is ExperimentVerdict.KEEP
+
+    accepted_dir = first_context.workspace / ".repotrial-accepted"
+    accepted_dir.mkdir()
+    accepted = accepted_dir / "accepted-0001.compose.yaml"
+    accepted.write_text(
+        "services:\n"
+        "  web:\n"
+        "    image: example/web:1\n"
+        "    read_only: true\n"
+        "    env_file:\n"
+        "      - .env\n",
+        encoding="utf-8",
+    )
+    accepted_hash = (
+        "sha256:"
+        + hashlib.sha256(
+            canonical_compose_json(load_compose(accepted)).encode("utf-8")
+        ).hexdigest()
+    )
+    second_state = state.model_copy(
+        deep=True,
+        update={
+            "compose_path": accepted.relative_to(first_context.workspace).as_posix(),
+            "current_config_hash": accepted_hash,
+        },
+    )
+    second_mutation = Mutation(
+        mutation_id="mutation-drop-caps",
+        type=MutationType.DROP_ALL_CAPS,
+        service="web",
+    )
+    second_artifacts = tmp_path / "second-artifacts"
+    second_artifacts.mkdir()
+    second_context = replace(
+        first_context,
+        overlay_path=first_context.workspace / "second-candidate.overlay.yaml",
+        artifact_dir=second_artifacts,
+    )
+    second_provider = StartupInputProvider()
+    second_runner_calls: list[
+        tuple[str, str, Path, tuple[tuple[object, ...], ...]]
+    ] = []
+    _install_http_runner(
+        monkeypatch, {"health": Verdict.PASS}, second_runner_calls, second_provider
+    )
+
+    second_record = _run(second_state, second_mutation, second_provider, second_context)
+
+    assert second_record.verdict is ExperimentVerdict.KEEP
+    first_terminal = _read_jsonl(
+        first_context.artifact_dir / "startup-input-attempt.jsonl"
+    )[-1]
+    second_terminal = _read_jsonl(
+        second_context.artifact_dir / "startup-input-attempt.jsonl"
+    )[-1]
+    assert second_terminal["source_relative_path"] == ".env.sample"
+    assert second_terminal["target_relative_path"] == ".env"
+    assert second_terminal["source_sha256"] == first_terminal["source_sha256"]
+    assert second_terminal["output_sha256"] == first_terminal["output_sha256"]
+    second_compose_calls = [
+        call[2]
+        for call in second_provider.calls
+        if call[0] == "exec" and "docker" in call[2] and "compose" in call[2]
+    ]
+    assert all("--project-directory" in argv for argv in second_compose_calls)
+    assert all(
+        accepted.relative_to(first_context.workspace).as_posix() in argv
+        for argv in second_compose_calls
+    )
 
 
 def test_conflicting_recorded_parent_hash_stops_before_overlay_and_sandbox(
