@@ -656,3 +656,21 @@ No RG1 policy plan is created, and no CLI/API default is changed.
   `RG4_ENTRY_GATE=NOT_PROVEN`; no production timeout plan or implementation is
   authorized. Continue the frozen sequence to RG5. Generic provider timeouts,
   readiness semantics, retries, and repository-specific logic remain frozen.
+
+## M7.5 release-gap closure - RG5 clone diagnosis (append-only; 2026-09-03)
+
+- Diagnostic HEAD `bf230cf957bea0a1f6292749ed4f197c94378415`; no production,
+  provider, manifest, README, or frozen-contract change.
+- Exact Paperless run `285c7f1f-5a62-4f6e-855c-93909a8af82d` verified the
+  frozen SHA and passed clone verification. The former malformed/truncated
+  `guest_status_not_clean` evidence did not reproduce, so no deterministic
+  tracked-path or Git-configuration representation exists to normalize.
+- The attempt later failed Boot because `PAPERLESS_SECRET_KEY` was absent or
+  remained the default value; recovery then reached the existing `180s` model
+  timeout. Terminal result: `trial_failed` / `boot_recovery_stopped`, report
+  present, no experiment, cleanup success. Before any subsequent sandbox
+  creation, a timestamped official inventory check was persisted as exactly
+  empty.
+- Ruling: `RG5_ENTRY_GATE=FAIL`; no normalization plan or code change is
+  authorized. Preserve the later Boot/recovery failure separately and continue
+  the frozen sequence to RG6.
