@@ -521,3 +521,19 @@ Full current-epoch evidence and run IDs are recorded in
   Known limitations and exact controller ruling are recorded in the Task 1
   artifacts. Controller ruling: preserve evidence and stop before real
   repositories; no release-readiness claim.
+
+## M7.5 release-gap closure - Task 1 proxy-causal rerun (append-only)
+
+- Parent HEAD `5c8265987fc85613f0247755b32ede3a5371570f`; production files
+  unchanged.
+- Root cause confirmed: host `sbx` Docker Hub refresh/network calls were
+  launched without the configured WSL proxy, causing refresh-lock waits and
+  consuming the calibration total-duration budget. Direct Docker Hub access
+  timed out without proxy; `172.24.64.1:7890` returned expected responses.
+- With `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` set to
+  `http://172.24.64.1:7890`, primary calibration passed (`1 passed, 2
+  deselected, 115.61s`) and the complete calibration passed (`3 passed,
+  270.40s`). SBX daemon remained healthy and inventory empty.
+- Controller ruling: retain the earlier no-proxy failure as historical
+  evidence; supported WSL calibration/canary execution must export the
+  configured proxy. No production retry/proxy behavior was added.
