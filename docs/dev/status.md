@@ -674,3 +674,23 @@ No RG1 policy plan is created, and no CLI/API default is changed.
 - Ruling: `RG5_ENTRY_GATE=FAIL`; no normalization plan or code change is
   authorized. Preserve the later Boot/recovery failure separately and continue
   the frozen sequence to RG6.
+
+## M7.5 release-gap closure - RG6 readiness diagnosis (2026-09-03)
+
+- Diagnostic HEAD `c975ad113466098d602f74f5f38af54e757fedfb`; no production,
+  provider, manifest, README, or frozen-contract change.
+- Final trusted fixture has no service host bind and passed the real two-window
+  diagnostic: the current 60-second path returned nonzero before `db` became
+  healthy at `80.970207s`; a fresh 120-second path returned zero at
+  `86.890421s` with both services healthy. Both sandboxes were destroyed and
+  final inventory was exactly empty.
+- The one frozen NetBox rerun, run
+  `1c794f9e-af12-4742-b2a2-8cc7eb0f80d3`, passed exact SHA but retained
+  `up=1`, `netbox=exited`, and `boot_recovery_stopped`. Its migration process
+  was killed before schema completion; no trusted kernel evidence narrows that
+  kill further. Other dependency services were running/healthy. Cleanup passed
+  and final inventory was exactly empty.
+- Ruling: `RG6_ENTRY_GATE=FAIL`. NetBox did not become healthy in the required
+  bounded interval and has migration/data-state evidence, so the frozen gate
+  does not authorize a readiness-window production change. Continue to RG2
+  startup-input diagnosis.
