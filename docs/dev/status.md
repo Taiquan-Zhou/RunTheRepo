@@ -537,3 +537,19 @@ Full current-epoch evidence and run IDs are recorded in
 - Controller ruling: retain the earlier no-proxy failure as historical
   evidence; supported WSL calibration/canary execution must export the
   configured proxy. No production retry/proxy behavior was added.
+
+## M7.5 release-gap closure - Task 1 final gate ruling (append-only)
+
+- Final reviewed controller HEAD: `ebaa984418addeeea55875308f9913d57fd293bb`.
+- Fresh Linux quality gates passed: locked sync, Ruff lint/format, mypy, and
+  full pytest (`1519 passed, 6 skipped, 1 warning`). SBX diagnose passed and
+  inventory is empty.
+- Proxy-backed trusted calibration passed all three tests (`3 passed in
+  270.40s`).
+- Independent review service returned HTTP `502/503` three times before a
+  report was produced; no reviewer success is claimed. Controller diff review
+  found no Critical/Important issue in the evidence-only append.
+- Ruling: Task 1 is accepted for execution under the explicit proxy-backed
+  WSL environment; the review-service outage remains a process deviation and
+  must be revisited before final integration. Continue to Task 2 without
+  production code changes.
