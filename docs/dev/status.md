@@ -604,3 +604,28 @@ historical review-service/process deviation is retained. Task 2's original
 review verdict was `CHANGES REQUESTED`; this evidence-only append corrects
 the erroneous interpretation only and still requires an independent review.
 No RG1 policy plan is created, and no CLI/API default is changed.
+
+## M7.5 release-gap closure - RG1 default policy and affected canary
+
+- Owner approved the common proven `8192 MiB` candidate. Implementation commit
+  `811fd25a5416433e3db587d71d4032ae66be3e40` changes only the CLI/API Docker
+  SBX default and their two unit assertions from `2048` to `8192`; provider,
+  allocator, public interfaces, frozen manifest, and README are unchanged.
+- RED proved both old entry points still emitted `2048`; GREEN passed the
+  focused pair, both complete entry-point unit files (`128 passed`), explicit
+  policy/allocation/environment checks, Ruff lint/format, mypy, full pytest
+  (`1519 passed, 6 skipped`), and branch coverage (`87.29%`).
+- Same execution HEAD affected canary ran strictly serially. Uptime Kuma run
+  `05c34388-3da0-4c10-8951-09cf3904c626` passed exact SHA, Boot, Observer,
+  report, and cleanup, but its single Journey received `302` rather than
+  expected `200`; stop reason `insufficient_coverage`.
+- n8n run `41332b89-9090-4e61-8036-1f59dfdcd6ec` passed exact SHA and Boot,
+  then retained a post-Boot Observer `diff` per-command timeout with about
+  `665s` of whole-trial budget remaining; no report was produced. Cleanup
+  succeeded and final inventory was empty.
+- RG1 default/capacity objective is verified, but same-HEAD autonomous recovery
+  is `0/2`. Uptime redirect verification and n8n Observer timeout are separate
+  generic compatibility gaps for later bounded tasks. PID hard bound remains
+  unsupported/disclosed; no host fallback or daemon lifecycle command occurred.
+- Full append-only run facts and artifact hashes are in
+  [`pilot-evidence/m7.5-release-gap-closure.md`](pilot-evidence/m7.5-release-gap-closure.md).
