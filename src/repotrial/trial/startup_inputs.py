@@ -11,6 +11,7 @@ import os
 import posixpath
 import re
 import stat
+import sys
 import time
 import unicodedata
 from collections.abc import Mapping
@@ -44,6 +45,8 @@ _MAX_RESOLVED_CONFIG_NODES: Final = 100_000
 _MAX_RESOLVED_CONFIG_DEPTH: Final = 128
 _MAX_EVIDENCE_BYTES: Final = 32 * 1024
 _MAX_PAYLOAD_BYTES: Final = 90_000
+_MAX_BIND_SOURCES: Final = 128
+_MAX_BIND_SOURCE_BYTES: Final = 4_096
 
 # This is code-owned and intentionally not assembled from repository input.
 _ADAPTER_SCRIPT: Final = """\
@@ -94,6 +97,29 @@ printf 'root=%s\nmode=%s\n' "$root" "$target_mode"
 """
 _ADAPTER_SHA256: Final = (
     "6c183581aa20385d694faf4f00ee19331ac57dfbf98cad553637df654be45fda"
+)
+_BIND_VALIDATOR_SCRIPT: Final = """\
+set -eu
+
+[ "$(pwd -P)" = "/workspace" ] || exit 40
+for source_path do
+    [ -e "$source_path" ] || exit 41
+    resolved=$(realpath -e "$source_path") || exit 41
+    case "$resolved" in
+        /workspace|/workspace/*) ;;
+        *) exit 42 ;;
+    esac
+    basename=${resolved##*/}
+    case "$basename" in
+        docker.sock|containerd.sock|cri-dockerd.sock|podman.sock|docker_engine)
+            exit 43
+            ;;
+    esac
+done
+printf 'binds=ok\n'
+"""
+_BIND_VALIDATOR_SHA256: Final = (
+    "cb6d2457656a09dccca1a9a71ac95673cd11623e43b60704687c596ac025d166"
 )
 
 
@@ -238,6 +264,9 @@ async def materialize_startup_input(
     adapter_sha256 = hashlib.sha256(_ADAPTER_SCRIPT.encode()).hexdigest()
     if adapter_sha256 != _ADAPTER_SHA256:
         raise RuntimeError("startup-input adapter identity mismatch")
+    bind_validator_sha256 = hashlib.sha256(_BIND_VALIDATOR_SCRIPT.encode()).hexdigest()
+    if bind_validator_sha256 != _BIND_VALIDATOR_SHA256:
+        raise RuntimeError("startup-input bind validator identity mismatch")
 
     started = time.monotonic()
     evidence = _EvidenceWriter(evidence_path)
@@ -269,7 +298,9 @@ async def materialize_startup_input(
         if not isinstance(adapter_result, ExecResult):
             raise TypeError("startup-input adapter returned a malformed result")
         if (
-            adapter_result.exit_code != 0
+            len(adapter_result.stdout) > _MAX_ADAPTER_OUTPUT_BYTES
+            or len(adapter_result.stderr) > _MAX_ADAPTER_OUTPUT_BYTES
+            or adapter_result.exit_code != 0
             or adapter_result.stdout != "root=/workspace\nmode=600\n"
             or adapter_result.stderr
         ):
@@ -293,7 +324,31 @@ async def materialize_startup_input(
         if config_result.exit_code != 0 or config_result.stderr:
             raise StartupInputUnsupported("resolved_config_failed")
         resolved = _parse_resolved_compose(config_result.stdout)
-        _validate_resolved_compose(resolved, plan.expected_service_names)
+        bind_sources = _validate_resolved_compose(resolved, plan.expected_service_names)
+        if bind_sources:
+            bind_result = await provider.exec(
+                sandbox_id,
+                [
+                    *prefix,
+                    "sh",
+                    "-eu",
+                    "-c",
+                    _BIND_VALIDATOR_SCRIPT,
+                    "repotrial-bind-validator",
+                    *bind_sources,
+                ],
+                timeout_s=30,
+            )
+            if not isinstance(bind_result, ExecResult):
+                raise TypeError("bind validator returned a malformed result")
+            if (
+                len(bind_result.stdout) > _MAX_ADAPTER_OUTPUT_BYTES
+                or len(bind_result.stderr) > _MAX_ADAPTER_OUTPUT_BYTES
+                or bind_result.exit_code != 0
+                or bind_result.stdout != "binds=ok\n"
+                or bind_result.stderr
+            ):
+                raise StartupInputUnsupported("unsafe_resolved_compose")
         resolved_material = json.dumps(
             resolved,
             ensure_ascii=False,
@@ -301,18 +356,14 @@ async def materialize_startup_input(
             sort_keys=True,
         ).encode()
         resolved_sha256 = hashlib.sha256(resolved_material).hexdigest()
-        terminal = _evidence_identity(plan, adapter_sha256)
-        terminal.update(
-            {
-                "elapsed_s": max(0.0, time.monotonic() - started),
-                "guest_validation": "satisfied",
-                "outcome": "terminal",
-                "reason": "materialized",
-                "resolved_compose_sha256": resolved_sha256,
-                "sequence": 1,
-                "schema_version": 1,
-                "target_mode": "0600",
-            }
+        terminal = _terminal_evidence(
+            plan,
+            adapter_sha256,
+            started,
+            guest_validation="satisfied",
+            reason="materialized",
+            resolved_compose_sha256=resolved_sha256,
+            target_mode="0600",
         )
         evidence.append(terminal)
         return StartupInputResult(
@@ -323,30 +374,22 @@ async def materialize_startup_input(
             artifact_relative_path=plan.target_relative_path,
         )
     except StartupInputUnsupported as error:
-        terminal = _evidence_identity(plan, adapter_sha256)
-        terminal.update(
-            {
-                "elapsed_s": max(0.0, time.monotonic() - started),
-                "guest_validation": "failed",
-                "outcome": "terminal",
-                "reason": error.reason,
-                "sequence": 1,
-                "schema_version": 1,
-            }
+        terminal = _terminal_evidence(
+            plan,
+            adapter_sha256,
+            started,
+            guest_validation="failed",
+            reason=error.reason,
         )
         evidence.append(terminal)
         raise
     except BaseException:
-        terminal = _evidence_identity(plan, adapter_sha256)
-        terminal.update(
-            {
-                "elapsed_s": max(0.0, time.monotonic() - started),
-                "guest_validation": "failed",
-                "outcome": "terminal",
-                "reason": "provider_exception",
-                "sequence": 1,
-                "schema_version": 1,
-            }
+        terminal = _terminal_evidence(
+            plan,
+            adapter_sha256,
+            started,
+            guest_validation="failed",
+            reason="provider_exception",
         )
         try:
             evidence.append(terminal)
@@ -354,7 +397,11 @@ async def materialize_startup_input(
             pass
         raise
     finally:
-        evidence.close()
+        try:
+            evidence.close()
+        except OSError:
+            if sys.exception() is None:
+                raise StartupInputUnsupported("evidence_persistence_failed") from None
 
 
 def _evidence_identity(
@@ -365,6 +412,7 @@ def _evidence_identity(
         "adapter_sha256": adapter_sha256,
         "all_source_key_names": list(plan.all_source_key_names),
         "argv_category": "fixed_guest_startup_input_adapter",
+        "bind_validator_sha256": _BIND_VALIDATOR_SHA256,
         "compose_config_hash": plan.compose_config_hash,
         "compose_relative_path": plan.compose_relative_path,
         "expected_service_names": list(plan.expected_service_names),
@@ -377,6 +425,34 @@ def _evidence_identity(
         "synthetic_key_names": list(plan.synthetic_key_names),
         "target_relative_path": plan.target_relative_path,
     }
+
+
+def _terminal_evidence(
+    plan: StartupInputPlan,
+    adapter_sha256: str,
+    started: float,
+    *,
+    guest_validation: str,
+    reason: str,
+    resolved_compose_sha256: str | None = None,
+    target_mode: str | None = None,
+) -> dict[str, object]:
+    terminal = _evidence_identity(plan, adapter_sha256)
+    terminal.update(
+        {
+            "elapsed_s": max(0.0, time.monotonic() - started),
+            "guest_validation": guest_validation,
+            "outcome": "terminal",
+            "reason": reason,
+            "sequence": 1,
+            "schema_version": 1,
+        }
+    )
+    if resolved_compose_sha256 is not None:
+        terminal["resolved_compose_sha256"] = resolved_compose_sha256
+    if target_mode is not None:
+        terminal["target_mode"] = target_mode
+    return terminal
 
 
 def _guest_environment_prefix(
@@ -479,12 +555,13 @@ def _validate_json_budget(value: object, *, depth: int, budget: list[int]) -> No
 
 def _validate_resolved_compose(
     resolved: Mapping[str, object], expected_service_names: tuple[str, ...]
-) -> None:
+) -> tuple[str, ...]:
     services = resolved.get("services")
     if not isinstance(services, Mapping) or set(services) != set(
         expected_service_names
     ):
         raise StartupInputUnsupported("resolved_service_mismatch")
+    bind_sources: list[str] = []
     for service in services.values():
         if not isinstance(service, Mapping):
             raise StartupInputUnsupported("resolved_config_invalid")
@@ -497,12 +574,17 @@ def _validate_resolved_compose(
             raise StartupInputUnsupported("unsafe_resolved_compose")
         volumes = service.get("volumes")
         if volumes is not None:
-            _validate_resolved_volumes(volumes)
+            bind_sources.extend(_validate_resolved_volumes(volumes))
+    unique_sources = tuple(sorted(set(bind_sources)))
+    if len(unique_sources) > _MAX_BIND_SOURCES:
+        raise StartupInputUnsupported("unsafe_resolved_compose")
+    return unique_sources
 
 
-def _validate_resolved_volumes(volumes: object) -> None:
+def _validate_resolved_volumes(volumes: object) -> list[str]:
     if not isinstance(volumes, list):
         raise StartupInputUnsupported("unsafe_resolved_compose")
+    bind_sources: list[str] = []
     for volume in volumes:
         if not isinstance(volume, Mapping):
             raise StartupInputUnsupported("unsafe_resolved_compose")
@@ -512,10 +594,16 @@ def _validate_resolved_volumes(volumes: object) -> None:
         if _is_engine_socket(source) or _is_engine_socket(target):
             raise StartupInputUnsupported("unsafe_resolved_compose")
         if kind == "bind":
-            if not isinstance(source, str) or not _is_inside_guest_clone(source):
+            if (
+                not isinstance(source, str)
+                or len(source.encode()) > _MAX_BIND_SOURCE_BYTES
+                or not _is_inside_guest_clone(source)
+            ):
                 raise StartupInputUnsupported("unsafe_resolved_compose")
+            bind_sources.append(source)
         elif kind not in {"volume", "tmpfs", "image", "cluster"}:
             raise StartupInputUnsupported("unsafe_resolved_compose")
+    return bind_sources
 
 
 def _is_engine_socket(value: object) -> bool:
@@ -533,7 +621,12 @@ def _is_engine_socket(value: object) -> bool:
 
 
 def _is_inside_guest_clone(source: str) -> bool:
-    if "\0" in source or "\\" in source or not source.startswith("/"):
+    if (
+        "\0" in source
+        or "\\" in source
+        or any(ord(character) < 32 for character in source)
+        or not source.startswith("/")
+    ):
         return False
     normalized = posixpath.normpath(source)
     return normalized == _GUEST_CLONE_ROOT or normalized.startswith(

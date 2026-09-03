@@ -7,6 +7,7 @@ import stat
 from dataclasses import replace
 from pathlib import Path
 from shutil import copytree
+from typing import cast
 
 import pytest
 
@@ -550,14 +551,22 @@ class _MaterializeProvider(FakeSandboxProvider):
         adapter_result: ExecResult | BaseException | None = None,
         config: object | None = None,
         config_result: ExecResult | BaseException | None = None,
+        bind_result: ExecResult | BaseException | None = None,
     ) -> None:
         super().__init__()
         self.exec_calls: list[tuple[str, ...]] = []
         self.adapter_result = adapter_result or ExecResult(
             exit_code=0, stdout="root=/workspace\nmode=600\n", stderr=""
         )
-        self.config = config or {"services": {"web": {"image": "busybox:1.36.1"}}}
+        self.config = (
+            {"services": {"web": {"image": "busybox:1.36.1"}}}
+            if config is None
+            else config
+        )
         self.config_result = config_result
+        self.bind_result = bind_result or ExecResult(
+            exit_code=0, stdout="binds=ok\n", stderr=""
+        )
 
     async def exec(
         self, sandbox_id: str, argv: list[str], timeout_s: int = 60
@@ -568,15 +577,19 @@ class _MaterializeProvider(FakeSandboxProvider):
             if isinstance(self.adapter_result, BaseException):
                 raise self.adapter_result
             return self.adapter_result
-        if isinstance(self.config_result, BaseException):
-            raise self.config_result
-        if self.config_result is not None:
-            return self.config_result
-        return ExecResult(
-            exit_code=0,
-            stdout=json.dumps(self.config),
-            stderr="",
-        )
+        if len(self.exec_calls) == 2:
+            if isinstance(self.config_result, BaseException):
+                raise self.config_result
+            if self.config_result is not None:
+                return self.config_result
+            return ExecResult(
+                exit_code=0,
+                stdout=json.dumps(self.config),
+                stderr="",
+            )
+        if isinstance(self.bind_result, BaseException):
+            raise self.bind_result
+        return self.bind_result
 
 
 def test_materializes_guest_input_before_resolved_compose_config(
@@ -614,6 +627,14 @@ def test_materializes_guest_input_before_resolved_compose_config(
     assert provider.exec_calls[0][10] == "-c"
     assert hashlib.sha256(provider.exec_calls[0][11].encode()).hexdigest() == (
         "6c183581aa20385d694faf4f00ee19331ac57dfbf98cad553637df654be45fda"
+    )
+    assert provider.exec_calls[0][12:] == (
+        "repotrial-startup-input",
+        plan.source_relative_path,
+        plan.target_relative_path,
+        plan.source_sha256,
+        plan.output_sha256,
+        base64.b64encode(plan.output_bytes).decode(),
     )
     assert provider.exec_calls[1][:8] == (
         "env",
@@ -795,6 +816,59 @@ def test_provider_exception_is_preserved_without_message_in_evidence(
     assert "sensitive-provider-message" not in evidence
 
 
+def test_close_failure_does_not_replace_provider_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _copy_fixture(tmp_path, "close_failure")
+    plan = plan_startup_input(workspace, "compose.yaml")
+    assert plan is not None
+    provider = _MaterializeProvider(adapter_result=TimeoutError("primary"))
+
+    def fail_close(_: int) -> None:
+        raise OSError("close failed")
+
+    monkeypatch.setattr(startup_inputs.os, "close", fail_close)
+
+    with pytest.raises(TimeoutError, match="primary"):
+        asyncio.run(
+            materialize_startup_input(
+                provider,
+                "sandbox-1",
+                plan,
+                compose_path="compose.yaml",
+                compose_env={},
+                evidence_path=tmp_path / "attempt.jsonl",
+            )
+        )
+
+
+@pytest.mark.parametrize("phase", ("adapter", "config"))
+def test_malformed_provider_result_is_type_error(tmp_path: Path, phase: str) -> None:
+    workspace = _copy_fixture(tmp_path, f"malformed_{phase}")
+    plan = plan_startup_input(workspace, "compose.yaml")
+    assert plan is not None
+    malformed = cast(ExecResult, object())
+    provider = _MaterializeProvider(
+        adapter_result=malformed if phase == "adapter" else None,
+        config_result=malformed if phase == "config" else None,
+    )
+    evidence_path = tmp_path / "attempt.jsonl"
+
+    with pytest.raises(TypeError, match="malformed result"):
+        asyncio.run(
+            materialize_startup_input(
+                provider,
+                "sandbox-1",
+                plan,
+                compose_path="compose.yaml",
+                compose_env={},
+                evidence_path=evidence_path,
+            )
+        )
+
+    assert "provider_exception" in evidence_path.read_text(encoding="utf-8")
+
+
 def test_config_failure_is_bounded(tmp_path: Path) -> None:
     workspace = _copy_fixture(tmp_path, "config_failure")
     plan = plan_startup_input(workspace, "compose.yaml")
@@ -950,6 +1024,51 @@ def test_confined_bind_and_named_volume_are_accepted(tmp_path: Path) -> None:
     )
 
     assert result.target_mode == 0o600
+    assert provider.exec_calls[2][-2:] == (
+        "repotrial-bind-validator",
+        "/workspace/data",
+    )
+    assert hashlib.sha256(provider.exec_calls[2][-3].encode()).hexdigest() == (
+        "cb6d2457656a09dccca1a9a71ac95673cd11623e43b60704687c596ac025d166"
+    )
+
+
+def test_guest_realpath_escape_is_rejected(tmp_path: Path) -> None:
+    workspace = _copy_fixture(tmp_path, "guest_realpath_escape")
+    plan = plan_startup_input(workspace, "compose.yaml")
+    assert plan is not None
+    provider = _MaterializeProvider(
+        config={
+            "services": {
+                "web": {
+                    "image": "busybox",
+                    "volumes": [
+                        {
+                            "type": "bind",
+                            "source": "/workspace/link",
+                            "target": "/data",
+                        }
+                    ],
+                }
+            }
+        },
+        bind_result=ExecResult(exit_code=42, stdout="", stderr=""),
+    )
+
+    with pytest.raises(StartupInputUnsupported) as error:
+        asyncio.run(
+            materialize_startup_input(
+                provider,
+                "sandbox-1",
+                plan,
+                compose_path="compose.yaml",
+                compose_env={},
+                evidence_path=tmp_path / "attempt.jsonl",
+            )
+        )
+
+    assert error.value.reason == "unsafe_resolved_compose"
+    assert len(provider.exec_calls) == 3
 
 
 def test_invalid_identity_and_environment_fail_before_evidence(tmp_path: Path) -> None:
