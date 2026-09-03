@@ -203,7 +203,7 @@ def test_cli_docker_sbx_default_uses_supported_cpu_and_keeps_memory_bound(
     assert isinstance(policy.cpus, int)
     assert policy.memory_mb == 1024
     assert policy.pids_limit == 64
-    assert policy.disk_mb == 2048
+    assert policy.disk_mb == 8192
     assert policy.total_duration_s == 900
 
 
