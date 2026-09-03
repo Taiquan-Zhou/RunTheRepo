@@ -250,6 +250,9 @@
   cleaned up successfully and ended with empty sandbox inventory.
 - Evidence and runner commit: `032e4d9` (`docs: record M7.5 RG1 disk capacity
   calibration`).
+- Evidence field completion commit: `813733a` (per-run UTC intervals, exact
+  argv, R/D/W allocations, observed admission/after df+du, explicit
+  `not_observed` markers for guest/peak samples, numeric reserve calculation).
 - Gate: `RG1_CAPACITY_GATE=FAIL no_common_bounded_total_through_8192`.
   The default `2048 MiB` policy and public CLI/API remain unchanged; no RG1
   policy design was created. Implementer/reviewer relay failures are recorded
