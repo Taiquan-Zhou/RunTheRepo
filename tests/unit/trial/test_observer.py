@@ -218,6 +218,9 @@ def test_internal_observer_uses_startup_input_compose_prefix(tmp_path: Path) -> 
     ).hexdigest()
     assert rows[0]["argv_sha256"] == expected_hash
     assert rows[0]["argv_sha256"] != raw_hash
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert "APP_MODE=test" not in artifact_path.read_text(encoding="utf-8")
+    assert artifact["discovery"]["argv"] == list(redacted_discovery)
 
 
 def _assert_parse_failure(

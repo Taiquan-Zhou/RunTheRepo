@@ -245,6 +245,10 @@ async def _collect_observation(
             "json",
         ]
     )
+    recorded_discovery_argv = [
+        *_redacted_compose_prefix(prefix),
+        *discovery_argv[len(prefix) :],
+    ]
     discovery_result, containers = await _collect_exec_operation(
         provider,
         sandbox_id,
@@ -253,10 +257,7 @@ async def _collect_observation(
         operation="discovery",
         parser=_parse_discovery,
         recorder=recorder,
-        evidence_argv=[
-            *_redacted_compose_prefix(prefix),
-            *discovery_argv[len(prefix) :],
-        ],
+        evidence_argv=recorded_discovery_argv,
     )
 
     inspect_by_service: dict[str, list[dict[str, object]]] = {}
@@ -393,7 +394,7 @@ async def _collect_observation(
         audit = {
             "schema_version": 1,
             "discovery": _command_audit(
-                discovery_argv,
+                recorded_discovery_argv,
                 discovery_result.stdout,
                 [
                     {"service": service, "container_id": container_id}
