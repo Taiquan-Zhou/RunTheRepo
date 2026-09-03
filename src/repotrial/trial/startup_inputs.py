@@ -298,8 +298,10 @@ async def materialize_startup_input(
         if not isinstance(adapter_result, ExecResult):
             raise TypeError("startup-input adapter returned a malformed result")
         if (
-            len(adapter_result.stdout) > _MAX_ADAPTER_OUTPUT_BYTES
-            or len(adapter_result.stderr) > _MAX_ADAPTER_OUTPUT_BYTES
+            len(adapter_result.stdout.encode(errors="surrogatepass"))
+            > _MAX_ADAPTER_OUTPUT_BYTES
+            or len(adapter_result.stderr.encode(errors="surrogatepass"))
+            > _MAX_ADAPTER_OUTPUT_BYTES
             or adapter_result.exit_code != 0
             or adapter_result.stdout != "root=/workspace\nmode=600\n"
             or adapter_result.stderr
@@ -342,8 +344,10 @@ async def materialize_startup_input(
             if not isinstance(bind_result, ExecResult):
                 raise TypeError("bind validator returned a malformed result")
             if (
-                len(bind_result.stdout) > _MAX_ADAPTER_OUTPUT_BYTES
-                or len(bind_result.stderr) > _MAX_ADAPTER_OUTPUT_BYTES
+                len(bind_result.stdout.encode(errors="surrogatepass"))
+                > _MAX_ADAPTER_OUTPUT_BYTES
+                or len(bind_result.stderr.encode(errors="surrogatepass"))
+                > _MAX_ADAPTER_OUTPUT_BYTES
                 or bind_result.exit_code != 0
                 or bind_result.stdout != "binds=ok\n"
                 or bind_result.stderr
