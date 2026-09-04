@@ -863,7 +863,10 @@ class DockerSbxProvider(SandboxProvider):
             self._command_timeout_s,
             sandbox_id=sandbox_id,
         )
-        _require_success(operation, result)
+        if result.returncode != 0 and not _is_exact_sandbox_absence(
+            result.stderr, sandbox_id
+        ):
+            _require_success(operation, result)
         self._sandbox_states[sandbox_id] = _SandboxState.CLEANED
         self._sandbox_deadlines.pop(sandbox_id, None)
         self._network_log_sandboxes.discard(sandbox_id)
@@ -1427,6 +1430,22 @@ def _require_success(operation: str, result: _CommandResult) -> None:
             stderr=_decode_human_output(result.stderr),
             failure_evidence=failure_evidence,
         )
+
+
+def _is_exact_sandbox_absence(stderr: bytes, sandbox_id: str) -> bool:
+    try:
+        decoded = stderr.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    escaped_sandbox_id = re.escape(sandbox_id)
+    return (
+        re.search(
+            rf"(?m)^Error:\s+sandbox\s+\x27{escaped_sandbox_id}\x27\s+not found"
+            rf"(?:\s+\(run \x27sbx ls\x27 to see your sandboxes\))?\s*$",
+            decoded,
+        )
+        is not None
+    )
 
 
 def _has_token(output: bytes, token: str) -> bool:

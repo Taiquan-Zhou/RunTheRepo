@@ -2313,6 +2313,61 @@ def test_failed_destroy_keeps_provider_state_for_retry(
     assert spawner.calls[-2:] == [remove_command, remove_command]
 
 
+@pytest.mark.parametrize(
+    ("stderr", "should_clean"),
+    [
+        (
+            (
+                b"Error: sandbox \x27sandbox-17\x27 not found "
+                b"(run \x27sbx ls\x27 to see your sandboxes)\n"
+            ),
+            True,
+        ),
+        (
+            (
+                b"Error: sandbox \x27other-id\x27 not found "
+                b"(run \x27sbx ls\x27 to see your sandboxes)\n"
+            ),
+            False,
+        ),
+        (b"Error: sandbox not found\n", False),
+        (
+            b"Error: sandbox \x27sandbox-17\x27 not found or unavailable\n",
+            False,
+        ),
+        (b"cleanup failed\n", False),
+    ],
+)
+def test_destroy_only_accepts_exact_id_absence_as_cleanup_success(
+    stderr: bytes,
+    should_clean: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(monkeypatch, spawner)
+    remove_command = ("sbx", "rm", "--force", sandbox_id)
+    spawner.overrides[remove_command] = _Outcome(returncode=1, stderr=stderr)
+
+    if should_clean:
+        asyncio.run(provider.destroy(sandbox_id))
+        assert provider._sandbox_states[sandbox_id] is docker_sbx._SandboxState.CLEANED
+        calls_before_destroy = len(spawner.calls)
+        asyncio.run(provider.destroy(sandbox_id))
+        assert len(spawner.calls) == calls_before_destroy
+    else:
+        with pytest.raises(DockerSbxError) as raised:
+            asyncio.run(provider.destroy(sandbox_id))
+        assert raised.value.reason == "nonzero_exit"
+        assert (
+            provider._sandbox_states[sandbox_id]
+            is docker_sbx._SandboxState.CLEANUP_UNSAFE
+        )
+        del spawner.overrides[remove_command]
+        asyncio.run(provider.destroy(sandbox_id))
+        assert provider._sandbox_states[sandbox_id] is docker_sbx._SandboxState.CLEANED
+        assert spawner.calls[-2:] == [remove_command, remove_command]
+
+
 def test_nonzero_command_error_has_deterministically_truncated_stderr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
