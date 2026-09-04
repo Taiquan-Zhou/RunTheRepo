@@ -1,5 +1,6 @@
 import asyncio
 import gzip
+import hashlib
 import inspect
 import json
 from collections.abc import AsyncIterator, Callable
@@ -1050,10 +1051,430 @@ def test_redirect_response_is_not_followed_even_cross_origin(tmp_path: Path) -> 
     ]
 
 
+def test_valid_relative_same_origin_redirect_is_followed_for_final_assertions(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/redirect":
+            return httpx.Response(302, headers={"location": "/final"})
+        return httpx.Response(200, text="final")
+
+    result = run(
+        journey(
+            step(
+                "redirect",
+                "GET",
+                "/redirect",
+                [
+                    assertion("status_code", "response.status", 200),
+                    assertion("text_contains", "response.text", "final"),
+                ],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.verdict is Verdict.PASS
+    assert [str(request.url) for request in requests] == [
+        "https://fixture.test/redirect",
+        "https://fixture.test/final",
+    ]
+
+
+def test_followed_redirect_adds_only_a_bounded_target_hash_to_evidence(
+    tmp_path: Path,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/redirect":
+            return httpx.Response(302, headers={"location": "/final?token=secret"})
+        return httpx.Response(200, text="final")
+
+    result = run(
+        journey(
+            step(
+                "redirect",
+                "GET",
+                "/redirect",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    evidence = json.loads(Path(result.evidence_paths[0]).read_text(encoding="utf-8"))
+    assert evidence["redirects"] == [
+        {
+            "status_code": 302,
+            "target_sha256": hashlib.sha256(b"/final?token=<redacted>").hexdigest(),
+        }
+    ]
+    assert "secret" not in json.dumps(evidence)
+    assert "location" not in json.dumps(evidence).lower()
+
+
+@pytest.mark.parametrize(
+    ("location", "reason"),
+    [
+        (None, "missing_location"),
+        ("duplicate", "duplicate_location"),
+        ("https://fixture.test:444/final", "origin_change"),
+        ("http://fixture.test/final", "origin_change"),
+        ("https://user:password@fixture.test/final", "credential_location"),
+        ("/final#fragment", "fragment"),
+        ("/final#", "fragment"),
+        ("//fixture.test/final", "network_path"),
+        ("https://attacker.test/final", "origin_change"),
+        ("", "malformed_location"),
+        ("/bad%0apath", "invalid_target"),
+        ("/a/../final", "invalid_target"),
+        ("/%252e%252e/final", "invalid_target"),
+        ("/a%2fb", "invalid_target"),
+        ("/bad%ZZ", "invalid_target"),
+        ("/bad%5cpath", "invalid_location"),
+        ("/bad\\path", "invalid_location"),
+    ],
+)
+def test_unsafe_redirect_locations_fail_closed_without_following(
+    tmp_path: Path, location: str | None, reason: str
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        headers: list[tuple[str, str]] = []
+        if location is None:
+            return httpx.Response(302, headers=headers)
+        if location == "duplicate":
+            headers = [("location", "/one"), ("location", "/two")]
+        else:
+            headers = [("location", location)]
+        return httpx.Response(302, headers=headers)
+
+    result = run(
+        journey(
+            step(
+                "redirect",
+                "GET",
+                "/redirect",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.verdict is Verdict.FAIL
+    assert result.failure_reason == f"step-0000:redirect:{reason}"
+    assert [str(request.url) for request in requests] == [
+        "https://fixture.test/redirect"
+    ]
+
+
+def test_redirect_cycle_is_rejected_without_a_fourth_request(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(302, headers={"location": "/redirect"})
+
+    result = run(
+        journey(
+            step(
+                "redirect",
+                "GET",
+                "/redirect",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.failure_reason == "step-0000:redirect:cycle"
+    assert len(requests) == 1
+
+
+def test_redirect_target_over_2048_characters_is_rejected(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+    location = "/" + "x" * 2_048
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(302, headers={"location": location})
+
+    result = run(
+        journey(
+            step(
+                "redirect",
+                "GET",
+                "/redirect",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.failure_reason == "step-0000:redirect:invalid_target"
+    assert len(requests) == 1
+
+
+def test_redirects_are_limited_to_three_hops(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+    targets = {"/one": "/two", "/two": "/three", "/three": "/four", "/four": "/five"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(302, headers={"location": targets[request.url.path]})
+
+    result = run(
+        journey(
+            step(
+                "redirect",
+                "GET",
+                "/one",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.failure_reason == "step-0000:redirect:max_hops"
+    assert [request.url.path for request in requests] == [
+        "/one",
+        "/two",
+        "/three",
+        "/four",
+    ]
+
+
+def test_explicit_redirect_status_assertion_does_not_follow_same_origin_location(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(302, text="redirect", headers={"location": "/final"})
+
+    result = run(
+        journey(
+            step(
+                "redirect",
+                "GET",
+                "/redirect",
+                [
+                    assertion("status_code", "response.status", 302),
+                    assertion("text_contains", "response.text", "redirect"),
+                ],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.verdict is Verdict.PASS
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])
+def test_all_supported_get_redirect_statuses_are_followed(
+    tmp_path: Path, status_code: int
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/redirect":
+            return httpx.Response(status_code, headers={"location": "/final"})
+        return httpx.Response(200, text="final")
+
+    result = run(
+        journey(
+            step(
+                "redirect",
+                "GET",
+                "/redirect",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.verdict is Verdict.PASS
+    assert [request.url.path for request in requests] == ["/redirect", "/final"]
+
+
+def test_unsupported_redirect_status_is_evaluated_without_following(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(300, headers={"location": "/final"})
+
+    result = run(
+        journey(
+            step(
+                "redirect",
+                "GET",
+                "/redirect",
+                [assertion("status_code", "response.status", 300)],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.verdict is Verdict.PASS
+    assert len(requests) == 1
+
+
+def test_post_redirect_is_not_followed_and_keeps_original_body(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(302, text="redirect", headers={"location": "/final"})
+
+    result = run(
+        journey(
+            step(
+                "redirect",
+                "POST",
+                "/redirect",
+                [assertion("status_code", "response.status", 302)],
+                {"name": "original"},
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.verdict is Verdict.PASS
+    assert len(requests) == 1
+    assert json.loads(requests[0].content) == {"name": "original"}
+
+
+def test_followed_get_redirect_drops_cookie_authorization_and_body(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/redirect":
+            return httpx.Response(
+                302,
+                headers={
+                    "location": "/final",
+                    "set-cookie": "session=secret",
+                },
+            )
+        return httpx.Response(200, text="final")
+
+    result = run(
+        journey(
+            step(
+                "redirect",
+                "GET",
+                "/redirect",
+                [assertion("status_code", "response.status", 200)],
+                {"name": "original"},
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.verdict is Verdict.PASS
+    assert len(requests) == 2
+    assert requests[0].content
+    assert requests[1].content == b""
+    assert requests[1].headers.get("cookie") is None
+    assert requests[1].headers.get("authorization") is None
+
+
+def test_intermediate_redirect_body_is_not_read_and_stream_is_closed(
+    tmp_path: Path,
+) -> None:
+    intermediate = ChunkedStream([b"must-not-be-read"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/redirect":
+            return httpx.Response(
+                302,
+                headers={"location": "/final"},
+                stream=intermediate,
+            )
+        return httpx.Response(200, text="final")
+
+    result = run(
+        journey(
+            step(
+                "redirect",
+                "GET",
+                "/redirect",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.verdict is Verdict.PASS
+    assert intermediate.yielded == 0
+    assert intermediate.closed is True
+
+
+def test_redirect_chain_uses_one_step_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import repotrial.journey.http_runner as http_runner_module
+
+    monkeypatch.setattr(http_runner_module, "_REQUEST_TIMEOUT_SECONDS", 0.05)
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        await asyncio.sleep(0.04)
+        if request.url.path == "/redirect":
+            return httpx.Response(302, headers={"location": "/final"})
+        return httpx.Response(200, text="final")
+
+    result = run(
+        journey(
+            step(
+                "redirect",
+                "GET",
+                "/redirect",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.verdict is Verdict.FAIL
+    assert result.failure_reason == "step-0000:network_error"
+    assert len(requests) == 2
+
+
 class ChunkedStream(httpx.AsyncByteStream):
     def __init__(self, chunks: list[bytes]) -> None:
         self.chunks = chunks
         self.yielded = 0
+        self.closed = False
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         for chunk in self.chunks:
@@ -1061,7 +1482,7 @@ class ChunkedStream(httpx.AsyncByteStream):
             yield chunk
 
     async def aclose(self) -> None:
-        return None
+        self.closed = True
 
 
 def test_response_body_is_capped_during_streaming_before_extra_bytes_can_match(
