@@ -850,3 +850,32 @@ No RG1 policy plan is created, and no CLI/API default is changed.
   `BLOCKED_AT_CLEANUP`; no next module is selected pending cleanup
   adjudication. No daemon lifecycle operation, repair, retry, or production
   change was performed.
+
+## M7.5 Stage A Task 2 — independent-review audit correction (2026-09-04)
+
+```text
+task_1_head=97605c56726ae77a10f5a12ba0fcb48f96d6f792
+task_2_initial_evidence_head=a5e64056a95e4bad0f5f6e6069bdbced90425539
+task_2_cleanup_closeout_head=dd341c4ff29f08f65f11ec162fdb834eb272fdd7
+correction_scope=audit_wording_only
+review_initial_verdict=CHANGES_REQUESTED
+review_fix_status=APPLIED_PENDING_REREVIEW
+stage_a_status=BLOCKED_AT_CLEANUP
+changedetection_run_id=NOT_RUN
+NO_DAEMON_OPERATION=RETRACTED_AS_IMPRECISE
+NO_DAEMON_LIFECYCLE_MUTATION=true
+```
+
+- The first Task 2 section is the primary Linkding attempt record; the second
+  is its hard-stop closeout. Both remain append-only and describe the same
+  single retained run, not duplicate attempts or different rulings.
+- Lifecycle precision: only `create_cleanup_unsafe` and
+  `cleanup_retry_failure` carry `exception_type=DockerSbxError`.
+  `create_attempt` and `cleanup_retry_attempt` have no `exception_type`.
+- `sbx list` was a read-only inventory query and `repotrial inspect` was the
+  diagnostic trial through the existing daemon. No daemon start, stop,
+  restart, reset, or repair occurred; this checkpoint claims no daemon
+  lifecycle mutation, not zero daemon interaction.
+- This correction commit is limited to audit wording. It does not change the
+  Linkding artifact, cleanup/inventory ruling, blocked Stage A state, or any
+  production, test, manifest, README, or historical evidence content.
