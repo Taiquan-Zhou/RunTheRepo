@@ -719,3 +719,37 @@ No RG1 policy plan is created, and no CLI/API default is changed.
   RED-first implementation plan for closed-prefix omission in the guest file,
   unchanged host-environment restrictions, and pre-Boot resolved-Compose
   validation. No production implementation has yet been committed.
+
+## M7.5 release-gap closure - RG2 implementation status (2026-09-04)
+
+- Option B is implemented through execution HEAD
+  `0c7c44678d81b9889c683bde8aae8dcbf93b7553`: host planning, guest-only
+  `0600` materialization, closed control-key omission, resolved-Compose
+  validation, complete terminal evidence, and baseline/candidate identity
+  parity are present without changing frozen graph/state/public contracts.
+- A real SBX compatibility correction replaced the invalid fixed
+  `/workspace` assumption with a dynamically reported clone root that must be
+  absolute, normalized, non-root, and exactly equal to the guest Git top-level.
+- Trusted real-SBX verification on the final code snapshot passed `2/2` in
+  `248.42s`: pinned unprivileged fixture create -> materialize -> healthy Boot
+  on `8080` -> `echo ok` -> destroy. Evidence retained no values, target mode
+  was `0600`, and official inventory was empty before and after.
+- The sole valid frozen Linkding canary is run
+  `8f4b9f78-e1de-46d6-b1c2-98ffa464c232`. It stopped before checkout/sandbox
+  at `intake:clone_timeout` after `125.083775s`; exact SHA was requested but
+  not verified, no workload started, and final inventory was empty. It used
+  the public OpenAI-compatible DeepSeek endpoint class and model
+  `deepseek-v4-flash`; no credential is recorded. Therefore Linkding is not
+  recovered and the same-HEAD recovery count is unchanged.
+- Current ruling: generic startup-input materialization is proven in real SBX;
+  Linkding recovery remains unproven because intake did not reach the feature.
+  Continue the frozen release-gap sequence; do not claim the four-recovery
+  release gate from this result.
+- Independent focused review: APPROVED with zero Critical/Important findings.
+  Both Minor findings were closed before commit by rejecting Unicode `Cc`/`Cf`
+  characters in the dynamic root parser and recording the canary endpoint/model
+  attribution without credentials.
+- Final gates: focused `322 passed, 1 skipped`; full
+  `1629 passed, 9 skipped, 1 warning`; branch coverage `87.13%`; Ruff,
+  formatting, mypy, pre-commit, diff-check, secret-pattern scan, and final
+  empty SBX inventory all PASS.

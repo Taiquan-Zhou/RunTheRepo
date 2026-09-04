@@ -25,7 +25,7 @@ from repotrial.trial.startup_inputs import (
 )
 
 _FIXTURE_ROOT = Path(__file__).parents[2] / "fixtures" / "startup_input_diagnostic"
-_ADAPTER_SHA256 = "6c183581aa20385d694faf4f00ee19331ac57dfbf98cad553637df654be45fda"
+_ADAPTER_SHA256 = "2e409d6d7c3ed2f72ba78d7e0712467351df54ef759952eedb4bf3f93fa47233"
 
 
 def _copy_fixture(tmp_path: Path, case: str) -> Path:
@@ -631,7 +631,7 @@ def test_materializes_guest_input_before_resolved_compose_config(
     )
     assert provider.exec_calls[0][10] == "-c"
     assert hashlib.sha256(provider.exec_calls[0][11].encode()).hexdigest() == (
-        "6c183581aa20385d694faf4f00ee19331ac57dfbf98cad553637df654be45fda"
+        "2e409d6d7c3ed2f72ba78d7e0712467351df54ef759952eedb4bf3f93fa47233"
     )
     assert provider.exec_calls[0][12:] == (
         "repotrial-startup-input",
@@ -761,7 +761,9 @@ def test_adapter_failure_is_bounded_and_skips_config(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "adapter_result",
     (
-        ExecResult(exit_code=0, stdout="root=/wrong\nmode=600\n", stderr=""),
+        ExecResult(exit_code=0, stdout="root=/\nmode=600\n", stderr=""),
+        ExecResult(exit_code=0, stdout="root=/workspace/\x7f\nmode=600\n", stderr=""),
+        ExecResult(exit_code=0, stdout="root=/workspace/\u202e\nmode=600\n", stderr=""),
         ExecResult(
             exit_code=0,
             stdout="root=/workspace\nmode=600\n",
@@ -1029,12 +1031,58 @@ def test_confined_bind_and_named_volume_are_accepted(tmp_path: Path) -> None:
     )
 
     assert result.target_mode == 0o600
-    assert provider.exec_calls[2][-2:] == (
+    assert provider.exec_calls[2][-3:] == (
         "repotrial-bind-validator",
+        "/workspace",
         "/workspace/data",
     )
-    assert hashlib.sha256(provider.exec_calls[2][-3].encode()).hexdigest() == (
-        "cb6d2457656a09dccca1a9a71ac95673cd11623e43b60704687c596ac025d166"
+    assert hashlib.sha256(provider.exec_calls[2][-4].encode()).hexdigest() == (
+        "23e41330934144f7c1f017e1c16e9a34e90d374956de5273be247264d0b7e868"
+    )
+
+
+def test_materializer_accepts_dynamic_verified_guest_clone_root(
+    tmp_path: Path,
+) -> None:
+    workspace = _copy_fixture(tmp_path, "dynamic_guest_root")
+    plan = plan_startup_input(workspace, "compose.yaml")
+    assert plan is not None
+    guest_root = "/home/repotrial/worktrees/run-1"
+    provider = _MaterializeProvider(
+        adapter_result=ExecResult(
+            exit_code=0, stdout=f"root={guest_root}\nmode=600\n", stderr=""
+        ),
+        config={
+            "services": {
+                "web": {
+                    "image": "busybox",
+                    "volumes": [
+                        {
+                            "type": "bind",
+                            "source": f"{guest_root}/data",
+                            "target": "/data",
+                        }
+                    ],
+                }
+            }
+        },
+    )
+
+    asyncio.run(
+        materialize_startup_input(
+            provider,
+            "sandbox-1",
+            plan,
+            compose_path="compose.yaml",
+            compose_env={},
+            evidence_path=tmp_path / "dynamic-root.jsonl",
+        )
+    )
+
+    assert provider.exec_calls[2][-3:] == (
+        "repotrial-bind-validator",
+        guest_root,
+        f"{guest_root}/data",
     )
 
 

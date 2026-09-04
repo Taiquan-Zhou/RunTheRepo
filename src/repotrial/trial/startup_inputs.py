@@ -38,7 +38,6 @@ _CONTROL_EXACT: Final = frozenset(
 )
 _CONTROL_PREFIXES: Final = ("COMPOSE_", "DOCKER_", "DYLD_", "LD_")
 _SECRET_COMPONENTS: Final = frozenset({"PASSWORD", "SECRET", "TOKEN"})
-_GUEST_CLONE_ROOT: Final = "/workspace"
 _MAX_ADAPTER_OUTPUT_BYTES: Final = 1_024
 _MAX_RESOLVED_CONFIG_BYTES: Final = 4 * 1024 * 1024
 _MAX_RESOLVED_CONFIG_NODES: Final = 100_000
@@ -65,8 +64,14 @@ source_sha256=$3
 output_sha256=$4
 payload=$5
 
-root=$(pwd -P)
-[ "$root" = "/workspace" ] || exit 21
+root=$(pwd -P) || exit 21
+case "$root" in
+    /*) ;;
+    *) exit 21 ;;
+esac
+[ "$root" != "/" ] || exit 21
+git_root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 21
+[ "$git_root" = "$root" ] || exit 21
 [ "$source_path" = ".env.sample" ] || exit 22
 [ "$target_path" = ".env" ] || exit 22
 [ "$(dirname "$source_path")" = "." ] || exit 22
@@ -98,17 +103,20 @@ target_hash=$(sha256sum "$target_path" | cut -d ' ' -f 1)
 printf 'root=%s\nmode=%s\n' "$root" "$target_mode"
 """
 _ADAPTER_SHA256: Final = (
-    "6c183581aa20385d694faf4f00ee19331ac57dfbf98cad553637df654be45fda"
+    "2e409d6d7c3ed2f72ba78d7e0712467351df54ef759952eedb4bf3f93fa47233"
 )
 _BIND_VALIDATOR_SCRIPT: Final = """\
 set -eu
 
-[ "$(pwd -P)" = "/workspace" ] || exit 40
+expected_root=$1
+shift
+root=$(pwd -P) || exit 40
+[ "$root" = "$expected_root" ] || exit 40
 for source_path do
     [ -e "$source_path" ] || exit 41
     resolved=$(realpath -e "$source_path") || exit 41
     case "$resolved" in
-        /workspace|/workspace/*) ;;
+        "$root"|"$root"/*) ;;
         *) exit 42 ;;
     esac
     basename=${resolved##*/}
@@ -121,7 +129,7 @@ done
 printf 'binds=ok\n'
 """
 _BIND_VALIDATOR_SHA256: Final = (
-    "cb6d2457656a09dccca1a9a71ac95673cd11623e43b60704687c596ac025d166"
+    "23e41330934144f7c1f017e1c16e9a34e90d374956de5273be247264d0b7e868"
 )
 
 
@@ -307,10 +315,10 @@ async def materialize_startup_input(
             or len(adapter_result.stderr.encode(errors="surrogatepass"))
             > _MAX_ADAPTER_OUTPUT_BYTES
             or adapter_result.exit_code != 0
-            or adapter_result.stdout != "root=/workspace\nmode=600\n"
             or adapter_result.stderr
         ):
             raise StartupInputUnsupported("guest_validation_failed")
+        guest_clone_root = _parse_adapter_output(adapter_result.stdout)
 
         compose_argv = [
             *prefix,
@@ -330,7 +338,9 @@ async def materialize_startup_input(
         if config_result.exit_code != 0 or config_result.stderr:
             raise StartupInputUnsupported("resolved_config_failed")
         resolved = _parse_resolved_compose(config_result.stdout)
-        bind_sources = _validate_resolved_compose(resolved, plan.expected_service_names)
+        bind_sources = _validate_resolved_compose(
+            resolved, plan.expected_service_names, guest_clone_root
+        )
         if bind_sources:
             bind_result = await provider.exec(
                 sandbox_id,
@@ -341,6 +351,7 @@ async def materialize_startup_input(
                     "-c",
                     _BIND_VALIDATOR_SCRIPT,
                     "repotrial-bind-validator",
+                    guest_clone_root,
                     *bind_sources,
                 ],
                 timeout_s=30,
@@ -731,6 +742,30 @@ def _parse_resolved_compose(stdout: str) -> dict[str, object]:
     return resolved
 
 
+def _parse_adapter_output(stdout: str) -> str:
+    if not isinstance(stdout, str):
+        raise TypeError("startup-input adapter stdout must be a string")
+    lines = stdout.splitlines()
+    if (
+        not stdout.endswith("\n")
+        or len(lines) != 2
+        or not lines[0].startswith("root=")
+        or lines[1] != "mode=600"
+    ):
+        raise StartupInputUnsupported("guest_validation_failed")
+    root = lines[0].removeprefix("root=")
+    if (
+        not root.startswith("/")
+        or root == "/"
+        or posixpath.normpath(root) != root
+        or len(root.encode("utf-8", errors="surrogatepass")) > _MAX_BIND_SOURCE_BYTES
+        or "\0" in root
+        or any(unicodedata.category(character) in {"Cc", "Cf"} for character in root)
+    ):
+        raise StartupInputUnsupported("guest_validation_failed")
+    return root
+
+
 def _json_object_without_duplicates(
     pairs: list[tuple[str, object]],
 ) -> dict[str, object]:
@@ -770,7 +805,9 @@ def _validate_json_budget(value: object, *, depth: int, budget: list[int]) -> No
 
 
 def _validate_resolved_compose(
-    resolved: Mapping[str, object], expected_service_names: tuple[str, ...]
+    resolved: Mapping[str, object],
+    expected_service_names: tuple[str, ...],
+    guest_clone_root: str,
 ) -> tuple[str, ...]:
     services = resolved.get("services")
     if not isinstance(services, Mapping) or set(services) != set(
@@ -790,14 +827,14 @@ def _validate_resolved_compose(
             raise StartupInputUnsupported("unsafe_resolved_compose")
         volumes = service.get("volumes")
         if volumes is not None:
-            bind_sources.extend(_validate_resolved_volumes(volumes))
+            bind_sources.extend(_validate_resolved_volumes(volumes, guest_clone_root))
     unique_sources = tuple(sorted(set(bind_sources)))
     if len(unique_sources) > _MAX_BIND_SOURCES:
         raise StartupInputUnsupported("unsafe_resolved_compose")
     return unique_sources
 
 
-def _validate_resolved_volumes(volumes: object) -> list[str]:
+def _validate_resolved_volumes(volumes: object, guest_clone_root: str) -> list[str]:
     if not isinstance(volumes, list):
         raise StartupInputUnsupported("unsafe_resolved_compose")
     bind_sources: list[str] = []
@@ -813,7 +850,7 @@ def _validate_resolved_volumes(volumes: object) -> list[str]:
             if (
                 not isinstance(source, str)
                 or len(source.encode()) > _MAX_BIND_SOURCE_BYTES
-                or not _is_inside_guest_clone(source)
+                or not _is_inside_guest_clone(source, guest_clone_root)
             ):
                 raise StartupInputUnsupported("unsafe_resolved_compose")
             bind_sources.append(source)
@@ -836,7 +873,7 @@ def _is_engine_socket(value: object) -> bool:
     }
 
 
-def _is_inside_guest_clone(source: str) -> bool:
+def _is_inside_guest_clone(source: str, guest_clone_root: str) -> bool:
     if (
         "\0" in source
         or "\\" in source
@@ -845,8 +882,8 @@ def _is_inside_guest_clone(source: str) -> bool:
     ):
         return False
     normalized = posixpath.normpath(source)
-    return normalized == _GUEST_CLONE_ROOT or normalized.startswith(
-        f"{_GUEST_CLONE_ROOT}/"
+    return normalized == guest_clone_root or normalized.startswith(
+        f"{guest_clone_root}/"
     )
 
 
