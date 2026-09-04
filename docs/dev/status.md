@@ -805,3 +805,28 @@ No RG1 policy plan is created, and no CLI/API default is changed.
 - Task 8 independent review: `APPROVE`, zero Critical/Important/Minor after
   Task 7 review provenance was made durable. Reviewer task:
   `01a06ad1-8c2a-7e80-a579-8a83b9342d1e`.
+
+## M7.5 Stage A Task 2 diagnostic recertification — STOPPED (2026-09-04)
+
+- Task 2 started at Task 1 HEAD
+  `97605c56726ae77a10f5a12ba0fcb48f96d6f792` on the isolated WSL worktree.
+- Linkding ran once as diagnostic-only:
+  `37a85bd2-0034-437a-8de1-9968843b1684`; exact requested SHA
+  `65813a75404b1319aca8b09700fadc0b15adabaf` was verified. It reached the
+  existing `startup-input-v1-option-b` materializer, then terminated with
+  `exit_code=4`, `terminal_outcome=exception`, and
+  `stop_reason=internal:cleanuperror` after `131.71963241800404s`.
+- Linkding artifact evidence has `report_present=false`,
+  `journey_count=not_observed`, `cleanup=FAIL`, and
+  `attempt_result_sha256=c669aa676e4f6aa0de140ea63816811f4a6385771bf88ae64e926c015d06e116`.
+  Lifecycle SHA-256 is
+  `c5ecf44886b3500ece4a6e7b7e3c30e3ad3c078fd780c45d781e06c57eb7c375`.
+- The official post-attempt inventory was exactly empty. Because cleanup
+  failed, the hard stop prevented any changedetection.io execution; there is
+  no second run ID or inferred result.
+- Routing: no new startup policy and no production compatibility change;
+  Boot/Journey publication was not observed. The next module plan is not
+  selected pending controller/Owner adjudication of the cleanup failure.
+- No production code, tests, manifest, README, or historical evidence was
+  changed. Daemon lifecycle commands were not used and host fallback was not
+  observed.
