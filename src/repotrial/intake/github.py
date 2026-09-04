@@ -139,7 +139,6 @@ async def clone_and_resolve(
                 "fetch",
                 *repository_arguments,
                 "fetch",
-                "--depth=1",
                 "--no-tags",
                 "--",
                 clone_source,

@@ -612,7 +612,7 @@ def test_remote_clone_uses_explicit_http_1_1_transport(
     assert local_path == destination.resolve()
 
 
-def test_remote_full_sha_fetches_only_exact_commit_in_one_pack(
+def test_remote_full_sha_fetches_exact_commit_as_complete_repository(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     source = "https://github.com/Owner/Project"
@@ -655,7 +655,6 @@ def test_remote_full_sha_fetches_only_exact_commit_in_one_pack(
         (
             *common,
             "fetch",
-            "--depth=1",
             "--no-tags",
             "--",
             source,
