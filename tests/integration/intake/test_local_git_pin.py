@@ -126,6 +126,58 @@ def test_clone_and_resolve_checks_out_a_requested_full_sha_detached(
     assert detached.returncode == 1
 
 
+def test_local_full_sha_keeps_filtered_clone_then_checks_out_requested_sha(
+    monkeypatch: pytest.MonkeyPatch,
+    local_repository: tuple[Path, str, str],
+    tmp_path: Path,
+) -> None:
+    source, first_commit, _second_commit = local_repository
+    destination = tmp_path / "local exact-sha argv destination"
+    invocations: list[tuple[object, ...]] = []
+
+    async def fake_create_subprocess_exec(
+        *arguments: object, **keywords: object
+    ) -> _FakeProcess:
+        invocations.append(arguments)
+        if "clone" in arguments:
+            _assert_clone_invocation(arguments, keywords, source, destination)
+            return _FakeProcess(stdout=_FakeStream(), stderr=_FakeStream())
+        if "checkout" in arguments:
+            assert arguments == (
+                "git",
+                "-C",
+                str(destination),
+                "checkout",
+                "--detach",
+                first_commit,
+            )
+            return _FakeProcess(stdout=_FakeStream(), stderr=_FakeStream())
+        assert arguments == (
+            "git",
+            "-C",
+            str(destination),
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+        )
+        return _FakeProcess(
+            stdout=_FakeStream([f"{first_commit}\n".encode()]),
+            stderr=_FakeStream(),
+        )
+
+    monkeypatch.setattr(
+        github.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+
+    commit_sha, local_path = asyncio.run(
+        github.clone_and_resolve(str(source), destination, requested_ref=first_commit)
+    )
+
+    assert len(invocations) == 3
+    assert commit_sha == first_commit
+    assert local_path == destination.resolve()
+
+
 def test_clone_and_resolve_removes_owned_destination_after_missing_ref(
     local_repository: tuple[Path, str, str], tmp_path: Path
 ) -> None:
@@ -622,6 +674,44 @@ def test_remote_full_sha_fetches_only_exact_commit_in_one_pack(
     assert all("--filter=blob:none" not in command for command in invocations)
     assert commit_sha == expected_sha
     assert local_path == destination.resolve()
+
+
+def test_remote_full_sha_mismatch_fails_closed_and_cleans_owned_destination(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = "https://github.com/Owner/Project"
+    destination = tmp_path / "remote mismatched exact-sha destination"
+    requested_sha = "a" * 40
+    resolved_sha = "b" * 40
+    invocations: list[tuple[object, ...]] = []
+
+    async def fake_create_subprocess_exec(
+        *arguments: object, **_keywords: object
+    ) -> _FakeProcess:
+        invocations.append(arguments)
+        stdout = (
+            _FakeStream([f"{resolved_sha}\n".encode()])
+            if "rev-parse" in arguments
+            else _FakeStream()
+        )
+        return _FakeProcess(stdout=stdout, stderr=_FakeStream())
+
+    monkeypatch.setattr(
+        github.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+
+    with pytest.raises(github.RepoIntakeError) as raised:
+        asyncio.run(
+            github.clone_and_resolve(source, destination, requested_ref=requested_sha)
+        )
+
+    assert raised.value.operation == "commit_sha_mismatch"
+    assert len(invocations) == 4
+    assert "init" in invocations[0]
+    assert "fetch" in invocations[1]
+    assert "checkout" in invocations[2]
+    assert "rev-parse" in invocations[3]
+    _assert_normal_clone_cleanup_result(destination)
 
 
 def test_clone_timeout_kills_and_reaps_direct_child(
