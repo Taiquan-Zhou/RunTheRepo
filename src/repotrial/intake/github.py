@@ -122,9 +122,10 @@ async def clone_and_resolve(
             "credential.helper=",
             "-c",
             "core.askPass=",
-            "clone",
-            "--filter=blob:none",
         ]
+        if _parse_credential_free_https_url(clone_source) is not None:
+            clone_arguments.extend(("-c", "http.version=HTTP/1.1"))
+        clone_arguments.extend(("clone", "--filter=blob:none"))
         if (
             requested_ref is not None
             and _FULL_COMMIT_SHA.fullmatch(requested_ref) is None

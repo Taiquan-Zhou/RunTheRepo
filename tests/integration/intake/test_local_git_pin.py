@@ -491,21 +491,30 @@ def test_git_spawn_oserror_is_local_io_without_raw_error(
 def _assert_clone_invocation(
     arguments: tuple[object, ...],
     keywords: dict[str, object],
-    source: Path,
+    source: Path | str,
     destination: Path,
+    *,
+    requires_http_1_1: bool = False,
 ) -> None:
-    assert arguments == (
+    expected_arguments: list[object] = [
         "git",
         "-c",
         "credential.helper=",
         "-c",
         "core.askPass=",
-        "clone",
-        "--filter=blob:none",
-        "--",
-        str(source.resolve()),
-        str(destination),
+    ]
+    if requires_http_1_1:
+        expected_arguments.extend(("-c", "http.version=HTTP/1.1"))
+    expected_arguments.extend(
+        (
+            "clone",
+            "--filter=blob:none",
+            "--",
+            str(source.resolve()) if isinstance(source, Path) else source,
+            str(destination),
+        )
     )
+    assert arguments == tuple(expected_arguments)
     assert keywords["stdin"] == asyncio.subprocess.DEVNULL
     assert keywords["stdout"] == asyncio.subprocess.PIPE
     assert keywords["stderr"] == asyncio.subprocess.PIPE
@@ -518,6 +527,37 @@ def _assert_clone_invocation(
     assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
     assert environment["GIT_TERMINAL_PROMPT"] == "0"
     assert environment["GCM_INTERACTIVE"] == "never"
+
+
+def test_remote_clone_uses_explicit_http_1_1_transport(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = "https://github.com/Owner/Project"
+    destination = tmp_path / "remote destination"
+    expected_sha = "a" * 40
+
+    async def fake_create_subprocess_exec(
+        *arguments: object, **keywords: object
+    ) -> _FakeProcess:
+        if "clone" in arguments:
+            _assert_clone_invocation(
+                arguments, keywords, source, destination, requires_http_1_1=True
+            )
+            return _FakeProcess(stdout=_FakeStream(), stderr=_FakeStream())
+        assert "rev-parse" in arguments
+        return _FakeProcess(
+            stdout=_FakeStream([f"{expected_sha}\n".encode()]),
+            stderr=_FakeStream(),
+        )
+
+    monkeypatch.setattr(
+        github.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+
+    commit_sha, local_path = asyncio.run(github.clone_and_resolve(source, destination))
+
+    assert commit_sha == expected_sha
+    assert local_path == destination.resolve()
 
 
 def test_clone_timeout_kills_and_reaps_direct_child(
