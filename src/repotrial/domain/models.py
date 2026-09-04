@@ -1,7 +1,7 @@
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .enums import ExperimentVerdict, MutationType, Verdict
 
@@ -90,6 +90,8 @@ class RunState(BaseModel):
     repo_url: str
     commit_sha: str | None = None
     compose_path: str | None = None
+    compatibility_overlay_path: str | None = None
+    compatibility_overlay_sha256: str | None = None
     sandbox_id: str | None = None
     baseline_config_hash: str | None = None
     current_config_hash: str | None = None
@@ -100,3 +102,13 @@ class RunState(BaseModel):
     experiments: list[ExperimentRecord] = Field(default_factory=list)
     artifacts: list[str] = Field(default_factory=list)
     stop_reason: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_compatibility_identity(self) -> Self:
+        if (self.compatibility_overlay_path is None) != (
+            self.compatibility_overlay_sha256 is None
+        ):
+            raise ValueError(
+                "compatibility overlay path and sha256 must be provided together"
+            )
+        return self

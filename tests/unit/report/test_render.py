@@ -119,6 +119,8 @@ def _state(*, hostile: bool = False, untested: bool = False) -> RunState:
             "artifacts/nonexistent-sentinel.json",
             "artifacts/accepted-compose.yaml",
         ],
+        compatibility_overlay_path=None,
+        compatibility_overlay_sha256=None,
         stop_reason="no_remaining_mutations",
     )
 
@@ -253,6 +255,54 @@ def test_renderer_selects_only_established_overlay_artifact_suffixes(
         "artifacts/second.overlay.yml",
     ]
     assert report["artifacts"]["references"] == state.artifacts
+
+
+def test_renderer_separates_compatibility_overlay_from_experiment_overlays(
+    tmp_path: Path,
+) -> None:
+    state = _state()
+    state.compatibility_overlay_path = "artifacts/compatibility.overlay.yaml"
+    state.compatibility_overlay_sha256 = "b" * 64
+    state.artifacts.insert(0, state.compatibility_overlay_path)
+
+    report = json.loads(_render(state, tmp_path).json_path.read_text(encoding="utf-8"))
+
+    assert report["artifacts"]["compatibility_overlay"] == {
+        "reference": "artifacts/compatibility.overlay.yaml",
+        "sha256": "b" * 64,
+    }
+    assert (
+        "artifacts/compatibility.overlay.yaml"
+        not in report["artifacts"]["experiment_overlays"]
+    )
+
+
+def test_renderer_emits_null_compatibility_identity_when_absent(tmp_path: Path) -> None:
+    report = json.loads(
+        _render(_state(), tmp_path).json_path.read_text(encoding="utf-8")
+    )
+
+    assert report["artifacts"]["compatibility_overlay"] == {
+        "reference": None,
+        "sha256": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("compatibility_overlay_path", "compatibility_overlay_sha256"),
+    [("artifacts/compatibility.overlay.yaml", None), (None, "b" * 64)],
+)
+def test_run_state_rejects_partial_compatibility_identity(
+    compatibility_overlay_path: str | None,
+    compatibility_overlay_sha256: str | None,
+) -> None:
+    with pytest.raises(ValueError):
+        RunState(
+            run_id="run-partial-compatibility",
+            repo_url="https://example.invalid/repo",
+            compatibility_overlay_path=compatibility_overlay_path,
+            compatibility_overlay_sha256=compatibility_overlay_sha256,
+        )
 
 
 def test_renderer_escapes_hostile_html_and_marks_hardened_overlay_unavailable(

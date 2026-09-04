@@ -87,8 +87,13 @@ def _project(state: RunState) -> dict[str, object]:
                 reference
                 for reference in state.artifacts
                 if reference != state.compose_path
+                and reference != state.compatibility_overlay_path
                 and reference.lower().endswith((".overlay.yaml", ".overlay.yml"))
             ],
+            "compatibility_overlay": {
+                "reference": state.compatibility_overlay_path,
+                "sha256": state.compatibility_overlay_sha256,
+            },
             "accepted_configuration": {
                 "compose_reference": state.compose_path,
                 "config_hash": state.current_config_hash,
