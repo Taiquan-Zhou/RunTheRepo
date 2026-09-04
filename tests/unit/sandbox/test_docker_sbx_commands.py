@@ -172,11 +172,16 @@ class _SbxSpawner:
             None
         )
         self.before_spawn: Callable[[tuple[str, ...]], None] | None = None
+        self.before_spawn_with_kwargs: (
+            Callable[[tuple[str, ...], dict[str, object]], None] | None
+        ) = None
 
     async def __call__(self, *argv: str, **kwargs: object) -> _FakeProcess:
         command = tuple(argv)
         if self.before_spawn is not None:
             self.before_spawn(command)
+        if self.before_spawn_with_kwargs is not None:
+            self.before_spawn_with_kwargs(command, kwargs)
         self.calls.append(command)
         self.kwargs.append(kwargs)
         outcome: _Outcome | BaseException
@@ -342,6 +347,13 @@ def _actual_create_call(spawner: _SbxSpawner) -> tuple[str, ...]:
         for call in spawner.calls
         if call[:2] == ("sbx", "create") and call[-1] != "--help"
     )
+
+
+def _actual_create_config_path(spawner: _SbxSpawner) -> Path:
+    create_call = _actual_create_call(spawner)
+    create_index = spawner.calls.index(create_call)
+    environment = cast(dict[str, str], spawner.kwargs[create_index]["env"])
+    return Path(environment["DOCKER_CONFIG"])
 
 
 def _guest_verification_outcome(command: tuple[str, ...]) -> _Outcome:
@@ -1294,6 +1306,18 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
     monkeypatch.setenv("REGISTRY_AUTH_FILE", "host-registry-auth-must-not-leak")
     monkeypatch.setenv("REPOTRIAL_TEST_SENTINEL", "preserved")
     spawner = _SbxSpawner()
+
+    def assert_anonymous_config_is_live_and_empty(
+        command: tuple[str, ...], kwargs: dict[str, object]
+    ) -> None:
+        if command[:2] != ("sbx", "create") or command[-1] == "--help":
+            return
+        environment = cast(dict[str, str], kwargs["env"])
+        docker_config = Path(environment["DOCKER_CONFIG"])
+        assert docker_config.is_dir()
+        assert list(docker_config.iterdir()) == []
+
+    spawner.before_spawn_with_kwargs = assert_anonymous_config_is_live_and_empty
     provider = _provider(monkeypatch, spawner)
 
     sandbox_id = _create(provider, tmp_path)
@@ -1380,6 +1404,153 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
         and any("df -B1 -P" in argument for argument in call)
         for call in spawner.calls
     )
+
+
+def test_anonymous_config_creation_failure_is_structured_before_pending_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+
+    def fail_mkdtemp(*_args: object, **_kwargs: object) -> str:
+        raise OSError("anonymous config unavailable")
+
+    monkeypatch.setattr(docker_sbx.tempfile, "mkdtemp", fail_mkdtemp)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert (raised.value.operation, raised.value.reason) == (
+        "create",
+        "anonymous_config_io",
+    )
+    assert _non_help_create_calls(spawner) == []
+    assert provider._sandbox_states == {}
+
+
+def test_unreaped_create_retains_anonymous_config_and_reports_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    anonymous_config = tmp_path / "retained-anonymous-config"
+
+    def make_known_config(*_args: object, **_kwargs: object) -> str:
+        anonymous_config.mkdir()
+        return str(anonymous_config)
+
+    monkeypatch.setattr(docker_sbx.tempfile, "mkdtemp", make_known_config)
+    monkeypatch.setattr(docker_sbx, "REAP_TIMEOUT_SECONDS", 0.01)
+    spawner = _SbxSpawner()
+    spawner.handler = lambda command: (
+        _Outcome(hang=True, reap_hang=True)
+        if command[:2] == ("sbx", "create") and command[-1] != "--help"
+        else _Outcome()
+    )
+    provider = _provider(monkeypatch, spawner, command_timeout_s=0.05)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert raised.value.reason == "process_cleanup_unconfirmed"
+    assert anonymous_config.is_dir()
+    assert "anonymous Docker config retained" in " ".join(raised.value.__notes__)
+    anonymous_config.rmdir()
+
+
+def test_cancelled_unreaped_create_retains_anonymous_config_and_reports_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    anonymous_config = tmp_path / "retained-anonymous-config"
+
+    def make_known_config(*_args: object, **_kwargs: object) -> str:
+        anonymous_config.mkdir()
+        return str(anonymous_config)
+
+    monkeypatch.setattr(docker_sbx.tempfile, "mkdtemp", make_known_config)
+    monkeypatch.setattr(docker_sbx, "REAP_TIMEOUT_SECONDS", 0.01)
+    spawner = _SbxSpawner()
+    spawner.handler = lambda command: (
+        _Outcome(hang=True, kill_error=OSError("kill denied"))
+        if command[:2] == ("sbx", "create") and command[-1] != "--help"
+        else _Outcome()
+    )
+    provider = _provider(monkeypatch, spawner)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(provider.create(tmp_path, "trial"))
+        while not _non_help_create_calls(spawner):
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        notes = " ".join(raised.value.__notes__)
+        assert "process cleanup unconfirmed" in notes
+        assert "anonymous Docker config retained" in notes
+
+    asyncio.run(exercise())
+
+    assert anonymous_config.is_dir()
+    anonymous_config.rmdir()
+
+
+def test_anonymous_config_cleanup_failure_aborts_and_cleans_partial_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    anonymous_config = tmp_path / "anonymous-config"
+
+    def make_known_config(*_args: object, **_kwargs: object) -> str:
+        anonymous_config.mkdir()
+        return str(anonymous_config)
+
+    def fail_cleanup(_path: Path) -> None:
+        raise OSError("cleanup denied")
+
+    monkeypatch.setattr(docker_sbx.tempfile, "mkdtemp", make_known_config)
+    monkeypatch.setattr(docker_sbx.shutil, "rmtree", fail_cleanup)
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    create_call = _actual_create_call(spawner)
+    sandbox_id = create_call[create_call.index("--name") + 1]
+    assert (raised.value.operation, raised.value.reason) == (
+        "create",
+        "anonymous_config_cleanup",
+    )
+    assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
+    assert provider._sandbox_states[sandbox_id] is docker_sbx._SandboxState.CLEANED
+    anonymous_config.rmdir()
+
+
+def test_anonymous_config_cleanup_failure_does_not_mask_create_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    anonymous_config = tmp_path / "anonymous-config"
+
+    def make_known_config(*_args: object, **_kwargs: object) -> str:
+        anonymous_config.mkdir()
+        return str(anonymous_config)
+
+    def fail_cleanup(_path: Path) -> None:
+        raise OSError("cleanup denied")
+
+    monkeypatch.setattr(docker_sbx.tempfile, "mkdtemp", make_known_config)
+    monkeypatch.setattr(docker_sbx.shutil, "rmtree", fail_cleanup)
+    spawner = _SbxSpawner()
+    spawner.handler = lambda command: (
+        _Outcome(returncode=7, stderr=b"create failed")
+        if command[:2] == ("sbx", "create") and command[-1] != "--help"
+        else _Outcome()
+    )
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert raised.value.reason == "nonzero_exit"
+    assert "anonymous Docker config cleanup failed" in " ".join(raised.value.__notes__)
+    anonymous_config.rmdir()
 
 
 @pytest.mark.parametrize(
@@ -1542,6 +1713,7 @@ def test_failed_create_force_removes_pending_id_and_cleaned_destroy_is_noop(
     sandbox_id = create_call[create_call.index("--name") + 1]
     remove_call = ("sbx", "rm", "--force", sandbox_id)
     assert raised.value.reason == "nonzero_exit"
+    assert not _actual_create_config_path(spawner).exists()
     assert spawner.calls[-1] == remove_call
     calls_before_destroy = len(spawner.calls)
     asyncio.run(provider.destroy(sandbox_id))
@@ -1627,6 +1799,7 @@ def test_cancelled_create_force_removes_pending_id_and_preserves_cancellation(
     create_index = spawner.calls.index(create_call)
     assert spawner.processes[create_index].killed is True
     assert spawner.processes[create_index].waited is True
+    assert not _actual_create_config_path(spawner).exists()
 
 
 @pytest.mark.parametrize("failure", ["timeout", "io_error"])
@@ -1649,6 +1822,7 @@ def test_create_timeout_or_io_error_force_removes_pending_id(
     create_call = _actual_create_call(spawner)
     sandbox_id = create_call[create_call.index("--name") + 1]
     assert raised.value.reason == failure
+    assert not _actual_create_config_path(spawner).exists()
     assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
 
 
