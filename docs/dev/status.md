@@ -769,3 +769,10 @@ No RG1 policy plan is created, and no CLI/API default is changed.
   fixture result is not sufficient to infer the target result. No production
   compatibility change or separate design is authorized; proceed to the
   frozen same-HEAD Stage 1 recovery recomputation.
+- Independent review found that generic Provider failures and post-publication
+  HTTP failures needed distinct bounded classifications. A fake-provider RED
+  now proves deadline errors cannot match the topology signature; the trusted
+  fixture also verifies the exact marker and uses bounded, isolated Git setup.
+  The strengthened real-SBX fixture passed in `89.94s`, reproduced the same
+  observation hash, cleaned successfully, and left inventory empty. The RG3
+  ruling remains `NOT_PROVEN` because target probes were not observed.

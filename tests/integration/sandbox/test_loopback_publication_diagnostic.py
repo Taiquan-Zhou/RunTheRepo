@@ -18,6 +18,7 @@ from repotrial.sandbox.docker_sbx import (
     DockerSbxPolicy,
     DockerSbxProvider,
 )
+from repotrial.sandbox.fake import FakeSandboxProvider
 from repotrial.sandbox.lifecycle import managed_sandbox
 from repotrial.trial.boot import boot_compose
 
@@ -31,6 +32,17 @@ _CHANGEDTECTION_URL = "https://github.com/dgtlmoon/changedetection.io"
 _CHANGEDTECTION_SHA = "5d9c7c6da76340597243e8163c4f2439237fa0e8"
 _OBSERVATION_KEYS = {"address_class", "port", "status", "error"}
 _ERROR_TOKEN = re.compile(r"[a-z0-9_]{1,64}\Z")
+_MARKER_BODY = b"repotrial-loopback-marker\n"
+_NETWORK_FAILURE_TOKENS = frozenset(
+    {
+        "connection_aborted_error",
+        "connection_refused_error",
+        "connection_reset_error",
+        "os_error",
+        "timeout_error",
+        "url_error",
+    }
+)
 
 
 def test_loopback_publication_fixture_is_pinned_bounded_and_unprivileged() -> None:
@@ -68,20 +80,42 @@ def test_loopback_publication_fixture_is_pinned_bounded_and_unprivileged() -> No
 def _create_fixture_repository(tmp_path: Path) -> Path:
     repository = tmp_path / "loopback-publication-repository"
     shutil.copytree(_FIXTURE_ROOT, repository)
-    for argv in (
+    git_environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.upper().startswith("GIT_") and name.upper() != "SSH_ASKPASS"
+    }
+    git_environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    for arguments in (
         ["git", "init", "--quiet"],
         ["git", "config", "user.email", "rg3@example.invalid"],
         ["git", "config", "user.name", "RepoTrial RG3"],
         ["git", "add", "."],
         ["git", "commit", "--quiet", "-m", "trusted loopback fixture"],
     ):
+        argv = [
+            arguments[0],
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            *arguments[1:],
+        ]
         subprocess.run(
             argv,
             cwd=repository,
             check=True,
+            env=git_environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            timeout=30,
         )
     return repository
 
@@ -143,12 +177,66 @@ async def _run_exec_probe(
     address_class: str,
     port: int,
     argv: list[str],
+    expected_stdout: str | None = None,
 ) -> dict[str, object]:
     try:
         result = await provider.exec(sandbox_id, argv, timeout_s=30)
     except DockerSbxError as error:
         return _error_observation(address_class, port, error)
-    return _exec_observation(address_class, port, result)
+    observation = _exec_observation(address_class, port, result)
+    if (
+        result.exit_code == 0
+        and expected_stdout is not None
+        and result.stdout != expected_stdout
+    ):
+        observation["status"] = "fail"
+        observation["error"] = "marker_mismatch"
+    return observation
+
+
+def _provider_error_token(error: DockerSbxError) -> str:
+    reason = error.reason
+    token = f"provider_{reason}"
+    return token if _ERROR_TOKEN.fullmatch(token) else "provider_error"
+
+
+async def _run_provider_probe(
+    provider: SandboxProvider,
+    sandbox_id: str,
+    *,
+    port: int,
+    request_path: str,
+    expected_body: bytes | None,
+) -> dict[str, object]:
+    try:
+        host_port = await provider.publish_port(sandbox_id, port)
+    except DockerSbxError as error:
+        return {
+            "address_class": "provider_published_loopback",
+            "port": port,
+            "status": "error",
+            "error": _provider_error_token(error),
+        }
+
+    try:
+        body = await asyncio.to_thread(
+            _request_published_port, host_port, request_path, expected_body
+        )
+    except OSError as error:
+        return _error_observation("provider_published_loopback", port, error)
+    if expected_body is not None and body != expected_body:
+        return {
+            "address_class": "provider_published_loopback",
+            "port": port,
+            "status": "fail",
+            "error": "marker_mismatch",
+        }
+    return {
+        "address_class": "provider_published_loopback",
+        "port": port,
+        "status": "pass",
+        "error": None,
+    }
 
 
 async def _run_three_probes(
@@ -159,6 +247,7 @@ async def _run_three_probes(
     service_name: str,
     port: int,
     request_path: str,
+    expected_body: bytes | None = None,
 ) -> list[dict[str, object]]:
     container_id = await provider.exec(
         sandbox_id,
@@ -167,6 +256,7 @@ async def _run_three_probes(
     )
     normalized_id = container_id.stdout.strip().lower()
     if container_id.exit_code == 0 and re.fullmatch(r"[0-9a-f]{12,64}", normalized_id):
+        wget_output = "-" if expected_body is not None else "/dev/null"
         container_argv = [
             "docker",
             "run",
@@ -179,7 +269,7 @@ async def _run_three_probes(
             "-T",
             "10",
             "-O",
-            "/dev/null",
+            wget_output,
             f"http://127.0.0.1:{port}{request_path}",
         ]
         container_observation = await _run_exec_probe(
@@ -188,6 +278,9 @@ async def _run_three_probes(
             address_class="target_container_loopback",
             port=port,
             argv=container_argv,
+            expected_stdout=(
+                expected_body.decode("ascii") if expected_body is not None else None
+            ),
         )
     else:
         container_observation = {
@@ -214,37 +307,36 @@ async def _run_three_probes(
             "-T",
             "10",
             "-O",
-            "/dev/null",
+            "-" if expected_body is not None else "/dev/null",
             f"http://127.0.0.1:{port}{request_path}",
         ],
+        expected_stdout=(
+            expected_body.decode("ascii") if expected_body is not None else None
+        ),
     )
 
-    try:
-        host_port = await provider.publish_port(sandbox_id, port)
-        await asyncio.to_thread(_request_published_port, host_port, request_path)
-    except (DockerSbxError, OSError) as error:
-        provider_observation = _error_observation(
-            "provider_published_loopback", port, error
-        )
-    else:
-        provider_observation = {
-            "address_class": "provider_published_loopback",
-            "port": port,
-            "status": "pass",
-            "error": None,
-        }
+    provider_observation = await _run_provider_probe(
+        provider,
+        sandbox_id,
+        port=port,
+        request_path=request_path,
+        expected_body=expected_body,
+    )
 
     return [container_observation, guest_observation, provider_observation]
 
 
-def _request_published_port(host_port: int, request_path: str) -> None:
+def _request_published_port(
+    host_port: int, request_path: str, expected_body: bytes | None
+) -> bytes:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(
         f"http://127.0.0.1:{host_port}{request_path}", timeout=10
     ) as response:
         if not 200 <= response.status < 400:
             raise OSError("unexpected_http_status")
-        response.read(1)
+        read_limit = 1 if expected_body is None else len(expected_body) + 1
+        return response.read(read_limit)
 
 
 def _write_observations(path: Path, observations: list[dict[str, object]]) -> None:
@@ -270,6 +362,57 @@ def _assert_bounded_observations(
         assert error is None or (
             isinstance(error, str) and _ERROR_TOKEN.fullmatch(error) is not None
         )
+
+
+def _publication_topology_signature(observations: list[dict[str, object]]) -> bool:
+    if len(observations) != 3:
+        return False
+    return (
+        observations[0]["status"] == "pass"
+        and observations[1]["status"] == "pass"
+        and observations[2]["status"] == "error"
+        and observations[2]["error"] in _NETWORK_FAILURE_TOKENS
+    )
+
+
+class _DeadlinePublishProvider(FakeSandboxProvider):
+    async def publish_port(self, sandbox_id: str, container_port: int) -> int:
+        raise DockerSbxError("publish_port", "total_duration_exhausted")
+
+
+def test_provider_deadline_failure_is_not_a_loopback_topology_signature() -> None:
+    observation = asyncio.run(
+        _run_provider_probe(
+            _DeadlinePublishProvider(),
+            "sandbox-1",
+            port=8080,
+            request_path="/marker.txt",
+            expected_body=b"repotrial-loopback-marker\n",
+        )
+    )
+    observations = [
+        {
+            "address_class": "target_container_loopback",
+            "port": 8080,
+            "status": "pass",
+            "error": None,
+        },
+        {
+            "address_class": "sandbox_guest_loopback",
+            "port": 8080,
+            "status": "pass",
+            "error": None,
+        },
+        observation,
+    ]
+
+    assert observation == {
+        "address_class": "provider_published_loopback",
+        "port": 8080,
+        "status": "error",
+        "error": "provider_total_duration_exhausted",
+    }
+    assert _publication_topology_signature(observations) is False
 
 
 @pytest.mark.skipif(
@@ -300,6 +443,7 @@ def test_real_sbx_observes_loopback_publication_boundary(tmp_path: Path) -> None
                 service_name="web",
                 port=8080,
                 request_path="/marker.txt",
+                expected_body=_MARKER_BODY,
             )
 
     _assert_empty_inventory()
@@ -363,5 +507,6 @@ def test_changedetection_loopback_publication_boundary(tmp_path: Path) -> None:
 
     assert actual_sha == _CHANGEDTECTION_SHA
     _assert_bounded_observations(observations, 5000)
+    assert _publication_topology_signature(observations)
     assert evidence_path.stat().st_mode & 0o777 == 0o600
     assert lifecycle_path.is_file()
