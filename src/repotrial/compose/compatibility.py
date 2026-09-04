@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import os
 import stat
 from collections.abc import Mapping, MutableMapping
 from copy import deepcopy
@@ -248,6 +249,8 @@ def _parse_long_entry(
 
 
 def _parse_host_ip(value: object) -> tuple[str | None, bool]:
+    if _tag_name(value) is not None:
+        raise CompatibilityError("tagged_port")
     if value is None:
         return None, False
     if not isinstance(value, str) or not value:
@@ -329,6 +332,9 @@ def _persist_overlay(
     try:
         with path.open("x", encoding="utf-8") as output:
             yaml.dump(overlay, output)
+            output.flush()
+            os.fsync(output.fileno())
+            created_identity = _regular_fd_identity(output.fileno())
     except FileExistsError:
         raise CompatibilityError("artifact_path_exists") from None
     except (OSError, TypeError, ValueError, RecursionError, YAMLError):
@@ -336,22 +342,40 @@ def _persist_overlay(
 
     try:
         first_identity = _regular_file_identity(path)
+        if first_identity != created_identity:
+            raise CompatibilityError("artifact_persistence_failed")
         data = path.read_bytes()
         second_identity = _regular_file_identity(path)
+    except CompatibilityError:
+        raise
     except (OSError, ValueError, UnicodeError):
         raise CompatibilityError("artifact_persistence_failed") from None
-    if first_identity != second_identity:
+    if second_identity != created_identity:
         raise CompatibilityError("artifact_persistence_failed")
     return CompatibilityArtifact(path=path, sha256=hashlib.sha256(data).hexdigest())
 
 
-def _regular_file_identity(path: Path) -> tuple[int, int, int, int]:
+def _regular_file_identity(path: Path) -> tuple[int, int, int, int, int]:
     file_stat = path.lstat()
     if not stat.S_ISREG(file_stat.st_mode):
         raise OSError("artifact is not a regular file")
     return (
         file_stat.st_dev,
         file_stat.st_ino,
+        stat.S_IFMT(file_stat.st_mode),
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+    )
+
+
+def _regular_fd_identity(fd: int) -> tuple[int, int, int, int, int]:
+    file_stat = os.fstat(fd)
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise OSError("artifact is not a regular file")
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        stat.S_IFMT(file_stat.st_mode),
         file_stat.st_size,
         file_stat.st_mtime_ns,
     )

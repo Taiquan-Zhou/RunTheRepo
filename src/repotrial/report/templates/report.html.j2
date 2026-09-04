@@ -46,6 +46,11 @@
 
   <h2>Artifact references</h2>
   <ul>{% for reference in report.artifacts.references %}<li>{{ reference }}</li>{% endfor %}</ul>
+  <h2>Compatibility overlay</h2>
+  <p>Reference: {{ report.artifacts.compatibility_overlay.reference }}</p>
+  <p>SHA-256: {{ report.artifacts.compatibility_overlay.sha256 }}</p>
+  <h2>Experiment overlays</h2>
+  <ul>{% for overlay in report.artifacts.experiment_overlays %}<li>{{ overlay }}</li>{% endfor %}</ul>
   <p>Accepted configuration: {{ report.artifacts.accepted_configuration }}</p>
   <p>Hardened overlay: {{ report.artifacts.hardened_overlay }}</p>
 </body>

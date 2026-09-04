@@ -275,3 +275,122 @@ def test_persisted_sha256_matches_exact_file_bytes(tmp_path: Path) -> None:
     assert artifact is not None
     assert artifact.path == path
     assert artifact.sha256 == sha256(path.read_bytes()).hexdigest()
+
+
+def test_path_replaced_after_close_before_first_check_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "compatibility.overlay.yaml"
+    replacement = tmp_path / "replacement.overlay.yaml"
+    replacement.write_text("replacement", encoding="utf-8")
+    original_lstat = Path.lstat
+    replaced = False
+
+    def replace_before_first_path_check(candidate: Path) -> object:
+        nonlocal replaced
+        if candidate == path and not replaced:
+            replaced = True
+            path.unlink()
+            replacement.replace(path)
+        return original_lstat(candidate)
+
+    monkeypatch.setattr(Path, "lstat", replace_before_first_path_check)
+
+    with pytest.raises(CompatibilityError) as error:
+        write_loopback_compatibility_overlay(
+            _compose(["127.0.0.1:5000:5000"]),
+            container_port=5000,
+            path=path,
+        )
+
+    assert replaced
+    assert error.value.reason == "artifact_persistence_failed"
+
+
+@pytest.mark.parametrize("field", ["target", "published", "host_ip"])
+def test_tagged_long_binding_values_fail_closed(tmp_path: Path, field: str) -> None:
+    value = {
+        "target": "5000",
+        "published": "5000",
+        "host_ip": "127.0.0.1",
+    }
+    value[field] = f"!override {value[field]}"
+    yaml = YAML(typ="rt", pure=True)
+    compose = yaml.load(
+        "services:\n"
+        "  app:\n"
+        "    image: example/app\n"
+        "    ports:\n"
+        "      - target: "
+        f"{value['target']}\n"
+        "        published: "
+        f"{value['published']}\n"
+        "        host_ip: "
+        f"{value['host_ip']}\n"
+    )
+
+    with pytest.raises(CompatibilityError) as error:
+        write_loopback_compatibility_overlay(
+            compose,
+            container_port=5000,
+            path=tmp_path / f"tagged-{field}.overlay.yaml",
+        )
+
+    assert error.value.reason == "tagged_port"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("target", "5000-5001", "port_range"),
+        ("published", "5000-5001", "port_range"),
+        ("protocol", "sctp", "invalid_protocol"),
+    ],
+)
+def test_invalid_long_binding_values_fail_closed(
+    tmp_path: Path, field: str, value: str, reason: str
+) -> None:
+    binding: dict[str, object] = {
+        "target": 5000,
+        "published": 5000,
+        "host_ip": "127.0.0.1",
+    }
+    binding[field] = value
+
+    with pytest.raises(CompatibilityError) as error:
+        write_loopback_compatibility_overlay(
+            _compose([binding]),
+            container_port=5000,
+            path=tmp_path / f"invalid-{field}.overlay.yaml",
+        )
+
+    assert error.value.reason == reason
+
+
+def test_same_long_published_port_with_different_protocol_can_coexist(
+    tmp_path: Path,
+) -> None:
+    compose = _compose(
+        [
+            {
+                "target": 5000,
+                "published": 5000,
+                "host_ip": "127.0.0.1",
+                "protocol": "tcp",
+            },
+            {
+                "target": 5001,
+                "published": 5000,
+                "host_ip": "0.0.0.0",
+                "protocol": "udp",
+            },
+        ]
+    )
+
+    artifact = write_loopback_compatibility_overlay(
+        compose,
+        container_port=5000,
+        path=tmp_path / "different-protocol.overlay.yaml",
+    )
+
+    assert artifact is not None

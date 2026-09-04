@@ -260,32 +260,45 @@ def test_renderer_selects_only_established_overlay_artifact_suffixes(
 def test_renderer_separates_compatibility_overlay_from_experiment_overlays(
     tmp_path: Path,
 ) -> None:
-    state = _state()
-    state.compatibility_overlay_path = "artifacts/compatibility.overlay.yaml"
-    state.compatibility_overlay_sha256 = "b" * 64
-    state.artifacts.insert(0, state.compatibility_overlay_path)
+    compatibility_path = "artifacts/<script>compatibility.overlay.yaml</script>"
+    state = _state().model_copy(
+        update={
+            "compatibility_overlay_path": compatibility_path,
+            "compatibility_overlay_sha256": "b" * 64,
+        }
+    )
+    state.artifacts.insert(0, compatibility_path)
 
-    report = json.loads(_render(state, tmp_path).json_path.read_text(encoding="utf-8"))
+    paths = _render(state, tmp_path)
+    report = json.loads(paths.json_path.read_text(encoding="utf-8"))
+    html = paths.html_path.read_text(encoding="utf-8")
 
     assert report["artifacts"]["compatibility_overlay"] == {
-        "reference": "artifacts/compatibility.overlay.yaml",
+        "reference": compatibility_path,
         "sha256": "b" * 64,
     }
+    assert compatibility_path not in report["artifacts"]["experiment_overlays"]
+    assert "Compatibility overlay" in html
     assert (
-        "artifacts/compatibility.overlay.yaml"
-        not in report["artifacts"]["experiment_overlays"]
+        "Reference: artifacts/&lt;script&gt;compatibility.overlay.yaml&lt;/script&gt;"
+        in html
     )
+    assert f"SHA-256: {'b' * 64}" in html
+    assert compatibility_path not in html
 
 
 def test_renderer_emits_null_compatibility_identity_when_absent(tmp_path: Path) -> None:
-    report = json.loads(
-        _render(_state(), tmp_path).json_path.read_text(encoding="utf-8")
-    )
+    paths = _render(_state(), tmp_path)
+    report = json.loads(paths.json_path.read_text(encoding="utf-8"))
+    html = paths.html_path.read_text(encoding="utf-8")
 
     assert report["artifacts"]["compatibility_overlay"] == {
         "reference": None,
         "sha256": None,
     }
+    assert "Compatibility overlay" in html
+    assert "Reference: None" in html
+    assert "SHA-256: None" in html
 
 
 @pytest.mark.parametrize(
@@ -303,6 +316,48 @@ def test_run_state_rejects_partial_compatibility_identity(
             compatibility_overlay_path=compatibility_overlay_path,
             compatibility_overlay_sha256=compatibility_overlay_sha256,
         )
+
+
+def test_run_state_assignment_rejects_partial_compatibility_identity() -> None:
+    state = _state()
+
+    with pytest.raises(ValueError):
+        state.compatibility_overlay_path = "artifacts/compatibility.overlay.yaml"
+
+    assert state.compatibility_overlay_path is None
+    assert state.compatibility_overlay_sha256 is None
+
+
+def test_run_state_model_copy_uses_atomic_validated_identity_update() -> None:
+    state = _state()
+
+    with pytest.raises(ValueError):
+        state.model_copy(
+            update={
+                "compatibility_overlay_path": "artifacts/compatibility.overlay.yaml"
+            }
+        )
+
+    updated = state.model_copy(
+        update={
+            "compatibility_overlay_path": "artifacts/compatibility.overlay.yaml",
+            "compatibility_overlay_sha256": "b" * 64,
+        }
+    )
+    assert updated.compatibility_overlay_path == "artifacts/compatibility.overlay.yaml"
+    assert updated.compatibility_overlay_sha256 == "b" * 64
+
+
+def test_renderer_rejects_partial_compatibility_identity_at_boundary(
+    tmp_path: Path,
+) -> None:
+    state = _state()
+    object.__setattr__(
+        state, "compatibility_overlay_path", "artifacts/compatibility.overlay.yaml"
+    )
+
+    with pytest.raises(ValueError):
+        _render(state, tmp_path)
 
 
 def test_renderer_escapes_hostile_html_and_marks_hardened_overlay_unavailable(
