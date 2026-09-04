@@ -58,7 +58,10 @@ from repotrial.sandbox.lifecycle import managed_sandbox
 from repotrial.trial import boot as boot_module
 from repotrial.trial.boot import BootResult, _boot_compose_with_evidence, boot_compose
 from repotrial.trial.boot_evidence import record_recovery_evidence
-from repotrial.trial.compatibility import verify_guest_compatibility_overlay
+from repotrial.trial.compatibility import (
+    materialize_guest_compatibility_overlay,
+    verify_guest_compatibility_overlay,
+)
 from repotrial.trial.journey_artifact import (
     verify_baseline_journeys,
     write_or_verify_baseline_journeys,
@@ -349,6 +352,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
     observation_evidence = attempt_dir / "baseline-observation-boundary.jsonl"
     evidence_artifact = attempt_dir / "baseline-boot-attempt.json"
     startup_input_evidence = attempt_dir / "startup-input-attempt.jsonl"
+    compatibility_evidence = attempt_dir / "compatibility-materialization.jsonl"
     startup_input_identity = (
         _run_evidence_directory(state.run, context) / "startup-input-identity.json"
     )
@@ -397,6 +401,16 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
     ) as sandbox_id:
         try:
             if compatibility_relative is not None:
+                if compatibility_path is None:
+                    raise CompatibilityError("identity_incomplete")
+                await materialize_guest_compatibility_overlay(
+                    context.provider,
+                    sandbox_id,
+                    host_artifact_path=compatibility_path,
+                    relative_path=compatibility_relative,
+                    expected_sha256=state.run.compatibility_overlay_sha256 or "",
+                    evidence_path=compatibility_evidence,
+                )
                 await verify_guest_compatibility_overlay(
                     context.provider,
                     sandbox_id,
@@ -1003,6 +1017,11 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
         container_port=context.container_port,
         compatibility_overlay_path=compatibility_path,
         compatibility_overlay_sha256=state.run.compatibility_overlay_sha256,
+        compatibility_overlay_evidence_path=(
+            None
+            if compatibility_path is None
+            else attempt_dir / "compatibility-materialization.jsonl"
+        ),
         prior_attempt_directories=prior_attempt_directories,
         startup_input_identity_path=(
             _run_evidence_directory(state.run, context) / "startup-input-identity.json"

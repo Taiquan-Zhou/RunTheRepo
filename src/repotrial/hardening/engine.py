@@ -26,7 +26,10 @@ from repotrial.sandbox.base import SandboxProvider
 from repotrial.sandbox.docker_sbx import DockerSbxError
 from repotrial.sandbox.lifecycle import CleanupError, managed_sandbox
 from repotrial.trial.boot import _validated_env_prefix, boot_compose
-from repotrial.trial.compatibility import verify_guest_compatibility_overlay
+from repotrial.trial.compatibility import (
+    materialize_guest_compatibility_overlay,
+    verify_guest_compatibility_overlay,
+)
 from repotrial.trial.observer import (
     _collect_observation_with_evidence,
     collect_observation,
@@ -73,14 +76,17 @@ class ExperimentContext:
     startup_input_identity_path: Path | None = None
     compatibility_overlay_path: Path | None = None
     compatibility_overlay_sha256: str | None = None
+    compatibility_overlay_evidence_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class _PreparedExperiment:
     compose_path: str
     overlay_path: Path
+    compatibility_overlay_path: Path | None
     overlay_relative: str
     compatibility_overlay_relative: str | None
+    compatibility_overlay_evidence_path: Path | None
     env: dict[str, str]
     parent_hash: str
     candidate_hash: str
@@ -204,8 +210,14 @@ def _prepare(
     workspace = _real_directory(context.workspace, "workspace")
     compose_path, compose_file = _compose_file(workspace, state.compose_path)
     overlay_path, overlay_relative = _overlay_target(workspace, context.overlay_path)
-    compatibility_overlay_relative = _compatibility_target(
+    compatibility_target = _compatibility_target_details(
         workspace, context.compatibility_overlay_path
+    )
+    compatibility_overlay_path = (
+        None if compatibility_target is None else compatibility_target[1]
+    )
+    compatibility_overlay_relative = (
+        None if compatibility_target is None else compatibility_target[0]
     )
     artifact_dir = _real_directory(context.artifact_dir, "artifact_dir")
     if artifact_dir.is_relative_to(workspace):
@@ -214,6 +226,13 @@ def _prepare(
         raise TypeError("container_port must be an integer")
     if not 1 <= context.container_port <= 65_535:
         raise ValueError("container_port is outside the valid range")
+    compatibility_overlay_evidence_path = (
+        None
+        if compatibility_overlay_relative is None
+        else _compatibility_evidence_target(
+            artifact_dir, context.compatibility_overlay_evidence_path
+        )
+    )
     env = _snapshot_env(context.env)
     _validated_env_prefix(compose_path, env)
 
@@ -250,8 +269,10 @@ def _prepare(
     return _PreparedExperiment(
         compose_path=compose_path,
         overlay_path=overlay_path,
+        compatibility_overlay_path=compatibility_overlay_path,
         overlay_relative=overlay_relative,
         compatibility_overlay_relative=compatibility_overlay_relative,
+        compatibility_overlay_evidence_path=compatibility_overlay_evidence_path,
         env=env,
         parent_hash=parent_hash,
         candidate_hash=candidate_hash,
@@ -353,6 +374,13 @@ def _overlay_target(workspace: Path, value: object) -> tuple[Path, str]:
 
 
 def _compatibility_target(workspace: Path, value: object) -> str | None:
+    target = _compatibility_target_details(workspace, value)
+    return None if target is None else target[0]
+
+
+def _compatibility_target_details(
+    workspace: Path, value: object
+) -> tuple[str, Path] | None:
     if value is None:
         return None
     if not isinstance(value, Path):
@@ -373,7 +401,25 @@ def _compatibility_target(workspace: Path, value: object) -> str | None:
         or not resolved.is_relative_to(workspace)
     ):
         raise ValueError("compatibility_overlay_path must be an existing regular file")
-    return resolved.relative_to(workspace).as_posix()
+    return resolved.relative_to(workspace).as_posix(), resolved
+
+
+def _compatibility_evidence_target(artifact_dir: Path, value: Path | None) -> Path:
+    target = (
+        artifact_dir / "compatibility-materialization.jsonl" if value is None else value
+    )
+    if not isinstance(target, Path):
+        raise TypeError("compatibility_overlay_evidence_path must be a Path")
+    if not target.is_absolute():
+        target = artifact_dir / target
+    if (
+        target.parent != artifact_dir
+        or target.name != "compatibility-materialization.jsonl"
+    ):
+        raise ValueError("compatibility overlay evidence path must be in artifact_dir")
+    if target.exists() or target.is_symlink():
+        raise ValueError("compatibility overlay evidence target is already in use")
+    return target
 
 
 def _snapshot_env(value: object) -> dict[str, str]:
@@ -400,6 +446,8 @@ def _validate_artifact_targets(prepared: _PreparedExperiment) -> None:
     ]
     if prepared.startup_input_plan is not None:
         targets.extend([prepared.startup_input_evidence, prepared.observation_evidence])
+    if prepared.compatibility_overlay_evidence_path is not None:
+        targets.append(prepared.compatibility_overlay_evidence_path)
     for target in targets:
         if target.exists() or target.is_symlink():
             raise ValueError("experiment artifact target is already in use")
@@ -424,6 +472,21 @@ async def _run_candidate(
     sandbox_id: str,
 ) -> ExperimentRecord:
     if prepared.compatibility_overlay_relative is not None:
+        host_artifact_path = prepared.compatibility_overlay_path
+        if (
+            context.compatibility_overlay_path is None
+            or host_artifact_path is None
+            or prepared.compatibility_overlay_evidence_path is None
+        ):
+            raise CompatibilityError("identity_incomplete")
+        await materialize_guest_compatibility_overlay(
+            provider,
+            sandbox_id,
+            host_artifact_path=host_artifact_path,
+            relative_path=prepared.compatibility_overlay_relative,
+            expected_sha256=context.compatibility_overlay_sha256 or "",
+            evidence_path=prepared.compatibility_overlay_evidence_path,
+        )
         await verify_guest_compatibility_overlay(
             provider,
             sandbox_id,

@@ -102,6 +102,27 @@ class RecordingProvider(FakeSandboxProvider):
             self.source_env["APP_MODE"] = "mutated-after-first-await"
         return await super().create(workspace, name)
 
+    async def exec(
+        self, sandbox_id: str, argv: list[str], timeout_s: int = 60
+    ) -> ExecResult:
+        self._require_active(sandbox_id)
+        snapshot = tuple(argv)
+        if "repotrial-compatibility-overlay" in snapshot:
+            self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+            relative_path = snapshot[-3]
+            expected_sha256 = snapshot[-2]
+            return ExecResult(
+                exit_code=0,
+                stdout=(
+                    "root=/workspace\n"
+                    f"path={relative_path}\n"
+                    "mode=600\n"
+                    f"sha256={expected_sha256}\n"
+                ),
+                stderr="",
+            )
+        return await super().exec(sandbox_id, argv, timeout_s)
+
     async def publish_port(self, sandbox_id: str, container_port: int) -> int:
         if self.publish_failure is not None:
             self.calls.append(("publish_port", sandbox_id, container_port))
@@ -126,6 +147,19 @@ class StartupInputProvider(RecordingProvider):
         self._require_active(sandbox_id)
         snapshot = tuple(argv)
         self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+        if "repotrial-compatibility-overlay" in snapshot:
+            relative_path = snapshot[-3]
+            expected_sha256 = snapshot[-2]
+            return ExecResult(
+                exit_code=0,
+                stdout=(
+                    "root=/workspace\n"
+                    f"path={relative_path}\n"
+                    "mode=600\n"
+                    f"sha256={expected_sha256}\n"
+                ),
+                stderr="",
+            )
         if "repotrial-startup-input" in snapshot:
             return ExecResult(
                 exit_code=self.adapter_exit_code,
@@ -232,7 +266,10 @@ def _compose_argv(
     compose_files = ("-f", "compose.yaml")
     compatibility_path = getattr(context, "compatibility_overlay_path", None)
     if compatibility_path is not None:
-        compose_files += ("-f", compatibility_path.name)
+        compose_files += (
+            "-f",
+            compatibility_path.relative_to(context.workspace).as_posix(),
+        )
     base = ("docker", "compose", *compose_files, "-f", context.overlay_path.name)
     return (
         (*prefix, *base, "up", "-d", "--wait", "--wait-timeout", "60"),
@@ -474,7 +511,9 @@ def test_candidate_threads_compatibility_before_hardening_overlay_without_hash_c
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state, mutation, context = _case(tmp_path)
-    compatibility = context.workspace / "compatibility.overlay.yaml"
+    compatibility_dir = context.workspace / ".repotrial-overlays"
+    compatibility_dir.mkdir()
+    compatibility = compatibility_dir / "compatibility.overlay.yaml"
     compatibility.write_text("services: {}\n", encoding="utf-8")
     context = replace(
         context,
@@ -540,15 +579,65 @@ def test_candidate_threads_compatibility_before_hardening_overlay_without_hash_c
     assert boundary_calls == [
         (
             "boot",
-            compatibility.name,
+            compatibility.relative_to(context.workspace).as_posix(),
             context.overlay_path.name,
         ),
         (
             "observation",
-            compatibility.name,
+            compatibility.relative_to(context.workspace).as_posix(),
             context.overlay_path.name,
         ),
     ]
+
+
+def test_candidate_materializes_relative_compatibility_from_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    compatibility_dir = context.workspace / ".repotrial-overlays"
+    compatibility_dir.mkdir()
+    compatibility = compatibility_dir / "compatibility.overlay.yaml"
+    compatibility.write_text("services: {}\n", encoding="utf-8")
+    relative_compatibility = Path(".repotrial-overlays/compatibility.overlay.yaml")
+    absolute_context = replace(
+        context,
+        compatibility_overlay_path=compatibility,
+        compatibility_overlay_sha256=hashlib.sha256(
+            compatibility.read_bytes()
+        ).hexdigest(),
+    )
+    context = replace(
+        absolute_context, compatibility_overlay_path=relative_compatibility
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    provider = RecordingProvider(
+        scripts=_healthy_scripts(absolute_context),
+        ports={8080: 45123},
+        expected_overlay=context.overlay_path,
+    )
+    _install_http_runner(monkeypatch, {"health": Verdict.PASS}, [], provider)
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.verdict is ExperimentVerdict.KEEP
+    compatibility_index = next(
+        index
+        for index, call in enumerate(provider.calls)
+        if call[0] == "exec" and "repotrial-compatibility-overlay" in call[2]
+    )
+    verify_index = next(
+        index
+        for index, call in enumerate(provider.calls)
+        if call[0] == "exec" and call[2][:2] == ("sha256sum", "--")
+    )
+    compose_index = next(
+        index
+        for index, call in enumerate(provider.calls)
+        if call[0] == "exec" and "docker" in call[2] and "compose" in call[2]
+    )
+    assert compatibility_index < verify_index < compose_index
 
 
 def test_candidate_materializes_startup_input_before_boot_with_shared_compose_scope(

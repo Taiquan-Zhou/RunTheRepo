@@ -145,10 +145,6 @@ class GraphProvider(FakeSandboxProvider):
             healthy, logs = self.candidate_healthy, ""
         self._healthy[sandbox_id] = healthy
         self._logs[sandbox_id] = logs
-        if role in self.compatibility_swap_roles:
-            compatibility = workspace / ".repotrial-overlays/compatibility.overlay.yaml"
-            if compatibility.exists():
-                compatibility.write_bytes(b"guest-clone-tampered")
         return sandbox_id
 
     async def exec(
@@ -157,6 +153,23 @@ class GraphProvider(FakeSandboxProvider):
         self._require_active(sandbox_id)
         snapshot = tuple(argv)
         self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+        if "repotrial-compatibility-overlay" in snapshot:
+            relative_path = snapshot[-3]
+            expected_sha256 = snapshot[-2]
+            if self._roles[sandbox_id] in self.compatibility_swap_roles:
+                (self._workspaces[sandbox_id] / relative_path).write_bytes(
+                    b"guest-clone-tampered"
+                )
+            return ExecResult(
+                exit_code=0,
+                stdout=(
+                    "root=/workspace\n"
+                    f"path={relative_path}\n"
+                    "mode=600\n"
+                    f"sha256={expected_sha256}\n"
+                ),
+                stderr="",
+            )
         if "repotrial-startup-input" in snapshot:
             return self.startup_adapter_result
         if snapshot[:2] == ("sha256sum", "--"):
@@ -1277,6 +1290,84 @@ def test_baseline_guest_compatibility_is_verified_before_workload_compose(
     )
     assert verify_index < compose_index
     assert result.run.stop_reason == "no_remaining_mutations"
+
+
+def test_baseline_materializes_compatibility_before_guest_hash_and_compose(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port)
+        context, source = _context(tmp_path, provider, journeys=[])
+        source.write_text(
+            _compose_text(()).replace(
+                "    image: example/web:1\n",
+                "    image: example/web:1\n    ports:\n      - '127.0.0.1:5000:8080'\n",
+            ),
+            encoding="utf-8",
+        )
+
+        _run(_state(source.parent, run_id="materialize-baseline"), context)
+
+    baseline_id = next(
+        sandbox_id for sandbox_id, role in provider._roles.items() if role == "baseline"
+    )
+    baseline_calls = [
+        call for call in provider.calls if call[0] == "exec" and call[1] == baseline_id
+    ]
+    materialize_index = next(
+        index
+        for index, call in enumerate(baseline_calls)
+        if "repotrial-compatibility-overlay" in call[2]
+    )
+    verify_index = next(
+        index for index, call in enumerate(baseline_calls) if call[2][0] == "sha256sum"
+    )
+    compose_index = next(
+        index
+        for index, call in enumerate(baseline_calls)
+        if "docker" in call[2] and "compose" in call[2]
+    )
+    assert materialize_index < verify_index < compose_index
+
+
+def test_candidate_materializes_compatibility_before_guest_hash_and_compose(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+        source.write_text(
+            _compose_text(("root_user",)).replace(
+                "    image: example/web:1\n",
+                "    image: example/web:1\n    ports:\n      - '127.0.0.1:5000:8080'\n",
+            ),
+            encoding="utf-8",
+        )
+
+        _run(_state(source.parent, run_id="materialize-candidate"), context)
+
+    candidate_id = next(
+        sandbox_id
+        for sandbox_id, role in provider._roles.items()
+        if role == "candidate"
+    )
+    candidate_calls = [
+        call for call in provider.calls if call[0] == "exec" and call[1] == candidate_id
+    ]
+    materialize_index = next(
+        index
+        for index, call in enumerate(candidate_calls)
+        if "repotrial-compatibility-overlay" in call[2]
+    )
+    verify_index = next(
+        index for index, call in enumerate(candidate_calls) if call[2][0] == "sha256sum"
+    )
+    compose_index = next(
+        index
+        for index, call in enumerate(candidate_calls)
+        if "docker" in call[2] and "compose" in call[2]
+    )
+    assert materialize_index < verify_index < compose_index
 
 
 def test_baseline_guest_compatibility_mismatch_cleans_and_reports_before_compose(
