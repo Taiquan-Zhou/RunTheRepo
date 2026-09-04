@@ -1117,6 +1117,71 @@ def test_followed_redirect_adds_only_a_bounded_target_hash_to_evidence(
     assert "location" not in json.dumps(evidence).lower()
 
 
+def test_redirect_location_with_space_is_rejected_before_url_normalization(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/redirect":
+            return httpx.Response(302, headers={"location": "/has space"})
+        return httpx.Response(200, text="final")
+
+    result = run(
+        journey(
+            step(
+                "redirect",
+                "GET",
+                "/redirect",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.verdict is Verdict.FAIL
+    assert result.failure_reason == "step-0000:redirect:invalid_location"
+    assert [str(request.url) for request in requests] == [
+        "https://fixture.test/redirect"
+    ]
+
+
+def test_redirect_location_with_non_ascii_raw_byte_is_rejected_before_url_normalization(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/redirect":
+            return httpx.Response(
+                302,
+                headers=[(b"location", b"/x\x85y")],
+            )
+        return httpx.Response(200, text="final")
+
+    result = run(
+        journey(
+            step(
+                "redirect",
+                "GET",
+                "/redirect",
+                [assertion("status_code", "response.status", 200)],
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.verdict is Verdict.FAIL
+    assert result.failure_reason == "step-0000:redirect:invalid_location"
+    assert [str(request.url) for request in requests] == [
+        "https://fixture.test/redirect"
+    ]
+
+
 @pytest.mark.parametrize(
     ("location", "reason"),
     [
@@ -1131,6 +1196,7 @@ def test_followed_redirect_adds_only_a_bounded_target_hash_to_evidence(
         ("https://attacker.test/final", "origin_change"),
         ("", "malformed_location"),
         ("/bad%0apath", "invalid_target"),
+        ("/final?bad=%ZZ", "invalid_target"),
         ("/a/../final", "invalid_target"),
         ("/%252e%252e/final", "invalid_target"),
         ("/a%2fb", "invalid_target"),

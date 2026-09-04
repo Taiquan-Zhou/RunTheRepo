@@ -24,6 +24,10 @@ _MAX_ASSERTIONS_PER_STEP = 64
 _ALLOWED_METHODS = frozenset({"GET", "POST", "DELETE"})
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _MAX_REDIRECTS = 3
+_URI_REFERENCE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~:/?#[]@!$&'()*+,;=%"
+)
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _BEARER_TOKEN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*")
 _PEM_PRIVATE_KEY = re.compile(
     r"-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?(?:-----END [^-\r\n]*PRIVATE KEY-----|\Z)",
@@ -170,6 +174,17 @@ def _validate_redirect_reference_path(path: str) -> bool:
     )
 
 
+def _validate_raw_location(location: str) -> str | None:
+    for index, character in enumerate(location):
+        if character == "%":
+            escape = location[index + 1 : index + 3]
+            if len(escape) != 2 or any(digit not in _HEX_DIGITS for digit in escape):
+                return "invalid_target"
+        elif ord(character) > 127 or character not in _URI_REFERENCE_CHARS:
+            return "invalid_location"
+    return None
+
+
 def _redirect_target(
     response: httpx.Response,
     *,
@@ -187,6 +202,9 @@ def _redirect_target(
         return None, "malformed_location"
     if _has_controls_or_backslash(location):
         return None, "invalid_location"
+    raw_location_error = _validate_raw_location(location)
+    if raw_location_error is not None:
+        return None, raw_location_error
     if location.startswith("//"):
         return None, "network_path"
 
