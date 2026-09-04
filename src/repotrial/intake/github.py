@@ -117,31 +117,59 @@ async def clone_and_resolve(
     claim = _claim_destination(destination)
 
     try:
-        clone_arguments = [
+        git_arguments = [
             "-c",
             "credential.helper=",
             "-c",
             "core.askPass=",
         ]
-        if _parse_credential_free_https_url(clone_source) is not None:
-            clone_arguments.extend(("-c", "http.version=HTTP/1.1"))
-        clone_arguments.extend(("clone", "--filter=blob:none"))
-        if (
-            requested_ref is not None
-            and _FULL_COMMIT_SHA.fullmatch(requested_ref) is None
-        ):
-            clone_arguments.append(f"--branch={requested_ref}")
-        clone_arguments.extend(("--", clone_source, str(destination)))
-        await _run_git("clone", *clone_arguments)
-        if requested_ref is not None and _FULL_COMMIT_SHA.fullmatch(requested_ref):
+        is_remote = _parse_credential_free_https_url(clone_source) is not None
+        if is_remote:
+            git_arguments.extend(("-c", "http.version=HTTP/1.1"))
+        is_exact_remote_commit = bool(
+            is_remote
+            and requested_ref is not None
+            and _FULL_COMMIT_SHA.fullmatch(requested_ref)
+        )
+        if is_exact_remote_commit:
+            assert requested_ref is not None
+            repository_arguments = (*git_arguments, "-C", str(destination))
+            await _run_git("init", *repository_arguments, "init")
             await _run_git(
-                "checkout",
-                "-C",
-                str(destination),
-                "checkout",
-                "--detach",
+                "fetch",
+                *repository_arguments,
+                "fetch",
+                "--depth=1",
+                "--no-tags",
+                "--",
+                clone_source,
                 requested_ref,
             )
+            await _run_git(
+                "checkout",
+                *repository_arguments,
+                "checkout",
+                "--detach",
+                "FETCH_HEAD",
+            )
+        else:
+            clone_arguments = [*git_arguments, "clone", "--filter=blob:none"]
+            if (
+                requested_ref is not None
+                and _FULL_COMMIT_SHA.fullmatch(requested_ref) is None
+            ):
+                clone_arguments.append(f"--branch={requested_ref}")
+            clone_arguments.extend(("--", clone_source, str(destination)))
+            await _run_git("clone", *clone_arguments)
+            if requested_ref is not None and _FULL_COMMIT_SHA.fullmatch(requested_ref):
+                await _run_git(
+                    "checkout",
+                    "-C",
+                    str(destination),
+                    "checkout",
+                    "--detach",
+                    requested_ref,
+                )
         sha_output = await _run_git(
             "resolve", "-C", str(destination), "rev-parse", "--verify", "HEAD^{commit}"
         )
