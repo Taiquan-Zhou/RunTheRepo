@@ -10,7 +10,7 @@ from repotrial.compose.compatibility import CompatibilityError
 from repotrial.sandbox.base import ExecResult, SandboxProvider
 from repotrial.sandbox.lifecycle import CleanupError
 
-_GUEST_VERIFY_TIMEOUT_S = 5
+_GUEST_VERIFY_TIMEOUT_S = 30
 _MAX_GUEST_VERIFY_OUTPUT_BYTES = 1024
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_GUEST_RELATIVE_PATH_BYTES = 4096

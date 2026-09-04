@@ -49,7 +49,7 @@ def test_guest_compatibility_verifier_uses_bounded_argv_and_exact_digest(
         "exec",
         sandbox_id,
         ("sha256sum", "--", relative_path),
-        5,
+        30,
     )
 
 
