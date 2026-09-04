@@ -38,6 +38,14 @@ class CompatibilityArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class CompatibilityPlan:
+    """The side-effect-free serialized bytes for one compatibility overlay."""
+
+    payload: bytes
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class _ShortParts:
     published: str
     target: str
@@ -64,6 +72,17 @@ def write_loopback_compatibility_overlay(
     The input is expected to be the round-trip mapping returned by
     :func:`repotrial.compose.parser.load_compose`.  It is never modified.
     """
+    plan = plan_loopback_compatibility_overlay(compose, container_port)
+    if plan is None:
+        return None
+    return _persist_overlay(plan.payload, path)
+
+
+def plan_loopback_compatibility_overlay(
+    compose: dict[str, object], container_port: int
+) -> CompatibilityPlan | None:
+    """Plan compatibility overlay bytes without touching the filesystem."""
+
     _validate_container_port(container_port)
     bindings = _collect_bindings(compose)
     matches = [
@@ -87,7 +106,10 @@ def write_loopback_compatibility_overlay(
             raise CompatibilityError("published_port_collision")
 
     overlay = _compatibility_overlay(compose, selected)
-    return _persist_overlay(overlay, path)
+    payload = _serialize_overlay(overlay)
+    return CompatibilityPlan(
+        payload=payload, sha256=hashlib.sha256(payload).hexdigest()
+    )
 
 
 def _validate_container_port(container_port: object) -> None:
@@ -325,18 +347,18 @@ def _compatibility_overlay(
         raise CompatibilityError("invalid_compose") from None
 
 
-def _persist_overlay(
-    overlay: Mapping[object, object], path: Path
-) -> CompatibilityArtifact:
+def _serialize_overlay(overlay: Mapping[object, object]) -> bytes:
     yaml = YAML(typ="rt", pure=True)
     yaml.preserve_quotes = True
     try:
         serialized = io.StringIO()
         yaml.dump(overlay, serialized)
-        payload = serialized.getvalue().encode("utf-8")
+        return serialized.getvalue().encode("utf-8")
     except (OSError, TypeError, UnicodeError, ValueError, RecursionError, YAMLError):
         raise CompatibilityError("artifact_persistence_failed") from None
 
+
+def _persist_overlay(payload: bytes, path: Path) -> CompatibilityArtifact:
     try:
         with path.open("x+b") as output:
             written = output.write(payload)

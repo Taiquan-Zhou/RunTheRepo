@@ -11,6 +11,8 @@ from ruamel.yaml import YAML
 from repotrial.compose.compatibility import (
     CompatibilityArtifact,
     CompatibilityError,
+    CompatibilityPlan,
+    plan_loopback_compatibility_overlay,
     write_loopback_compatibility_overlay,
 )
 
@@ -151,6 +153,39 @@ def test_writer_does_not_mutate_input(tmp_path: Path) -> None:
     )
 
     assert compose == before
+
+
+def test_plan_is_side_effect_free_and_writer_reuses_serialized_payload(
+    tmp_path: Path,
+) -> None:
+    compose = _compose(["127.0.0.1:5000:5000"])
+    before = deepcopy(compose)
+    path = tmp_path / "compatibility.overlay.yaml"
+
+    plan = plan_loopback_compatibility_overlay(compose, container_port=5000)
+
+    assert isinstance(plan, CompatibilityPlan)
+    assert plan.sha256 == sha256(plan.payload).hexdigest()
+    assert not path.exists()
+    assert compose == before
+
+    artifact = write_loopback_compatibility_overlay(
+        compose, container_port=5000, path=path
+    )
+
+    assert artifact is not None
+    assert artifact.sha256 == plan.sha256
+    assert path.read_bytes() == plan.payload
+    assert compose == before
+
+
+def test_plan_returns_none_without_writing_for_no_eligible_binding() -> None:
+    assert (
+        plan_loopback_compatibility_overlay(
+            _compose(["0.0.0.0:5000:5000"]), container_port=5000
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(

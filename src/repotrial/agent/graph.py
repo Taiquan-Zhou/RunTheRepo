@@ -28,10 +28,16 @@ from repotrial.agent.state import GraphContext, GraphState, StageName
 from repotrial.compose.compatibility import (
     CompatibilityArtifact,
     CompatibilityError,
+    CompatibilityPlan,
+    plan_loopback_compatibility_overlay,
     write_loopback_compatibility_overlay,
 )
 from repotrial.compose.mutations import apply_mutation
-from repotrial.compose.parser import canonical_compose_json, load_compose
+from repotrial.compose.parser import (
+    ComposeParseError,
+    canonical_compose_json,
+    load_compose,
+)
 from repotrial.compose.risk import analyze_risk
 from repotrial.domain.enums import ExperimentVerdict, Verdict
 from repotrial.domain.models import (
@@ -82,6 +88,7 @@ type NodeUpdate = dict[str, object]
 type BaselineRoute = Literal["boot", "report_or_next"]
 type BootRoute = Literal["boot", "journeys", "report_or_next"]
 type MutationRoute = Literal["experiment", "report_or_next"]
+type ExperimentRoute = Literal["decide", "report_or_next"]
 type ReportRoute = Literal["propose_mutation", "__end__"]
 
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
@@ -113,7 +120,7 @@ def build_run_graph(
     builder.add_edge("journeys", "observe")
     builder.add_edge("observe", "propose_mutation")
     builder.add_conditional_edges("propose_mutation", _mutation_route)
-    builder.add_edge("experiment", "decide")
+    builder.add_conditional_edges("experiment", _experiment_route)
     builder.add_edge("decide", "report_or_next")
     builder.add_conditional_edges("report_or_next", _report_route)
     return builder.compile(
@@ -219,6 +226,7 @@ async def _baseline(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUp
             state.run,
             context,
             compose,
+            allow_create="baseline" not in state.stage_history,
         )
     except CompatibilityError as error:
         run = state.run.model_copy(
@@ -291,7 +299,13 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
     context = runtime.context
     compose_path = _required_compose_path(state.run)
     try:
-        compatibility_path = _verified_compatibility_path(state.run, context)
+        compose = _current_compose(state.run, context)
+        compatibility_artifact = _plan_or_verify_compatibility(
+            state.run,
+            context,
+            compose,
+            allow_create=False,
+        )
     except CompatibilityError as error:
         return {
             "boot_attempt": attempt,
@@ -301,6 +315,9 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
             ),
             "stage_history": _visit(state, "boot"),
         }
+    compatibility_path = (
+        None if compatibility_artifact is None else compatibility_artifact.path
+    )
     compatibility_relative = (
         None
         if compatibility_path is None
@@ -581,40 +598,131 @@ def _plan_or_verify_compatibility(
     run: RunState,
     context: GraphContext,
     compose: dict[str, object],
+    *,
+    allow_create: bool,
 ) -> CompatibilityArtifact | None:
-    workspace = _real_directory(context.workspace, "workspace")
-    overlay_dir = _real_directory_inside(context.overlay_dir, workspace, "overlay_dir")
+    workspace, overlay_dir = _compatibility_directories(context)
     target = overlay_dir / _COMPATIBILITY_OVERLAY_NAME
+    plan = plan_loopback_compatibility_overlay(compose, context.container_port)
     if run.compatibility_overlay_path is not None or (
         run.compatibility_overlay_sha256 is not None
     ):
+        if plan is None:
+            raise CompatibilityError("plan_changed")
         verified = _verified_compatibility_path(run, context)
         if verified is None or run.compatibility_overlay_sha256 is None:
             raise CompatibilityError("identity_incomplete")
+        _verify_compatibility_plan(verified, workspace, overlay_dir, plan)
         return CompatibilityArtifact(
             path=verified,
-            sha256=run.compatibility_overlay_sha256,
+            sha256=plan.sha256,
         )
+    if plan is None:
+        try:
+            target_exists = target.exists() or target.is_symlink()
+        except OSError:
+            raise CompatibilityError("artifact_unreadable") from None
+        if target_exists:
+            raise CompatibilityError("artifact_path_exists")
+        return None
+    if not allow_create:
+        raise CompatibilityError("plan_changed")
     artifact = write_loopback_compatibility_overlay(
         compose,
         context.container_port,
         target,
     )
     if artifact is None:
-        if target.exists() or target.is_symlink():
-            raise CompatibilityError("artifact_path_exists")
-        return None
+        raise CompatibilityError("plan_changed")
     if not isinstance(artifact, CompatibilityArtifact):
         raise CompatibilityError("artifact_invalid")
     if artifact.path != target:
         raise CompatibilityError("planned_artifact_mismatch")
+    if artifact.sha256 != plan.sha256:
+        raise CompatibilityError("artifact_hash_mismatch")
+    _verify_compatibility_plan(target, workspace, overlay_dir, plan)
+    return artifact
+
+
+def _current_compose(run: RunState, context: GraphContext) -> dict[str, object]:
     try:
-        actual_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+        workspace = _real_directory(context.workspace, "workspace")
+        compose_path = _compose_source(workspace, _required_compose_path(run))
+        return load_compose(compose_path)
+    except (ComposeParseError, TypeError, ValueError):
+        raise CompatibilityError("compose_invalid") from None
+
+
+def _compatibility_directories(context: GraphContext) -> tuple[Path, Path]:
+    try:
+        workspace = _real_directory(context.workspace, "workspace")
+    except (TypeError, ValueError):
+        raise CompatibilityError("path_invalid") from None
+    overlay_path = context.overlay_dir
+    if not isinstance(overlay_path, Path):
+        raise CompatibilityError("path_invalid")
+    try:
+        _require_lexical_path_inside(overlay_path, workspace, "overlay_dir")
+    except ValueError:
+        raise CompatibilityError("path_invalid") from None
+    try:
+        _reject_linked_components(workspace, overlay_path)
+    except ValueError as error:
+        reason = "artifact_linked" if "link" in str(error) else "artifact_missing"
+        raise CompatibilityError(reason) from None
+    try:
+        overlay_stat = overlay_path.lstat()
+    except FileNotFoundError:
+        raise CompatibilityError("artifact_missing") from None
+    except OSError:
+        raise CompatibilityError("path_invalid") from None
+    if _is_link(overlay_path, overlay_stat):
+        raise CompatibilityError("artifact_linked")
+    if not stat.S_ISDIR(overlay_stat.st_mode):
+        raise CompatibilityError("path_invalid")
+    try:
+        overlay_dir = overlay_path.resolve(strict=True)
+    except FileNotFoundError:
+        raise CompatibilityError("artifact_missing") from None
+    except OSError:
+        raise CompatibilityError("path_invalid") from None
+    if not overlay_dir.is_relative_to(workspace):
+        raise CompatibilityError("path_invalid")
+    return workspace, overlay_dir
+
+
+def _verify_compatibility_plan(
+    target: Path,
+    workspace: Path,
+    overlay_dir: Path,
+    plan: CompatibilityPlan,
+) -> None:
+    payload = _read_compatibility_artifact(target, workspace, overlay_dir)
+    if payload != plan.payload or hashlib.sha256(payload).hexdigest() != plan.sha256:
+        raise CompatibilityError("plan_changed")
+
+
+def _read_compatibility_artifact(
+    target: Path, workspace: Path, overlay_dir: Path
+) -> bytes:
+    try:
+        target_stat = target.lstat()
+        resolved = target.resolve(strict=True)
+        parent = target.parent.resolve(strict=True)
+    except FileNotFoundError:
+        raise CompatibilityError("artifact_missing") from None
+    except OSError:
+        raise CompatibilityError("artifact_unreadable") from None
+    if _is_link(target, target_stat):
+        raise CompatibilityError("artifact_linked")
+    if not stat.S_ISREG(target_stat.st_mode):
+        raise CompatibilityError("artifact_not_regular")
+    if parent != overlay_dir or resolved != target:
+        raise CompatibilityError("path_invalid")
+    try:
+        return target.read_bytes()
     except (OSError, ValueError):
         raise CompatibilityError("artifact_unreadable") from None
-    if actual_sha256 != artifact.sha256:
-        raise CompatibilityError("artifact_hash_mismatch")
-    return CompatibilityArtifact(path=target, sha256=actual_sha256)
 
 
 def _verified_compatibility_path(
@@ -632,8 +740,7 @@ def _verified_compatibility_path(
     relative = Path(path_value)
     if relative.is_absolute() or relative.drive or ".." in relative.parts:
         raise CompatibilityError("path_invalid")
-    workspace = _real_directory(context.workspace, "workspace")
-    overlay_dir = _real_directory_inside(context.overlay_dir, workspace, "overlay_dir")
+    workspace, overlay_dir = _compatibility_directories(context)
     expected = overlay_dir / _COMPATIBILITY_OVERLAY_NAME
     try:
         expected_relative = expected.relative_to(workspace).as_posix()
@@ -642,24 +749,9 @@ def _verified_compatibility_path(
     if path_value != expected_relative:
         raise CompatibilityError("planned_artifact_mismatch")
     target = workspace / relative
-    try:
-        target_stat = target.lstat()
-        resolved = target.resolve(strict=True)
-        parent = target.parent.resolve(strict=True)
-    except FileNotFoundError:
-        raise CompatibilityError("artifact_missing") from None
-    except OSError:
-        raise CompatibilityError("artifact_unreadable") from None
-    if _is_link(target, target_stat):
-        raise CompatibilityError("artifact_linked")
-    if not stat.S_ISREG(target_stat.st_mode):
-        raise CompatibilityError("artifact_not_regular")
-    if parent != overlay_dir or resolved != target:
-        raise CompatibilityError("path_invalid")
-    try:
-        actual_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
-    except (OSError, ValueError):
-        raise CompatibilityError("artifact_unreadable") from None
+    actual_sha256 = hashlib.sha256(
+        _read_compatibility_artifact(target, workspace, overlay_dir)
+    ).hexdigest()
     if actual_sha256 != sha256_value:
         raise CompatibilityError("artifact_hash_mismatch")
     return target
@@ -718,15 +810,37 @@ def _mutation_route(state: GraphState) -> MutationRoute:
     return "experiment" if state.pending_mutation is not None else "report_or_next"
 
 
+def _experiment_route(state: GraphState) -> ExperimentRoute:
+    return "report_or_next" if state.run.stop_reason is not None else "decide"
+
+
 async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate:
     mutation = state.pending_mutation
     if mutation is None:
         raise ValueError("experiment requires a pending mutation")
     context = runtime.context
     try:
-        compatibility_path = _verified_compatibility_path(state.run, context)
+        compose = _current_compose(state.run, context)
+        compatibility_artifact = _plan_or_verify_compatibility(
+            state.run,
+            context,
+            compose,
+            allow_create=False,
+        )
     except CompatibilityError as error:
-        raise ValueError(f"compatibility:{error.reason}") from None
+        return {
+            "run": state.run.model_copy(
+                update={"stop_reason": f"compatibility:{error.reason}"}
+            ),
+            "pending_mutation": None,
+            "pending_experiment": None,
+            "pending_overlay_path": None,
+            "pending_overlay_materialized": None,
+            "stage_history": _visit(state, "experiment"),
+        }
+    compatibility_path = (
+        None if compatibility_artifact is None else compatibility_artifact.path
+    )
     token = _run_token(state.run.run_id)
     index = len(state.run.experiments)
     attempt_dir, attempt_slot, prior_attempt_directories = _claim_attempt_directory(
