@@ -783,3 +783,9 @@ No RG1 policy plan is created, and no CLI/API default is changed.
   full trusted topology signature. The final strengthened real fixture passed
   in `79.39s` and cleaned to empty inventory. Production remains unchanged and
   the target gate remains `NOT_PROVEN`.
+- Final code HEAD `edd7ad3eb76638e1f53f55358b6678fcd1d002d1`
+  treats every same-origin HTTP status as endpoint reachability while only
+  explicit transport failures may match the topology signature. Focused tests
+  are `9 passed, 2 skipped`; full pytest is `1638 passed, 11 skipped`, coverage
+  `87.13%`; Ruff, format, mypy, pre-commit, diff-check, SBX diagnose 12/12,
+  cleanup, and empty inventory pass. Final independent review remains pending.
