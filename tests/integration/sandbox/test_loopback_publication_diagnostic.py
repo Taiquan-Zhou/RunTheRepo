@@ -42,7 +42,6 @@ _NETWORK_FAILURE_TOKENS = frozenset(
         "connection_aborted_error",
         "connection_refused_error",
         "connection_reset_error",
-        "os_error",
         "remote_disconnected",
         "timeout_error",
         "url_error",
@@ -384,19 +383,18 @@ def _request_published_port(
         urllib.request.ProxyHandler({}), _NoRedirectHandler()
     )
     read_limit = 1 if expected_body is None else len(expected_body) + 1
+    request_url = f"http://127.0.0.1:{host_port}{request_path}"
     try:
-        response = opener.open(
-            f"http://127.0.0.1:{host_port}{request_path}", timeout=10
-        )
+        response = opener.open(request_url, timeout=10)
     except HTTPError as error:
-        if not 300 <= error.code < 400:
+        if error.geturl() != request_url or not 300 <= error.code < 600:
             raise OSError("unexpected_http_status") from None
         try:
             return error.read(read_limit)
         finally:
             error.close()
     with response:
-        if not 200 <= response.status < 400:
+        if not 200 <= response.status < 600:
             raise OSError("unexpected_http_status")
         return response.read(read_limit)
 
@@ -448,6 +446,11 @@ class _DeadlinePublishProvider(FakeSandboxProvider):
 class _InvalidPortProvider(FakeSandboxProvider):
     async def publish_port(self, sandbox_id: str, container_port: int) -> int:
         return 0
+
+
+class _FixedPortProvider(FakeSandboxProvider):
+    async def publish_port(self, sandbox_id: str, container_port: int) -> int:
+        return 12345
 
 
 def test_provider_deadline_failure_is_not_a_loopback_topology_signature() -> None:
@@ -573,6 +576,47 @@ def test_redirect_response_is_reachable_without_following(
     )
 
     assert _request_published_port(12345, "/", None) == b"r"
+
+
+@pytest.mark.parametrize("status", [404, 500])
+def test_http_error_status_proves_original_loopback_endpoint_is_reachable(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    response = HTTPError(
+        "http://127.0.0.1:12345/",
+        status,
+        "target response",
+        {},
+        BytesIO(b"target body"),
+    )
+
+    class _StatusOpener:
+        def open(self, request: str, timeout: int) -> object:
+            raise response
+
+    monkeypatch.setattr(
+        urllib.request,
+        "build_opener",
+        lambda *handlers: _StatusOpener(),
+    )
+    observation = asyncio.run(
+        _run_provider_probe(
+            _FixedPortProvider(),
+            "sandbox-1",
+            port=8080,
+            request_path="/",
+            expected_body=None,
+        )
+    )
+
+    assert observation["status"] == "pass"
+    assert observation["error"] is None
+    assert (
+        _publication_topology_signature(
+            [{"status": "pass"}, {"status": "pass"}, observation]
+        )
+        is False
+    )
 
 
 def test_invalid_observation_is_rejected_before_evidence_file_creation(
