@@ -1,11 +1,15 @@
 import asyncio
+import http.client
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import urllib.request
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 
 import pytest
 from ruamel.yaml import YAML
@@ -39,6 +43,7 @@ _NETWORK_FAILURE_TOKENS = frozenset(
         "connection_refused_error",
         "connection_reset_error",
         "os_error",
+        "remote_disconnected",
         "timeout_error",
         "url_error",
     }
@@ -200,6 +205,32 @@ def _provider_error_token(error: DockerSbxError) -> str:
     return token if _ERROR_TOKEN.fullmatch(token) else "provider_error"
 
 
+def _network_error_token(error: OSError) -> str:
+    reason: object = error.reason if isinstance(error, URLError) else error
+    if isinstance(reason, ConnectionRefusedError):
+        return "connection_refused_error"
+    if isinstance(reason, http.client.RemoteDisconnected):
+        return "remote_disconnected"
+    if isinstance(reason, ConnectionResetError):
+        return "connection_reset_error"
+    if isinstance(reason, ConnectionAbortedError):
+        return "connection_aborted_error"
+    if isinstance(reason, TimeoutError):
+        return "timeout_error"
+    return "url_error" if isinstance(error, URLError) else "os_error"
+
+
+def _network_error_observation(
+    address_class: str, port: int, error: OSError
+) -> dict[str, object]:
+    return {
+        "address_class": address_class,
+        "port": port,
+        "status": "error",
+        "error": _network_error_token(error),
+    }
+
+
 async def _run_provider_probe(
     provider: SandboxProvider,
     sandbox_id: str,
@@ -217,13 +248,20 @@ async def _run_provider_probe(
             "status": "error",
             "error": _provider_error_token(error),
         }
+    if type(host_port) is not int or not 1 <= host_port <= 65_535:
+        return {
+            "address_class": "provider_published_loopback",
+            "port": port,
+            "status": "error",
+            "error": "provider_port_invalid",
+        }
 
     try:
         body = await asyncio.to_thread(
             _request_published_port, host_port, request_path, expected_body
         )
     except OSError as error:
-        return _error_observation("provider_published_loopback", port, error)
+        return _network_error_observation("provider_published_loopback", port, error)
     if expected_body is not None and body != expected_body:
         return {
             "address_class": "provider_published_loopback",
@@ -326,20 +364,47 @@ async def _run_three_probes(
     return [container_observation, guest_observation, provider_observation]
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> None:
+        return None
+
+
 def _request_published_port(
     host_port: int, request_path: str, expected_body: bytes | None
 ) -> bytes:
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(
-        f"http://127.0.0.1:{host_port}{request_path}", timeout=10
-    ) as response:
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _NoRedirectHandler()
+    )
+    read_limit = 1 if expected_body is None else len(expected_body) + 1
+    try:
+        response = opener.open(
+            f"http://127.0.0.1:{host_port}{request_path}", timeout=10
+        )
+    except HTTPError as error:
+        if not 300 <= error.code < 400:
+            raise OSError("unexpected_http_status") from None
+        try:
+            return error.read(read_limit)
+        finally:
+            error.close()
+    with response:
         if not 200 <= response.status < 400:
             raise OSError("unexpected_http_status")
-        read_limit = 1 if expected_body is None else len(expected_body) + 1
         return response.read(read_limit)
 
 
-def _write_observations(path: Path, observations: list[dict[str, object]]) -> None:
+def _write_observations(
+    path: Path, observations: list[dict[str, object]], port: int
+) -> None:
+    _assert_bounded_observations(observations, port)
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
         json.dump(observations, stream, sort_keys=True, separators=(",", ":"))
@@ -380,6 +445,11 @@ class _DeadlinePublishProvider(FakeSandboxProvider):
         raise DockerSbxError("publish_port", "total_duration_exhausted")
 
 
+class _InvalidPortProvider(FakeSandboxProvider):
+    async def publish_port(self, sandbox_id: str, container_port: int) -> int:
+        return 0
+
+
 def test_provider_deadline_failure_is_not_a_loopback_topology_signature() -> None:
     observation = asyncio.run(
         _run_provider_probe(
@@ -413,6 +483,116 @@ def test_provider_deadline_failure_is_not_a_loopback_topology_signature() -> Non
         "error": "provider_total_duration_exhausted",
     }
     assert _publication_topology_signature(observations) is False
+
+
+def test_invalid_provider_port_is_not_requested_or_classified_as_topology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = False
+
+    def unexpected_request(
+        host_port: int, request_path: str, expected_body: bytes | None
+    ) -> bytes:
+        nonlocal requested
+        requested = True
+        raise AssertionError("invalid provider port must not be requested")
+
+    monkeypatch.setattr(
+        sys.modules[__name__], "_request_published_port", unexpected_request
+    )
+    observation = asyncio.run(
+        _run_provider_probe(
+            _InvalidPortProvider(),
+            "sandbox-1",
+            port=8080,
+            request_path="/",
+            expected_body=None,
+        )
+    )
+
+    assert requested is False
+    assert observation["error"] == "provider_port_invalid"
+    assert (
+        _publication_topology_signature(
+            [
+                {"status": "pass"},
+                {"status": "pass"},
+                observation,
+            ]
+        )
+        is False
+    )
+
+
+def test_network_error_tokens_are_explicit_and_match_the_signature() -> None:
+    assert (
+        _network_error_token(URLError(ConnectionRefusedError()))
+        == "connection_refused_error"
+    )
+    assert _network_error_token(TimeoutError()) == "timeout_error"
+    assert (
+        _network_error_token(http.client.RemoteDisconnected()) == "remote_disconnected"
+    )
+
+
+def test_redirect_handler_never_follows_untrusted_location() -> None:
+    request = urllib.request.Request("http://127.0.0.1:12345/")
+
+    assert (
+        _NoRedirectHandler().redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {"Location": "http://169.254.169.254/latest/meta-data/"},
+            "http://169.254.169.254/latest/meta-data/",
+        )
+        is None
+    )
+
+
+def test_redirect_response_is_reachable_without_following(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redirect = HTTPError(
+        "http://127.0.0.1:12345/",
+        302,
+        "Found",
+        {"Location": "http://169.254.169.254/latest/meta-data/"},
+        BytesIO(b"redirect body"),
+    )
+
+    class _RedirectingOpener:
+        def open(self, request: str, timeout: int) -> object:
+            raise redirect
+
+    monkeypatch.setattr(
+        urllib.request,
+        "build_opener",
+        lambda *handlers: _RedirectingOpener(),
+    )
+
+    assert _request_published_port(12345, "/", None) == b"r"
+
+
+def test_invalid_observation_is_rejected_before_evidence_file_creation(
+    tmp_path: Path,
+) -> None:
+    evidence_path = tmp_path / "invalid.json"
+    invalid = [
+        {
+            "address_class": "target_container_loopback",
+            "port": 8080,
+            "status": "pass",
+            "error": None,
+            "unexpected": "must-not-persist",
+        }
+    ]
+
+    with pytest.raises(AssertionError):
+        _write_observations(evidence_path, invalid, 8080)
+
+    assert not evidence_path.exists()
 
 
 @pytest.mark.skipif(
@@ -449,13 +629,14 @@ def test_real_sbx_observes_loopback_publication_boundary(tmp_path: Path) -> None
     _assert_empty_inventory()
     try:
         observations = asyncio.run(exercise())
-        _write_observations(evidence_path, observations)
+        _write_observations(evidence_path, observations, 8080)
     finally:
         _assert_empty_inventory()
 
     _assert_bounded_observations(observations, 8080)
     assert observations[0]["status"] == "pass"
     assert observations[1]["status"] == "pass"
+    assert _publication_topology_signature(observations)
     assert evidence_path.stat().st_mode & 0o777 == 0o600
     assert lifecycle_path.is_file()
 
@@ -501,7 +682,7 @@ def test_changedetection_loopback_publication_boundary(tmp_path: Path) -> None:
     _assert_empty_inventory()
     try:
         actual_sha, observations = asyncio.run(exercise())
-        _write_observations(evidence_path, observations)
+        _write_observations(evidence_path, observations, 5000)
     finally:
         _assert_empty_inventory()
 

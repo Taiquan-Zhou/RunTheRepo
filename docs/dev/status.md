@@ -757,10 +757,10 @@ No RG1 policy plan is created, and no CLI/API default is changed.
 ## M7.5 release-gap closure - RG3 loopback diagnosis (2026-09-04)
 
 - A pinned, unprivileged trusted fixture proved the specific boundary:
-  target-container and sandbox-guest loopback both passed, while
-  `SandboxProvider.publish_port()` ended in a connection reset for the same
-  port. Real-SBX fixture verification passed and cleanup left official
-  inventory exactly empty.
+  target-container and sandbox-guest loopback both passed;
+  `SandboxProvider.publish_port()` returned a host port, after which the fixed
+  host-loopback HTTP request was reset. Real-SBX fixture verification passed
+  and cleanup left official inventory exactly empty.
 - The one frozen changedetection.io diagnostic requested SHA
   `5d9c7c6da76340597243e8163c4f2439237fa0e8` but stopped in the 120-second
   production intake clone window before SHA verification, sandbox creation,
@@ -776,3 +776,10 @@ No RG1 policy plan is created, and no CLI/API default is changed.
   The strengthened real-SBX fixture passed in `89.94s`, reproduced the same
   observation hash, cleaned successfully, and left inventory empty. The RG3
   ruling remains `NOT_PROVEN` because target probes were not observed.
+- A second independent review found that the default host HTTP client could
+  follow an untrusted redirect away from loopback. The diagnostic now forbids
+  redirects, accepts only a valid Provider host port, explicitly classifies
+  network errors, validates evidence before file creation, and requires the
+  full trusted topology signature. The final strengthened real fixture passed
+  in `79.39s` and cleaned to empty inventory. Production remains unchanged and
+  the target gate remains `NOT_PROVEN`.
