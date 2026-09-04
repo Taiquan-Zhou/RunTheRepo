@@ -307,6 +307,57 @@ def test_path_replaced_after_close_before_first_check_is_rejected(
     assert error.value.reason == "artifact_persistence_failed"
 
 
+def test_path_swap_during_read_is_rejected_before_hashing_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "compatibility.overlay.yaml"
+    original = tmp_path / "created.overlay.yaml"
+    replacement = tmp_path / "replacement.overlay.yaml"
+    replacement.write_text("replacement", encoding="utf-8")
+    original_lstat = Path.lstat
+    original_read_bytes = Path.read_bytes
+    swapped = False
+    restored = False
+
+    def swap_after_first_identity_check(candidate: Path) -> object:
+        nonlocal swapped
+        result = original_lstat(candidate)
+        if candidate == path and not swapped:
+            swapped = True
+            path.replace(original)
+            replacement.replace(path)
+        return result
+
+    def read_and_restore(candidate: Path) -> bytes:
+        nonlocal restored
+        data = original_read_bytes(candidate)
+        if candidate == path and swapped and not restored:
+            restored = True
+            path.unlink()
+            original.replace(path)
+        return data
+
+    monkeypatch.setattr(Path, "lstat", swap_after_first_identity_check)
+    monkeypatch.setattr(Path, "read_bytes", read_and_restore)
+
+    try:
+        with pytest.raises(CompatibilityError) as error:
+            write_loopback_compatibility_overlay(
+                _compose(["127.0.0.1:5000:5000"]),
+                container_port=5000,
+                path=path,
+            )
+    finally:
+        if original.exists():
+            if path.exists():
+                path.unlink()
+            original.replace(path)
+
+    assert swapped
+    assert restored is False
+    assert error.value.reason == "artifact_persistence_failed"
+
+
 @pytest.mark.parametrize("field", ["target", "published", "host_ip"])
 def test_tagged_long_binding_values_fail_closed(tmp_path: Path, field: str) -> None:
     value = {

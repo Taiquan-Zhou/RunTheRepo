@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import ipaddress
 import os
 import stat
@@ -330,27 +331,42 @@ def _persist_overlay(
     yaml = YAML(typ="rt", pure=True)
     yaml.preserve_quotes = True
     try:
-        with path.open("x", encoding="utf-8") as output:
-            yaml.dump(overlay, output)
+        serialized = io.StringIO()
+        yaml.dump(overlay, serialized)
+        payload = serialized.getvalue().encode("utf-8")
+    except (OSError, TypeError, UnicodeError, ValueError, RecursionError, YAMLError):
+        raise CompatibilityError("artifact_persistence_failed") from None
+
+    try:
+        with path.open("x+b") as output:
+            written = output.write(payload)
+            if written != len(payload):
+                raise OSError("short artifact write")
             output.flush()
             os.fsync(output.fileno())
             created_identity = _regular_fd_identity(output.fileno())
+            first_identity = _regular_file_identity(path)
+            if first_identity != created_identity:
+                raise CompatibilityError("artifact_persistence_failed")
+            output.seek(0)
+            data = output.read()
+            if _regular_fd_identity(output.fileno()) != created_identity:
+                raise CompatibilityError("artifact_persistence_failed")
+            second_identity = _regular_file_identity(path)
+            if second_identity != created_identity:
+                raise CompatibilityError("artifact_persistence_failed")
+    except CompatibilityError:
+        raise
     except FileExistsError:
         raise CompatibilityError("artifact_path_exists") from None
     except (OSError, TypeError, ValueError, RecursionError, YAMLError):
         raise CompatibilityError("artifact_persistence_failed") from None
 
     try:
-        first_identity = _regular_file_identity(path)
-        if first_identity != created_identity:
-            raise CompatibilityError("artifact_persistence_failed")
-        data = path.read_bytes()
-        second_identity = _regular_file_identity(path)
-    except CompatibilityError:
-        raise
+        closed_identity = _regular_file_identity(path)
     except (OSError, ValueError, UnicodeError):
         raise CompatibilityError("artifact_persistence_failed") from None
-    if second_identity != created_identity:
+    if closed_identity != created_identity:
         raise CompatibilityError("artifact_persistence_failed")
     return CompatibilityArtifact(path=path, sha256=hashlib.sha256(data).hexdigest())
 
