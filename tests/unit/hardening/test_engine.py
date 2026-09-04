@@ -254,7 +254,7 @@ def _healthy_scripts(
     context: ExperimentContext, env: dict[str, str] | None = None
 ) -> dict[tuple[str, ...], ExecResult]:
     up, ps, logs, discovery = _compose_argv(context, env)
-    return {
+    scripts = {
         up: _exec_result(),
         ps: _exec_result(
             stdout=json.dumps(
@@ -269,6 +269,14 @@ def _healthy_scripts(
         logs: _exec_result(),
         discovery: _exec_result(),
     }
+    compatibility_path = getattr(context, "compatibility_overlay_path", None)
+    if compatibility_path is not None:
+        relative = compatibility_path.relative_to(context.workspace).as_posix()
+        digest = hashlib.sha256(compatibility_path.read_bytes()).hexdigest()
+        scripts[("sha256sum", "--", relative)] = _exec_result(
+            stdout=f"{digest}  {relative}\n"
+        )
+    return scripts
 
 
 def _install_http_runner(
@@ -468,7 +476,13 @@ def test_candidate_threads_compatibility_before_hardening_overlay_without_hash_c
     state, mutation, context = _case(tmp_path)
     compatibility = context.workspace / "compatibility.overlay.yaml"
     compatibility.write_text("services: {}\n", encoding="utf-8")
-    context = replace(context, compatibility_overlay_path=compatibility)
+    context = replace(
+        context,
+        compatibility_overlay_path=compatibility,
+        compatibility_overlay_sha256=hashlib.sha256(
+            compatibility.read_bytes()
+        ).hexdigest(),
+    )
     provider = RecordingProvider(
         scripts=_healthy_scripts(context),
         ports={8080: 45123},

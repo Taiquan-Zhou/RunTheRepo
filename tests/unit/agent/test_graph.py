@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import threading
 from contextlib import contextmanager
 from dataclasses import replace
@@ -16,6 +17,7 @@ from ruamel.yaml import YAML
 from repotrial.agent import graph as graph_module
 from repotrial.agent.graph import ainvoke_run, aresume_run, build_run_graph
 from repotrial.agent.state import GraphContext, GraphState
+from repotrial.compose.compatibility import CompatibilityError
 from repotrial.compose.mutations import apply_mutation
 from repotrial.compose.parser import canonical_compose_json, load_compose
 from repotrial.domain.enums import ExperimentVerdict, MutationType, Verdict
@@ -115,6 +117,8 @@ class GraphProvider(FakeSandboxProvider):
         host_port: int | None = None,
         candidate_publish: bool = True,
         startup_adapter_result: ExecResult | None = None,
+        compatibility_mismatch_roles: set[str] | None = None,
+        compatibility_swap_roles: set[str] | None = None,
     ) -> None:
         super().__init__(ports={} if host_port is None else {8080: host_port})
         self.baseline_boots = list(baseline_boots or [(True, "")])
@@ -123,20 +127,28 @@ class GraphProvider(FakeSandboxProvider):
         self.startup_adapter_result = startup_adapter_result or ExecResult(
             exit_code=0, stdout="root=/workspace\nmode=600\n", stderr=""
         )
+        self.compatibility_mismatch_roles = set(compatibility_mismatch_roles or ())
+        self.compatibility_swap_roles = set(compatibility_swap_roles or ())
         self._healthy: dict[str, bool] = {}
         self._logs: dict[str, str] = {}
         self._roles: dict[str, str] = {}
+        self._workspaces: dict[str, Path] = {}
 
     async def create(self, workspace: Path, name: str) -> str:
         sandbox_id = await super().create(workspace, name)
         role = "baseline" if name.startswith("repotrial-baseline-") else "candidate"
         self._roles[sandbox_id] = role
+        self._workspaces[sandbox_id] = workspace
         if role == "baseline":
             healthy, logs = self.baseline_boots.pop(0)
         else:
             healthy, logs = self.candidate_healthy, ""
         self._healthy[sandbox_id] = healthy
         self._logs[sandbox_id] = logs
+        if role in self.compatibility_swap_roles:
+            compatibility = workspace / ".repotrial-overlays/compatibility.overlay.yaml"
+            if compatibility.exists():
+                compatibility.write_bytes(b"guest-clone-tampered")
         return sandbox_id
 
     async def exec(
@@ -147,6 +159,19 @@ class GraphProvider(FakeSandboxProvider):
         self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
         if "repotrial-startup-input" in snapshot:
             return self.startup_adapter_result
+        if snapshot[:2] == ("sha256sum", "--"):
+            relative_path = snapshot[2]
+            if self._roles[sandbox_id] in self.compatibility_mismatch_roles:
+                digest = "0" * 64
+            else:
+                digest = hashlib.sha256(
+                    (self._workspaces[sandbox_id] / relative_path).read_bytes()
+                ).hexdigest()
+            return ExecResult(
+                exit_code=0,
+                stdout=f"{digest}  {relative_path}\n",
+                stderr="",
+            )
         if snapshot[-3:] == ("config", "--format", "json"):
             return ExecResult(
                 exit_code=0,
@@ -1133,6 +1158,230 @@ def test_baseline_records_loopback_compatibility_before_sandbox_and_replays_exac
     )
 
 
+def test_host_compatibility_reader_rejects_lstat_to_open_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    overlay_dir = workspace / ".repotrial-overlays"
+    workspace.mkdir()
+    overlay_dir.mkdir()
+    artifact = overlay_dir / "compatibility.overlay.yaml"
+    artifact.write_bytes(b"safe")
+    original_lstat = Path.lstat
+    swapped = False
+
+    def racing_lstat(path: Path) -> os.stat_result:
+        nonlocal swapped
+        result = original_lstat(path)
+        if path == artifact and not swapped:
+            swapped = True
+            artifact.unlink()
+            artifact.write_bytes(b"swapped")
+        return result
+
+    monkeypatch.setattr(Path, "lstat", racing_lstat)
+    with pytest.raises(CompatibilityError) as error:
+        graph_module._read_compatibility_artifact(
+            artifact, workspace, overlay_dir, max_bytes=4
+        )
+
+    assert error.value.reason == "artifact_changed"
+
+
+def test_host_compatibility_reader_rechecks_identity_after_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    overlay_dir = workspace / ".repotrial-overlays"
+    workspace.mkdir()
+    overlay_dir.mkdir()
+    artifact = overlay_dir / "compatibility.overlay.yaml"
+    artifact.write_bytes(b"safe")
+    original_read = os.read
+    swapped = False
+
+    def racing_read(fd: int, count: int) -> bytes:
+        nonlocal swapped
+        data = original_read(fd, count)
+        if not swapped:
+            swapped = True
+            artifact.unlink()
+            artifact.write_bytes(b"swapped")
+        return data
+
+    monkeypatch.setattr(graph_module.os, "read", racing_read)
+    with pytest.raises(CompatibilityError) as error:
+        graph_module._read_compatibility_artifact(
+            artifact, workspace, overlay_dir, max_bytes=4
+        )
+
+    assert error.value.reason == "artifact_changed"
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_reason"),
+    [("oversize", "artifact_oversize"), ("fifo", "artifact_not_regular")],
+)
+def test_host_compatibility_reader_bounds_and_rejects_non_regular_files(
+    tmp_path: Path, kind: str, expected_reason: str
+) -> None:
+    workspace = tmp_path / "workspace"
+    overlay_dir = workspace / ".repotrial-overlays"
+    workspace.mkdir()
+    overlay_dir.mkdir()
+    artifact = overlay_dir / "compatibility.overlay.yaml"
+    if kind == "oversize":
+        artifact.write_bytes(b"safe!")
+    else:
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO support is unavailable")
+        os.mkfifo(artifact)
+
+    with pytest.raises(CompatibilityError) as error:
+        graph_module._read_compatibility_artifact(
+            artifact, workspace, overlay_dir, max_bytes=4
+        )
+
+    assert error.value.reason == expected_reason
+
+
+def test_baseline_guest_compatibility_is_verified_before_workload_compose(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port)
+        context, source = _context(tmp_path, provider)
+        source.write_text(
+            _compose_text(()).replace(
+                "    image: example/web:1\n",
+                "    image: example/web:1\n    ports:\n      - '127.0.0.1:5000:8080'\n",
+            ),
+            encoding="utf-8",
+        )
+
+        result = _run(_state(source.parent, run_id="guest-order"), context)
+
+    baseline_id = next(
+        sandbox_id for sandbox_id, role in provider._roles.items() if role == "baseline"
+    )
+    baseline_calls = [
+        call for call in provider.calls if call[0] == "exec" and call[1] == baseline_id
+    ]
+    verify_index = next(
+        index for index, call in enumerate(baseline_calls) if call[2][0] == "sha256sum"
+    )
+    compose_index = next(
+        index
+        for index, call in enumerate(baseline_calls)
+        if "docker" in call[2] and "compose" in call[2]
+    )
+    assert verify_index < compose_index
+    assert result.run.stop_reason == "no_remaining_mutations"
+
+
+def test_baseline_guest_compatibility_mismatch_cleans_and_reports_before_compose(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(
+            host_port=port, compatibility_mismatch_roles={"baseline"}
+        )
+        context, source = _context(tmp_path, provider, journeys=[])
+        source.write_text(
+            _compose_text(()).replace(
+                "    image: example/web:1\n",
+                "    image: example/web:1\n    ports:\n      - '127.0.0.1:5000:8080'\n",
+            ),
+            encoding="utf-8",
+        )
+
+        result = _run(_state(source.parent, run_id="guest-baseline-mismatch"), context)
+
+    assert result.run.stop_reason == "compatibility:guest_hash_mismatch"
+    assert result.stage_history[-2:] == ["boot", "report_or_next"]
+    baseline_id = next(
+        sandbox_id for sandbox_id, role in provider._roles.items() if role == "baseline"
+    )
+    assert any(
+        call[0] == "destroy" and call[1] == baseline_id for call in provider.calls
+    )
+    assert not any(
+        call[0] == "exec"
+        and call[1] == baseline_id
+        and "docker" in call[2]
+        and "compose" in call[2]
+        for call in provider.calls
+    )
+
+
+def test_guest_compatibility_detects_verify_to_clone_swap_before_compose(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port, compatibility_swap_roles={"baseline"})
+        context, source = _context(tmp_path, provider, journeys=[])
+        source.write_text(
+            _compose_text(()).replace(
+                "    image: example/web:1\n",
+                "    image: example/web:1\n    ports:\n      - '127.0.0.1:5000:8080'\n",
+            ),
+            encoding="utf-8",
+        )
+
+        result = _run(_state(source.parent, run_id="guest-clone-swap"), context)
+
+    assert result.run.stop_reason == "compatibility:guest_hash_mismatch"
+    baseline_id = next(
+        sandbox_id for sandbox_id, role in provider._roles.items() if role == "baseline"
+    )
+    assert any(
+        call[0] == "destroy" and call[1] == baseline_id for call in provider.calls
+    )
+    assert not any(
+        call[0] == "exec"
+        and call[1] == baseline_id
+        and "docker" in call[2]
+        and "compose" in call[2]
+        for call in provider.calls
+    )
+
+
+def test_candidate_guest_compatibility_mismatch_cleans_and_reports_before_compose(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(
+            host_port=port, compatibility_mismatch_roles={"candidate"}
+        )
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+        source.write_text(
+            _compose_text(("root_user",)).replace(
+                "    image: example/web:1\n",
+                "    image: example/web:1\n    ports:\n      - '127.0.0.1:5000:8080'\n",
+            ),
+            encoding="utf-8",
+        )
+
+        result = _run(_state(source.parent, run_id="guest-candidate-mismatch"), context)
+
+    assert result.run.stop_reason == "compatibility:guest_hash_mismatch"
+    assert result.stage_history[-2:] == ["experiment", "report_or_next"]
+    candidate_id = next(
+        sandbox_id
+        for sandbox_id, role in provider._roles.items()
+        if role == "candidate"
+    )
+    candidate_calls = [
+        call for call in provider.calls if call[0] == "exec" and call[1] == candidate_id
+    ]
+    assert any(
+        call[0] == "destroy" and call[1] == candidate_id for call in provider.calls
+    )
+    assert not any(
+        "docker" in call[2] and "compose" in call[2] for call in candidate_calls
+    )
+
+
 def test_candidate_preserves_compatibility_identity_and_hash_policy(
     tmp_path: Path,
 ) -> None:
@@ -1175,6 +1424,20 @@ def test_candidate_preserves_compatibility_identity_and_hash_policy(
         for sandbox_id, role in provider._roles.items()
         if role == "candidate"
     )
+    candidate_exec_calls = [
+        call for call in provider.calls if call[0] == "exec" and call[1] == candidate_id
+    ]
+    guest_verify_index = next(
+        index
+        for index, call in enumerate(candidate_exec_calls)
+        if call[2][0] == "sha256sum"
+    )
+    first_compose_index = next(
+        index
+        for index, call in enumerate(candidate_exec_calls)
+        if "docker" in call[2] and "compose" in call[2]
+    )
+    assert guest_verify_index < first_compose_index
     compose_calls = [
         call[2]
         for call in provider.calls

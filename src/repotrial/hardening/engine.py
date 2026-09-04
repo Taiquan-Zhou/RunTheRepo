@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from repotrial.compose.compatibility import CompatibilityError
 from repotrial.compose.mutations import MutationError, apply_mutation
 from repotrial.compose.overlay import write_overlay
 from repotrial.compose.parser import canonical_compose_json, load_compose
@@ -25,6 +26,7 @@ from repotrial.sandbox.base import SandboxProvider
 from repotrial.sandbox.docker_sbx import DockerSbxError
 from repotrial.sandbox.lifecycle import CleanupError, managed_sandbox
 from repotrial.trial.boot import _validated_env_prefix, boot_compose
+from repotrial.trial.compatibility import verify_guest_compatibility_overlay
 from repotrial.trial.observer import (
     _collect_observation_with_evidence,
     collect_observation,
@@ -70,6 +72,7 @@ class ExperimentContext:
     prior_attempt_directories: tuple[Path, ...] = ()
     startup_input_identity_path: Path | None = None
     compatibility_overlay_path: Path | None = None
+    compatibility_overlay_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +173,8 @@ async def run_experiment(
                 sandbox_id,
             )
     except CleanupError:
+        raise
+    except CompatibilityError:
         raise
     except _ExperimentSandboxFailure as failure:
         return _record(
@@ -418,6 +423,13 @@ async def _run_candidate(
     prepared: _PreparedExperiment,
     sandbox_id: str,
 ) -> ExperimentRecord:
+    if prepared.compatibility_overlay_relative is not None:
+        await verify_guest_compatibility_overlay(
+            provider,
+            sandbox_id,
+            relative_path=prepared.compatibility_overlay_relative,
+            expected_sha256=context.compatibility_overlay_sha256 or "",
+        )
     startup_plan = prepared.startup_input_plan
     if startup_plan is not None:
         try:
