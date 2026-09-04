@@ -1283,6 +1283,15 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
     }
     for key in disk_keys:
         monkeypatch.setenv(key, "host-value-must-not-leak")
+    host_docker_config = tmp_path / "host-docker-config"
+    host_docker_config.mkdir()
+    (host_docker_config / "config.json").write_text(
+        '{"auths":{"registry.example":{"auth":"must-not-leak"}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DOCKER_CONFIG", str(host_docker_config))
+    monkeypatch.setenv("DOCKER_AUTH_CONFIG", "host-auth-must-not-leak")
+    monkeypatch.setenv("REGISTRY_AUTH_FILE", "host-registry-auth-must-not-leak")
     monkeypatch.setenv("REPOTRIAL_TEST_SENTINEL", "preserved")
     spawner = _SbxSpawner()
     provider = _provider(monkeypatch, spawner)
@@ -1350,12 +1359,21 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
     assert create_env["DOCKER_SANDBOXES_ROOT_SIZE"] == "1m"
     assert create_env["DOCKER_SANDBOXES_DOCKER_SIZE"] == "1919m"
     assert create_env["DOCKER_SANDBOXES_CLONED_WORKSPACE_SIZE"] == "128m"
+    anonymous_docker_config = Path(create_env["DOCKER_CONFIG"])
+    assert anonymous_docker_config != host_docker_config
+    assert anonymous_docker_config.name.startswith("repotrial-docker-config-")
+    assert not anonymous_docker_config.exists()
+    assert "DOCKER_AUTH_CONFIG" not in create_env
+    assert "REGISTRY_AUTH_FILE" not in create_env
     assert create_env["REPOTRIAL_TEST_SENTINEL"] == "preserved"
     for index, kwargs in enumerate(spawner.kwargs):
         if index == create_index:
             continue
         environment = cast(dict[str, str], kwargs.get("env"))
         assert environment["REPOTRIAL_TEST_SENTINEL"] == "preserved"
+        assert environment["DOCKER_CONFIG"] == str(host_docker_config)
+        assert environment["DOCKER_AUTH_CONFIG"] == "host-auth-must-not-leak"
+        assert environment["REGISTRY_AUTH_FILE"] == "host-registry-auth-must-not-leak"
         assert disk_keys.isdisjoint(environment)
     assert not any(
         call[:2] == ("sbx", "exec")

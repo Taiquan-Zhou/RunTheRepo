@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -350,14 +351,22 @@ class DockerSbxProvider(SandboxProvider):
             arguments.extend(("--deny-network", resource))
         arguments.extend(("shell", str(resolved_workspace)))
         try:
-            result = await self._run(
-                "create",
-                arguments,
-                self._command_timeout_s,
-                env=self._disk_environment(allocation),
-                deadline=deadline,
-                sandbox_id=sandbox_id,
-            )
+            with tempfile.TemporaryDirectory(
+                prefix="repotrial-docker-config-",
+                ignore_cleanup_errors=True,
+            ) as docker_config:
+                create_environment = self._disk_environment(allocation)
+                create_environment.pop("DOCKER_AUTH_CONFIG", None)
+                create_environment.pop("REGISTRY_AUTH_FILE", None)
+                create_environment["DOCKER_CONFIG"] = docker_config
+                result = await self._run(
+                    "create",
+                    arguments,
+                    self._command_timeout_s,
+                    env=create_environment,
+                    deadline=deadline,
+                    sandbox_id=sandbox_id,
+                )
             _require_success("create", result)
             await self._verify_guest_clone(
                 sandbox_id,
