@@ -830,3 +830,23 @@ No RG1 policy plan is created, and no CLI/API default is changed.
 - No production code, tests, manifest, README, or historical evidence was
   changed. Daemon lifecycle commands were not used and host fallback was not
   observed.
+
+## M7.5 Stage A Task 2 — blocked at cleanup (2026-09-04)
+
+- Controller reread the retained Linkding artifact
+  `37a85bd2-0034-437a-8de1-9968843b1684` after the process exited. It records
+  exact SHA verification, `exit_code=4`, `CleanupError`,
+  `stop_reason=internal:cleanuperror`, and `131.71963241800404s` duration.
+- Cleanup evidence is exact and retained: lifecycle SHA-256
+  `c5ecf44886b3500ece4a6e7b7e3c30e3ad3c078fd780c45d781e06c57eb7c375`, with
+  `create_cleanup_unsafe` followed by `cleanup_retry_failure`, both
+  `DockerSbxError`. Attempt-result SHA-256 is
+  `c669aa676e4f6aa0de140ea63816811f4a6385771bf88ae64e926c015d06e116`.
+- The official `sbx list` exited `0` and returned `No sandboxes found.` (plus
+  its non-inventory launch hint); the Docker Hub refresh-lock warning was
+  recorded but is not inventory evidence. Therefore `cleanup=FAIL` and
+  `post_attempt_inventory=empty` are retained as distinct facts.
+- This hard stop prevented any changedetection.io run. Stage A is
+  `BLOCKED_AT_CLEANUP`; no next module is selected pending cleanup
+  adjudication. No daemon lifecycle operation, repair, retry, or production
+  change was performed.
