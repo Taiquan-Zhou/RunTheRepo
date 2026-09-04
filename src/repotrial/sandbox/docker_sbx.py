@@ -863,9 +863,7 @@ class DockerSbxProvider(SandboxProvider):
             self._command_timeout_s,
             sandbox_id=sandbox_id,
         )
-        if result.returncode != 0 and not _is_exact_sandbox_absence(
-            result.stderr, sandbox_id
-        ):
+        if result.returncode != 0 and not _is_exact_sandbox_absence(result, sandbox_id):
             _require_success(operation, result)
         self._sandbox_states[sandbox_id] = _SandboxState.CLEANED
         self._sandbox_deadlines.pop(sandbox_id, None)
@@ -1432,20 +1430,24 @@ def _require_success(operation: str, result: _CommandResult) -> None:
         )
 
 
-def _is_exact_sandbox_absence(stderr: bytes, sandbox_id: str) -> bool:
-    try:
-        decoded = stderr.decode("utf-8")
-    except UnicodeDecodeError:
+def _is_exact_sandbox_absence(result: _CommandResult, sandbox_id: str) -> bool:
+    if result.stdout != b"":
         return False
-    escaped_sandbox_id = re.escape(sandbox_id)
-    return (
-        re.search(
-            rf"(?m)^Error:\s+sandbox\s+\x27{escaped_sandbox_id}\x27\s+not found"
-            rf"(?:\s+\(run \x27sbx ls\x27 to see your sandboxes\))?\s*$",
-            decoded,
-        )
-        is not None
+    exact_error = (
+        f"Error: sandbox \x27{sandbox_id}\x27 not found "
+        "(run \x27sbx ls\x27 to see your sandboxes)"
+    ).encode()
+    warning = (
+        b"WARN: could not acquire docker hub refresh lock, proceeding without "
+        b"cross-process lock: context deadline exceeded"
     )
+    allowed_stderr = (
+        exact_error,
+        exact_error + b"\n",
+        warning + b"\n" + exact_error,
+        warning + b"\n" + exact_error + b"\n",
+    )
+    return result.stderr in allowed_stderr
 
 
 def _has_token(output: bytes, token: str) -> bool:

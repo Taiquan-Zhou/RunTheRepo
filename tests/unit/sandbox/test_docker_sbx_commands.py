@@ -67,6 +67,12 @@ PROBE_CALLS = [
 ]
 HOST_HEAD = b"0123456789abcdef0123456789abcdef01234567\n"
 GUEST_WORKSPACE = b"/workspace\n"
+OBSERVED_ABSENCE_STDERR = (
+    b"WARN: could not acquire docker hub refresh lock, proceeding without cross-process lock: "
+    b"context deadline exceeded\n"
+    b"Error: sandbox \x27sandbox-17\x27 not found "
+    b"(run \x27sbx ls\x27 to see your sandboxes)\n"
+)
 
 
 @dataclass(frozen=True)
@@ -2314,39 +2320,74 @@ def test_failed_destroy_keeps_provider_state_for_retry(
 
 
 @pytest.mark.parametrize(
-    ("stderr", "should_clean"),
+    ("case", "stdout", "stderr", "should_clean"),
     [
         (
-            (
-                b"Error: sandbox \x27sandbox-17\x27 not found "
-                b"(run \x27sbx ls\x27 to see your sandboxes)\n"
-            ),
+            "observed exact-ID absence",
+            b"",
+            OBSERVED_ABSENCE_STDERR,
             True,
         ),
         (
+            "wrong ID",
+            b"",
             (
+                b"WARN: could not acquire docker hub refresh lock, proceeding without cross-process lock: "
+                b"context deadline exceeded\n"
                 b"Error: sandbox \x27other-id\x27 not found "
                 b"(run \x27sbx ls\x27 to see your sandboxes)\n"
             ),
             False,
         ),
-        (b"Error: sandbox not found\n", False),
         (
+            "generic not-found",
+            b"",
+            b"Error: sandbox not found\n",
+            False,
+        ),
+        (
+            "ambiguous suffix",
+            b"",
             b"Error: sandbox \x27sandbox-17\x27 not found or unavailable\n",
             False,
         ),
-        (b"cleanup failed\n", False),
+        ("other error", b"", b"cleanup failed\n", False),
+        (
+            "invalid stderr",
+            b"",
+            b"Error: sandbox \x27sandbox-17\x27 not found\xff\n",
+            False,
+        ),
+        ("nonempty stdout", b"unexpected\n", OBSERVED_ABSENCE_STDERR, False),
+        ("invalid stdout", b"\xff", OBSERVED_ABSENCE_STDERR, False),
+        (
+            "extra error line",
+            b"",
+            OBSERVED_ABSENCE_STDERR + b"Error: cleanup failed\n",
+            False,
+        ),
+        (
+            "cross-line token",
+            b"",
+            b"Error: sandbox\n\x27sandbox-17\x27 not found\n",
+            False,
+        ),
     ],
 )
-def test_destroy_only_accepts_exact_id_absence_as_cleanup_success(
+def test_destroy_requires_strict_exact_id_absence_result(
+    case: str,
+    stdout: bytes,
     stderr: bytes,
     should_clean: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    assert case
     spawner = _SbxSpawner()
     provider, sandbox_id = _active_provider(monkeypatch, spawner)
     remove_command = ("sbx", "rm", "--force", sandbox_id)
-    spawner.overrides[remove_command] = _Outcome(returncode=1, stderr=stderr)
+    spawner.overrides[remove_command] = _Outcome(
+        returncode=1, stdout=stdout, stderr=stderr
+    )
 
     if should_clean:
         asyncio.run(provider.destroy(sandbox_id))
