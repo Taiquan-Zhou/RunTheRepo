@@ -789,3 +789,19 @@ No RG1 policy plan is created, and no CLI/API default is changed.
   are `9 passed, 2 skipped`; full pytest is `1638 passed, 11 skipped`, coverage
   `87.13%`; Ruff, format, mypy, pre-commit, diff-check, SBX diagnose 12/12,
   cleanup, and empty inventory pass. Final independent review remains pending.
+
+## M7.5 release-gap closure - Task 7/8 final ruling (2026-09-04)
+
+- Task 7 final independent review: `APPROVE`, zero Critical/Important findings,
+  for code HEAD `edd7ad3e` and evidence closure `b981cae7`; provenance is
+  retained in pilot evidence under reviewer task
+  `01a06acd-0c2b-7530-b791-263a21d46f99`.
+- Task 8 mechanically recomputed the seven former failures at latest reviewed
+  HEAD `b981cae72b5ca7166ce025d504f94b4c6abb699b`. No retained row satisfies the
+  complete same-HEAD autonomous-success predicate; `recovery_count=0`.
+- Ruling: `STAGE1_RECOVERY_GATE_UNMET`. The frozen four-recovery admission to
+  Task 9 is not met. Do not run the complete cohort, mutation stage, or README
+  release update; no broader compatibility work is authorized by this plan.
+- Task 8 independent review: `APPROVE`, zero Critical/Important/Minor after
+  Task 7 review provenance was made durable. Reviewer task:
+  `01a06ad1-8c2a-7e80-a579-8a83b9342d1e`.
