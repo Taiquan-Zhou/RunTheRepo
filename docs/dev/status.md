@@ -753,3 +753,19 @@ No RG1 policy plan is created, and no CLI/API default is changed.
   `1629 passed, 9 skipped, 1 warning`; branch coverage `87.13%`; Ruff,
   formatting, mypy, pre-commit, diff-check, secret-pattern scan, and final
   empty SBX inventory all PASS.
+
+## M7.5 release-gap closure - RG3 loopback diagnosis (2026-09-04)
+
+- A pinned, unprivileged trusted fixture proved the specific boundary:
+  target-container and sandbox-guest loopback both passed, while
+  `SandboxProvider.publish_port()` ended in a connection reset for the same
+  port. Real-SBX fixture verification passed and cleanup left official
+  inventory exactly empty.
+- The one frozen changedetection.io diagnostic requested SHA
+  `5d9c7c6da76340597243e8163c4f2439237fa0e8` but stopped in the 120-second
+  production intake clone window before SHA verification, sandbox creation,
+  Boot, or any target probe. No target observation artifact exists.
+- Ruling: `RG3_ENTRY_GATE=NOT_PROVEN`, recovery increment `0`. The trusted
+  fixture result is not sufficient to infer the target result. No production
+  compatibility change or separate design is authorized; proceed to the
+  frozen same-HEAD Stage 1 recovery recomputation.
