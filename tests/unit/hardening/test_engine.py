@@ -229,7 +229,11 @@ def _compose_argv(
     prefix: tuple[str, ...] = ()
     if env:
         prefix = ("env", *(f"{key}={value}" for key, value in sorted(env.items())))
-    base = ("docker", "compose", "-f", "compose.yaml", "-f", context.overlay_path.name)
+    compose_files = ("-f", "compose.yaml")
+    compatibility_path = getattr(context, "compatibility_overlay_path", None)
+    if compatibility_path is not None:
+        compose_files += ("-f", compatibility_path.name)
+    base = ("docker", "compose", *compose_files, "-f", context.overlay_path.name)
     return (
         (*prefix, *base, "up", "-d", "--wait", "--wait-timeout", "60"),
         (*prefix, *base, "ps", "--all", "--format", "json"),
@@ -456,6 +460,81 @@ def test_real_overlay_hashes_ordered_replay_and_environment_snapshot_yield_keep(
     )
     assert state == state_before
     assert mutation == mutation_before
+
+
+def test_candidate_threads_compatibility_before_hardening_overlay_without_hash_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    compatibility = context.workspace / "compatibility.overlay.yaml"
+    compatibility.write_text("services: {}\n", encoding="utf-8")
+    context = replace(context, compatibility_overlay_path=compatibility)
+    provider = RecordingProvider(
+        scripts=_healthy_scripts(context),
+        ports={8080: 45123},
+        expected_overlay=context.overlay_path,
+    )
+    boundary_calls: list[tuple[str, str | None, str | None]] = []
+
+    async def fake_boot(
+        provider: FakeSandboxProvider,
+        sandbox_id: str,
+        compose_path: str,
+        env: dict[str, str],
+        attempt: int,
+        *,
+        overlay_path: str | None = None,
+        compatibility_overlay_path: str | None = None,
+    ) -> BootResult:
+        del provider, sandbox_id, compose_path, env, attempt
+        boundary_calls.append(("boot", compatibility_overlay_path, overlay_path))
+        return BootResult(verdict=Verdict.PASS, service_states={}, logs={}, attempt=1)
+
+    async def fake_observer(
+        provider: FakeSandboxProvider,
+        sandbox_id: str,
+        compose_path: str,
+        artifact_path: Path,
+        *,
+        overlay_path: str | None = None,
+        compatibility_overlay_path: str | None = None,
+    ) -> ObservationSnapshot:
+        del provider, sandbox_id, compose_path
+        boundary_calls.append(("observation", compatibility_overlay_path, overlay_path))
+        artifact_path.write_text("observed", encoding="utf-8")
+        return ObservationSnapshot()
+
+    monkeypatch.setattr(engine_module, "boot_compose", fake_boot)
+    monkeypatch.setattr(engine_module, "collect_observation", fake_observer)
+    _install_http_runner(monkeypatch, {"health": Verdict.PASS}, [], provider)
+    base = load_compose(context.workspace / "compose.yaml")
+    candidate = apply_mutation(base, mutation)
+    expected_parent = (
+        "sha256:"
+        + hashlib.sha256(canonical_compose_json(base).encode("utf-8")).hexdigest()
+    )
+    expected_candidate = (
+        "sha256:"
+        + hashlib.sha256(canonical_compose_json(candidate).encode("utf-8")).hexdigest()
+    )
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.verdict is ExperimentVerdict.KEEP
+    assert record.parent_config_hash == expected_parent
+    assert record.candidate_config_hash == expected_candidate
+    assert boundary_calls == [
+        (
+            "boot",
+            compatibility.name,
+            context.overlay_path.name,
+        ),
+        (
+            "observation",
+            compatibility.name,
+            context.overlay_path.name,
+        ),
+    ]
 
 
 def test_candidate_materializes_startup_input_before_boot_with_shared_compose_scope(
@@ -743,8 +822,9 @@ def _patch_boot(
         attempt: int,
         *,
         overlay_path: str | None = None,
+        compatibility_overlay_path: str | None = None,
     ) -> BootResult:
-        del provider, sandbox_id, env, attempt
+        del provider, sandbox_id, env, attempt, compatibility_overlay_path
         calls.append((compose_path, overlay_path))
         return BootResult(verdict=verdict, service_states={}, logs={}, attempt=1)
 
@@ -761,8 +841,17 @@ def _patch_boot_error(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> 
         attempt: int,
         *,
         overlay_path: str | None = None,
+        compatibility_overlay_path: str | None = None,
     ) -> BootResult:
-        del provider, sandbox_id, compose_path, env, attempt, overlay_path
+        del (
+            provider,
+            sandbox_id,
+            compose_path,
+            env,
+            attempt,
+            overlay_path,
+            compatibility_overlay_path,
+        )
         raise error
 
     monkeypatch.setattr(engine_module, "boot_compose", fake_boot)
@@ -781,8 +870,9 @@ def _patch_observer(
         artifact_path: Path,
         *,
         overlay_path: str | None = None,
+        compatibility_overlay_path: str | None = None,
     ) -> ObservationSnapshot:
-        del provider, sandbox_id
+        del provider, sandbox_id, compatibility_overlay_path
         calls.append((compose_path, overlay_path, artifact_path))
         if isinstance(snapshot, BaseException):
             raise snapshot

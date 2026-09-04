@@ -1080,6 +1080,202 @@ def test_default_graph_composes_real_baseline_services_in_one_sandbox(
     assert "collector_succeeded" not in result.run.model_dump_json()
 
 
+def test_baseline_records_loopback_compatibility_before_sandbox_and_replays_exact_file(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port)
+        context, source = _context(tmp_path, provider, journeys=[])
+        source.write_text(
+            _compose_text(()).replace(
+                "    image: example/web:1\n",
+                "    image: example/web:1\n"
+                f"    ports:\n      - '127.0.0.1:{port}:8080'\n",
+            ),
+            encoding="utf-8",
+        )
+        source_before = source.read_bytes()
+        graph = build_run_graph(interrupt_after=("baseline",))
+        state = _state(source.parent, run_id="compatibility-baseline")
+
+        interrupted = asyncio.run(ainvoke_run(graph, state, context=context))
+
+        assert [call for call in provider.calls if call[0] == "create"] == []
+        assert interrupted.run.compatibility_overlay_path == (
+            ".repotrial-overlays/compatibility.overlay.yaml"
+        )
+        assert interrupted.run.compatibility_overlay_sha256 is not None
+        compatibility = context.workspace / interrupted.run.compatibility_overlay_path
+        assert compatibility.is_file()
+        assert hashlib.sha256(compatibility.read_bytes()).hexdigest() == (
+            interrupted.run.compatibility_overlay_sha256
+        )
+        assert (
+            interrupted.run.artifacts.count(interrupted.run.compatibility_overlay_path)
+            == 1
+        )
+        assert source.read_bytes() == source_before
+
+        resumed = asyncio.run(aresume_run(graph, state.run_id, context=context))
+
+    compose_calls = [
+        call[2]
+        for call in provider.calls
+        if call[0] == "exec" and "docker" in call[2] and "compose" in call[2]
+    ]
+    assert compose_calls
+    assert all(
+        ".repotrial-overlays/compatibility.overlay.yaml" in argv
+        for argv in compose_calls
+    )
+    assert resumed.run.compatibility_overlay_path == (
+        interrupted.run.compatibility_overlay_path
+    )
+
+
+def test_candidate_preserves_compatibility_identity_and_hash_policy(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+        source.write_text(
+            _compose_text(("root_user",)).replace(
+                "    image: example/web:1\n",
+                "    image: example/web:1\n"
+                f"    ports:\n      - '127.0.0.1:{port}:8080'\n",
+            ),
+            encoding="utf-8",
+        )
+        source_before = source.read_bytes()
+        state = _state(source.parent, run_id="compatibility-candidate")
+
+        result = _run(state, context)
+
+    assert result.run.compatibility_overlay_path == (
+        ".repotrial-overlays/compatibility.overlay.yaml"
+    )
+    assert result.run.compatibility_overlay_sha256 is not None
+    assert result.run.artifacts.count(result.run.compatibility_overlay_path) == 1
+    assert source.read_bytes() == source_before
+    assert result.run.experiments
+    experiment = result.run.experiments[0]
+    assert experiment.parent_config_hash == _compose_hash(source)
+    candidate = apply_mutation(load_compose(source), experiment.mutation)
+    assert experiment.candidate_config_hash == (
+        "sha256:"
+        + hashlib.sha256(canonical_compose_json(candidate).encode("utf-8")).hexdigest()
+    )
+    compose_calls = [
+        call[2]
+        for call in provider.calls
+        if call[0] == "exec" and "docker" in call[2] and "compose" in call[2]
+    ]
+    candidate_calls = [
+        argv
+        for argv in compose_calls
+        if sum(item.endswith(".overlay.yaml") for item in argv) >= 2
+        and ".repotrial-overlays/compatibility.overlay.yaml" in argv
+    ]
+    assert candidate_calls
+    for argv in candidate_calls:
+        compatibility_index = argv.index(
+            ".repotrial-overlays/compatibility.overlay.yaml"
+        )
+        overlay_indices = [
+            index
+            for index, item in enumerate(argv)
+            if item.endswith(".overlay.yaml")
+            and item != ".repotrial-overlays/compatibility.overlay.yaml"
+        ]
+        assert overlay_indices
+        assert compatibility_index < overlay_indices[0]
+
+
+def test_compatibility_planning_rejection_reports_without_creating_sandbox(
+    tmp_path: Path,
+) -> None:
+    provider = GraphProvider()
+    context, source = _context(tmp_path, provider, journeys=[])
+    source.write_text(
+        "services:\n"
+        "  web:\n"
+        "    image: example/web:1\n"
+        "    ports:\n"
+        "      - '127.0.0.1:5000:8080'\n"
+        "      - '[::1]:5001:8080'\n",
+        encoding="utf-8",
+    )
+
+    result = _run(_state(source.parent, run_id="compatibility-rejection"), context)
+
+    assert result.run.stop_reason == "compatibility:ambiguous_loopback_binding"
+    assert result.stage_history == [
+        "intake",
+        "baseline",
+        "report_or_next",
+    ]
+    assert [call for call in provider.calls if call[0] == "create"] == []
+    assert result.run.compatibility_overlay_path is None
+    assert result.run.compatibility_overlay_sha256 is None
+    assert not (context.overlay_dir / "compatibility.overlay.yaml").exists()
+
+
+def test_no_eligible_loopback_mapping_keeps_compatibility_artifact_absent(
+    tmp_path: Path,
+) -> None:
+    provider = GraphProvider()
+    context, source = _context(tmp_path, provider, journeys=[])
+
+    result = _run(_state(source.parent, run_id="compatibility-noop"), context)
+
+    assert result.run.compatibility_overlay_path is None
+    assert result.run.compatibility_overlay_sha256 is None
+    assert "compatibility.overlay.yaml" not in result.run.artifacts
+    assert not (context.overlay_dir / "compatibility.overlay.yaml").exists()
+
+
+@pytest.mark.parametrize(
+    ("tamper", "reason"),
+    [
+        ("delete", "artifact_missing"),
+        ("replace", "artifact_hash_mismatch"),
+        ("symlink", "artifact_linked"),
+    ],
+)
+def test_checkpoint_resume_rejects_tampered_compatibility_artifact(
+    tmp_path: Path, tamper: str, reason: str
+) -> None:
+    provider = GraphProvider()
+    context, source = _context(tmp_path, provider, journeys=[])
+    source.write_text(
+        _compose_text(()).replace(
+            "    image: example/web:1\n",
+            "    image: example/web:1\n    ports:\n      - '127.0.0.1:5000:8080'\n",
+        ),
+        encoding="utf-8",
+    )
+    graph = build_run_graph(interrupt_after=("baseline",))
+    state = _state(source.parent, run_id=f"compatibility-tamper-{tamper}")
+    interrupted = asyncio.run(ainvoke_run(graph, state, context=context))
+    assert interrupted.run.compatibility_overlay_path is not None
+    artifact = context.workspace / interrupted.run.compatibility_overlay_path
+    if tamper == "delete":
+        artifact.unlink()
+    elif tamper == "replace":
+        artifact.write_text("services: {}\n", encoding="utf-8")
+    else:
+        replacement = tmp_path / "replacement.overlay.yaml"
+        replacement.write_text("services: {}\n", encoding="utf-8")
+        artifact.unlink()
+        artifact.symlink_to(replacement)
+
+    resumed = asyncio.run(aresume_run(graph, state.run_id, context=context))
+
+    assert resumed.run.stop_reason == f"compatibility:{reason}"
+    assert [call for call in provider.calls if call[0] == "create"] == []
+
+
 def test_graph_persists_baseline_journeys_before_workload_and_rejects_tampering(
     tmp_path: Path,
 ) -> None:

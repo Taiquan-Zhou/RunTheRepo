@@ -258,6 +258,7 @@ async def materialize_startup_input(
     compose_env: Mapping[str, str],
     evidence_path: Path,
     overlay_path: str | None = None,
+    compatibility_overlay_path: str | None = None,
 ) -> StartupInputResult:
     """Create and verify one guest-only input, then validate resolved Compose."""
     if not isinstance(evidence_path, Path):
@@ -268,6 +269,10 @@ async def materialize_startup_input(
         compose_path, compose_env, plan.all_source_key_names
     )
     _validate_guest_relative_path(compose_path, "compose_path")
+    if compatibility_overlay_path is not None:
+        _validate_guest_relative_path(
+            compatibility_overlay_path, "compatibility_overlay_path"
+        )
     if overlay_path is not None:
         _validate_guest_relative_path(overlay_path, "overlay_path")
     payload = base64.b64encode(plan.output_bytes).decode("ascii")
@@ -329,6 +334,8 @@ async def materialize_startup_input(
             "-f",
             compose_path,
         ]
+        if compatibility_overlay_path is not None:
+            compose_argv.extend(["-f", compatibility_overlay_path])
         if overlay_path is not None:
             compose_argv.extend(["-f", overlay_path])
         compose_argv.extend(["config", "--format", "json"])

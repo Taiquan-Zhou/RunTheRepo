@@ -49,6 +49,7 @@ async def boot_compose(
     attempt: int,
     *,
     overlay_path: str | None = None,
+    compatibility_overlay_path: str | None = None,
     unset_env_keys: Sequence[str] = (),
     project_directory: str | None = None,
 ) -> BootResult:
@@ -59,6 +60,7 @@ async def boot_compose(
         env,
         attempt,
         overlay_path=overlay_path,
+        compatibility_overlay_path=compatibility_overlay_path,
         unset_env_keys=unset_env_keys,
         project_directory=project_directory,
     )
@@ -73,6 +75,7 @@ async def _boot_compose_with_evidence(
     *,
     evidence_path: Path | None = None,
     overlay_path: str | None = None,
+    compatibility_overlay_path: str | None = None,
     unset_env_keys: Sequence[str] = (),
     project_directory: str | None = None,
 ) -> BootResult:
@@ -82,6 +85,9 @@ async def _boot_compose_with_evidence(
         _validate_project_directory(project_directory)
         docker_compose.extend(["--project-directory", project_directory])
     docker_compose.extend(["-f", compose_path])
+    if compatibility_overlay_path is not None:
+        _validate_compose_path(compatibility_overlay_path, "compatibility_overlay_path")
+        docker_compose.extend(["-f", compatibility_overlay_path])
     if overlay_path is not None:
         _validate_compose_path(overlay_path, "overlay_path")
         docker_compose.extend(["-f", overlay_path])

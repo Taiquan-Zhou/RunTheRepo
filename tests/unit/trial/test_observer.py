@@ -48,6 +48,22 @@ OVERLAY_DISCOVERY_ARGV = (
     "--format",
     "json",
 )
+COMPATIBILITY_OVERLAY_DISCOVERY_ARGV = (
+    "docker",
+    "compose",
+    "-f",
+    "compose.yaml",
+    "-f",
+    "compatibility.overlay.yml",
+    "-f",
+    "candidate.overlay.yml",
+    "ps",
+    "--all",
+    "--no-trunc",
+    "--orphans=false",
+    "--format",
+    "json",
+)
 TOP_FORMAT = "pid,ppid,user,comm"
 TOP_HEADER = "PID PPID USER COMMAND"
 
@@ -145,7 +161,8 @@ def test_public_collect_observation_signature_remains_unchanged() -> None:
     assert str(inspect.signature(collect_observation)) == (
         "(provider: repotrial.sandbox.base.SandboxProvider, sandbox_id: str, "
         "compose_path: str, artifact_path: pathlib.Path, *, "
-        "overlay_path: str | None = None) -> "
+        "overlay_path: str | None = None, "
+        "compatibility_overlay_path: str | None = None) -> "
         "repotrial.domain.models.ObservationSnapshot"
     )
 
@@ -519,6 +536,30 @@ def test_overlay_discovery_uses_base_then_overlay_in_exact_order(
     ]
     audit = json.loads(artifact_path.read_text(encoding="utf-8"))
     assert audit["discovery"]["argv"] == list(OVERLAY_DISCOVERY_ARGV)
+
+
+def test_compatibility_discovery_precedes_candidate_in_exact_order(
+    tmp_path: Path,
+) -> None:
+    provider = ScriptedProvider({COMPATIBILITY_OVERLAY_DISCOVERY_ARGV: _result()})
+    artifact_path = tmp_path / "observation.json"
+
+    snapshot = asyncio.run(
+        collect_observation(
+            provider,
+            "sandbox-1",
+            "compose.yaml",
+            artifact_path,
+            compatibility_overlay_path="compatibility.overlay.yml",
+            overlay_path="candidate.overlay.yml",
+        )
+    )
+
+    assert snapshot == ObservationSnapshot()
+    assert provider.calls == [
+        ("exec", "sandbox-1", COMPATIBILITY_OVERLAY_DISCOVERY_ARGV, 30),
+        ("network_log", "sandbox-1"),
+    ]
 
 
 @pytest.mark.parametrize("overlay_path", [cast(str, 7), "bad\0overlay.yml"])

@@ -25,6 +25,11 @@ from ruamel.yaml.error import YAMLError
 
 from repotrial.agent.checkpoint import build_memory_checkpointer
 from repotrial.agent.state import GraphContext, GraphState, StageName
+from repotrial.compose.compatibility import (
+    CompatibilityArtifact,
+    CompatibilityError,
+    write_loopback_compatibility_overlay,
+)
 from repotrial.compose.mutations import apply_mutation
 from repotrial.compose.parser import canonical_compose_json, load_compose
 from repotrial.compose.risk import analyze_risk
@@ -74,6 +79,7 @@ from repotrial.trial.startup_inputs import (
 
 type RunGraph = CompiledStateGraph[GraphState, GraphContext, GraphState, GraphState]
 type NodeUpdate = dict[str, object]
+type BaselineRoute = Literal["boot", "report_or_next"]
 type BootRoute = Literal["boot", "journeys", "report_or_next"]
 type MutationRoute = Literal["experiment", "report_or_next"]
 type ReportRoute = Literal["propose_mutation", "__end__"]
@@ -82,6 +88,7 @@ _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
 _GRAPH_RECURSION_LIMIT = 64
 _FULL_COMMIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
 _MAX_ATTEMPT_SLOTS = 4
+_COMPATIBILITY_OVERLAY_NAME = "compatibility.overlay.yaml"
 
 
 def build_run_graph(
@@ -101,7 +108,7 @@ def build_run_graph(
     builder.add_node("report_or_next", _report_or_next)
     builder.add_edge(START, "intake")
     builder.add_edge("intake", "baseline")
-    builder.add_edge("baseline", "boot")
+    builder.add_conditional_edges("baseline", _baseline_route)
     builder.add_conditional_edges("boot", _boot_route)
     builder.add_edge("journeys", "observe")
     builder.add_edge("observe", "propose_mutation")
@@ -200,6 +207,31 @@ async def _baseline(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUp
         and state.run.current_config_hash != compose_hash
     ):
         raise ValueError("current_config_hash does not match compose")
+    baseline_update = {
+        "compose_path": compose_relative,
+        "baseline_config_hash": compose_hash,
+        "current_config_hash": compose_hash,
+        "risk_findings": analyze_risk(compose),
+        "journeys": list(state.run.journeys),
+    }
+    try:
+        compatibility = _plan_or_verify_compatibility(
+            state.run,
+            context,
+            compose,
+        )
+    except CompatibilityError as error:
+        run = state.run.model_copy(
+            deep=True,
+            update={
+                **baseline_update,
+                "stop_reason": f"compatibility:{error.reason}",
+            },
+        )
+        return {
+            "run": run,
+            "stage_history": _visit(state, "baseline"),
+        }
     journeys = list(state.run.journeys)
     if not journeys:
         journey_readme_excerpt = (
@@ -222,13 +254,23 @@ async def _baseline(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUp
     run = state.run.model_copy(
         deep=True,
         update={
-            "compose_path": compose_relative,
-            "baseline_config_hash": compose_hash,
-            "current_config_hash": compose_hash,
-            "risk_findings": analyze_risk(compose),
+            **baseline_update,
             "journeys": journeys,
+            "compatibility_overlay_path": (
+                None
+                if compatibility is None
+                else compatibility.path.relative_to(workspace).as_posix()
+            ),
+            "compatibility_overlay_sha256": (
+                None if compatibility is None else compatibility.sha256
+            ),
         },
     )
+    if compatibility is not None:
+        _append_artifact(
+            run,
+            compatibility.path.relative_to(workspace).as_posix(),
+        )
     return {
         "run": run,
         "stage_history": _visit(state, "baseline"),
@@ -248,6 +290,24 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
     env.update(state.recovery_env)
     context = runtime.context
     compose_path = _required_compose_path(state.run)
+    try:
+        compatibility_path = _verified_compatibility_path(state.run, context)
+    except CompatibilityError as error:
+        return {
+            "boot_attempt": attempt,
+            "boot_verdict": Verdict.UNSUPPORTED,
+            "run": state.run.model_copy(
+                update={"stop_reason": f"compatibility:{error.reason}"}
+            ),
+            "stage_history": _visit(state, "boot"),
+        }
+    compatibility_relative = (
+        None
+        if compatibility_path is None
+        else compatibility_path.relative_to(
+            _real_directory(context.workspace, "workspace")
+        ).as_posix()
+    )
     recovery_context = (
         None
         if context.allowed_env_keys
@@ -324,6 +384,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                     compose_path=compose_path,
                     compose_env=env,
                     evidence_path=startup_input_evidence,
+                    compatibility_overlay_path=compatibility_relative,
                 )
         except StartupInputUnsupported:
             result = BootResult(
@@ -342,6 +403,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                         env,
                         attempt,
                         evidence_path=evidence_artifact,
+                        compatibility_overlay_path=compatibility_relative,
                     )
                 else:
                     result = await _boot_compose_with_evidence(
@@ -351,24 +413,51 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                         env,
                         attempt,
                         evidence_path=evidence_artifact,
+                        compatibility_overlay_path=compatibility_relative,
                         unset_env_keys=startup_plan.all_source_key_names,
                         project_directory=".",
                     )
             else:
                 if startup_plan is None:
-                    result = await boot_compose(
-                        context.provider, sandbox_id, compose_path, env, attempt
-                    )
+                    if compatibility_relative is None:
+                        result = await boot_compose(
+                            context.provider,
+                            sandbox_id,
+                            compose_path,
+                            env,
+                            attempt,
+                        )
+                    else:
+                        result = await boot_compose(
+                            context.provider,
+                            sandbox_id,
+                            compose_path,
+                            env,
+                            attempt,
+                            compatibility_overlay_path=compatibility_relative,
+                        )
                 else:
-                    result = await boot_compose(
-                        context.provider,
-                        sandbox_id,
-                        compose_path,
-                        env,
-                        attempt,
-                        unset_env_keys=startup_plan.all_source_key_names,
-                        project_directory=".",
-                    )
+                    if compatibility_relative is None:
+                        result = await boot_compose(
+                            context.provider,
+                            sandbox_id,
+                            compose_path,
+                            env,
+                            attempt,
+                            unset_env_keys=startup_plan.all_source_key_names,
+                            project_directory=".",
+                        )
+                    else:
+                        result = await boot_compose(
+                            context.provider,
+                            sandbox_id,
+                            compose_path,
+                            env,
+                            attempt,
+                            compatibility_overlay_path=compatibility_relative,
+                            unset_env_keys=startup_plan.all_source_key_names,
+                            project_directory=".",
+                        )
         journey_results: list[JourneyResult] | None = None
         observation = None
         if result.verdict is Verdict.PASS:
@@ -385,6 +474,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                     compose_path,
                     observation_artifact,
                     evidence_path=observation_evidence,
+                    compatibility_overlay_path=compatibility_relative,
                 )
             else:
                 observation = await _collect_observation_with_evidence(
@@ -394,6 +484,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                     observation_artifact,
                     evidence_path=observation_evidence,
                     env=env,
+                    compatibility_overlay_path=compatibility_relative,
                     unset_env_keys=startup_plan.all_source_key_names,
                     project_directory=".",
                 )
@@ -482,6 +573,98 @@ async def _apply_recovery(
     raise ValueError("validated recovery action is unsupported")
 
 
+def _baseline_route(state: GraphState) -> BaselineRoute:
+    return "report_or_next" if state.run.stop_reason is not None else "boot"
+
+
+def _plan_or_verify_compatibility(
+    run: RunState,
+    context: GraphContext,
+    compose: dict[str, object],
+) -> CompatibilityArtifact | None:
+    workspace = _real_directory(context.workspace, "workspace")
+    overlay_dir = _real_directory_inside(context.overlay_dir, workspace, "overlay_dir")
+    target = overlay_dir / _COMPATIBILITY_OVERLAY_NAME
+    if run.compatibility_overlay_path is not None or (
+        run.compatibility_overlay_sha256 is not None
+    ):
+        verified = _verified_compatibility_path(run, context)
+        if verified is None or run.compatibility_overlay_sha256 is None:
+            raise CompatibilityError("identity_incomplete")
+        return CompatibilityArtifact(
+            path=verified,
+            sha256=run.compatibility_overlay_sha256,
+        )
+    artifact = write_loopback_compatibility_overlay(
+        compose,
+        context.container_port,
+        target,
+    )
+    if artifact is None:
+        if target.exists() or target.is_symlink():
+            raise CompatibilityError("artifact_path_exists")
+        return None
+    if not isinstance(artifact, CompatibilityArtifact):
+        raise CompatibilityError("artifact_invalid")
+    if artifact.path != target:
+        raise CompatibilityError("planned_artifact_mismatch")
+    try:
+        actual_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        raise CompatibilityError("artifact_unreadable") from None
+    if actual_sha256 != artifact.sha256:
+        raise CompatibilityError("artifact_hash_mismatch")
+    return CompatibilityArtifact(path=target, sha256=actual_sha256)
+
+
+def _verified_compatibility_path(
+    run: RunState,
+    context: GraphContext,
+) -> Path | None:
+    path_value = run.compatibility_overlay_path
+    sha256_value = run.compatibility_overlay_sha256
+    if path_value is None and sha256_value is None:
+        return None
+    if not isinstance(path_value, str) or not isinstance(sha256_value, str):
+        raise CompatibilityError("identity_incomplete")
+    if _contains_controls(path_value) or "\\" in path_value:
+        raise CompatibilityError("path_invalid")
+    relative = Path(path_value)
+    if relative.is_absolute() or relative.drive or ".." in relative.parts:
+        raise CompatibilityError("path_invalid")
+    workspace = _real_directory(context.workspace, "workspace")
+    overlay_dir = _real_directory_inside(context.overlay_dir, workspace, "overlay_dir")
+    expected = overlay_dir / _COMPATIBILITY_OVERLAY_NAME
+    try:
+        expected_relative = expected.relative_to(workspace).as_posix()
+    except ValueError:
+        raise CompatibilityError("planned_artifact_mismatch") from None
+    if path_value != expected_relative:
+        raise CompatibilityError("planned_artifact_mismatch")
+    target = workspace / relative
+    try:
+        target_stat = target.lstat()
+        resolved = target.resolve(strict=True)
+        parent = target.parent.resolve(strict=True)
+    except FileNotFoundError:
+        raise CompatibilityError("artifact_missing") from None
+    except OSError:
+        raise CompatibilityError("artifact_unreadable") from None
+    if _is_link(target, target_stat):
+        raise CompatibilityError("artifact_linked")
+    if not stat.S_ISREG(target_stat.st_mode):
+        raise CompatibilityError("artifact_not_regular")
+    if parent != overlay_dir or resolved != target:
+        raise CompatibilityError("path_invalid")
+    try:
+        actual_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        raise CompatibilityError("artifact_unreadable") from None
+    if actual_sha256 != sha256_value:
+        raise CompatibilityError("artifact_hash_mismatch")
+    return target
+
+
 def _boot_route(state: GraphState) -> BootRoute:
     if state.run.stop_reason is not None:
         return "report_or_next"
@@ -540,6 +723,10 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
     if mutation is None:
         raise ValueError("experiment requires a pending mutation")
     context = runtime.context
+    try:
+        compatibility_path = _verified_compatibility_path(state.run, context)
+    except CompatibilityError as error:
+        raise ValueError(f"compatibility:{error.reason}") from None
     token = _run_token(state.run.run_id)
     index = len(state.run.experiments)
     attempt_dir, attempt_slot, prior_attempt_directories = _claim_attempt_directory(
@@ -565,6 +752,7 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
         artifact_dir=attempt_dir,
         env={**context.env, **state.recovery_env},
         container_port=context.container_port,
+        compatibility_overlay_path=compatibility_path,
         prior_attempt_directories=prior_attempt_directories,
         startup_input_identity_path=(
             _run_evidence_directory(state.run, context) / "startup-input-identity.json"

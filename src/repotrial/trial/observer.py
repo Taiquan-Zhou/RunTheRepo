@@ -155,14 +155,22 @@ async def collect_observation(
     artifact_path: Path,
     *,
     overlay_path: str | None = None,
+    compatibility_overlay_path: str | None = None,
 ) -> ObservationSnapshot:
-    _validate_inputs(sandbox_id, compose_path, artifact_path, overlay_path)
+    _validate_inputs(
+        sandbox_id,
+        compose_path,
+        artifact_path,
+        overlay_path,
+        compatibility_overlay_path,
+    )
     return await _collect_observation(
         provider,
         sandbox_id,
         compose_path,
         artifact_path,
         overlay_path=overlay_path,
+        compatibility_overlay_path=compatibility_overlay_path,
         env={},
         unset_env_keys=(),
         project_directory=None,
@@ -177,12 +185,19 @@ async def _collect_observation_with_evidence(
     artifact_path: Path,
     *,
     overlay_path: str | None = None,
+    compatibility_overlay_path: str | None = None,
     evidence_path: Path,
     env: Mapping[str, str] | None = None,
     unset_env_keys: Sequence[str] = (),
     project_directory: str | None = None,
 ) -> ObservationSnapshot:
-    _validate_inputs(sandbox_id, compose_path, artifact_path, overlay_path)
+    _validate_inputs(
+        sandbox_id,
+        compose_path,
+        artifact_path,
+        overlay_path,
+        compatibility_overlay_path,
+    )
     if project_directory is not None:
         _validate_project_directory(project_directory)
     if not isinstance(evidence_path, Path):
@@ -199,6 +214,7 @@ async def _collect_observation_with_evidence(
             compose_path,
             artifact_path,
             overlay_path=overlay_path,
+            compatibility_overlay_path=compatibility_overlay_path,
             env={} if env is None else env,
             unset_env_keys=unset_env_keys,
             project_directory=project_directory,
@@ -218,6 +234,7 @@ async def _collect_observation(
     artifact_path: Path,
     *,
     overlay_path: str | None,
+    compatibility_overlay_path: str | None,
     env: Mapping[str, str],
     unset_env_keys: Sequence[str],
     project_directory: str | None,
@@ -233,6 +250,8 @@ async def _collect_observation(
     if project_directory is not None:
         discovery_argv.extend(["--project-directory", project_directory])
     discovery_argv.extend(["-f", compose_path])
+    if compatibility_overlay_path is not None:
+        discovery_argv.extend(["-f", compatibility_overlay_path])
     if overlay_path is not None:
         discovery_argv.extend(["-f", overlay_path])
     discovery_argv.extend(
@@ -460,12 +479,15 @@ def _validate_inputs(
     compose_path: str,
     artifact_path: Path,
     overlay_path: str | None,
+    compatibility_overlay_path: str | None,
 ) -> None:
     if not isinstance(sandbox_id, str):
         raise TypeError("sandbox_id must be a string")
     if not sandbox_id:
         raise ValueError("sandbox_id must not be empty")
     _validate_compose_path(compose_path, "compose_path")
+    if compatibility_overlay_path is not None:
+        _validate_compose_path(compatibility_overlay_path, "compatibility_overlay_path")
     if overlay_path is not None:
         _validate_compose_path(overlay_path, "overlay_path")
     if not isinstance(artifact_path, Path):

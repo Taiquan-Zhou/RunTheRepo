@@ -69,6 +69,7 @@ class ExperimentContext:
     container_port: int
     prior_attempt_directories: tuple[Path, ...] = ()
     startup_input_identity_path: Path | None = None
+    compatibility_overlay_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +77,7 @@ class _PreparedExperiment:
     compose_path: str
     overlay_path: Path
     overlay_relative: str
+    compatibility_overlay_relative: str | None
     env: dict[str, str]
     parent_hash: str
     candidate_hash: str
@@ -197,6 +199,9 @@ def _prepare(
     workspace = _real_directory(context.workspace, "workspace")
     compose_path, compose_file = _compose_file(workspace, state.compose_path)
     overlay_path, overlay_relative = _overlay_target(workspace, context.overlay_path)
+    compatibility_overlay_relative = _compatibility_target(
+        workspace, context.compatibility_overlay_path
+    )
     artifact_dir = _real_directory(context.artifact_dir, "artifact_dir")
     if artifact_dir.is_relative_to(workspace):
         raise ValueError("artifact_dir must resolve outside workspace")
@@ -241,6 +246,7 @@ def _prepare(
         compose_path=compose_path,
         overlay_path=overlay_path,
         overlay_relative=overlay_relative,
+        compatibility_overlay_relative=compatibility_overlay_relative,
         env=env,
         parent_hash=parent_hash,
         candidate_hash=candidate_hash,
@@ -341,6 +347,30 @@ def _overlay_target(workspace: Path, value: object) -> tuple[Path, str]:
     return normalized, normalized.relative_to(workspace).as_posix()
 
 
+def _compatibility_target(workspace: Path, value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, Path):
+        raise TypeError("compatibility_overlay_path must be a Path")
+    target = value if value.is_absolute() else workspace / value
+    try:
+        target_stat = target.lstat()
+        parent = target.parent.resolve(strict=True)
+        resolved = target.resolve(strict=True)
+    except OSError:
+        raise ValueError(
+            "compatibility_overlay_path must be an existing regular file"
+        ) from None
+    if (
+        _is_link(target, target_stat)
+        or not stat.S_ISREG(target_stat.st_mode)
+        or not parent.is_relative_to(workspace)
+        or not resolved.is_relative_to(workspace)
+    ):
+        raise ValueError("compatibility_overlay_path must be an existing regular file")
+    return resolved.relative_to(workspace).as_posix()
+
+
 def _snapshot_env(value: object) -> dict[str, str]:
     if not isinstance(value, Mapping):
         raise TypeError("env must be a mapping")
@@ -398,6 +428,7 @@ async def _run_candidate(
                 compose_path=prepared.compose_path,
                 compose_env=prepared.env,
                 evidence_path=prepared.startup_input_evidence,
+                compatibility_overlay_path=prepared.compatibility_overlay_relative,
                 overlay_path=prepared.overlay_relative,
             )
         except CleanupError:
@@ -419,6 +450,7 @@ async def _run_candidate(
                 prepared.compose_path,
                 prepared.env,
                 attempt=1,
+                compatibility_overlay_path=prepared.compatibility_overlay_relative,
                 overlay_path=prepared.overlay_relative,
             )
         else:
@@ -428,6 +460,7 @@ async def _run_candidate(
                 prepared.compose_path,
                 prepared.env,
                 attempt=1,
+                compatibility_overlay_path=prepared.compatibility_overlay_relative,
                 overlay_path=prepared.overlay_relative,
                 unset_env_keys=startup_plan.all_source_key_names,
                 project_directory=".",
@@ -463,6 +496,7 @@ async def _run_candidate(
                 sandbox_id,
                 prepared.compose_path,
                 prepared.observation_artifact,
+                compatibility_overlay_path=prepared.compatibility_overlay_relative,
                 overlay_path=prepared.overlay_relative,
             )
         else:
@@ -471,6 +505,7 @@ async def _run_candidate(
                 sandbox_id,
                 prepared.compose_path,
                 prepared.observation_artifact,
+                compatibility_overlay_path=prepared.compatibility_overlay_relative,
                 overlay_path=prepared.overlay_relative,
                 evidence_path=prepared.observation_evidence,
                 env=prepared.env,

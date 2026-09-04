@@ -43,6 +43,7 @@ LOGS_ARGV = (
     "200",
 )
 OVERLAY_PATH = "/workspace/candidate.overlay.yml"
+COMPATIBILITY_PATH = "/workspace/compatibility.overlay.yml"
 OVERLAY_UP_ARGV = (
     "docker",
     "compose",
@@ -73,6 +74,49 @@ OVERLAY_LOGS_ARGV = (
     "compose",
     "-f",
     COMPOSE_PATH,
+    "-f",
+    OVERLAY_PATH,
+    "logs",
+    "--no-color",
+    "--tail",
+    "200",
+)
+COMPATIBILITY_OVERLAY_UP_ARGV = (
+    "docker",
+    "compose",
+    "-f",
+    COMPOSE_PATH,
+    "-f",
+    COMPATIBILITY_PATH,
+    "-f",
+    OVERLAY_PATH,
+    "up",
+    "-d",
+    "--wait",
+    "--wait-timeout",
+    "60",
+)
+COMPATIBILITY_OVERLAY_PS_ARGV = (
+    "docker",
+    "compose",
+    "-f",
+    COMPOSE_PATH,
+    "-f",
+    COMPATIBILITY_PATH,
+    "-f",
+    OVERLAY_PATH,
+    "ps",
+    "--all",
+    "--format",
+    "json",
+)
+COMPATIBILITY_OVERLAY_LOGS_ARGV = (
+    "docker",
+    "compose",
+    "-f",
+    COMPOSE_PATH,
+    "-f",
+    COMPATIBILITY_PATH,
     "-f",
     OVERLAY_PATH,
     "logs",
@@ -272,6 +316,37 @@ def test_candidate_overlay_is_applied_after_base_for_every_compose_command() -> 
         ("exec", "sandbox-1", OVERLAY_UP_ARGV, 600),
         ("exec", "sandbox-1", OVERLAY_PS_ARGV, 30),
         ("exec", "sandbox-1", OVERLAY_LOGS_ARGV, 30),
+    ]
+
+
+def test_compatibility_overlay_precedes_candidate_for_every_compose_command() -> None:
+    provider = FakeSandboxProvider(
+        scripts={
+            COMPATIBILITY_OVERLAY_UP_ARGV: _result(),
+            COMPATIBILITY_OVERLAY_PS_ARGV: _result(stdout=_healthy_ps()),
+            COMPATIBILITY_OVERLAY_LOGS_ARGV: _result(),
+        }
+    )
+
+    async def exercise() -> BootResult:
+        sandbox_id = await provider.create(Path("missing-workspace"), "trial")
+        return await boot_compose(
+            provider,
+            sandbox_id,
+            COMPOSE_PATH,
+            {},
+            attempt=3,
+            compatibility_overlay_path=COMPATIBILITY_PATH,
+            overlay_path=OVERLAY_PATH,
+        )
+
+    result = asyncio.run(exercise())
+
+    assert result.verdict is Verdict.PASS
+    assert provider.calls[1:] == [
+        ("exec", "sandbox-1", COMPATIBILITY_OVERLAY_UP_ARGV, 600),
+        ("exec", "sandbox-1", COMPATIBILITY_OVERLAY_PS_ARGV, 30),
+        ("exec", "sandbox-1", COMPATIBILITY_OVERLAY_LOGS_ARGV, 30),
     ]
 
 

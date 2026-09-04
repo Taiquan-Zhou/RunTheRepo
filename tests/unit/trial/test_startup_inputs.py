@@ -703,6 +703,40 @@ def test_materializer_uses_overlay_in_resolved_config_argv(tmp_path: Path) -> No
     )
 
 
+def test_materializer_orders_compatibility_before_candidate_overlay(
+    tmp_path: Path,
+) -> None:
+    workspace = _copy_fixture(tmp_path, "materialize_overlay")
+    plan = plan_startup_input(workspace, "compose.yaml")
+    assert plan is not None
+    provider = _MaterializeProvider()
+
+    asyncio.run(
+        materialize_startup_input(
+            provider,
+            "sandbox-1",
+            plan,
+            compose_path="compose.yaml",
+            compatibility_overlay_path="overlays/compatibility.yaml",
+            overlay_path="overlays/candidate.yaml",
+            compose_env={},
+            evidence_path=tmp_path / "attempt.jsonl",
+        )
+    )
+
+    assert provider.exec_calls[1][-9:] == (
+        "-f",
+        "compose.yaml",
+        "-f",
+        "overlays/compatibility.yaml",
+        "-f",
+        "overlays/candidate.yaml",
+        "config",
+        "--format",
+        "json",
+    )
+
+
 def test_evidence_collision_fails_before_guest_exec(tmp_path: Path) -> None:
     workspace = _copy_fixture(tmp_path, "evidence_collision")
     plan = plan_startup_input(workspace, "compose.yaml")
