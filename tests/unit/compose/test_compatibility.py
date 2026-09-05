@@ -211,6 +211,49 @@ def test_invalid_short_bindings_fail_closed(
     assert error.value.reason == reason
 
 
+def test_compose_default_interpolation_is_not_split_and_is_ignored_without_loopback() -> (
+    None
+):
+    assert (
+        plan_loopback_compatibility_overlay(
+            _compose(["${LD_HOST_PORT:-9090}:9090"]), container_port=9090
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("published", ["${PORT:-9090}", "${PORT-9090}"])
+def test_loopback_dynamic_published_default_preserves_expression_in_overlay(
+    tmp_path: Path, published: str
+) -> None:
+    artifact = write_loopback_compatibility_overlay(
+        _compose([f"127.0.0.1:{published}:9090"]),
+        container_port=9090,
+        path=tmp_path / "compatibility.overlay.yaml",
+    )
+
+    assert artifact is not None
+    ports = _load_overlay(artifact.path)["services"]["app"]["ports"]
+    assert list(ports) == [f"0.0.0.0:{published}:9090"]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "127.0.0.1:${PORT}:9090",
+        "${HOST:-127.0.0.1}:9090:9090",
+        "127.0.0.1:${PORT:-9090}suffix:9090",
+        "127.0.0.1:${PORT:-${DEFAULT}}:9090",
+        "127.0.0.1:${PORT:-9090:9090",
+    ],
+)
+def test_interpolated_short_bindings_fail_closed(tmp_path: Path, entry: str) -> None:
+    with pytest.raises(CompatibilityError) as error:
+        plan_loopback_compatibility_overlay(_compose([entry]), container_port=9090)
+
+    assert error.value.reason in {"host_not_numeric", "invalid_port"}
+
+
 def test_tagged_port_value_fails_closed(tmp_path: Path) -> None:
     yaml = YAML(typ="rt", pure=True)
     compose = yaml.load(

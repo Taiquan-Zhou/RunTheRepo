@@ -6,6 +6,7 @@ import hashlib
 import io
 import ipaddress
 import os
+import re
 import stat
 from collections.abc import Mapping, MutableMapping
 from copy import deepcopy
@@ -183,12 +184,12 @@ def _parse_short_entry(service: str, index: int, entry: str) -> _PortBinding:
         if close < 0 or close + 1 >= len(body) or body[close + 1] != ":":
             raise CompatibilityError("invalid_port")
         host_ip = body[1:close]
-        parts = body[close + 2 :].split(":")
+        parts = _split_short_parts(body[close + 2 :])
         if len(parts) != 2:
             raise CompatibilityError("invalid_port")
         published_text, target_text = parts
     else:
-        parts = body.split(":")
+        parts = _split_short_parts(body)
         if len(parts) == 2:
             host_ip = None
             published_text, target_text = parts
@@ -214,6 +215,36 @@ def _parse_short_entry(service: str, index: int, entry: str) -> _PortBinding:
             protocol_suffix=protocol_suffix,
         ),
     )
+
+
+def _split_short_parts(body: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    in_interpolation = False
+    index = 0
+    while index < len(body):
+        character = body[index]
+        if in_interpolation:
+            if character == "{":
+                raise CompatibilityError("invalid_port")
+            if character == "}":
+                in_interpolation = False
+            index += 1
+            continue
+        if character == "$" and index + 1 < len(body) and body[index + 1] == "{":
+            in_interpolation = True
+            index += 2
+            continue
+        if character == "}":
+            raise CompatibilityError("invalid_port")
+        if character == ":":
+            parts.append(body[start:index])
+            start = index + 1
+        index += 1
+    if in_interpolation:
+        raise CompatibilityError("invalid_port")
+    parts.append(body[start:])
+    return parts
 
 
 def _split_protocol(
@@ -293,14 +324,24 @@ def _parse_port_number(value: object) -> int:
     if isinstance(value, int):
         number = value
     elif isinstance(value, str):
-        if "-" in value:
+        interpolation = re.fullmatch(
+            r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::-|-)[0-9]+\}", value
+        )
+        if interpolation:
+            default_text = value.rsplit("}", 1)[0].rsplit("-", 1)[1]
+            try:
+                number = int(default_text)
+            except ValueError:
+                raise CompatibilityError("invalid_port") from None
+        elif re.fullmatch(r"[0-9]+-[0-9]+", value):
             raise CompatibilityError("port_range")
-        if not value or not value.isascii() or not value.isdigit():
-            raise CompatibilityError("invalid_port")
-        try:
-            number = int(value)
-        except ValueError:
-            raise CompatibilityError("invalid_port") from None
+        else:
+            if not value or not value.isascii() or not value.isdigit():
+                raise CompatibilityError("invalid_port")
+            try:
+                number = int(value)
+            except ValueError:
+                raise CompatibilityError("invalid_port") from None
     else:
         raise CompatibilityError("invalid_port")
     if not 1 <= number <= 65_535:
