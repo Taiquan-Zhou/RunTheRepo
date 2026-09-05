@@ -71,9 +71,13 @@ def test_startup_input_fixture_is_pinned_bounded_and_unprivileged() -> None:
     assert health_path.read_text(encoding="utf-8") == "ok\n"
 
 
-def _create_fixture_repository(tmp_path: Path) -> Path:
+def _create_fixture_repository(tmp_path: Path, *, empty_output: bool = False) -> Path:
     repository = tmp_path / "startup-input-repository"
     shutil.copytree(_FIXTURE_ROOT, repository)
+    if empty_output:
+        (repository / ".env.sample").write_text(
+            "LD_HOST_PORT=9090\nld_preload=./bad.so\n", encoding="utf-8"
+        )
     for argv in (
         ["git", "init", "--quiet"],
         ["git", "config", "user.email", "startup-input@example.invalid"],
@@ -119,15 +123,22 @@ def _assert_empty_inventory() -> None:
     os.environ.get("REPOTRIAL_RUN_REAL_SBX") != "1",
     reason="UNSUPPORTED: set REPOTRIAL_RUN_REAL_SBX=1 for startup-input proof",
 )
-def test_real_sbx_materializes_startup_input_before_boot(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("empty_output", "expected_output"),
+    ((False, b"APP_OPTIONAL=\n"), (True, b"")),
+    ids=("non-empty-output", "empty-output"),
+)
+def test_real_sbx_materializes_startup_input_before_boot(
+    tmp_path: Path, empty_output: bool, expected_output: bytes
+) -> None:
     if shutil.which("sbx") is None:
         pytest.skip("UNSUPPORTED: sbx executable is unavailable")
-    repository = _create_fixture_repository(tmp_path)
+    repository = _create_fixture_repository(tmp_path, empty_output=empty_output)
     evidence_path = tmp_path / "startup-input-attempt.jsonl"
     lifecycle_path = tmp_path / "startup-input-lifecycle.jsonl"
     plan = plan_startup_input(repository, "compose.yaml")
     assert plan is not None
-    assert plan.output_bytes == b"APP_OPTIONAL=\n"
+    assert plan.output_bytes == expected_output
     assert plan.omitted_control_key_names == ("LD_HOST_PORT", "ld_preload")
     provider = DockerSbxProvider(_policy(), command_timeout_s=60)
 
@@ -175,4 +186,5 @@ def test_real_sbx_materializes_startup_input_before_boot(tmp_path: Path) -> None
     assert "9090" not in evidence_text
     assert "./bad.so" not in evidence_text
     assert "APP_OPTIONAL=" not in evidence_text
+    assert "repotrial_empty_payload" not in evidence_text
     assert lifecycle_path.is_file()
