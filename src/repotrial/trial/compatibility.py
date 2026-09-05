@@ -419,6 +419,12 @@ def fingerprint_host_artifact(path: Path) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def read_host_artifact(path: Path) -> bytes:
+    """Read one bounded host artifact with race and symlink checks."""
+
+    return _read_host_compatibility_artifact(path, None)
+
+
 def _read_host_compatibility_artifact(path: Path, expected_sha256: str | None) -> bytes:
     """Read a bounded regular file while retaining its path/fd identity."""
 

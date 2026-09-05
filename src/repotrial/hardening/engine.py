@@ -9,7 +9,11 @@ from pathlib import Path
 from repotrial.compose.compatibility import CompatibilityError
 from repotrial.compose.mutations import MutationError, apply_mutation
 from repotrial.compose.overlay import write_overlay
-from repotrial.compose.parser import canonical_compose_json, load_compose
+from repotrial.compose.parser import (
+    canonical_compose_json,
+    load_compose,
+    load_compose_bytes,
+)
 from repotrial.domain.enums import ExperimentVerdict, Verdict
 from repotrial.domain.models import (
     ExperimentRecord,
@@ -27,12 +31,12 @@ from repotrial.sandbox.docker_sbx import DockerSbxError
 from repotrial.sandbox.lifecycle import CleanupError, managed_sandbox
 from repotrial.trial.boot import _validated_env_prefix, boot_compose
 from repotrial.trial.compatibility import (
-    _ACCEPTED_COMPOSE_PATTERN,
     _EXPERIMENT_RELATIVE_PATH,
     fingerprint_host_artifact,
     materialize_guest_accepted_compose,
     materialize_guest_compatibility_overlay,
     materialize_guest_experiment_overlay,
+    read_host_artifact,
     verify_guest_accepted_compose,
     verify_guest_compatibility_overlay,
     verify_guest_experiment_overlay,
@@ -92,6 +96,7 @@ class _PreparedExperiment:
     compose_file: Path
     accepted_compose_evidence_path: Path | None
     accepted_compose_error: str | None
+    accepted_compose_sha256: str | None
     overlay_path: Path
     compatibility_overlay_path: Path | None
     overlay_relative: str
@@ -194,19 +199,7 @@ async def run_experiment(
             verdict=ExperimentVerdict.STOP,
             reason="candidate_overlay_materialization_failed",
         )
-    accepted_compose_sha256: str | None = None
-    if prepared.accepted_compose_evidence_path is not None:
-        try:
-            accepted_compose_sha256 = fingerprint_host_artifact(prepared.compose_file)
-        except _ORDINARY_STAGE_ERRORS:
-            return _record(
-                state,
-                mutation,
-                prepared,
-                boot=Verdict.UNSUPPORTED,
-                verdict=ExperimentVerdict.STOP,
-                reason="accepted_compose_materialization_failed",
-            )
+    accepted_compose_sha256 = prepared.accepted_compose_sha256
 
     try:
         async with managed_sandbox(
@@ -271,18 +264,22 @@ def _prepare(
         raise ValueError("artifact_dir must resolve outside workspace")
     accepted_compose_error: str | None = None
     accepted_compose_evidence_path: Path | None = None
-    if isinstance(state.compose_path, str) and state.compose_path.startswith(
-        ".repotrial-accepted/"
-    ):
-        expected = _expected_accepted_compose_path(state)
-        if expected != compose_path or not _ACCEPTED_COMPOSE_PATTERN.fullmatch(
-            compose_path
-        ):
+    accepted_compose_sha256: str | None = None
+    expected = _expected_accepted_compose_path(state)
+    has_keep = any(
+        record.verdict is ExperimentVerdict.KEEP for record in state.experiments
+    )
+    if has_keep:
+        if expected != compose_path:
             accepted_compose_error = "accepted_compose_materialization_failed"
         else:
             accepted_compose_evidence_path = artifact_dir / (
                 "accepted-compose-materialization.jsonl"
             )
+    elif isinstance(state.compose_path, str) and state.compose_path.startswith(
+        ".repotrial-accepted/"
+    ):
+        accepted_compose_error = "accepted_compose_materialization_failed"
     if type(context.container_port) is not int:
         raise TypeError("container_port must be an integer")
     if not 1 <= context.container_port <= 65_535:
@@ -301,7 +298,16 @@ def _prepare(
     env = _snapshot_env(context.env)
     _validated_env_prefix(compose_path, env)
 
-    base = load_compose(compose_file)
+    if accepted_compose_evidence_path is not None:
+        try:
+            accepted_source = read_host_artifact(compose_file)
+            accepted_compose_sha256 = hashlib.sha256(accepted_source).hexdigest()
+            base = load_compose_bytes(accepted_source)
+        except (CompatibilityError, OSError, RuntimeError, TypeError, ValueError):
+            accepted_compose_error = "accepted_compose_materialization_failed"
+            base = load_compose(compose_file)
+    else:
+        base = load_compose(compose_file)
     candidate = apply_mutation(base, mutation)
     parent_hash = _compose_hash(base)
     candidate_hash = _compose_hash(candidate)
@@ -336,6 +342,7 @@ def _prepare(
         compose_file=compose_file,
         accepted_compose_evidence_path=accepted_compose_evidence_path,
         accepted_compose_error=accepted_compose_error,
+        accepted_compose_sha256=accepted_compose_sha256,
         overlay_path=overlay_path,
         compatibility_overlay_path=compatibility_overlay_path,
         overlay_relative=overlay_relative,

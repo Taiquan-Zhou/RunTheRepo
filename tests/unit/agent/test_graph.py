@@ -273,6 +273,21 @@ class GraphProvider(FakeSandboxProvider):
                 stdout=f"{digest}  {relative_path}\n",
                 stderr="",
             )
+        if "docker" in snapshot and "compose" in snapshot:
+            compose_files = [
+                snapshot[index + 1]
+                for index, item in enumerate(snapshot[:-1])
+                if item == "-f"
+            ]
+            for relative_path in compose_files:
+                if relative_path.startswith(
+                    ".repotrial-accepted/"
+                ) and relative_path not in self._accepted_guest_files.get(
+                    sandbox_id, {}
+                ):
+                    raise AssertionError(
+                        "accepted compose was not materialized in guest"
+                    )
         if snapshot[-3:] == ("config", "--format", "json"):
             return ExecResult(
                 exit_code=0,

@@ -56,6 +56,16 @@ def load_compose(path: Path) -> dict[str, object]:
     """Load one safe Compose mapping without altering its round-trip metadata."""
     try:
         source = _read_compose_source(path)
+        return load_compose_bytes(source)
+    except ComposeParseError:
+        raise
+    except (OverflowError, RecursionError, UnicodeError, ValueError, YAMLError):
+        raise ComposeParseError("invalid_yaml") from None
+
+
+def load_compose_bytes(source: bytes) -> dict[str, object]:
+    """Load one safe Compose mapping from already identity-checked bytes."""
+    try:
         yaml = _new_round_trip_yaml()
         _validate_yaml_events(yaml, source)
         loaded = yaml.load(source)
