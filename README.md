@@ -62,6 +62,17 @@ Playwright OS dependencies, is in
 Before a real run, require a healthy runtime and empty inventory:
 
 ```bash
+uv run repotrial doctor
+uv run repotrial doctor --json
+```
+
+The read-only doctor prints one `PASS`, `FAIL`, or `UNSUPPORTED` line per
+check and ends with `READY` or `NOT_READY`; a blocking failure exits with code
+2. The JSON form contains only the stable report object (`ready` and ordered
+`checks`). The known Docker Sandboxes PID hard-bound limitation is reported as
+non-blocking `UNSUPPORTED`.
+
+```bash
 sbx version
 sbx diagnose --output json
 sbx policy ls --type network --json

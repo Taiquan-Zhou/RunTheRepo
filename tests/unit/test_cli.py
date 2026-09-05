@@ -9,6 +9,7 @@ from typer.testing import CliRunner
 from repotrial import cli
 from repotrial.cli import create_app
 from repotrial.config import create_run_layout
+from repotrial.doctor import DoctorCheck, DoctorReport
 from repotrial.domain.enums import Verdict
 from repotrial.domain.models import JourneyResult, RunState
 from repotrial.intake import github
@@ -56,17 +57,57 @@ def fixed_run_id() -> str:
     return FIXED_RUN_ID
 
 
-def make_app(artifacts_root: Path) -> Typer:
-    return create_app(artifacts_root=artifacts_root, run_id_generator=fixed_run_id)
+def make_app(artifacts_root: Path, doctor_report: DoctorReport | None = None) -> Typer:
+    doctor_callable = (lambda: doctor_report) if doctor_report is not None else None
+    return create_app(
+        artifacts_root=artifacts_root,
+        run_id_generator=fixed_run_id,
+        doctor_callable=doctor_callable,
+    )
 
 
 def test_doctor_reports_a_healthy_result(tmp_path: Path) -> None:
     artifacts_root = tmp_path / "artifacts"
+    report = DoctorReport(
+        checks=(DoctorCheck("linux", "PASS", True, "Linux runtime", None),)
+    )
 
-    result = CliRunner().invoke(make_app(artifacts_root), ["doctor"])
+    result = CliRunner().invoke(make_app(artifacts_root, report), ["doctor"])
 
     assert result.exit_code == 0
-    assert result.stdout == "ok\n"
+    assert result.stdout.endswith("READY\n")
+    assert not artifacts_root.exists()
+
+
+def test_doctor_json_is_stable_and_failure_exits_two(tmp_path: Path) -> None:
+    artifacts_root = tmp_path / "artifacts"
+    report = DoctorReport(
+        checks=(
+            DoctorCheck(
+                "kvm",
+                "FAIL",
+                True,
+                "KVM is unavailable",
+                "Enable nested virtualization.",
+            ),
+        )
+    )
+
+    result = CliRunner().invoke(make_app(artifacts_root, report), ["doctor", "--json"])
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "ready": False,
+        "checks": [
+            {
+                "name": "kvm",
+                "status": "FAIL",
+                "blocking": True,
+                "detail": "KVM is unavailable",
+                "remediation": "Enable nested virtualization.",
+            }
+        ],
+    }
     assert not artifacts_root.exists()
 
 

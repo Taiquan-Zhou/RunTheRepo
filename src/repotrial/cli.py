@@ -17,6 +17,7 @@ import typer
 from repotrial.agent.graph import ainvoke_run, build_run_graph
 from repotrial.agent.state import GraphContext, RepositoryPinner
 from repotrial.config import create_run_layout, generate_run_id
+from repotrial.doctor import DoctorReport, render_human, render_json, run_doctor
 from repotrial.domain.models import PinnedRepo, RepoRef, RunState
 from repotrial.intake.github import (
     RepoIntakeError,
@@ -38,6 +39,7 @@ from repotrial.sandbox.docker_sbx import (
 )
 
 type ProviderFactory = Callable[[Literal["fake", "docker-sbx"]], SandboxProvider]
+type DoctorCallable = Callable[[], DoctorReport]
 
 _FROZEN_MAX_EXPERIMENTS = 8
 _DEFAULT_CONTAINER_PORT = 8080
@@ -70,6 +72,7 @@ def create_app(
     run_id_generator: Callable[[], str] = generate_run_id,
     provider_factory: ProviderFactory | None = None,
     model: ModelAdapter | None = None,
+    doctor_callable: DoctorCallable | None = None,
 ) -> typer.Typer:
     # Keep validation errors readable in captured and non-interactive output.
     # Typer forces Rich terminal rendering in GitHub Actions, where narrow
@@ -77,8 +80,14 @@ def create_app(
     app = typer.Typer(rich_markup_mode=None)
 
     @app.command()
-    def doctor() -> None:
-        typer.echo("ok")
+    def doctor(
+        as_json: Annotated[bool, typer.Option("--json")] = False,
+    ) -> None:
+        report = (doctor_callable or run_doctor)()
+        rendered = render_json(report) if as_json else render_human(report)
+        typer.echo(rendered, nl=False)
+        if not report.ready:
+            raise typer.Exit(2)
 
     @app.command()
     def inspect(
