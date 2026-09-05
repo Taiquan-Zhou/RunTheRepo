@@ -58,12 +58,7 @@ _MARKDOWN_LINK = re.compile(r"(?<!!)\[[^\]\r\n]*\]\(([^()\s]+)\)")
 _MARKDOWN_IMAGE_DESTINATION = re.compile(
     r"!\[[^\]\r\n]*\]\((?P<destination>[^()\s]+)\)"
 )
-_ROOT_RELATIVE_PATH_TOKEN = re.compile(
-    r"(?<![A-Za-z0-9_:/\\])"
-    r"(?P<path>/[A-Za-z0-9._~@=+,-]*(?:/[A-Za-z0-9._~@=+,-]*)*"
-    r"(?:\?[A-Za-z0-9._~=&,-]*)?)"
-    r"(?![A-Za-z0-9._~@=+,\-/?%\\:])"
-)
+_INLINE_CODE_PATH = re.compile(r"(?<!`)`(?P<path>[^`\r\n]+)`(?!`)")
 _PLAIN_URL_TOKEN = re.compile(
     r"""(?P<prefix>^|[\s(<\[{\'"`])(?P<url>https?://[^\s]+)""",
     re.IGNORECASE,
@@ -417,18 +412,11 @@ def _journeys_from_readme(readme_excerpt: str) -> list[Journey]:
 
 def _readme_evidence_paths(readme_excerpt: str) -> frozenset[str]:
     paths = {"/"}
-    image_destination_spans = [
-        (match.start("destination"), match.end("destination"))
-        for match in _MARKDOWN_IMAGE_DESTINATION.finditer(readme_excerpt)
-    ]
     for match in _MARKDOWN_LINK.finditer(readme_excerpt):
         path = match.group(1)
         if _valid_root_relative_path(path):
             paths.add(path)
-    for match in _ROOT_RELATIVE_PATH_TOKEN.finditer(readme_excerpt):
-        path_start = match.start("path")
-        if any(start <= path_start < end for start, end in image_destination_spans):
-            continue
+    for match in _INLINE_CODE_PATH.finditer(readme_excerpt):
         path = match.group("path")
         if _valid_root_relative_path(path):
             paths.add(path)

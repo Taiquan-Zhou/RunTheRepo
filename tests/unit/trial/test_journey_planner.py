@@ -503,6 +503,27 @@ def test_external_absolute_url_does_not_evidence_its_local_path(
     assert model.calls == 1
 
 
+@pytest.mark.parametrize(
+    ("readme", "model_path"),
+    [
+        ("[External](https://example.test/?next=/admin)", "/admin"),
+        ("[External](https://example.test/#/admin)", "/admin"),
+        ('![shot](/admin "preview")', "/admin"),
+        ("Mount /var/lib/app...", "/var/lib/app..."),
+        ("Run " + chr(96) + "cat /admin" + chr(96), "/admin"),
+    ],
+)
+def test_unstructured_readme_paths_do_not_authorize_model_routes(
+    tmp_path: Path, readme: str, model_path: str
+) -> None:
+    model = FakeModelAdapter([_http_journey(model_path)])
+
+    journeys = _plan(tmp_path, readme, model)
+
+    assert [journey.steps[0].params["path"] for journey in journeys] == ["/"]
+    assert model.calls == 1
+
+
 def test_api_prose_does_not_evidence_a_guessed_api_endpoint(
     tmp_path: Path,
 ) -> None:
