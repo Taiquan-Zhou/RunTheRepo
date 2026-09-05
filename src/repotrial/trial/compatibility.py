@@ -28,6 +28,7 @@ _MAX_COMPATIBILITY_ARTIFACT_BYTES = 1_048_576
 _MAX_COMPATIBILITY_PAYLOAD_BYTES = 1_398_104
 _MAX_COMPATIBILITY_EVIDENCE_BYTES = 32 * 1024
 _COMPATIBILITY_RELATIVE_PATH = ".repotrial-overlays/compatibility.overlay.yaml"
+_EXPERIMENT_RELATIVE_PATH = ".repotrial-overlays/experiment.overlay.yaml"
 
 # This is code-owned and intentionally not assembled from repository input.
 _COMPATIBILITY_ADAPTER_SCRIPT = """\
@@ -82,6 +83,12 @@ printf 'root=%s\npath=%s\nmode=%s\nsha256=%s\n' \
 """
 _COMPATIBILITY_ADAPTER_SHA256 = (
     "0cb405f669bfce44fcee22a92000abf92d1826f14cbed5223f06af3e16050c19"
+)
+_EXPERIMENT_ADAPTER_SCRIPT = _COMPATIBILITY_ADAPTER_SCRIPT.replace(
+    "repotrial-compatibility-overlay", "repotrial-experiment-overlay"
+).replace(_COMPATIBILITY_RELATIVE_PATH, _EXPERIMENT_RELATIVE_PATH)
+_EXPERIMENT_ADAPTER_SHA256 = (
+    "d0540c9aefa3bfb23cc27a7af79fbdbb8b8c2e714311acc4e1c09f1580a82827"
 )
 
 
@@ -169,22 +176,77 @@ async def materialize_guest_compatibility_overlay(
 ) -> None:
     """Copy one verified host overlay into a managed sandbox guest."""
 
+    await _materialize_guest_overlay(
+        provider,
+        sandbox_id,
+        host_artifact_path=host_artifact_path,
+        relative_path=relative_path,
+        expected_sha256=expected_sha256,
+        evidence_path=evidence_path,
+        expected_relative_path=_COMPATIBILITY_RELATIVE_PATH,
+        adapter_script=_COMPATIBILITY_ADAPTER_SCRIPT,
+        adapter_sha256=_COMPATIBILITY_ADAPTER_SHA256,
+        purpose="compatibility_overlay_materialization",
+        command_name="repotrial-compatibility-overlay",
+    )
+
+
+async def materialize_guest_experiment_overlay(
+    provider: SandboxProvider,
+    sandbox_id: str,
+    *,
+    host_artifact_path: Path,
+    expected_sha256: str,
+    evidence_path: Path,
+) -> None:
+    """Copy one verified candidate overlay to its fixed guest path."""
+
+    await _materialize_guest_overlay(
+        provider,
+        sandbox_id,
+        host_artifact_path=host_artifact_path,
+        relative_path=_EXPERIMENT_RELATIVE_PATH,
+        expected_sha256=expected_sha256,
+        evidence_path=evidence_path,
+        expected_relative_path=_EXPERIMENT_RELATIVE_PATH,
+        adapter_script=_EXPERIMENT_ADAPTER_SCRIPT,
+        adapter_sha256=_EXPERIMENT_ADAPTER_SHA256,
+        purpose="experiment_overlay_materialization",
+        command_name="repotrial-experiment-overlay",
+    )
+
+
+async def _materialize_guest_overlay(
+    provider: SandboxProvider,
+    sandbox_id: str,
+    *,
+    host_artifact_path: Path,
+    relative_path: str,
+    expected_sha256: str,
+    evidence_path: Path,
+    expected_relative_path: str,
+    adapter_script: str,
+    adapter_sha256: str,
+    purpose: str,
+    command_name: str,
+) -> None:
+
     _validate_materialization_inputs(
         host_artifact_path,
         relative_path,
         expected_sha256,
         evidence_path,
+        expected_relative_path,
     )
     started = time.monotonic()
-    adapter_sha256 = hashlib.sha256(_COMPATIBILITY_ADAPTER_SCRIPT.encode()).hexdigest()
-    if adapter_sha256 != _COMPATIBILITY_ADAPTER_SHA256:
+    if hashlib.sha256(adapter_script.encode()).hexdigest() != adapter_sha256:
         raise CompatibilityError("adapter_identity_mismatch")
     evidence = _CompatibilityEvidenceWriter(evidence_path)
     identity = {
         "adapter_sha256": adapter_sha256,
         "artifact_relative_path": relative_path,
         "artifact_sha256": expected_sha256,
-        "purpose": "compatibility_overlay_materialization",
+        "purpose": purpose,
         "schema_version": 1,
     }
     try:
@@ -202,8 +264,8 @@ async def materialize_guest_compatibility_overlay(
                     "sh",
                     "-eu",
                     "-c",
-                    _COMPATIBILITY_ADAPTER_SCRIPT,
-                    "repotrial-compatibility-overlay",
+                    adapter_script,
+                    command_name,
                     relative_path,
                     expected_sha256,
                     payload,
@@ -268,10 +330,11 @@ def _validate_materialization_inputs(
     relative_path: str,
     expected_sha256: str,
     evidence_path: Path,
+    expected_relative_path: str,
 ) -> None:
     if not isinstance(host_artifact_path, Path):
         raise CompatibilityError("artifact_path_invalid")
-    if relative_path != _COMPATIBILITY_RELATIVE_PATH:
+    if relative_path != expected_relative_path:
         raise CompatibilityError("artifact_path_invalid")
     if (
         not isinstance(expected_sha256, str)
@@ -301,7 +364,14 @@ def _append_materialization_terminal(
     )
 
 
-def _read_host_compatibility_artifact(path: Path, expected_sha256: str) -> bytes:
+def fingerprint_host_artifact(path: Path) -> str:
+    """Return a race-detected SHA-256 fingerprint of one host artifact."""
+
+    payload = _read_host_compatibility_artifact(path, None)
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _read_host_compatibility_artifact(path: Path, expected_sha256: str | None) -> bytes:
     """Read a bounded regular file while retaining its path/fd identity."""
 
     try:
@@ -379,7 +449,10 @@ def _read_host_compatibility_artifact(path: Path, expected_sha256: str) -> bytes
         ):
             raise CompatibilityError("artifact_changed")
         data = bytes(payload)
-        if hashlib.sha256(data).hexdigest() != expected_sha256:
+        if (
+            expected_sha256 is not None
+            and hashlib.sha256(data).hexdigest() != expected_sha256
+        ):
             raise CompatibilityError("artifact_hash_mismatch")
         return data
     finally:
@@ -451,6 +524,37 @@ async def verify_guest_compatibility_overlay(
 ) -> None:
     """Verify the cloned compatibility artifact before any workload command."""
 
+    await _verify_guest_overlay(
+        provider,
+        sandbox_id,
+        relative_path=relative_path,
+        expected_sha256=expected_sha256,
+    )
+
+
+async def verify_guest_experiment_overlay(
+    provider: SandboxProvider,
+    sandbox_id: str,
+    *,
+    expected_sha256: str,
+) -> None:
+    """Verify the fixed candidate artifact before any workload command."""
+
+    await _verify_guest_overlay(
+        provider,
+        sandbox_id,
+        relative_path=_EXPERIMENT_RELATIVE_PATH,
+        expected_sha256=expected_sha256,
+    )
+
+
+async def _verify_guest_overlay(
+    provider: SandboxProvider,
+    sandbox_id: str,
+    *,
+    relative_path: str,
+    expected_sha256: str,
+) -> None:
     _validate_identity(relative_path, expected_sha256)
     try:
         result = await provider.exec(

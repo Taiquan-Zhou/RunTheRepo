@@ -91,6 +91,7 @@ class RecordingProvider(FakeSandboxProvider):
         )
         self.expected_overlay = expected_overlay
         self.overlay_at_create: str | None = None
+        self.experiment_sha256: str | None = None
         self.source_env = source_env
         self.publish_failure = publish_failure
         self.destroy_failure = destroy_failure
@@ -108,10 +109,18 @@ class RecordingProvider(FakeSandboxProvider):
     ) -> ExecResult:
         self._require_active(sandbox_id)
         snapshot = tuple(argv)
-        if "repotrial-compatibility-overlay" in snapshot:
+        if any(
+            command in snapshot
+            for command in (
+                "repotrial-compatibility-overlay",
+                "repotrial-experiment-overlay",
+            )
+        ):
             self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
             relative_path = snapshot[-3]
             expected_sha256 = snapshot[-2]
+            if "repotrial-experiment-overlay" in snapshot:
+                self.experiment_sha256 = expected_sha256
             return ExecResult(
                 exit_code=0,
                 stdout=(
@@ -122,6 +131,14 @@ class RecordingProvider(FakeSandboxProvider):
                 ),
                 stderr="",
             )
+        if snapshot == (
+            "sha256sum",
+            "--",
+            ".repotrial-overlays/experiment.overlay.yaml",
+        ):
+            assert self.experiment_sha256 is not None
+            self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+            return _exec_result(stdout=f"{self.experiment_sha256}  {snapshot[-1]}\n")
         return await super().exec(sandbox_id, argv, timeout_s)
 
     async def publish_port(self, sandbox_id: str, container_port: int) -> int:
@@ -148,9 +165,17 @@ class StartupInputProvider(RecordingProvider):
         self._require_active(sandbox_id)
         snapshot = tuple(argv)
         self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
-        if "repotrial-compatibility-overlay" in snapshot:
+        if any(
+            command in snapshot
+            for command in (
+                "repotrial-compatibility-overlay",
+                "repotrial-experiment-overlay",
+            )
+        ):
             relative_path = snapshot[-3]
             expected_sha256 = snapshot[-2]
+            if "repotrial-experiment-overlay" in snapshot:
+                self.experiment_sha256 = expected_sha256
             return ExecResult(
                 exit_code=0,
                 stdout=(
@@ -161,6 +186,14 @@ class StartupInputProvider(RecordingProvider):
                 ),
                 stderr="",
             )
+        if snapshot == (
+            "sha256sum",
+            "--",
+            ".repotrial-overlays/experiment.overlay.yaml",
+        ):
+            assert self.experiment_sha256 is not None
+            self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+            return _exec_result(stdout=f"{self.experiment_sha256}  {snapshot[-1]}\n")
         if "repotrial-startup-input" in snapshot:
             return ExecResult(
                 exit_code=self.adapter_exit_code,
@@ -271,7 +304,13 @@ def _compose_argv(
             "-f",
             compatibility_path.relative_to(context.workspace).as_posix(),
         )
-    base = ("docker", "compose", *compose_files, "-f", context.overlay_path.name)
+    base = (
+        "docker",
+        "compose",
+        *compose_files,
+        "-f",
+        ".repotrial-overlays/experiment.overlay.yaml",
+    )
     return (
         (*prefix, *base, "up", "-d", "--wait", "--wait-timeout", "60"),
         (*prefix, *base, "ps", "--all", "--format", "json"),
@@ -583,12 +622,12 @@ def test_candidate_threads_compatibility_before_hardening_overlay_without_hash_c
         (
             "boot",
             compatibility.relative_to(context.workspace).as_posix(),
-            context.overlay_path.name,
+            ".repotrial-overlays/experiment.overlay.yaml",
         ),
         (
             "observation",
             compatibility.relative_to(context.workspace).as_posix(),
-            context.overlay_path.name,
+            ".repotrial-overlays/experiment.overlay.yaml",
         ),
     ]
 
@@ -1074,11 +1113,18 @@ def test_boot_failure_short_circuits_observation_and_replay_but_cleans_up(
     assert record.verdict is expected_verdict
     assert record.reason == reason
     assert record.boot is boot_verdict
-    assert boot_calls == [("compose.yaml", context.overlay_path.name)]
-    assert provider.calls == [
-        ("create", context.workspace, cast(str, provider.calls[0][2])),
-        ("destroy", "sandbox-1"),
+    assert boot_calls == [
+        ("compose.yaml", ".repotrial-overlays/experiment.overlay.yaml")
     ]
+    assert provider.calls[0][0:2] == ("create", context.workspace)
+    assert provider.calls[-1] == ("destroy", "sandbox-1")
+    exec_commands = [call[2] for call in provider.calls if call[0] == "exec"]
+    assert any("repotrial-experiment-overlay" in command for command in exec_commands)
+    assert any(
+        command[:3]
+        == ("sha256sum", "--", ".repotrial-overlays/experiment.overlay.yaml")
+        for command in exec_commands
+    ), repr(exec_commands)
 
 
 def test_observation_failure_stops_with_boot_pass_and_cleanup(

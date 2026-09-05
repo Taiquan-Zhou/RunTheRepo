@@ -27,8 +27,12 @@ from repotrial.sandbox.docker_sbx import DockerSbxError
 from repotrial.sandbox.lifecycle import CleanupError, managed_sandbox
 from repotrial.trial.boot import _validated_env_prefix, boot_compose
 from repotrial.trial.compatibility import (
+    _EXPERIMENT_RELATIVE_PATH,
+    fingerprint_host_artifact,
     materialize_guest_compatibility_overlay,
+    materialize_guest_experiment_overlay,
     verify_guest_compatibility_overlay,
+    verify_guest_experiment_overlay,
 )
 from repotrial.trial.observer import (
     _collect_observation_with_evidence,
@@ -87,6 +91,8 @@ class _PreparedExperiment:
     overlay_relative: str
     compatibility_overlay_relative: str | None
     compatibility_overlay_evidence_path: Path | None
+    experiment_overlay_relative: str
+    experiment_overlay_evidence_path: Path
     env: dict[str, str]
     parent_hash: str
     candidate_hash: str
@@ -162,6 +168,17 @@ async def run_experiment(
             verdict=ExperimentVerdict.STOP,
             reason="overlay_write_failed",
         )
+    try:
+        experiment_overlay_sha256 = fingerprint_host_artifact(prepared.overlay_path)
+    except _ORDINARY_STAGE_ERRORS:
+        return _record(
+            state,
+            mutation,
+            prepared,
+            boot=Verdict.UNSUPPORTED,
+            verdict=ExperimentVerdict.STOP,
+            reason="candidate_overlay_materialization_failed",
+        )
 
     try:
         async with managed_sandbox(
@@ -177,6 +194,7 @@ async def run_experiment(
                 context,
                 prepared,
                 sandbox_id,
+                experiment_overlay_sha256,
             )
     except CleanupError:
         raise
@@ -233,6 +251,10 @@ def _prepare(
             artifact_dir, context.compatibility_overlay_evidence_path
         )
     )
+    experiment_overlay_relative = _EXPERIMENT_RELATIVE_PATH
+    experiment_overlay_evidence_path = artifact_dir / (
+        "experiment-overlay-materialization.jsonl"
+    )
     env = _snapshot_env(context.env)
     _validated_env_prefix(compose_path, env)
 
@@ -273,6 +295,8 @@ def _prepare(
         overlay_relative=overlay_relative,
         compatibility_overlay_relative=compatibility_overlay_relative,
         compatibility_overlay_evidence_path=compatibility_overlay_evidence_path,
+        experiment_overlay_relative=experiment_overlay_relative,
+        experiment_overlay_evidence_path=experiment_overlay_evidence_path,
         env=env,
         parent_hash=parent_hash,
         candidate_hash=candidate_hash,
@@ -448,6 +472,7 @@ def _validate_artifact_targets(prepared: _PreparedExperiment) -> None:
         targets.extend([prepared.startup_input_evidence, prepared.observation_evidence])
     if prepared.compatibility_overlay_evidence_path is not None:
         targets.append(prepared.compatibility_overlay_evidence_path)
+    targets.append(prepared.experiment_overlay_evidence_path)
     for target in targets:
         if target.exists() or target.is_symlink():
             raise ValueError("experiment artifact target is already in use")
@@ -470,6 +495,7 @@ async def _run_candidate(
     context: ExperimentContext,
     prepared: _PreparedExperiment,
     sandbox_id: str,
+    experiment_overlay_sha256: str,
 ) -> ExperimentRecord:
     if prepared.compatibility_overlay_relative is not None:
         host_artifact_path = prepared.compatibility_overlay_path
@@ -493,6 +519,30 @@ async def _run_candidate(
             relative_path=prepared.compatibility_overlay_relative,
             expected_sha256=context.compatibility_overlay_sha256 or "",
         )
+    try:
+        await materialize_guest_experiment_overlay(
+            provider,
+            sandbox_id,
+            host_artifact_path=prepared.overlay_path,
+            expected_sha256=experiment_overlay_sha256,
+            evidence_path=prepared.experiment_overlay_evidence_path,
+        )
+        await verify_guest_experiment_overlay(
+            provider,
+            sandbox_id,
+            expected_sha256=experiment_overlay_sha256,
+        )
+    except CleanupError:
+        raise
+    except _ORDINARY_STAGE_ERRORS:
+        return _record(
+            state,
+            mutation,
+            prepared,
+            boot=Verdict.UNSUPPORTED,
+            verdict=ExperimentVerdict.STOP,
+            reason="candidate_overlay_materialization_failed",
+        )
     startup_plan = prepared.startup_input_plan
     if startup_plan is not None:
         try:
@@ -504,7 +554,7 @@ async def _run_candidate(
                 compose_env=prepared.env,
                 evidence_path=prepared.startup_input_evidence,
                 compatibility_overlay_path=prepared.compatibility_overlay_relative,
-                overlay_path=prepared.overlay_relative,
+                overlay_path=prepared.experiment_overlay_relative,
             )
         except CleanupError:
             raise
@@ -526,7 +576,7 @@ async def _run_candidate(
                 prepared.env,
                 attempt=1,
                 compatibility_overlay_path=prepared.compatibility_overlay_relative,
-                overlay_path=prepared.overlay_relative,
+                overlay_path=prepared.experiment_overlay_relative,
             )
         else:
             boot = await boot_compose(
@@ -536,7 +586,7 @@ async def _run_candidate(
                 prepared.env,
                 attempt=1,
                 compatibility_overlay_path=prepared.compatibility_overlay_relative,
-                overlay_path=prepared.overlay_relative,
+                overlay_path=prepared.experiment_overlay_relative,
                 unset_env_keys=startup_plan.all_source_key_names,
                 project_directory=".",
             )
@@ -574,7 +624,7 @@ async def _run_candidate(
                 prepared.compose_path,
                 prepared.observation_artifact,
                 compatibility_overlay_path=prepared.compatibility_overlay_relative,
-                overlay_path=prepared.overlay_relative,
+                overlay_path=prepared.experiment_overlay_relative,
                 env=effective_env,
             )
         else:
@@ -584,7 +634,7 @@ async def _run_candidate(
                 prepared.compose_path,
                 prepared.observation_artifact,
                 compatibility_overlay_path=prepared.compatibility_overlay_relative,
-                overlay_path=prepared.overlay_relative,
+                overlay_path=prepared.experiment_overlay_relative,
                 evidence_path=prepared.observation_evidence,
                 env=effective_env,
                 unset_env_keys=startup_plan.all_source_key_names,

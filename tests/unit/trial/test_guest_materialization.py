@@ -9,9 +9,15 @@ import pytest
 
 from repotrial.compose.compatibility import CompatibilityError
 from repotrial.sandbox.base import ExecResult, SandboxProvider
-from repotrial.trial.compatibility import materialize_guest_compatibility_overlay
+from repotrial.sandbox.fake import FakeSandboxProvider
+from repotrial.trial.compatibility import (
+    materialize_guest_compatibility_overlay,
+    materialize_guest_experiment_overlay,
+    verify_guest_experiment_overlay,
+)
 
 _RELATIVE_PATH = ".repotrial-overlays/compatibility.overlay.yaml"
+_EXPERIMENT_RELATIVE_PATH = ".repotrial-overlays/experiment.overlay.yaml"
 
 
 class RecordingProvider(SandboxProvider):
@@ -133,6 +139,75 @@ def test_materializes_bounded_host_artifact_with_controlled_argv_and_identity_ev
     assert rows[1]["reason"] == "materialized"
     assert "c2VydmljZXM6" not in evidence.read_text()
     assert "services: {}" not in evidence.read_text()
+
+
+def test_experiment_materializer_uses_fixed_guest_path_and_purpose(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "candidate.overlay.yaml"
+    payload = b"services: {}\n"
+    artifact.write_bytes(payload)
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    provider = RecordingProvider(
+        ExecResult(
+            exit_code=0,
+            stdout=(
+                "root=/workspace\n"
+                f"path={_EXPERIMENT_RELATIVE_PATH}\n"
+                "mode=600\n"
+                f"sha256={expected_sha256}\n"
+            ),
+            stderr="",
+        )
+    )
+    evidence = tmp_path / "experiment-materialization.jsonl"
+
+    asyncio.run(
+        materialize_guest_experiment_overlay(
+            provider,
+            "sandbox-1",
+            host_artifact_path=artifact,
+            expected_sha256=expected_sha256,
+            evidence_path=evidence,
+        )
+    )
+
+    _, argv, timeout_s = provider.calls[0]
+    assert argv[4] == "repotrial-experiment-overlay"
+    assert argv[5] == _EXPERIMENT_RELATIVE_PATH
+    assert timeout_s == 30
+    rows = [json.loads(line) for line in evidence.read_text().splitlines()]
+    assert all(row["purpose"] == "experiment_overlay_materialization" for row in rows)
+    assert all(
+        row["artifact_relative_path"] == _EXPERIMENT_RELATIVE_PATH for row in rows
+    )
+
+
+def test_experiment_verifier_cannot_be_redirected_to_compatibility_path() -> None:
+    expected_sha256 = "a" * 64
+    provider = FakeSandboxProvider(
+        scripts={
+            ("sha256sum", "--", _EXPERIMENT_RELATIVE_PATH): ExecResult(
+                exit_code=0,
+                stdout=f"{expected_sha256}  {_EXPERIMENT_RELATIVE_PATH}\n",
+                stderr="",
+            )
+        }
+    )
+    sandbox_id = asyncio.run(provider.create(Path("/tmp"), "guest-verify"))
+
+    asyncio.run(
+        verify_guest_experiment_overlay(
+            provider, sandbox_id, expected_sha256=expected_sha256
+        )
+    )
+
+    assert provider.calls[-1] == (
+        "exec",
+        sandbox_id,
+        ("sha256sum", "--", _EXPERIMENT_RELATIVE_PATH),
+        30,
+    )
 
 
 def test_host_hash_mismatch_fails_before_provider_transport(tmp_path: Path) -> None:
