@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -133,6 +135,7 @@ class GraphProvider(FakeSandboxProvider):
         self._logs: dict[str, str] = {}
         self._roles: dict[str, str] = {}
         self._workspaces: dict[str, Path] = {}
+        self._experiment_expected_sha256: dict[str, str] = {}
 
     async def create(self, workspace: Path, name: str) -> str:
         sandbox_id = await super().create(workspace, name)
@@ -170,16 +173,56 @@ class GraphProvider(FakeSandboxProvider):
                 ),
                 stderr="",
             )
+        if "repotrial-experiment-overlay" in snapshot:
+            relative_path = snapshot[-3]
+            expected_sha256 = snapshot[-2]
+            payload = snapshot[-1]
+            if relative_path != ".repotrial-overlays/experiment.overlay.yaml":
+                raise AssertionError("experiment adapter path must be fixed")
+            try:
+                content = base64.b64decode(payload, validate=True)
+            except (ValueError, binascii.Error) as error:
+                raise AssertionError(
+                    "experiment payload must be valid base64"
+                ) from error
+            if hashlib.sha256(content).hexdigest() != expected_sha256:
+                raise AssertionError("experiment payload hash mismatch")
+            target = self._workspaces[sandbox_id] / relative_path
+            target.parent.mkdir(exist_ok=True)
+            if target.exists() or target.is_symlink():
+                return ExecResult(exit_code=24, stdout="", stderr="")
+            target.write_bytes(content)
+            target.chmod(0o600)
+            self._experiment_expected_sha256[sandbox_id] = expected_sha256
+            return ExecResult(
+                exit_code=0,
+                stdout=(
+                    "root=/workspace\n"
+                    f"path={relative_path}\n"
+                    "mode=600\n"
+                    f"sha256={expected_sha256}\n"
+                ),
+                stderr="",
+            )
         if "repotrial-startup-input" in snapshot:
             return self.startup_adapter_result
         if snapshot[:2] == ("sha256sum", "--"):
             relative_path = snapshot[2]
-            if self._roles[sandbox_id] in self.compatibility_mismatch_roles:
+            if (
+                relative_path == ".repotrial-overlays/compatibility.overlay.yaml"
+                and self._roles[sandbox_id] in self.compatibility_mismatch_roles
+            ):
                 digest = "0" * 64
             else:
-                digest = hashlib.sha256(
-                    (self._workspaces[sandbox_id] / relative_path).read_bytes()
-                ).hexdigest()
+                target = self._workspaces[sandbox_id] / relative_path
+                if not target.is_file() or target.is_symlink():
+                    raise AssertionError("guest verifier target was not materialized")
+                digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                if (
+                    relative_path == ".repotrial-overlays/experiment.overlay.yaml"
+                    and self._experiment_expected_sha256.get(sandbox_id) != digest
+                ):
+                    raise AssertionError("experiment verifier hash mismatch")
             return ExecResult(
                 exit_code=0,
                 stdout=f"{digest}  {relative_path}\n",
@@ -235,6 +278,14 @@ class GraphProvider(FakeSandboxProvider):
             self.calls.append(("publish_port", sandbox_id, container_port))
             raise KeyError("candidate port is unavailable")
         return await super().publish_port(sandbox_id, container_port)
+
+    async def destroy(self, sandbox_id: str) -> None:
+        workspace = self._workspaces.get(sandbox_id)
+        if workspace is not None:
+            (workspace / ".repotrial-overlays/experiment.overlay.yaml").unlink(
+                missing_ok=True
+            )
+        await super().destroy(sandbox_id)
 
 
 class PreflightObservationProvider(GraphProvider):
@@ -1527,15 +1578,32 @@ def test_candidate_materializes_compatibility_before_guest_hash_and_compose(
         for index, call in enumerate(candidate_calls)
         if "repotrial-compatibility-overlay" in call[2]
     )
-    verify_index = next(
+    compatibility_verify_index = next(
         index for index, call in enumerate(candidate_calls) if call[2][0] == "sha256sum"
+    )
+    experiment_materialize_index = next(
+        index
+        for index, call in enumerate(candidate_calls)
+        if "repotrial-experiment-overlay" in call[2]
+    )
+    experiment_verify_index = next(
+        index
+        for index, call in enumerate(candidate_calls)
+        if call[2][:3]
+        == ("sha256sum", "--", ".repotrial-overlays/experiment.overlay.yaml")
     )
     compose_index = next(
         index
         for index, call in enumerate(candidate_calls)
         if "docker" in call[2] and "compose" in call[2]
     )
-    assert materialize_index < verify_index < compose_index
+    assert (
+        materialize_index
+        < compatibility_verify_index
+        < experiment_materialize_index
+        < experiment_verify_index
+        < compose_index
+    )
 
 
 def test_baseline_guest_compatibility_mismatch_cleans_and_reports_before_compose(
