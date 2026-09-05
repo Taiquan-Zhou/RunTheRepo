@@ -241,17 +241,86 @@ def test_loopback_dynamic_published_default_preserves_expression_in_overlay(
     "entry",
     [
         "127.0.0.1:${PORT}:9090",
-        "${HOST:-127.0.0.1}:9090:9090",
-        "127.0.0.1:${PORT:-9090}suffix:9090",
+        "127.0.0.1:$${PORT:-9090}:9090",
+        "127.0.0.1:${PORT:?required}:9090",
+        "127.0.0.1:${PORT?required}:9090",
+        "127.0.0.1:${PORT:+9090}:9090",
+        "127.0.0.1:${PORT+9090}:9090",
+        "127.0.0.1:${PORT:-}:9090",
+        "127.0.0.1:${PORT:-abc}:9090",
+        "127.0.0.1:${PORT:-0}:9090",
+        "127.0.0.1:${PORT:-65536}:9090",
+        "127.0.0.1:${PORT:-" + "9" * 5000 + "}:9090",
+        "127.0.0.1:{PORT:-9090}:9090",
+        "127.0.0.1:}:9090",
         "127.0.0.1:${PORT:-${DEFAULT}}:9090",
+        "127.0.0.1:${PORT:-9090}suffix:9090",
         "127.0.0.1:${PORT:-9090:9090",
     ],
 )
-def test_interpolated_short_bindings_fail_closed(tmp_path: Path, entry: str) -> None:
+def test_invalid_port_interpolations_fail_closed(tmp_path: Path, entry: str) -> None:
     with pytest.raises(CompatibilityError) as error:
         plan_loopback_compatibility_overlay(_compose([entry]), container_port=9090)
 
-    assert error.value.reason in {"host_not_numeric", "invalid_port"}
+    assert error.value.reason == "invalid_port"
+
+
+def test_interpolated_host_fails_closed_as_non_numeric() -> None:
+    with pytest.raises(CompatibilityError) as error:
+        plan_loopback_compatibility_overlay(
+            _compose(["${HOST:-127.0.0.1}:9090:9090"]), container_port=9090
+        )
+
+    assert error.value.reason == "host_not_numeric"
+
+
+@pytest.mark.parametrize("published", ["5000-5001", "-1", "1-2-3"])
+def test_port_range_reason_is_preserved(published: str) -> None:
+    with pytest.raises(CompatibilityError) as error:
+        plan_loopback_compatibility_overlay(
+            _compose([f"127.0.0.1:{published}:9090"]), container_port=9090
+        )
+
+    assert error.value.reason == "port_range"
+
+
+@pytest.mark.parametrize("protocol", ["/tcp", "/udp"])
+def test_dynamic_published_expression_preserves_protocol(
+    tmp_path: Path, protocol: str
+) -> None:
+    artifact = write_loopback_compatibility_overlay(
+        _compose([f"127.0.0.1:${{PORT:-9090}}:9090{protocol}"]),
+        container_port=9090,
+        path=tmp_path / f"compatibility{protocol[1:]}.overlay.yaml",
+    )
+
+    assert artifact is not None
+    ports = _load_overlay(artifact.path)["services"]["app"]["ports"]
+    assert list(ports) == [f"0.0.0.0:${{PORT:-9090}}:9090{protocol}"]
+
+
+def test_bracketed_ipv6_with_dynamic_published_expression_is_supported(
+    tmp_path: Path,
+) -> None:
+    artifact = write_loopback_compatibility_overlay(
+        _compose(["[::1]:${PORT:-9090}:9090"]),
+        container_port=9090,
+        path=tmp_path / "compatibility.overlay.yaml",
+    )
+
+    assert artifact is not None
+    ports = _load_overlay(artifact.path)["services"]["app"]["ports"]
+    assert list(ports) == ["0.0.0.0:${PORT:-9090}:9090"]
+
+
+def test_invalid_interpolated_protocol_fails_closed() -> None:
+    with pytest.raises(CompatibilityError) as error:
+        plan_loopback_compatibility_overlay(
+            _compose(["127.0.0.1:${PORT:-9090}:9090/sctp"]),
+            container_port=9090,
+        )
+
+    assert error.value.reason == "invalid_protocol"
 
 
 def test_tagged_port_value_fails_closed(tmp_path: Path) -> None:

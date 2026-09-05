@@ -333,7 +333,9 @@ def _parse_port_number(value: object) -> int:
                 number = int(default_text)
             except ValueError:
                 raise CompatibilityError("invalid_port") from None
-        elif re.fullmatch(r"[0-9]+-[0-9]+", value):
+        elif "{" in value or "}" in value:
+            raise CompatibilityError("invalid_port")
+        elif "-" in value:
             raise CompatibilityError("port_range")
         else:
             if not value or not value.isascii() or not value.isdigit():
