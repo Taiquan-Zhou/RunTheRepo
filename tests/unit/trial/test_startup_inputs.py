@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from shutil import copytree
@@ -25,7 +26,7 @@ from repotrial.trial.startup_inputs import (
 )
 
 _FIXTURE_ROOT = Path(__file__).parents[2] / "fixtures" / "startup_input_diagnostic"
-_ADAPTER_SHA256 = "2e409d6d7c3ed2f72ba78d7e0712467351df54ef759952eedb4bf3f93fa47233"
+_ADAPTER_SHA256 = "0b1e0679c9e9ef0f6a13695cfecb1d056112f367f2a77e0ebd58e127fbe89737"
 
 
 def _copy_fixture(tmp_path: Path, case: str) -> Path:
@@ -134,6 +135,113 @@ def test_option_b_allows_an_empty_generated_file(tmp_path: Path) -> None:
     assert plan.output_bytes == b""
     assert plan.accepted_key_names == ()
     assert plan.omitted_control_key_names == ("DOCKER_HOST",)
+
+
+def test_empty_plan_passes_non_empty_sentinel_to_adapter(tmp_path: Path) -> None:
+    workspace = _diagnostic_workspace(tmp_path, "empty_adapter_sentinel")
+    (workspace / ".env.sample").write_bytes(b"DOCKER_HOST=safe\n")
+    plan = plan_startup_input(workspace, "compose.yaml")
+    assert plan is not None
+    assert plan.output_bytes == b""
+    provider = _MaterializeProvider()
+
+    asyncio.run(
+        materialize_startup_input(
+            provider,
+            "sandbox-1",
+            plan,
+            compose_path="compose.yaml",
+            compose_env={},
+            evidence_path=tmp_path / "attempt.jsonl",
+        )
+    )
+
+    assert provider.exec_calls[0][-1] == "repotrial_empty_payload"
+
+
+def _run_local_adapter(
+    root: Path, payload: str, expected: bytes = b""
+) -> subprocess.CompletedProcess[str]:
+    source = root / ".env.sample"
+    source.write_bytes(b"APP_MODE=safe\n")
+    source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    output_sha256 = hashlib.sha256(expected).hexdigest()
+    return subprocess.run(
+        [
+            "sh",
+            "-eu",
+            "-c",
+            startup_inputs._ADAPTER_SCRIPT,
+            "repotrial-startup-input",
+            ".env.sample",
+            ".env",
+            source_sha256,
+            output_sha256,
+            payload,
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_local_adapter_materializes_empty_sentinel_as_0600_file(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "empty-adapter-repository"
+    root.mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+
+    result = _run_local_adapter(root, "repotrial_empty_payload")
+
+    assert result.returncode == 0
+    assert result.stdout == f"root={root.resolve()}\nmode=600\n"
+    assert result.stderr == ""
+    assert (root / ".env").read_bytes() == b""
+    assert stat.S_IMODE((root / ".env").stat().st_mode) == 0o600
+
+
+def test_local_adapter_keeps_non_empty_payload_path_unchanged(tmp_path: Path) -> None:
+    root = tmp_path / "non-empty-adapter-repository"
+    root.mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    expected = b"APP_MODE=safe\n"
+    payload = base64.b64encode(expected).decode("ascii")
+
+    result = _run_local_adapter(root, payload, expected)
+
+    assert result.returncode == 0
+    assert (root / ".env").read_bytes() == expected
+    assert stat.S_IMODE((root / ".env").stat().st_mode) == 0o600
+
+
+def test_local_adapter_rejects_invalid_payload_and_cleans_file(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "invalid-adapter-repository"
+    root.mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+
+    result = _run_local_adapter(root, "not_valid_base64")
+
+    assert result.returncode == 27
+    assert not (root / ".env").exists()
 
 
 def _diagnostic_workspace(tmp_path: Path, case: str) -> Path:
@@ -631,7 +739,7 @@ def test_materializes_guest_input_before_resolved_compose_config(
     )
     assert provider.exec_calls[0][10] == "-c"
     assert hashlib.sha256(provider.exec_calls[0][11].encode()).hexdigest() == (
-        "2e409d6d7c3ed2f72ba78d7e0712467351df54ef759952eedb4bf3f93fa47233"
+        "0b1e0679c9e9ef0f6a13695cfecb1d056112f367f2a77e0ebd58e127fbe89737"
     )
     assert provider.exec_calls[0][12:] == (
         "repotrial-startup-input",

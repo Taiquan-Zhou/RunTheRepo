@@ -44,6 +44,7 @@ _MAX_RESOLVED_CONFIG_NODES: Final = 100_000
 _MAX_RESOLVED_CONFIG_DEPTH: Final = 128
 _MAX_EVIDENCE_BYTES: Final = 32 * 1024
 _MAX_PAYLOAD_BYTES: Final = 90_000
+_EMPTY_PAYLOAD_SENTINEL: Final = "repotrial_empty_payload"
 _MAX_BIND_SOURCES: Final = 128
 _MAX_BIND_SOURCE_BYTES: Final = 4_096
 _MAX_IDENTITY_BYTES: Final = 4_096
@@ -87,7 +88,9 @@ fi
 
 payload_bytes=$(printf '%s' "$payload" | wc -c)
 [ "$payload_bytes" -le 90000 ] || exit 26
-if ! printf '%s' "$payload" | base64 -d > "$target_path"; then
+if [ "$payload" = "repotrial_empty_payload" ]; then
+    : > "$target_path"
+elif ! printf '%s' "$payload" | base64 -d > "$target_path"; then
     if [ -f "$target_path" ] && [ ! -L "$target_path" ]; then
         rm -f "$target_path"
     fi
@@ -103,7 +106,7 @@ target_hash=$(sha256sum "$target_path" | cut -d ' ' -f 1)
 printf 'root=%s\nmode=%s\n' "$root" "$target_mode"
 """
 _ADAPTER_SHA256: Final = (
-    "2e409d6d7c3ed2f72ba78d7e0712467351df54ef759952eedb4bf3f93fa47233"
+    "0b1e0679c9e9ef0f6a13695cfecb1d056112f367f2a77e0ebd58e127fbe89737"
 )
 _BIND_VALIDATOR_SCRIPT: Final = """\
 set -eu
@@ -275,7 +278,11 @@ async def materialize_startup_input(
         )
     if overlay_path is not None:
         _validate_guest_relative_path(overlay_path, "overlay_path")
-    payload = base64.b64encode(plan.output_bytes).decode("ascii")
+    payload = (
+        base64.b64encode(plan.output_bytes).decode("ascii")
+        if plan.output_bytes
+        else _EMPTY_PAYLOAD_SENTINEL
+    )
     if len(payload) > _MAX_PAYLOAD_BYTES:
         raise StartupInputUnsupported("payload_too_large")
     adapter_sha256 = hashlib.sha256(_ADAPTER_SCRIPT.encode()).hexdigest()
