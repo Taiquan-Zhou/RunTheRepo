@@ -194,14 +194,11 @@ def _run_with_active_sandbox(
     return asyncio.run(exercise())
 
 
-def test_declared_secret_preflight_resolves_multiple_keys_before_one_up() -> None:
+def test_declared_secret_preflight_batches_multiple_keys_before_one_up() -> None:
     first_error = (
         'environment variable "FIRST_SECRET" required by secret "first" is not set'
     )
-    second_error = (
-        'environment variable "SECOND_SECRET" required by secret "second" is not set'
-    )
-    provider = ComposePreflightProvider([first_error, second_error])
+    provider = ComposePreflightProvider([first_error])
 
     result = _run_with_active_sandbox(
         provider,
@@ -214,13 +211,13 @@ def test_declared_secret_preflight_resolves_multiple_keys_before_one_up() -> Non
         "FIRST_SECRET": "repotrial-synthetic-value",
         "SECOND_SECRET": "repotrial-synthetic-value",
     }
-    assert len(provider.config_argv) == 2
+    assert len(provider.config_argv) == 1
     assert len(provider.up_argv) == 1
-    assert provider.config_argv[0][:2] == ("env", "PUBLIC_VALUE=public")
-    assert provider.config_argv[1][:3] == (
+    assert provider.config_argv[0][:4] == (
         "env",
         "FIRST_SECRET=repotrial-synthetic-value",
         "PUBLIC_VALUE=public",
+        "SECOND_SECRET=repotrial-synthetic-value",
     )
     assert provider.up_argv[0][:4] == (
         "env",
@@ -234,6 +231,32 @@ def test_declared_secret_preflight_resolves_multiple_keys_before_one_up() -> Non
         "--wait",
         "--wait-timeout",
         "60",
+    )
+
+
+def test_preflight_batches_all_missing_declared_keys_when_config_succeeds() -> None:
+    provider = ComposePreflightProvider([])
+
+    result = _run_with_active_sandbox(
+        provider,
+        env={"FIRST_SECRET": "caller-provided"},
+        declared_secret_env_keys=frozenset(
+            {"FIRST_SECRET", "SECOND_SECRET", "THIRD_SECRET"}
+        ),
+    )
+
+    assert result.verdict is Verdict.PASS
+    assert result.recovery_env == {
+        "SECOND_SECRET": "repotrial-synthetic-value",
+        "THIRD_SECRET": "repotrial-synthetic-value",
+    }
+    assert len(provider.config_argv) == 1
+    assert len(provider.up_argv) == 1
+    assert provider.up_argv[0][:4] == (
+        "env",
+        "FIRST_SECRET=caller-provided",
+        "SECOND_SECRET=repotrial-synthetic-value",
+        "THIRD_SECRET=repotrial-synthetic-value",
     )
 
 
@@ -259,19 +282,22 @@ def test_preflight_does_not_batch_fill_ordinary_interpolation_keys() -> None:
             'environment variable "UNDECLARED" required by secret "unknown" is not set',
             frozenset({"DECLARED"}),
             1,
-            {},
+            {"DECLARED": "repotrial-synthetic-value"},
         ),
         (
             'environment variable "PATH" required by secret "control" is not set',
             frozenset({"DECLARED"}),
             1,
-            {},
+            {"DECLARED": "repotrial-synthetic-value"},
         ),
         (
             'environment variable "DECLARED" required by secret "declared" is not set',
             frozenset({"DECLARED", "OTHER"}),
-            2,
-            {"DECLARED": "repotrial-synthetic-value"},
+            1,
+            {
+                "DECLARED": "repotrial-synthetic-value",
+                "OTHER": "repotrial-synthetic-value",
+            },
         ),
     ],
 )

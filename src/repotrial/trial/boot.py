@@ -31,10 +31,6 @@ _COMPOSE_CONFIG_TIMEOUT_S = 30
 _MAX_DECLARED_SECRET_KEYS = 32
 _MAX_DECLARED_SECRET_KEY_LENGTH = 128
 _SYNTHETIC_VALUE = "repotrial-synthetic-value"
-_COMPOSE_MISSING_SECRET_ERROR = re.compile(
-    r'environment variable "(?P<key>[A-Za-z_][A-Za-z0-9_]*)" required by secret '
-    r'"[^"\r\n]+" is not set\Z'
-)
 _TRUNCATION_MARKER = "\n...[truncated]"
 _PEM_BEGIN = "-----BEGIN "
 _PEM_END = "-----END "
@@ -249,39 +245,23 @@ async def _preflight_compose(
 ) -> tuple[dict[str, str], ExecResult | None]:
     """Resolve only declared Compose secret inputs in the active sandbox."""
     recovered: dict[str, str] = {}
-    last_config: ExecResult | None = None
-    while len(recovered) < len(declared_secret_keys):
-        prefix = _validated_compose_env_prefix(compose_path, env, unset_env_keys)
-        config = await provider.exec(
-            sandbox_id,
-            [*prefix, *docker_compose, "config", "--quiet"],
-            timeout_s=_COMPOSE_CONFIG_TIMEOUT_S,
-        )
-        if not isinstance(config, ExecResult):
-            raise TypeError("boot command returned a malformed result")
-        last_config = config
-        if config.exit_code == 0:
-            break
-        key = _missing_secret_key(config)
-        if (
-            key is None
-            or key in recovered
-            or key not in declared_secret_keys
-            or not _is_safe_preflight_env_key(key)
-        ):
-            break
+    if not declared_secret_keys:
+        return recovered, None
+    for key in sorted(declared_secret_keys):
+        if key in env or not _is_safe_preflight_env_key(key):
+            continue
         env[key] = _SYNTHETIC_VALUE
         recovered[key] = _SYNTHETIC_VALUE
-    return recovered, last_config
 
-
-def _missing_secret_key(result: ExecResult) -> str | None:
-    for output in (result.stderr, result.stdout):
-        candidate = output.rstrip("\r\n")
-        match = _COMPOSE_MISSING_SECRET_ERROR.fullmatch(candidate)
-        if match is not None:
-            return match.group("key")
-    return None
+    prefix = _validated_compose_env_prefix(compose_path, env, unset_env_keys)
+    config = await provider.exec(
+        sandbox_id,
+        [*prefix, *docker_compose, "config", "--quiet"],
+        timeout_s=_COMPOSE_CONFIG_TIMEOUT_S,
+    )
+    if not isinstance(config, ExecResult):
+        raise TypeError("boot command returned a malformed result")
+    return recovered, config
 
 
 def _bounded_declared_secret_keys(
