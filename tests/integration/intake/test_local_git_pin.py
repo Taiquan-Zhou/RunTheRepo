@@ -656,6 +656,7 @@ def test_remote_full_sha_fetches_exact_commit_as_complete_repository(
             *common,
             "fetch",
             "--no-tags",
+            "--depth=1",
             "--",
             source,
             expected_sha,
