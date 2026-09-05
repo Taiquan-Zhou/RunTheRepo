@@ -12,6 +12,7 @@ from repotrial.compose.mutations import apply_mutation
 from repotrial.compose.parser import canonical_compose_json, load_compose
 from repotrial.domain.enums import ExperimentVerdict, MutationType, Verdict
 from repotrial.domain.models import (
+    ExperimentRecord,
     Journey,
     JourneyResult,
     JourneyStep,
@@ -1038,6 +1039,54 @@ def test_unmatched_accepted_compose_stops_before_overlay_and_sandbox(
 
     assert record.verdict is ExperimentVerdict.STOP
     assert record.reason == "accepted_compose_materialization_failed"
+    assert provider.calls == []
+    assert not context.overlay_path.exists()
+
+
+def test_accepted_compose_read_failure_does_not_fallback_to_path_parse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    accepted_dir = context.workspace / ".repotrial-accepted"
+    accepted_dir.mkdir()
+    accepted_hash = "sha256:" + ("a" * 64)
+    accepted = accepted_dir / "accepted-0001-aaaaaaaaaaaaaaaa.compose.yaml"
+    accepted.write_text(_compose_text(), encoding="utf-8")
+    state.compose_path = accepted.relative_to(context.workspace).as_posix()
+    state.current_config_hash = accepted_hash
+    state.experiments = [
+        ExperimentRecord(
+            experiment_id="keep-1",
+            parent_config_hash=accepted_hash,
+            candidate_config_hash=accepted_hash,
+            mutation=mutation,
+            boot=Verdict.PASS,
+            journeys=[],
+            verdict=ExperimentVerdict.KEEP,
+            reason="kept",
+        )
+    ]
+    read_calls = 0
+
+    def fail_read(path: Path) -> bytes:
+        nonlocal read_calls
+        read_calls += 1
+        raise engine_module.CompatibilityError("artifact_changed")
+
+    def forbidden_path_parse(path: Path) -> dict[str, object]:
+        raise AssertionError(f"unexpected path parse: {path}")
+
+    monkeypatch.setattr(engine_module, "read_host_artifact", fail_read)
+    monkeypatch.setattr(engine_module, "load_compose", forbidden_path_parse)
+    provider = RecordingProvider()
+
+    with pytest.raises(
+        engine_module.CompatibilityError,
+        match="accepted_compose_materialization_failed",
+    ):
+        _run(state, mutation, provider, context)
+
+    assert read_calls == 1
     assert provider.calls == []
     assert not context.overlay_path.exists()
 

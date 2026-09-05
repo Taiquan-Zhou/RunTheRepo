@@ -10,6 +10,7 @@ from repotrial.compose.compatibility import CompatibilityError
 from repotrial.compose.mutations import MutationError, apply_mutation
 from repotrial.compose.overlay import write_overlay
 from repotrial.compose.parser import (
+    ComposeParseError,
     canonical_compose_json,
     load_compose,
     load_compose_bytes,
@@ -303,9 +304,16 @@ def _prepare(
             accepted_source = read_host_artifact(compose_file)
             accepted_compose_sha256 = hashlib.sha256(accepted_source).hexdigest()
             base = load_compose_bytes(accepted_source)
-        except (CompatibilityError, OSError, RuntimeError, TypeError, ValueError):
-            accepted_compose_error = "accepted_compose_materialization_failed"
-            base = load_compose(compose_file)
+        except (
+            CompatibilityError,
+            ComposeParseError,
+            OSError,
+            TypeError,
+            ValueError,
+        ):
+            raise CompatibilityError(
+                "accepted_compose_materialization_failed"
+            ) from None
     else:
         base = load_compose(compose_file)
     candidate = apply_mutation(base, mutation)
