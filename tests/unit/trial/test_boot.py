@@ -331,6 +331,7 @@ def test_preflight_synthetic_value_is_redacted_from_result_and_evidence(
     assert "repotrial-synthetic-value" not in persisted
     assert "repotrial-synthetic-value" not in result.logs["up"]
     assert [item["name"] for item in json.loads(persisted)["commands"]] == [
+        "config",
         "up",
         "ps",
         "logs",

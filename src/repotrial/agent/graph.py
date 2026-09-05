@@ -520,6 +520,8 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                             project_directory=".",
                             declared_secret_env_keys=declared_secret_env_keys,
                         )
+        effective_env = dict(env)
+        effective_env.update(result.recovery_env)
         journey_results: list[JourneyResult] | None = None
         observation = None
         if result.verdict is Verdict.PASS:
@@ -536,6 +538,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                     compose_path,
                     observation_artifact,
                     evidence_path=observation_evidence,
+                    env=effective_env,
                     compatibility_overlay_path=compatibility_relative,
                 )
             else:
@@ -545,7 +548,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                     compose_path,
                     observation_artifact,
                     evidence_path=observation_evidence,
-                    env=env,
+                    env=effective_env,
                     compatibility_overlay_path=compatibility_relative,
                     unset_env_keys=startup_plan.all_source_key_names,
                     project_directory=".",

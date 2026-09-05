@@ -159,6 +159,19 @@ def test_evidence_records_malformed_results_and_exception_class_without_raw_exce
     assert "never-persist-this" not in evidence_path.read_text(encoding="utf-8")
 
 
+def test_evidence_records_config_preflight_stage_separately_from_up(
+    tmp_path: Path,
+) -> None:
+    evidence_path = tmp_path / "baseline-boot-attempt.json"
+    session = _session(evidence_path, {})
+
+    session.record_exception("config", TypeError("never-persist-this"))
+
+    payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert payload["commands"] == [{"exception_type": "TypeError", "name": "config"}]
+    assert "never-persist-this" not in evidence_path.read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize("target_kind", ["existing", "link", "missing_parent"])
 def test_evidence_rejects_untrusted_targets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_kind: str

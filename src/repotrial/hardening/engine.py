@@ -564,6 +564,8 @@ async def _run_candidate(
             state, mutation, prepared, boot.verdict, (), None, decision
         )
 
+    effective_env = dict(prepared.env)
+    effective_env.update(boot.recovery_env)
     try:
         if startup_plan is None:
             after = await collect_observation(
@@ -573,6 +575,7 @@ async def _run_candidate(
                 prepared.observation_artifact,
                 compatibility_overlay_path=prepared.compatibility_overlay_relative,
                 overlay_path=prepared.overlay_relative,
+                env=effective_env,
             )
         else:
             after = await _collect_observation_with_evidence(
@@ -583,7 +586,7 @@ async def _run_candidate(
                 compatibility_overlay_path=prepared.compatibility_overlay_relative,
                 overlay_path=prepared.overlay_relative,
                 evidence_path=prepared.observation_evidence,
-                env=prepared.env,
+                env=effective_env,
                 unset_env_keys=startup_plan.all_source_key_names,
                 project_directory=".",
             )

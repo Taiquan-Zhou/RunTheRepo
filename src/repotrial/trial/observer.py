@@ -156,6 +156,7 @@ async def collect_observation(
     *,
     overlay_path: str | None = None,
     compatibility_overlay_path: str | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> ObservationSnapshot:
     _validate_inputs(
         sandbox_id,
@@ -171,7 +172,7 @@ async def collect_observation(
         artifact_path,
         overlay_path=overlay_path,
         compatibility_overlay_path=compatibility_overlay_path,
-        env={},
+        env={} if env is None else env,
         unset_env_keys=(),
         project_directory=None,
         recorder=None,

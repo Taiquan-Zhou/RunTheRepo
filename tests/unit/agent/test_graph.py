@@ -237,6 +237,39 @@ class GraphProvider(FakeSandboxProvider):
         return await super().publish_port(sandbox_id, container_port)
 
 
+class PreflightObservationProvider(GraphProvider):
+    def __init__(self, error: str) -> None:
+        super().__init__(baseline_boots=[(True, "")])
+        self.error = error
+        self.config_calls = 0
+        self.observation_argv: tuple[str, ...] | None = None
+
+    async def exec(
+        self, sandbox_id: str, argv: list[str], timeout_s: int = 60
+    ) -> ExecResult:
+        snapshot = tuple(argv)
+        if snapshot[-2:] == ("config", "--quiet"):
+            self.config_calls += 1
+            self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+            if self.config_calls == 1:
+                return ExecResult(exit_code=1, stdout="", stderr=self.error)
+            return ExecResult(exit_code=0, stdout="", stderr="")
+        if snapshot[-6:] == (
+            "ps",
+            "--all",
+            "--no-trunc",
+            "--orphans=false",
+            "--format",
+            "json",
+        ):
+            self.observation_argv = snapshot
+            assert snapshot[:2] == (
+                "env",
+                "WAKAPI_DB_PASSWORD=repotrial-synthetic-value",
+            )
+        return await super().exec(sandbox_id, argv, timeout_s)
+
+
 class CancelOnceProvider(GraphProvider):
     def __init__(self, *, host_port: int) -> None:
         super().__init__(host_port=host_port)
@@ -701,6 +734,32 @@ def test_declared_secret_preflight_reuses_one_sandbox_and_projects_key_names(
         "env",
         "WAKAPI_DB_PASSWORD=repotrial-synthetic-value",
     )
+
+
+def test_boot_applies_preflight_env_before_baseline_observation(
+    tmp_path: Path,
+) -> None:
+    error = (
+        'environment variable "WAKAPI_DB_PASSWORD" required by secret '
+        '"workspace_db_password" is not set'
+    )
+    provider = PreflightObservationProvider(error)
+    context, source = _context(tmp_path, provider, journeys=[])
+    source.write_text(
+        _compose_text(())
+        + "secrets:\n"
+        + "  workspace_db_password:\n"
+        + "    environment: WAKAPI_DB_PASSWORD\n",
+        encoding="utf-8",
+    )
+    context = replace(context, allowed_env_keys=frozenset())
+
+    result = _run(_state(source.parent), context)
+
+    assert result.boot_verdict is Verdict.PASS
+    assert provider.config_calls == 1
+    assert provider.observation_argv is not None
+    assert result.recovery_env == {"WAKAPI_DB_PASSWORD": "repotrial-synthetic-value"}
 
 
 def test_explicit_allowed_environment_keys_override_pinned_declarations(

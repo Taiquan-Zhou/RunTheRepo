@@ -14,7 +14,7 @@ from repotrial.sandbox.base import ExecResult
 _SCHEMA_VERSION = 1
 _MAX_ARTIFACT_BYTES = 262_144
 _MAX_STREAM_BYTES = 32_000
-_MAX_COMMANDS = 3
+_MAX_COMMANDS = 4
 _TRUNCATION_MARKER = "\n...[truncated]"
 _REDACTION = "[REDACTED]"
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
@@ -35,7 +35,7 @@ class _StreamEvidence(BaseModel):
 class _CommandEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    name: Literal["up", "ps", "logs"]
+    name: Literal["config", "up", "ps", "logs"]
     exit_code: int
     stdout: _StreamEvidence
     stderr: _StreamEvidence
@@ -44,7 +44,7 @@ class _CommandEvidence(BaseModel):
 class _CommandExceptionEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    name: Literal["up", "ps", "logs"]
+    name: Literal["config", "up", "ps", "logs"]
     exception_type: str
 
 
@@ -103,7 +103,7 @@ class _BootEvidenceSession:
         self._created = False
 
     def record_command(
-        self, name: Literal["up", "ps", "logs"], result: ExecResult
+        self, name: Literal["config", "up", "ps", "logs"], result: ExecResult
     ) -> None:
         _validate_command_name(name)
         if not isinstance(result, ExecResult):
@@ -124,7 +124,7 @@ class _BootEvidenceSession:
         )
 
     def record_exception(
-        self, name: Literal["up", "ps", "logs"], error: BaseException
+        self, name: Literal["config", "up", "ps", "logs"], error: BaseException
     ) -> None:
         _validate_command_name(name)
         self._append(
@@ -227,7 +227,7 @@ def _decode_tail(value: bytes) -> str:
 
 
 def _serialize(document: _EvidenceDocument) -> bytes:
-    # Three commands with two 32,000-byte views leave more than 70 KiB for JSON.
+    # Four commands with two 32,000-byte views leave bounded room for JSON metadata.
     if _MAX_ARTIFACT_BYTES - (2 * _MAX_COMMANDS * _MAX_STREAM_BYTES) <= 0:
         raise AssertionError("boot evidence metadata budget is exhausted")
     serialized = (
@@ -328,7 +328,7 @@ def _verify_bytes(path: Path, expected: bytes) -> None:
 
 
 def _validate_command_name(name: str) -> None:
-    if name not in {"up", "ps", "logs"}:
+    if name not in {"config", "up", "ps", "logs"}:
         raise ValueError("invalid boot command name")
 
 

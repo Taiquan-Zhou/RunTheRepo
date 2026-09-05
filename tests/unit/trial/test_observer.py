@@ -157,12 +157,13 @@ def _collect(provider: SandboxProvider, artifact_path: Path) -> ObservationSnaps
     )
 
 
-def test_public_collect_observation_signature_remains_unchanged() -> None:
+def test_public_collect_observation_signature_includes_environment() -> None:
     assert str(inspect.signature(collect_observation)) == (
         "(provider: repotrial.sandbox.base.SandboxProvider, sandbox_id: str, "
         "compose_path: str, artifact_path: pathlib.Path, *, "
         "overlay_path: str | None = None, "
-        "compatibility_overlay_path: str | None = None) -> "
+        "compatibility_overlay_path: str | None = None, "
+        "env: collections.abc.Mapping[str, str] | None = None) -> "
         "repotrial.domain.models.ObservationSnapshot"
     )
 

@@ -124,7 +124,7 @@ async def _boot_compose_with_evidence(
     )
 
     try:
-        recovered_env = await _preflight_compose(
+        recovered_env, config_result = await _preflight_compose(
             provider,
             sandbox_id,
             docker_compose,
@@ -135,8 +135,10 @@ async def _boot_compose_with_evidence(
         )
     except BaseException as error:
         if evidence is not None:
-            evidence.record_exception("up", error)
+            evidence.record_exception("config", error)
         raise
+    if evidence is not None and config_result is not None:
+        evidence.record_command("config", config_result)
 
     prefix = _validated_compose_env_prefix(
         compose_path,
@@ -244,9 +246,10 @@ async def _preflight_compose(
     env: dict[str, str],
     declared_secret_keys: frozenset[str],
     unset_env_keys: Sequence[str],
-) -> dict[str, str]:
+) -> tuple[dict[str, str], ExecResult | None]:
     """Resolve only declared Compose secret inputs in the active sandbox."""
     recovered: dict[str, str] = {}
+    last_config: ExecResult | None = None
     while len(recovered) < len(declared_secret_keys):
         prefix = _validated_compose_env_prefix(compose_path, env, unset_env_keys)
         config = await provider.exec(
@@ -256,6 +259,7 @@ async def _preflight_compose(
         )
         if not isinstance(config, ExecResult):
             raise TypeError("boot command returned a malformed result")
+        last_config = config
         if config.exit_code == 0:
             break
         key = _missing_secret_key(config)
@@ -268,7 +272,7 @@ async def _preflight_compose(
             break
         env[key] = _SYNTHETIC_VALUE
         recovered[key] = _SYNTHETIC_VALUE
-    return recovered
+    return recovered, last_config
 
 
 def _missing_secret_key(result: ExecResult) -> str | None:

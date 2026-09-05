@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -276,6 +277,7 @@ def _compose_argv(
         (*prefix, *base, "ps", "--all", "--format", "json"),
         (*prefix, *base, "logs", "--no-color", "--tail", "200"),
         (
+            *prefix,
             *base,
             "ps",
             "--all",
@@ -551,8 +553,9 @@ def test_candidate_threads_compatibility_before_hardening_overlay_without_hash_c
         *,
         overlay_path: str | None = None,
         compatibility_overlay_path: str | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> ObservationSnapshot:
-        del provider, sandbox_id, compose_path
+        del provider, sandbox_id, compose_path, env
         boundary_calls.append(("observation", compatibility_overlay_path, overlay_path))
         artifact_path.write_text("observed", encoding="utf-8")
         return ObservationSnapshot()
@@ -913,7 +916,10 @@ def test_conflicting_recorded_parent_hash_stops_before_overlay_and_sandbox(
 
 
 def _patch_boot(
-    monkeypatch: pytest.MonkeyPatch, verdict: Verdict
+    monkeypatch: pytest.MonkeyPatch,
+    verdict: Verdict,
+    *,
+    recovery_env: dict[str, str] | None = None,
 ) -> list[tuple[str, str | None]]:
     calls: list[tuple[str, str | None]] = []
 
@@ -929,10 +935,62 @@ def _patch_boot(
     ) -> BootResult:
         del provider, sandbox_id, env, attempt, compatibility_overlay_path
         calls.append((compose_path, overlay_path))
-        return BootResult(verdict=verdict, service_states={}, logs={}, attempt=1)
+        return BootResult(
+            verdict=verdict,
+            service_states={},
+            logs={},
+            attempt=1,
+            recovery_env={} if recovery_env is None else recovery_env,
+        )
 
     monkeypatch.setattr(engine_module, "boot_compose", fake_boot)
     return calls
+
+
+def test_observation_without_startup_plan_receives_boot_recovery_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    provider = RecordingProvider(
+        expected_overlay=context.overlay_path,
+        ports={8080: 45123},
+    )
+    _patch_boot(
+        monkeypatch,
+        Verdict.PASS,
+        recovery_env={"APP_SECRET": "repotrial-synthetic-value"},
+    )
+    observed_env: dict[str, str] = {}
+
+    async def fake_observer(
+        provider: FakeSandboxProvider,
+        sandbox_id: str,
+        compose_path: str,
+        artifact_path: Path,
+        *,
+        overlay_path: str | None = None,
+        compatibility_overlay_path: str | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> ObservationSnapshot:
+        del (
+            provider,
+            sandbox_id,
+            compose_path,
+            overlay_path,
+            compatibility_overlay_path,
+        )
+        observed_env.update({} if env is None else env)
+        artifact_path.write_text("observed", encoding="utf-8")
+        return ObservationSnapshot()
+
+    monkeypatch.setattr(engine_module, "collect_observation", fake_observer)
+    runner_calls: list[tuple[str, str, Path, tuple[tuple[object, ...], ...]]] = []
+    _install_http_runner(monkeypatch, {"health": Verdict.PASS}, runner_calls, provider)
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.verdict is ExperimentVerdict.KEEP
+    assert observed_env == {"APP_SECRET": "repotrial-synthetic-value"}
 
 
 def _patch_boot_error(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
@@ -974,8 +1032,9 @@ def _patch_observer(
         *,
         overlay_path: str | None = None,
         compatibility_overlay_path: str | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> ObservationSnapshot:
-        del provider, sandbox_id, compatibility_overlay_path
+        del provider, sandbox_id, compatibility_overlay_path, env
         calls.append((compose_path, overlay_path, artifact_path))
         if isinstance(snapshot, BaseException):
             raise snapshot
