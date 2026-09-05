@@ -4,6 +4,7 @@ import shutil
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
+from urllib.parse import SplitResult
 
 import pytest
 
@@ -124,6 +125,44 @@ def test_clone_and_resolve_checks_out_a_requested_full_sha_detached(
         text=True,
     )
     assert detached.returncode == 1
+
+
+def test_remote_full_sha_uses_non_shallow_partial_clone(
+    monkeypatch: pytest.MonkeyPatch,
+    local_repository: tuple[Path, str, str],
+    tmp_path: Path,
+) -> None:
+    source, first_commit, _second_commit = local_repository
+    destination = tmp_path / "remote exact-sha actual destination"
+    source_path = str(source.resolve())
+    real_parse_url = github._parse_credential_free_https_url
+
+    def classify_local_fixture_as_remote(value: str) -> SplitResult | None:
+        if value == source_path:
+            return SplitResult("https", "github.com", "/Owner/Project", "", "")
+        return real_parse_url(value)
+
+    monkeypatch.setattr(
+        github, "_parse_credential_free_https_url", classify_local_fixture_as_remote
+    )
+
+    commit_sha, local_path = asyncio.run(
+        github.clone_and_resolve(source_path, destination, requested_ref=first_commit)
+    )
+
+    assert commit_sha == first_commit
+    assert local_path == destination.resolve()
+    assert _git(local_path, "rev-parse", "HEAD^{commit}") == first_commit
+    assert _git(local_path, "rev-parse", "--is-shallow-repository") == "false"
+    assert not (local_path / ".git" / "shallow").exists()
+    assert _git(local_path, "remote", "get-url", "origin") == source_path
+
+    sbx_destination = tmp_path / "remote exact-sha downstream clone"
+    sbx_commit_sha, sbx_path = asyncio.run(
+        github.clone_and_resolve(str(local_path), sbx_destination)
+    )
+    assert sbx_commit_sha == first_commit
+    assert sbx_path == sbx_destination.resolve()
 
 
 def test_local_full_sha_keeps_filtered_clone_then_checks_out_requested_sha(
@@ -775,7 +814,7 @@ def test_remote_clone_uses_explicit_http_1_1_transport(
     assert local_path == destination.resolve()
 
 
-def test_remote_full_sha_fetches_exact_commit_as_complete_repository(
+def test_remote_full_sha_fetches_exact_commit_into_partial_clone(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     source = "https://github.com/Owner/Project"
@@ -814,17 +853,32 @@ def test_remote_full_sha_fetches_exact_commit_as_complete_repository(
         str(destination),
     )
     assert invocations == [
-        (*common, "init"),
+        (
+            "git",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "core.askPass=",
+            "-c",
+            "http.version=HTTP/1.1",
+            "clone",
+            "--filter=blob:none",
+            "--no-checkout",
+            "--no-tags",
+            "--",
+            source,
+            str(destination),
+        ),
         (
             *common,
             "fetch",
+            "--filter=blob:none",
             "--no-tags",
-            "--depth=1",
             "--",
-            source,
+            "origin",
             expected_sha,
         ),
-        (*common, "checkout", "--detach", "FETCH_HEAD"),
+        (*common, "checkout", "--detach", expected_sha),
         (
             "git",
             "-C",
@@ -834,7 +888,6 @@ def test_remote_full_sha_fetches_exact_commit_as_complete_repository(
             "HEAD^{commit}",
         ),
     ]
-    assert all("--filter=blob:none" not in command for command in invocations)
     assert commit_sha == expected_sha
     assert local_path == destination.resolve()
 
@@ -870,7 +923,7 @@ def test_remote_full_sha_mismatch_fails_closed_and_cleans_owned_destination(
 
     assert raised.value.operation == "commit_sha_mismatch"
     assert len(invocations) == 4
-    assert "init" in invocations[0]
+    assert "clone" in invocations[0]
     assert "fetch" in invocations[1]
     assert "checkout" in invocations[2]
     assert "rev-parse" in invocations[3]

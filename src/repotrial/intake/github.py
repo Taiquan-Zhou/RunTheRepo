@@ -134,16 +134,26 @@ async def clone_and_resolve(
         )
         if is_exact_remote_commit:
             assert requested_ref is not None
+            clone_arguments = [
+                *git_arguments,
+                "clone",
+                "--filter=blob:none",
+                "--no-checkout",
+                "--no-tags",
+                "--",
+                clone_source,
+                str(destination),
+            ]
+            await _run_git("clone", *clone_arguments)
             repository_arguments = (*git_arguments, "-C", str(destination))
-            await _run_git("init", *repository_arguments, "init")
             await _run_git(
                 "fetch",
                 *repository_arguments,
                 "fetch",
+                "--filter=blob:none",
                 "--no-tags",
-                "--depth=1",
                 "--",
-                clone_source,
+                "origin",
                 requested_ref,
             )
             await _run_git(
@@ -151,7 +161,7 @@ async def clone_and_resolve(
                 *repository_arguments,
                 "checkout",
                 "--detach",
-                "FETCH_HEAD",
+                requested_ref,
             )
         else:
             clone_arguments = [*git_arguments, "clone", "--filter=blob:none"]
