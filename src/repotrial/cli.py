@@ -71,7 +71,10 @@ def create_app(
     provider_factory: ProviderFactory | None = None,
     model: ModelAdapter | None = None,
 ) -> typer.Typer:
-    app = typer.Typer()
+    # Keep validation errors readable in captured and non-interactive output.
+    # Typer forces Rich terminal rendering in GitHub Actions, where narrow
+    # capture widths can crop the actual error message to an ellipsis.
+    app = typer.Typer(rich_markup_mode=None)
 
     @app.command()
     def doctor() -> None:
