@@ -461,7 +461,7 @@ async def _run_git(operation: str, *arguments: str) -> bytes:
 
 
 async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
-    if process.returncode is None:
+    if os.name == "posix" or process.returncode is None:
         _kill_process_group(process)
     try:
         await asyncio.wait_for(process.wait(), timeout=REAP_TIMEOUT_SECONDS)
@@ -476,10 +476,11 @@ def _kill_process_group(process: asyncio.subprocess.Process) -> None:
             return
         except (AttributeError, OSError, ProcessLookupError):
             pass
-    try:
-        process.kill()
-    except (OSError, ProcessLookupError):
-        pass
+    if process.returncode is None:
+        try:
+            process.kill()
+        except (OSError, ProcessLookupError):
+            pass
 
 
 def _remove_owned_destination(
