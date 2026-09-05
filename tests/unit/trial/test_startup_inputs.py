@@ -244,6 +244,76 @@ def test_local_adapter_rejects_invalid_payload_and_cleans_file(
     assert not (root / ".env").exists()
 
 
+def _run_local_bind_validator(
+    root: Path, *source_paths: str
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "sh",
+            "-eu",
+            "-c",
+            startup_inputs._BIND_VALIDATOR_SCRIPT,
+            "repotrial-bind-validator",
+            str(root),
+            *source_paths,
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_local_bind_validator_accepts_existing_and_missing_paths(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "bind-repository"
+    root.mkdir()
+    (root / "existing").mkdir()
+
+    result = _run_local_bind_validator(
+        root, "existing", "missing", "nested/missing/file", "."
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "binds=ok\n"
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "source_path",
+    ["escape/new", "dangling/file"],
+)
+def test_local_bind_validator_rejects_symlink_ancestors(
+    tmp_path: Path, source_path: str
+) -> None:
+    root = tmp_path / "bind-repository"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if source_path.startswith("escape"):
+        (root / "escape").symlink_to(outside, target_is_directory=True)
+    else:
+        (root / "dangling").symlink_to(tmp_path / "missing-target")
+
+    result = _run_local_bind_validator(root, source_path)
+
+    assert result.returncode == 41
+    assert result.stdout == ""
+
+
+def test_local_bind_validator_rejects_existing_outside_path(tmp_path: Path) -> None:
+    root = tmp_path / "bind-repository"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    result = _run_local_bind_validator(root, str(outside))
+
+    assert result.returncode == 42
+    assert result.stdout == ""
+
+
 def _diagnostic_workspace(tmp_path: Path, case: str) -> Path:
     workspace = _copy_fixture(tmp_path, case)
     case_root = _FIXTURE_ROOT / case
@@ -1179,7 +1249,7 @@ def test_confined_bind_and_named_volume_are_accepted(tmp_path: Path) -> None:
         "/workspace/data",
     )
     assert hashlib.sha256(provider.exec_calls[2][-4].encode()).hexdigest() == (
-        "23e41330934144f7c1f017e1c16e9a34e90d374956de5273be247264d0b7e868"
+        "b62f3680698a355349a30a43a1fdd79b52e0377495c0e4773833aeb924faddde"
     )
 
 

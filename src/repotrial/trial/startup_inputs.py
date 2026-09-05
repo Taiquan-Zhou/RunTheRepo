@@ -116,8 +116,22 @@ shift
 root=$(pwd -P) || exit 40
 [ "$root" = "$expected_root" ] || exit 40
 for source_path do
-    [ -e "$source_path" ] || exit 41
-    resolved=$(realpath -e "$source_path") || exit 41
+    [ -n "$source_path" ] || exit 41
+    if [ -e "$source_path" ]; then
+        resolved=$(realpath -e "$source_path") || exit 41
+    else
+        ancestor=$source_path
+        while :; do
+            [ ! -L "$ancestor" ] || exit 41
+            if [ -e "$ancestor" ]; then
+                break
+            fi
+            parent=$(dirname "$ancestor") || exit 41
+            [ "$parent" != "$ancestor" ] || exit 41
+            ancestor=$parent
+        done
+        resolved=$(realpath -e "$ancestor") || exit 41
+    fi
     case "$resolved" in
         "$root"|"$root"/*) ;;
         *) exit 42 ;;
@@ -132,7 +146,7 @@ done
 printf 'binds=ok\n'
 """
 _BIND_VALIDATOR_SHA256: Final = (
-    "23e41330934144f7c1f017e1c16e9a34e90d374956de5273be247264d0b7e868"
+    "b62f3680698a355349a30a43a1fdd79b52e0377495c0e4773833aeb924faddde"
 )
 
 
