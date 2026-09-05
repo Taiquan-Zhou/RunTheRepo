@@ -879,3 +879,37 @@ NO_DAEMON_LIFECYCLE_MUTATION=true
 - This correction commit is limited to audit wording. It does not change the
   Linkding artifact, cleanup/inventory ruling, blocked Stage A state, or any
   production, test, manifest, README, or historical evidence content.
+
+## M7.5 release candidate closeout (append-only; 2026-09-05)
+
+- Execution HEAD: `4c13b8b9521427b9491e0de8a9f77e64169754ac`; the two final
+  representative runs below use this same HEAD. This section appends the
+  closeout and does not rewrite earlier records.
+- Earlier diagnostic run `a60ee5d8...` recorded `policy_rejected` with
+  `journeys=[]` and final `insufficient_coverage`. The generic planner fix now
+  limits autonomous retention to evidence-supported `GET` journeys, treats
+  invalid structured output as policy fallback, and uses fixed `GET /` with
+  expected `200` when no valid model proposal remains. Model transport/timeout
+  failures can still preserve `insufficient_coverage` and `stop_reason`.
+
+| Repository | Exact SHA | Final run | Result |
+| --- | --- | --- | --- |
+| changedetection.io | `5d9c7c6da76340597243e8163c4f2439237fa0e8` | `f883cb75-405c-4f01-b99c-b30c0cb2c8d0` | `exit_code=0`; `completed` / `no_remaining_mutations`; `GET /` -> `200` assertion passed; JSON+HTML; create/destroy success; inventory empty |
+| Listmonk | `670c01717d48647093335cc23a6be6f4b79c3b6b` | `df30728a-ab0a-4eec-b251-afd407400d71` | `exit_code=0`; `completed` / `consecutive_failures`; baseline `GET /` -> `200` assertion passed; JSON+HTML; create/destroy success; inventory empty |
+
+- Listmonk's `consecutive_failures` is the hardening-candidate rollback stop,
+  not a baseline failure. Both runs retain exact SHA, report, lifecycle, and
+  inventory evidence.
+- Fresh gates: `1794 passed, 11 skipped, 1 warning`; branch coverage `86.07%`
+  (`>=85%`); Ruff check, Ruff format (`140 files`), mypy (`47 files`), and
+  pre-commit all-files pass. `uv lock --check`, `uv build` (sdist + wheel),
+  fresh wheel install, and `repotrial --help` smoke pass.
+- Execution remains dedicated Ubuntu 24.04 WSL2 on ext4 with official Linux SBX
+  v0.39.0; no host fallback. CPU, memory, disk, and host total-duration bounds
+  remain enforced. PID hard bound is `unsupported`; cleanup is fail-closed, and
+  an empty inventory is not cleanup success. TUN is optional; Rule or Global
+  mode is acceptable when WSL, daemon, sandbox, and client connectivity is
+  verified. Model keys are not printed or recorded.
+- Ruling: this documents a demo-ready release candidate, not a published/tagged
+  release or proof of global safety/least privilege; results remain
+  tested-journey/workload-conditioned hardened-candidate evidence.
