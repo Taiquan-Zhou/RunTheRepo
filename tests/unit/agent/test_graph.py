@@ -192,6 +192,12 @@ class GraphProvider(FakeSandboxProvider):
                 stderr="",
             )
         healthy = self._healthy[sandbox_id]
+        if snapshot[-2:] == ("config", "--quiet"):
+            return ExecResult(
+                exit_code=0 if healthy else 1,
+                stdout="",
+                stderr="" if healthy else self._logs[sandbox_id],
+            )
         if snapshot[-5:] == ("up", "-d", "--wait", "--wait-timeout", "60"):
             return ExecResult(exit_code=0 if healthy else 1, stdout="", stderr="")
         if snapshot[-4:] == ("ps", "--all", "--format", "json"):
@@ -645,6 +651,56 @@ def test_boot_recovers_quoted_compose_secret_environment_and_deduplicates_keys(
     )
     assert result.recovery_env == {"WAKAPI_DB_PASSWORD": "repotrial-synthetic-value"}
     assert result.run.recovery_env_keys == ["WAKAPI_DB_PASSWORD"]
+
+
+def test_declared_secret_preflight_reuses_one_sandbox_and_projects_key_names(
+    tmp_path: Path,
+) -> None:
+    error = (
+        'environment variable "WAKAPI_DB_PASSWORD" required by secret '
+        '"workspace_db_password" is not set'
+    )
+    provider = GraphProvider(baseline_boots=[(False, error), (True, "")])
+    context, source = _context(tmp_path, provider, journeys=[])
+    source.write_text(
+        _compose_text(())
+        + "secrets:\n"
+        + "  workspace_db_password:\n"
+        + "    environment: WAKAPI_DB_PASSWORD\n",
+        encoding="utf-8",
+    )
+    context = replace(context, allowed_env_keys=frozenset())
+
+    result = _run(_state(source.parent), context)
+
+    baseline_sandboxes = [
+        call[2]
+        for call in provider.calls
+        if call[0] == "create" and str(call[2]).startswith("repotrial-baseline-")
+    ]
+    compose_calls = [
+        call
+        for call in provider.calls
+        if call[0] == "exec" and "docker" in call[2] and "compose" in call[2]
+    ]
+    assert len(baseline_sandboxes) == 2
+    assert result.recovery_env == {"WAKAPI_DB_PASSWORD": "repotrial-synthetic-value"}
+    assert result.run.recovery_env_keys == ["WAKAPI_DB_PASSWORD"]
+    first_config = next(
+        call for call in compose_calls if call[2][-2:] == ("config", "--quiet")
+    )
+    assert first_config[1] == "sandbox-1"
+    assert first_config[1] != "sandbox-2"
+    first_up = next(
+        call[2]
+        for call in compose_calls
+        if call[1] == first_config[1]
+        and call[2][-5:] == ("up", "-d", "--wait", "--wait-timeout", "60")
+    )
+    assert first_up[:2] == (
+        "env",
+        "WAKAPI_DB_PASSWORD=repotrial-synthetic-value",
+    )
 
 
 def test_explicit_allowed_environment_keys_override_pinned_declarations(

@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
 from ruamel.yaml.events import (
@@ -63,6 +63,10 @@ class RecoveryRepositoryContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     allowed_env_keys: frozenset[str]
+    declared_secret_env_keys: frozenset[str] = Field(
+        default_factory=frozenset,
+        max_length=_MAX_ENV_KEYS,
+    )
     declarations: tuple[DeclaredEnvSource, ...]
 
 
@@ -120,14 +124,15 @@ def derive_recovery_context(
         sources.append((env_example, ".env.example"))
 
     declarations: list[DeclaredEnvSource] = []
+    declared_secret_keys: set[str] = set()
     for source, relative_path in sources:
         label = ".env.example" if relative_path == ".env.example" else "compose"
         content, sha256 = _read_utf8_source(root, source, label)
-        keys = (
-            _compose_value_keys(content, label)
-            if relative_path != ".env.example"
-            else _env_example_keys(content)
-        )
+        if relative_path != ".env.example":
+            keys, secret_keys = _compose_value_keys(content, label)
+            declared_secret_keys.update(secret_keys)
+        else:
+            keys = _env_example_keys(content)
         declarations.extend(
             DeclaredEnvSource(key=key, relative_path=relative_path, sha256=sha256)
             for key in keys
@@ -141,6 +146,9 @@ def derive_recovery_context(
     ordered = tuple(item for _, item in sorted(unique.items()))
     return RecoveryRepositoryContext(
         allowed_env_keys=allowed_keys,
+        declared_secret_env_keys=frozenset(
+            sorted(declared_secret_keys)[:_MAX_ENV_KEYS]
+        ),
         declarations=ordered,
     )
 
@@ -281,14 +289,15 @@ def _read_utf8_source(workspace: Path, source: Path, label: str) -> tuple[str, s
     return content, hashlib.sha256(source_bytes).hexdigest()
 
 
-def _compose_value_keys(content: str, label: str) -> list[str]:
+def _compose_value_keys(content: str, label: str) -> tuple[list[str], list[str]]:
     values, secret_environment_keys = _yaml_values(content, label)
-    return [
+    interpolation_keys = [
         key
         for value, style in values
         if style != "'"
         for key in _interpolation_keys(value)
-    ] + secret_environment_keys
+    ]
+    return interpolation_keys + secret_environment_keys, secret_environment_keys
 
 
 def _yaml_values(

@@ -341,6 +341,11 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
         if recovery_context is None
         else recovery_context.allowed_env_keys
     )
+    declared_secret_env_keys = (
+        frozenset()
+        if recovery_context is None
+        else recovery_context.declared_secret_env_keys
+    )
     attempt_dir, attempt_slot, prior_attempt_directories = _claim_attempt_directory(
         state.run,
         context,
@@ -455,6 +460,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                         attempt,
                         evidence_path=evidence_artifact,
                         compatibility_overlay_path=compatibility_relative,
+                        declared_secret_env_keys=declared_secret_env_keys,
                     )
                 else:
                     result = await _boot_compose_with_evidence(
@@ -467,6 +473,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                         compatibility_overlay_path=compatibility_relative,
                         unset_env_keys=startup_plan.all_source_key_names,
                         project_directory=".",
+                        declared_secret_env_keys=declared_secret_env_keys,
                     )
             else:
                 if startup_plan is None:
@@ -477,6 +484,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                             compose_path,
                             env,
                             attempt,
+                            declared_secret_env_keys=declared_secret_env_keys,
                         )
                     else:
                         result = await boot_compose(
@@ -486,6 +494,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                             env,
                             attempt,
                             compatibility_overlay_path=compatibility_relative,
+                            declared_secret_env_keys=declared_secret_env_keys,
                         )
                 else:
                     if compatibility_relative is None:
@@ -497,6 +506,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                             attempt,
                             unset_env_keys=startup_plan.all_source_key_names,
                             project_directory=".",
+                            declared_secret_env_keys=declared_secret_env_keys,
                         )
                     else:
                         result = await boot_compose(
@@ -508,6 +518,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                             compatibility_overlay_path=compatibility_relative,
                             unset_env_keys=startup_plan.all_source_key_names,
                             project_directory=".",
+                            declared_secret_env_keys=declared_secret_env_keys,
                         )
         journey_results: list[JourneyResult] | None = None
         observation = None
@@ -544,12 +555,26 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
         "boot_verdict": result.verdict,
         "stage_history": _visit(state, "boot"),
     }
+    if result.recovery_env:
+        recovery_env = dict(state.recovery_env)
+        recovery_env.update(result.recovery_env)
+        update["recovery_env"] = recovery_env
+        update["run"] = state.run.model_copy(
+            update={
+                "recovery_env_keys": sorted(
+                    {*state.run.recovery_env_keys, *recovery_env}
+                )
+            }
+        )
     if result.verdict is Verdict.PASS:
         update["pending_journey_results"] = journey_results
         update["pending_observation"] = observation
         return update
     if result.verdict is Verdict.UNSUPPORTED:
-        update["run"] = state.run.model_copy(update={"stop_reason": "boot_unsupported"})
+        run = update.get("run", state.run)
+        if not isinstance(run, RunState):
+            raise TypeError("boot update contains a malformed run state")
+        update["run"] = run.model_copy(update={"stop_reason": "boot_unsupported"})
         return update
 
     recovery_evidence = project_recovery_evidence(result.logs)
@@ -605,8 +630,17 @@ async def _apply_recovery(
     update: NodeUpdate,
     recovery: RecoveryAction,
 ) -> None:
+    updated_run = update.get("run", state.run)
+    if not isinstance(updated_run, RunState):
+        raise TypeError("recovery update contains a malformed run state")
+    updated_env = update.get("recovery_env", state.recovery_env)
+    if not isinstance(updated_env, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in updated_env.items()
+    ):
+        raise TypeError("recovery update contains malformed environment")
     if recovery.action in {"stop", "wait"}:
-        update["run"] = state.run.model_copy(
+        update["run"] = updated_run.model_copy(
             update={"stop_reason": "boot_recovery_stopped"}
         )
         return
@@ -617,11 +651,11 @@ async def _apply_recovery(
         value = recovery.params.get("value")
         if not isinstance(key, str) or not isinstance(value, str):
             raise ValueError("validated set_env action is malformed")
-        recovery_env = dict(state.recovery_env)
+        recovery_env = dict(updated_env)
         recovery_env[key] = value
-        recovery_env_keys = sorted({*state.run.recovery_env_keys, *recovery_env})
+        recovery_env_keys = sorted({*updated_run.recovery_env_keys, *recovery_env})
         update["recovery_env"] = recovery_env
-        update["run"] = state.run.model_copy(
+        update["run"] = updated_run.model_copy(
             update={"recovery_env_keys": recovery_env_keys}
         )
         return

@@ -156,6 +156,7 @@ def test_derivation_collects_compose_forms_and_env_example_names_without_values(
             "EXTRA_TOKEN",
         }
     )
+    assert context.declared_secret_env_keys == frozenset()
     assert [(item.key, item.relative_path) for item in context.declarations] == [
         ("APP_TOKEN", "compose.yml"),
         ("CACHE_URL", "compose.yml"),
@@ -200,9 +201,33 @@ def test_derivation_collects_top_level_secret_environment_names_only(
     context = derive_recovery_context(tmp_path, "compose.yml")
 
     assert context.allowed_env_keys == frozenset({"WAKAPI_DB_PASSWORD"})
+    assert context.declared_secret_env_keys == frozenset({"WAKAPI_DB_PASSWORD"})
     assert [(item.key, item.relative_path) for item in context.declarations] == [
         ("WAKAPI_DB_PASSWORD", "compose.yml")
     ]
+
+
+def test_derivation_separates_secret_batch_authority_from_other_environment_keys(
+    tmp_path: Path,
+) -> None:
+    _write(
+        tmp_path / "compose.yml",
+        "services:\n"
+        "  web:\n"
+        "    environment:\n"
+        "      APP_MODE: ${APP_MODE}\n"
+        "secrets:\n"
+        "  db_password:\n"
+        "    environment: DB_PASSWORD\n",
+    )
+    _write(tmp_path / ".env.example", "EXAMPLE_TOKEN=placeholder\n")
+
+    context = derive_recovery_context(tmp_path, "compose.yml")
+
+    assert context.allowed_env_keys == frozenset(
+        {"APP_MODE", "DB_PASSWORD", "EXAMPLE_TOKEN"}
+    )
+    assert context.declared_secret_env_keys == frozenset({"DB_PASSWORD"})
 
 
 def test_derivation_does_not_authorize_secret_environment_aliases_or_tags(

@@ -1,9 +1,9 @@
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from repotrial.domain.enums import Verdict
 from repotrial.sandbox.base import ExecResult, SandboxProvider
@@ -27,6 +27,14 @@ _REDACTION = "[REDACTED]"
 _MARKER_OVERFLOW_REDACTION = "[REDACTED: excessive truncation markers]"
 _LOG_LIMIT = 65_536
 _COMPOSE_UP_TIMEOUT_S = 600
+_COMPOSE_CONFIG_TIMEOUT_S = 30
+_MAX_DECLARED_SECRET_KEYS = 32
+_MAX_DECLARED_SECRET_KEY_LENGTH = 128
+_SYNTHETIC_VALUE = "repotrial-synthetic-value"
+_COMPOSE_MISSING_SECRET_ERROR = re.compile(
+    r'environment variable "(?P<key>[A-Za-z_][A-Za-z0-9_]*)" required by secret '
+    r'"[^"\r\n]+" is not set\Z'
+)
 _TRUNCATION_MARKER = "\n...[truncated]"
 _PEM_BEGIN = "-----BEGIN "
 _PEM_END = "-----END "
@@ -39,6 +47,7 @@ class BootResult(BaseModel):
     service_states: dict[str, str]
     logs: dict[str, str]
     attempt: int
+    recovery_env: dict[str, str] = Field(default_factory=dict)
 
 
 async def boot_compose(
@@ -52,6 +61,7 @@ async def boot_compose(
     compatibility_overlay_path: str | None = None,
     unset_env_keys: Sequence[str] = (),
     project_directory: str | None = None,
+    declared_secret_env_keys: Collection[str] = (),
 ) -> BootResult:
     return await _boot_compose_with_evidence(
         provider,
@@ -63,6 +73,7 @@ async def boot_compose(
         compatibility_overlay_path=compatibility_overlay_path,
         unset_env_keys=unset_env_keys,
         project_directory=project_directory,
+        declared_secret_env_keys=declared_secret_env_keys,
     )
 
 
@@ -78,8 +89,10 @@ async def _boot_compose_with_evidence(
     compatibility_overlay_path: str | None = None,
     unset_env_keys: Sequence[str] = (),
     project_directory: str | None = None,
+    declared_secret_env_keys: Collection[str] = (),
 ) -> BootResult:
-    prefix = _validated_compose_env_prefix(compose_path, env, unset_env_keys)
+    effective_env = dict(env)
+    declared_secret_keys = _bounded_declared_secret_keys(declared_secret_env_keys)
     docker_compose = ["docker", "compose"]
     if project_directory is not None:
         _validate_project_directory(project_directory)
@@ -91,17 +104,45 @@ async def _boot_compose_with_evidence(
     if overlay_path is not None:
         _validate_compose_path(overlay_path, "overlay_path")
         docker_compose.extend(["-f", overlay_path])
+    redaction_env = dict(effective_env)
+    redaction_env.update(
+        {
+            key: _SYNTHETIC_VALUE
+            for key in declared_secret_keys
+            if key not in redaction_env
+        }
+    )
     evidence = (
         None
         if evidence_path is None
         else _BootEvidenceSession(
             evidence_path,
-            env,
+            redaction_env,
             attempt=attempt,
             compose_path=compose_path,
         )
     )
 
+    try:
+        recovered_env = await _preflight_compose(
+            provider,
+            sandbox_id,
+            docker_compose,
+            compose_path,
+            effective_env,
+            declared_secret_keys,
+            unset_env_keys,
+        )
+    except BaseException as error:
+        if evidence is not None:
+            evidence.record_exception("up", error)
+        raise
+
+    prefix = _validated_compose_env_prefix(
+        compose_path,
+        effective_env,
+        unset_env_keys,
+    )
     try:
         up = await provider.exec(
             sandbox_id,
@@ -171,7 +212,14 @@ async def _boot_compose_with_evidence(
         if workload_commands_succeeded and all_services_ready
         else Verdict.FAIL
     )
-    sensitive_values = _sensitive_env_values(env)
+    sensitive_values = _sensitive_env_values(effective_env)
+    if _SYNTHETIC_VALUE in effective_env.values():
+        sensitive_values = tuple(
+            sorted(
+                {*sensitive_values, _SYNTHETIC_VALUE},
+                key=lambda value: (-len(value), value),
+            )
+        )
     if evidence is not None:
         evidence.finalize(verdict, service_states)
 
@@ -184,6 +232,81 @@ async def _boot_compose_with_evidence(
             "logs": _sanitize_logs_result(logs, sensitive_values),
         },
         attempt=attempt,
+        recovery_env=recovered_env,
+    )
+
+
+async def _preflight_compose(
+    provider: SandboxProvider,
+    sandbox_id: str,
+    docker_compose: list[str],
+    compose_path: str,
+    env: dict[str, str],
+    declared_secret_keys: frozenset[str],
+    unset_env_keys: Sequence[str],
+) -> dict[str, str]:
+    """Resolve only declared Compose secret inputs in the active sandbox."""
+    recovered: dict[str, str] = {}
+    while len(recovered) < len(declared_secret_keys):
+        prefix = _validated_compose_env_prefix(compose_path, env, unset_env_keys)
+        config = await provider.exec(
+            sandbox_id,
+            [*prefix, *docker_compose, "config", "--quiet"],
+            timeout_s=_COMPOSE_CONFIG_TIMEOUT_S,
+        )
+        if not isinstance(config, ExecResult):
+            raise TypeError("boot command returned a malformed result")
+        if config.exit_code == 0:
+            break
+        key = _missing_secret_key(config)
+        if (
+            key is None
+            or key in recovered
+            or key not in declared_secret_keys
+            or not _is_safe_preflight_env_key(key)
+        ):
+            break
+        env[key] = _SYNTHETIC_VALUE
+        recovered[key] = _SYNTHETIC_VALUE
+    return recovered
+
+
+def _missing_secret_key(result: ExecResult) -> str | None:
+    for output in (result.stderr, result.stdout):
+        candidate = output.rstrip("\r\n")
+        match = _COMPOSE_MISSING_SECRET_ERROR.fullmatch(candidate)
+        if match is not None:
+            return match.group("key")
+    return None
+
+
+def _bounded_declared_secret_keys(
+    keys: Collection[str],
+) -> frozenset[str]:
+    if isinstance(keys, (str, bytes, bytearray)):
+        return frozenset()
+    try:
+        values = list(keys)
+    except TypeError:
+        return frozenset()
+    if len(values) > _MAX_DECLARED_SECRET_KEYS:
+        return frozenset()
+    if any(
+        not isinstance(key, str)
+        or len(key) > _MAX_DECLARED_SECRET_KEY_LENGTH
+        or not _is_safe_preflight_env_key(key)
+        for key in values
+    ):
+        return frozenset()
+    return frozenset(values)
+
+
+def _is_safe_preflight_env_key(key: str) -> bool:
+    normalized_key = key.upper()
+    return (
+        _ENV_KEY_PATTERN.fullmatch(key) is not None
+        and normalized_key not in _CONTROL_ENV_KEYS
+        and not normalized_key.startswith(_CONTROL_ENV_PREFIXES)
     )
 
 

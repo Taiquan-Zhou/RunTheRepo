@@ -136,23 +136,205 @@ def _healthy_ps() -> str:
     )
 
 
+class ComposePreflightProvider(FakeSandboxProvider):
+    def __init__(
+        self,
+        config_errors: list[str],
+        *,
+        up_result: ExecResult | None = None,
+    ) -> None:
+        super().__init__()
+        self.config_errors = list(config_errors)
+        self.up_result = up_result or _result()
+        self.config_argv: list[tuple[str, ...]] = []
+        self.up_argv: list[tuple[str, ...]] = []
+
+    async def exec(
+        self, sandbox_id: str, argv: list[str], timeout_s: int = 60
+    ) -> ExecResult:
+        self._require_active(sandbox_id)
+        snapshot = tuple(argv)
+        self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+        if snapshot[-2:] == ("config", "--quiet"):
+            self.config_argv.append(snapshot)
+            if self.config_errors:
+                return _result(exit_code=1, stderr=self.config_errors.pop(0))
+            return _result()
+        if snapshot[-5:] == ("up", "-d", "--wait", "--wait-timeout", "60"):
+            self.up_argv.append(snapshot)
+            return self.up_result
+        if snapshot[-4:] == ("ps", "--all", "--format", "json"):
+            return _result(stdout=_healthy_ps())
+        if snapshot[-4:] == ("logs", "--no-color", "--tail", "200"):
+            return _result(stdout="logs")
+        raise AssertionError(f"unexpected provider command: {snapshot!r}")
+
+
 def _run_with_active_sandbox(
     provider: FakeSandboxProvider,
     *,
     env: dict[str, str] | None = None,
     attempt: int = 1,
+    declared_secret_env_keys: frozenset[str] | None = None,
 ) -> BootResult:
     async def exercise() -> BootResult:
         sandbox_id = await provider.create(Path("missing-workspace"), "trial")
+        kwargs: dict[str, object] = {}
+        if declared_secret_env_keys is not None:
+            kwargs["declared_secret_env_keys"] = declared_secret_env_keys
         return await boot_compose(
             provider,
             sandbox_id,
             COMPOSE_PATH,
             env or {},
             attempt,
+            **kwargs,
         )
 
     return asyncio.run(exercise())
+
+
+def test_declared_secret_preflight_resolves_multiple_keys_before_one_up() -> None:
+    first_error = (
+        'environment variable "FIRST_SECRET" required by secret "first" is not set'
+    )
+    second_error = (
+        'environment variable "SECOND_SECRET" required by secret "second" is not set'
+    )
+    provider = ComposePreflightProvider([first_error, second_error])
+
+    result = _run_with_active_sandbox(
+        provider,
+        env={"PUBLIC_VALUE": "public"},
+        declared_secret_env_keys=frozenset({"FIRST_SECRET", "SECOND_SECRET"}),
+    )
+
+    assert result.verdict is Verdict.PASS
+    assert result.recovery_env == {
+        "FIRST_SECRET": "repotrial-synthetic-value",
+        "SECOND_SECRET": "repotrial-synthetic-value",
+    }
+    assert len(provider.config_argv) == 2
+    assert len(provider.up_argv) == 1
+    assert provider.config_argv[0][:2] == ("env", "PUBLIC_VALUE=public")
+    assert provider.config_argv[1][:3] == (
+        "env",
+        "FIRST_SECRET=repotrial-synthetic-value",
+        "PUBLIC_VALUE=public",
+    )
+    assert provider.up_argv[0][:4] == (
+        "env",
+        "FIRST_SECRET=repotrial-synthetic-value",
+        "PUBLIC_VALUE=public",
+        "SECOND_SECRET=repotrial-synthetic-value",
+    )
+    assert provider.up_argv[0][-5:] == (
+        "up",
+        "-d",
+        "--wait",
+        "--wait-timeout",
+        "60",
+    )
+
+
+def test_preflight_does_not_batch_fill_ordinary_interpolation_keys() -> None:
+    provider = ComposePreflightProvider(["ORDINARY_KEY is required"])
+
+    result = _run_with_active_sandbox(
+        provider,
+        env={"PUBLIC_VALUE": "public"},
+        declared_secret_env_keys=frozenset(),
+    )
+
+    assert result.verdict is Verdict.PASS
+    assert result.recovery_env == {}
+    assert provider.config_argv == []
+    assert len(provider.up_argv) == 1
+
+
+@pytest.mark.parametrize(
+    ("error", "declared_keys", "expected_config_calls", "expected_env"),
+    [
+        (
+            'environment variable "UNDECLARED" required by secret "unknown" is not set',
+            frozenset({"DECLARED"}),
+            1,
+            {},
+        ),
+        (
+            'environment variable "PATH" required by secret "control" is not set',
+            frozenset({"DECLARED"}),
+            1,
+            {},
+        ),
+        (
+            'environment variable "DECLARED" required by secret "declared" is not set',
+            frozenset({"DECLARED", "OTHER"}),
+            2,
+            {"DECLARED": "repotrial-synthetic-value"},
+        ),
+    ],
+)
+def test_preflight_stops_on_undeclared_unsafe_or_repeated_errors(
+    error: str,
+    declared_keys: frozenset[str],
+    expected_config_calls: int,
+    expected_env: dict[str, str],
+) -> None:
+    repeated_errors = [error, error] if "DECLARED" in error else [error]
+    provider = ComposePreflightProvider(repeated_errors)
+
+    async def exercise() -> BootResult:
+        sandbox_id = await provider.create(Path("missing-workspace"), "trial")
+        return await boot_compose(
+            provider,
+            sandbox_id,
+            COMPOSE_PATH,
+            {},
+            attempt=1,
+            declared_secret_env_keys=declared_keys,
+        )
+
+    result = asyncio.run(exercise())
+
+    assert result.recovery_env == expected_env
+    assert len(provider.config_argv) == expected_config_calls
+    assert len(provider.up_argv) == 1
+
+
+def test_preflight_synthetic_value_is_redacted_from_result_and_evidence(
+    tmp_path: Path,
+) -> None:
+    error = 'environment variable "APP_SECRET" required by secret "app" is not set'
+    provider = ComposePreflightProvider(
+        [error],
+        up_result=_result(stdout="APP_SECRET=repotrial-synthetic-value"),
+    )
+    evidence_path = tmp_path / "baseline-boot-attempt.json"
+
+    async def exercise() -> BootResult:
+        sandbox_id = await provider.create(Path("missing-workspace"), "trial")
+        return await _boot_compose_with_evidence(
+            provider,
+            sandbox_id,
+            COMPOSE_PATH,
+            {},
+            attempt=1,
+            evidence_path=evidence_path,
+            declared_secret_env_keys=frozenset({"APP_SECRET"}),
+        )
+
+    result = asyncio.run(exercise())
+    persisted = evidence_path.read_text(encoding="utf-8")
+
+    assert result.recovery_env == {"APP_SECRET": "repotrial-synthetic-value"}
+    assert "repotrial-synthetic-value" not in persisted
+    assert "repotrial-synthetic-value" not in result.logs["up"]
+    assert [item["name"] for item in json.loads(persisted)["commands"]] == [
+        "up",
+        "ps",
+        "logs",
+    ]
 
 
 def test_private_boot_evidence_checkpoints_commands_final_readiness_and_redacts_env(
