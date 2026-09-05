@@ -172,6 +172,56 @@ def test_evidence_records_config_preflight_stage_separately_from_up(
     assert "never-persist-this" not in evidence_path.read_text(encoding="utf-8")
 
 
+def test_evidence_records_readiness_recheck_phases_within_schema_budget(
+    tmp_path: Path,
+) -> None:
+    evidence_path = tmp_path / "baseline-boot-attempt.json"
+    session = _session(evidence_path, {"APP_SECRET": "repotrial-synthetic-value"})
+
+    session.record_command("config", ExecResult(exit_code=0, stdout="", stderr=""))
+    session.record_command(
+        "up_initial", ExecResult(exit_code=1, stdout="initial", stderr="secret")
+    )
+    session.record_command(
+        "ps_initial", ExecResult(exit_code=0, stdout="starting", stderr="")
+    )
+    session.record_command(
+        "up_recheck", ExecResult(exit_code=0, stdout="recheck", stderr="")
+    )
+    session.record_command(
+        "ps_final", ExecResult(exit_code=0, stdout="healthy", stderr="")
+    )
+    session.record_command("logs", ExecResult(exit_code=0, stdout="logs", stderr=""))
+    session.finalize(Verdict.PASS, {"wakapi": "running/healthy"})
+
+    persisted = evidence_path.read_text(encoding="utf-8")
+    payload = json.loads(persisted)
+    assert [item["name"] for item in payload["commands"]] == [
+        "config",
+        "up_initial",
+        "ps_initial",
+        "up_recheck",
+        "ps_final",
+        "logs",
+    ]
+    assert "repotrial-synthetic-value" not in persisted
+    assert len(evidence_path.read_bytes()) <= boot_evidence._MAX_ARTIFACT_BYTES
+
+
+def test_evidence_records_readiness_recheck_exception_phase(
+    tmp_path: Path,
+) -> None:
+    evidence_path = tmp_path / "baseline-boot-attempt.json"
+    session = _session(evidence_path, {})
+
+    session.record_exception("up_recheck", TimeoutError("not persisted"))
+
+    payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert payload["commands"] == [
+        {"exception_type": "TimeoutError", "name": "up_recheck"}
+    ]
+
+
 @pytest.mark.parametrize("target_kind", ["existing", "link", "missing_parent"])
 def test_evidence_rejects_untrusted_targets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_kind: str

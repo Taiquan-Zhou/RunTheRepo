@@ -170,6 +170,52 @@ class ComposePreflightProvider(FakeSandboxProvider):
         raise AssertionError(f"unexpected provider command: {snapshot!r}")
 
 
+class ReadinessRecheckProvider(FakeSandboxProvider):
+    def __init__(
+        self,
+        up_results: list[ExecResult],
+        ps_results: list[ExecResult],
+    ) -> None:
+        super().__init__()
+        self.up_results = list(up_results)
+        self.ps_results = list(ps_results)
+        self.config_argv: list[tuple[str, ...]] = []
+        self.up_argv: list[tuple[str, ...]] = []
+        self.ps_argv: list[tuple[str, ...]] = []
+        self.logs_argv: list[tuple[str, ...]] = []
+
+    async def exec(
+        self, sandbox_id: str, argv: list[str], timeout_s: int = 60
+    ) -> ExecResult:
+        self._require_active(sandbox_id)
+        snapshot = tuple(argv)
+        self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+        if snapshot[-2:] == ("config", "--quiet"):
+            self.config_argv.append(snapshot)
+            return _result()
+        if snapshot[-5:] == ("up", "-d", "--wait", "--wait-timeout", "60"):
+            self.up_argv.append(snapshot)
+            return self.up_results.pop(0)
+        if snapshot[-7:] == (
+            "up",
+            "-d",
+            "--wait",
+            "--wait-timeout",
+            "60",
+            "--no-build",
+            "--no-recreate",
+        ):
+            self.up_argv.append(snapshot)
+            return self.up_results.pop(0)
+        if snapshot[-4:] == ("ps", "--all", "--format", "json"):
+            self.ps_argv.append(snapshot)
+            return self.ps_results.pop(0)
+        if snapshot[-4:] == ("logs", "--no-color", "--tail", "200"):
+            self.logs_argv.append(snapshot)
+            return _result(stdout="final logs")
+        raise AssertionError(f"unexpected provider command: {snapshot!r}")
+
+
 def _run_with_active_sandbox(
     provider: FakeSandboxProvider,
     *,
@@ -192,6 +238,299 @@ def _run_with_active_sandbox(
         )
 
     return asyncio.run(exercise())
+
+
+def _ps_service(
+    service: str,
+    state: str,
+    health: str | None,
+    exit_code: int = 0,
+    *,
+    container_id: str | None = None,
+    include_id: bool = True,
+) -> str:
+    row: dict[str, object] = {
+        "Service": service,
+        "State": state,
+        "Health": health,
+        "ExitCode": exit_code,
+    }
+    if include_id:
+        row["ID"] = container_id or f"container-{service}"
+    return json.dumps(row)
+
+
+def _transient_ps(
+    *, db_id: str = "container-db", wakapi_id: str = "container-wakapi"
+) -> str:
+    return "\n".join(
+        [
+            _ps_service("db", "running", "healthy", container_id=db_id),
+            _ps_service("wakapi", "running", "starting", container_id=wakapi_id),
+        ]
+    )
+
+
+def _ready_ps(
+    *, db_id: str = "container-db", wakapi_id: str = "container-wakapi"
+) -> str:
+    return "\n".join(
+        [
+            _ps_service("db", "running", "healthy", container_id=db_id),
+            _ps_service("wakapi", "running", "healthy", container_id=wakapi_id),
+        ]
+    )
+
+
+def _run_readiness_recheck(
+    provider: ReadinessRecheckProvider,
+    *,
+    evidence_path: Path | None = None,
+    declared_secret_env_keys: frozenset[str] = frozenset(),
+) -> BootResult:
+    async def exercise() -> BootResult:
+        sandbox_id = await provider.create(Path("missing-workspace"), "trial")
+        if evidence_path is None:
+            return await boot_compose(
+                provider,
+                sandbox_id,
+                COMPOSE_PATH,
+                {},
+                attempt=1,
+                declared_secret_env_keys=declared_secret_env_keys,
+            )
+        return await _boot_compose_with_evidence(
+            provider,
+            sandbox_id,
+            COMPOSE_PATH,
+            {},
+            attempt=1,
+            evidence_path=evidence_path,
+            declared_secret_env_keys=declared_secret_env_keys,
+        )
+
+    return asyncio.run(exercise())
+
+
+def test_boot_rechecks_transient_starting_services_once_and_passes() -> None:
+    provider = ReadinessRecheckProvider(
+        [_result(exit_code=1, stderr="container wakapi is unhealthy"), _result()],
+        [_result(exit_code=0, stdout=_transient_ps()), _result(stdout=_ready_ps())],
+    )
+
+    result = _run_readiness_recheck(provider)
+
+    assert result.verdict is Verdict.PASS
+    assert len(provider.up_argv) == 2
+    up_calls = [
+        call
+        for call in provider.calls
+        if call[2][-5:] == UP_ARGV[-5:]
+        or call[2][-7:] == UP_ARGV[-5:] + ("--no-build", "--no-recreate")
+    ]
+    assert [call[3] for call in up_calls] == [600, 120]
+    assert provider.up_argv[1][-7:] == (
+        "up",
+        "-d",
+        "--wait",
+        "--wait-timeout",
+        "60",
+        "--no-build",
+        "--no-recreate",
+    )
+    assert len(provider.ps_argv) == 2
+    assert len(provider.logs_argv) == 1
+
+
+def test_boot_readiness_recheck_failure_does_not_try_a_third_up() -> None:
+    provider = ReadinessRecheckProvider(
+        [
+            _result(exit_code=1, stderr="container wakapi is unhealthy"),
+            _result(exit_code=1, stderr="container wakapi is unhealthy"),
+        ],
+        [_result(stdout=_transient_ps()), _result(stdout=_transient_ps())],
+    )
+
+    result = _run_readiness_recheck(provider)
+
+    assert result.verdict is Verdict.FAIL
+    assert len(provider.up_argv) == 2
+    assert len(provider.ps_argv) == 2
+    assert len(provider.logs_argv) == 1
+
+
+@pytest.mark.parametrize(
+    "initial_ps",
+    [
+        _ps_service("wakapi", "running", "unhealthy"),
+        _ps_service("wakapi", "exited", None),
+        _ps_service("wakapi", "running", "starting", exit_code=1),
+    ],
+)
+def test_boot_does_not_recheck_non_transient_readiness(initial_ps: str) -> None:
+    provider = ReadinessRecheckProvider(
+        [_result(exit_code=1, stderr="container wakapi is unhealthy"), _result()],
+        [_result(stdout=initial_ps)],
+    )
+
+    result = _run_readiness_recheck(provider)
+
+    assert result.verdict is Verdict.FAIL
+    assert len(provider.up_argv) == 1
+    assert len(provider.ps_argv) == 1
+    assert len(provider.logs_argv) == 1
+
+
+def test_boot_rechecks_healthy_snapshot_race_once() -> None:
+    provider = ReadinessRecheckProvider(
+        [_result(exit_code=1, stderr="timeout waiting for dependencies"), _result()],
+        [_result(stdout=_ready_ps()), _result(stdout=_ready_ps())],
+    )
+
+    result = _run_readiness_recheck(provider)
+
+    assert result.verdict is Verdict.PASS
+    assert len(provider.up_argv) == 2
+    assert len(provider.ps_argv) == 2
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "build output\ncontainer workspace-wakapi-1 is unhealthy",
+        "build output\r\ncontainer workspace-wakapi-1 is unhealthy\r\n\r\n",
+    ],
+)
+def test_boot_accepts_readiness_error_as_last_nonempty_stderr_line(
+    stderr: str,
+) -> None:
+    provider = ReadinessRecheckProvider(
+        [_result(exit_code=1, stderr=stderr), _result()],
+        [_result(stdout=_transient_ps()), _result(stdout=_ready_ps())],
+    )
+
+    result = _run_readiness_recheck(provider)
+
+    assert result.verdict is Verdict.PASS
+    assert len(provider.up_argv) == 2
+
+
+def test_boot_rejects_readiness_error_with_trailing_nonempty_stderr() -> None:
+    provider = ReadinessRecheckProvider(
+        [
+            _result(
+                exit_code=1,
+                stderr="container workspace-wakapi-1 is unhealthy\npostscript",
+            ),
+            _result(),
+        ],
+        [_result(stdout=_transient_ps())],
+    )
+
+    result = _run_readiness_recheck(provider)
+
+    assert result.verdict is Verdict.FAIL
+    assert len(provider.up_argv) == 1
+
+
+@pytest.mark.parametrize(
+    "initial_up",
+    [
+        _result(exit_code=2, stderr="container wakapi is unhealthy"),
+        _result(exit_code=1, stderr="unrelated compose failure"),
+    ],
+)
+def test_boot_does_not_recheck_non_readiness_up_failures(
+    initial_up: ExecResult,
+) -> None:
+    provider = ReadinessRecheckProvider(
+        [initial_up, _result()],
+        [_result(stdout=_transient_ps())],
+    )
+
+    result = _run_readiness_recheck(provider)
+
+    assert result.verdict is Verdict.FAIL
+    assert len(provider.up_argv) == 1
+    assert len(provider.ps_argv) == 1
+
+
+@pytest.mark.parametrize(
+    "initial_ps",
+    [
+        _ps_service("wakapi", "running", "starting", include_id=False),
+        "\n".join(
+            [
+                _ps_service("db", "running", "healthy", container_id="same"),
+                _ps_service("wakapi", "running", "starting", container_id="same"),
+            ]
+        ),
+    ],
+)
+def test_boot_does_not_recheck_invalid_container_ids(initial_ps: str) -> None:
+    provider = ReadinessRecheckProvider(
+        [_result(exit_code=1, stderr="container wakapi is unhealthy"), _result()],
+        [_result(stdout=initial_ps)],
+    )
+
+    result = _run_readiness_recheck(provider)
+
+    assert result.verdict is Verdict.FAIL
+    assert len(provider.up_argv) == 1
+    assert len(provider.ps_argv) == 1
+
+
+def test_boot_fails_when_readiness_recheck_changes_container_ids() -> None:
+    provider = ReadinessRecheckProvider(
+        [_result(exit_code=1, stderr="container wakapi is unhealthy"), _result()],
+        [
+            _result(stdout=_transient_ps()),
+            _result(stdout=_ready_ps(wakapi_id="replacement-wakapi")),
+        ],
+    )
+
+    result = _run_readiness_recheck(provider)
+
+    assert result.verdict is Verdict.FAIL
+    assert len(provider.up_argv) == 2
+    assert len(provider.ps_argv) == 2
+
+
+def test_boot_readiness_recheck_evidence_retains_both_attempts(
+    tmp_path: Path,
+) -> None:
+    provider = ReadinessRecheckProvider(
+        [
+            _result(exit_code=1, stderr="container wakapi is unhealthy"),
+            _result(stdout="recheck up"),
+        ],
+        [
+            _result(stdout=_transient_ps()),
+            _result(stdout=_ready_ps()),
+        ],
+    )
+    evidence_path = tmp_path / "baseline-boot-attempt.json"
+
+    result = _run_readiness_recheck(
+        provider,
+        evidence_path=evidence_path,
+        declared_secret_env_keys=frozenset({"APP_SECRET"}),
+    )
+
+    assert result.verdict is Verdict.PASS
+    payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert [item["name"] for item in payload["commands"]] == [
+        "config",
+        "up_initial",
+        "ps_initial",
+        "up_recheck",
+        "ps_final",
+        "logs",
+    ]
+    assert payload["commands"][1]["exit_code"] == 1
+    assert payload["commands"][3]["exit_code"] == 0
+    assert "container wakapi is unhealthy" in payload["commands"][1]["stderr"]["text"]
+    assert "repotrial-synthetic-value" not in evidence_path.read_text(encoding="utf-8")
 
 
 def test_declared_secret_preflight_batches_multiple_keys_before_one_up() -> None:

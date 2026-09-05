@@ -1,6 +1,7 @@
 import json
 import re
 from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -27,7 +28,11 @@ _REDACTION = "[REDACTED]"
 _MARKER_OVERFLOW_REDACTION = "[REDACTED: excessive truncation markers]"
 _LOG_LIMIT = 65_536
 _COMPOSE_UP_TIMEOUT_S = 600
+_COMPOSE_READINESS_RECHECK_TIMEOUT_S = 120
 _COMPOSE_CONFIG_TIMEOUT_S = 30
+_READINESS_ERROR_PATTERN = re.compile(
+    r"(?:dependency failed to start: )?container [A-Za-z0-9_.-]+ is unhealthy\Z"
+)
 _MAX_DECLARED_SECRET_KEYS = 32
 _MAX_DECLARED_SECRET_KEY_LENGTH = 128
 _SYNTHETIC_VALUE = "repotrial-synthetic-value"
@@ -164,9 +169,6 @@ async def _boot_compose_with_evidence(
         if evidence is not None:
             evidence.record_exception("up", error)
         raise error
-    if evidence is not None:
-        evidence.record_command("up", up)
-
     try:
         ps = await provider.exec(
             sandbox_id,
@@ -175,14 +177,72 @@ async def _boot_compose_with_evidence(
         )
     except BaseException as error:
         if evidence is not None:
+            evidence.record_command("up", up)
             evidence.record_exception("ps", error)
         raise
     if not isinstance(ps, ExecResult):
         error = TypeError("boot command returned a malformed result")
         if evidence is not None:
+            evidence.record_command("up", up)
             evidence.record_exception("ps", error)
         raise error
-    if evidence is not None:
+
+    initial_snapshot = _parse_readiness_snapshot(ps.stdout)
+    recheck = _should_recheck_readiness(up, ps, initial_snapshot)
+    final_up = up
+    final_ps = ps
+    if recheck:
+        if evidence is not None:
+            evidence.record_command("up_initial", up)
+            evidence.record_command("ps_initial", ps)
+        try:
+            recheck_up = await provider.exec(
+                sandbox_id,
+                [
+                    *prefix,
+                    *docker_compose,
+                    "up",
+                    "-d",
+                    "--wait",
+                    "--wait-timeout",
+                    "60",
+                    "--no-build",
+                    "--no-recreate",
+                ],
+                timeout_s=_COMPOSE_READINESS_RECHECK_TIMEOUT_S,
+            )
+        except BaseException as error:
+            if evidence is not None:
+                evidence.record_exception("up_recheck", error)
+            raise
+        if not isinstance(recheck_up, ExecResult):
+            error = TypeError("boot command returned a malformed result")
+            if evidence is not None:
+                evidence.record_exception("up_recheck", error)
+            raise error
+        if evidence is not None:
+            evidence.record_command("up_recheck", recheck_up)
+        try:
+            recheck_ps = await provider.exec(
+                sandbox_id,
+                [*prefix, *docker_compose, "ps", "--all", "--format", "json"],
+                timeout_s=30,
+            )
+        except BaseException as error:
+            if evidence is not None:
+                evidence.record_exception("ps_final", error)
+            raise
+        if not isinstance(recheck_ps, ExecResult):
+            error = TypeError("boot command returned a malformed result")
+            if evidence is not None:
+                evidence.record_exception("ps_final", error)
+            raise error
+        final_up = recheck_up
+        final_ps = recheck_ps
+        if evidence is not None:
+            evidence.record_command("ps_final", recheck_ps)
+    elif evidence is not None:
+        evidence.record_command("up", up)
         evidence.record_command("ps", ps)
 
     try:
@@ -203,8 +263,18 @@ async def _boot_compose_with_evidence(
     if evidence is not None:
         evidence.record_command("logs", logs)
 
-    service_states, all_services_ready = _parse_service_states(ps.stdout)
-    workload_commands_succeeded = up.exit_code == 0 and ps.exit_code == 0
+    service_states, all_services_ready = _parse_service_states(final_ps.stdout)
+    final_snapshot = _parse_readiness_snapshot(final_ps.stdout) if recheck else None
+    final_ids_match = not recheck or (
+        initial_snapshot is not None
+        and final_snapshot is not None
+        and initial_snapshot.container_ids == final_snapshot.container_ids
+    )
+    if recheck:
+        all_services_ready = (
+            final_snapshot is not None and final_snapshot.all_ready and final_ids_match
+        )
+    workload_commands_succeeded = final_up.exit_code == 0 and final_ps.exit_code == 0
     verdict = (
         Verdict.PASS
         if workload_commands_succeeded and all_services_ready
@@ -225,8 +295,8 @@ async def _boot_compose_with_evidence(
         verdict=verdict,
         service_states=service_states,
         logs={
-            "up": _sanitize_result(up, sensitive_values),
-            "ps": _sanitize_result(ps, sensitive_values),
+            "up": _sanitize_result(final_up, sensitive_values),
+            "ps": _sanitize_result(final_ps, sensitive_values),
             "logs": _sanitize_logs_result(logs, sensitive_values),
         },
         attempt=attempt,
@@ -291,6 +361,107 @@ def _is_safe_preflight_env_key(key: str) -> bool:
         _ENV_KEY_PATTERN.fullmatch(key) is not None
         and normalized_key not in _CONTROL_ENV_KEYS
         and not normalized_key.startswith(_CONTROL_ENV_PREFIXES)
+    )
+
+
+@dataclass(frozen=True)
+class _ReadinessSnapshot:
+    container_ids: frozenset[str]
+    all_running: bool
+    all_ready: bool
+    has_healthy_or_starting: bool
+
+
+def _should_recheck_readiness(
+    up: ExecResult,
+    ps: ExecResult,
+    snapshot: _ReadinessSnapshot | None,
+) -> bool:
+    return (
+        up.exit_code == 1
+        and _is_readiness_error(up.stderr)
+        and ps.exit_code == 0
+        and snapshot is not None
+        and snapshot.all_running
+        and snapshot.has_healthy_or_starting
+    )
+
+
+def _is_readiness_error(stderr: str) -> bool:
+    if not isinstance(stderr, str) or len(stderr) > _LOG_LIMIT:
+        return False
+    nonempty_lines = [line for line in stderr.splitlines() if line.strip()]
+    if not nonempty_lines:
+        return False
+    message = nonempty_lines[-1]
+    return message == "timeout waiting for dependencies" or (
+        _READINESS_ERROR_PATTERN.fullmatch(message) is not None
+    )
+
+
+def _parse_readiness_snapshot(output: str) -> _ReadinessSnapshot | None:
+    if not isinstance(output, str) or len(output) > _LOG_LIMIT:
+        return None
+    rows = [line for line in output.splitlines() if line.strip()]
+    if not rows:
+        return None
+
+    container_ids: set[str] = set()
+    all_running = True
+    all_ready = True
+    has_healthy_or_starting = False
+    for line in rows:
+        try:
+            decoded: object = json.loads(
+                line,
+                object_pairs_hook=_object_without_duplicate_keys,
+                parse_constant=_reject_nonstandard_constant,
+            )
+        except (ValueError, RecursionError):
+            return None
+        if not isinstance(decoded, dict) or not {
+            "Service",
+            "State",
+            "Health",
+            "ExitCode",
+            "ID",
+        }.issubset(decoded):
+            return None
+        service = decoded["Service"]
+        state = decoded["State"]
+        health = decoded["Health"]
+        exit_code = decoded["ExitCode"]
+        container_id = decoded["ID"]
+        if (
+            not isinstance(service, str)
+            or not service.strip()
+            or not isinstance(state, str)
+            or not (isinstance(health, str) or health is None)
+            or type(exit_code) is not int
+            or exit_code < 0
+            or not isinstance(container_id, str)
+            or not container_id.strip()
+            or container_id in container_ids
+        ):
+            return None
+        container_ids.add(container_id)
+        normalized_state = state.lower()
+        normalized_health = health.lower() if health is not None else ""
+        if normalized_state != "running" or exit_code != 0:
+            all_running = False
+            all_ready = False
+        if normalized_health not in {"", "healthy", "starting"}:
+            return None
+        if normalized_health in {"healthy", "starting"}:
+            has_healthy_or_starting = True
+        if normalized_health not in {"", "healthy"}:
+            all_ready = False
+
+    return _ReadinessSnapshot(
+        container_ids=frozenset(container_ids),
+        all_running=all_running,
+        all_ready=all_ready and has_healthy_or_starting,
+        has_healthy_or_starting=has_healthy_or_starting,
     )
 
 
