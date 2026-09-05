@@ -136,6 +136,8 @@ class GraphProvider(FakeSandboxProvider):
         self._roles: dict[str, str] = {}
         self._workspaces: dict[str, Path] = {}
         self._experiment_expected_sha256: dict[str, str] = {}
+        self._accepted_expected_sha256: dict[str, str] = {}
+        self._accepted_guest_files: dict[str, dict[str, bytes]] = {}
 
     async def create(self, workspace: Path, name: str) -> str:
         sandbox_id = await super().create(workspace, name)
@@ -163,6 +165,33 @@ class GraphProvider(FakeSandboxProvider):
                 (self._workspaces[sandbox_id] / relative_path).write_bytes(
                     b"guest-clone-tampered"
                 )
+            return ExecResult(
+                exit_code=0,
+                stdout=(
+                    "root=/workspace\n"
+                    f"path={relative_path}\n"
+                    "mode=600\n"
+                    f"sha256={expected_sha256}\n"
+                ),
+                stderr="",
+            )
+        if "repotrial-accepted-compose" in snapshot:
+            relative_path = snapshot[-3]
+            expected_sha256 = snapshot[-2]
+            payload = snapshot[-1]
+            if not relative_path.startswith(".repotrial-accepted/"):
+                raise AssertionError("accepted compose path must be fixed")
+            try:
+                content = base64.b64decode(payload, validate=True)
+            except (ValueError, binascii.Error) as error:
+                raise AssertionError("accepted payload must be valid base64") from error
+            if hashlib.sha256(content).hexdigest() != expected_sha256:
+                raise AssertionError("accepted payload hash mismatch")
+            guest_files = self._accepted_guest_files.setdefault(sandbox_id, {})
+            if relative_path in guest_files:
+                return ExecResult(exit_code=24, stdout="", stderr="")
+            guest_files[relative_path] = content
+            self._accepted_expected_sha256[sandbox_id] = expected_sha256
             return ExecResult(
                 exit_code=0,
                 stdout=(
@@ -214,15 +243,31 @@ class GraphProvider(FakeSandboxProvider):
             ):
                 digest = "0" * 64
             else:
-                target = self._workspaces[sandbox_id] / relative_path
-                if not target.is_file() or target.is_symlink():
-                    raise AssertionError("guest verifier target was not materialized")
-                digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                if relative_path.startswith(".repotrial-accepted/"):
+                    try:
+                        content = self._accepted_guest_files[sandbox_id][relative_path]
+                    except KeyError as error:
+                        raise AssertionError(
+                            "accepted guest target was not materialized"
+                        ) from error
+                else:
+                    target = self._workspaces[sandbox_id] / relative_path
+                    if not target.is_file() or target.is_symlink():
+                        raise AssertionError(
+                            "guest verifier target was not materialized"
+                        )
+                    content = target.read_bytes()
+                digest = hashlib.sha256(content).hexdigest()
                 if (
                     relative_path == ".repotrial-overlays/experiment.overlay.yaml"
                     and self._experiment_expected_sha256.get(sandbox_id) != digest
                 ):
                     raise AssertionError("experiment verifier hash mismatch")
+                if (
+                    relative_path.startswith(".repotrial-accepted/")
+                    and self._accepted_expected_sha256.get(sandbox_id) != digest
+                ):
+                    raise AssertionError("accepted verifier hash mismatch")
             return ExecResult(
                 exit_code=0,
                 stdout=f"{digest}  {relative_path}\n",
@@ -285,6 +330,7 @@ class GraphProvider(FakeSandboxProvider):
             (workspace / ".repotrial-overlays/experiment.overlay.yaml").unlink(
                 missing_ok=True
             )
+        self._accepted_guest_files.pop(sandbox_id, None)
         await super().destroy(sandbox_id)
 
 

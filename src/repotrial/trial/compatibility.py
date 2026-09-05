@@ -29,6 +29,9 @@ _MAX_COMPATIBILITY_PAYLOAD_BYTES = 1_398_104
 _MAX_COMPATIBILITY_EVIDENCE_BYTES = 32 * 1024
 _COMPATIBILITY_RELATIVE_PATH = ".repotrial-overlays/compatibility.overlay.yaml"
 _EXPERIMENT_RELATIVE_PATH = ".repotrial-overlays/experiment.overlay.yaml"
+_ACCEPTED_COMPOSE_PATTERN = re.compile(
+    r"\.repotrial-accepted/accepted-[0-9]{4}-[0-9a-f]{16}\.compose\.yaml\Z"
+)
 
 # This is code-owned and intentionally not assembled from repository input.
 _COMPATIBILITY_ADAPTER_SCRIPT = """\
@@ -89,6 +92,23 @@ _EXPERIMENT_ADAPTER_SCRIPT = _COMPATIBILITY_ADAPTER_SCRIPT.replace(
 )
 _EXPERIMENT_ADAPTER_SHA256 = (
     "d0540c9aefa3bfb23cc27a7af79fbdbb8b8c2e714311acc4e1c09f1580a82827"
+)
+_ACCEPTED_COMPOSE_SHELL_PATTERN = (
+    ".repotrial-accepted/accepted-"
+    + "[0-9]" * 4
+    + "-"
+    + "[0-9a-f]" * 16
+    + ".compose.yaml"
+)
+_ACCEPTED_COMPOSE_ADAPTER_SCRIPT = _COMPATIBILITY_ADAPTER_SCRIPT.replace(
+    '[ "$target_path" = ".repotrial-overlays/compatibility.overlay.yaml" ] || exit 22',
+    f"""case "$target_path" in
+    {_ACCEPTED_COMPOSE_SHELL_PATTERN}) ;;
+    *) exit 22 ;;
+esac""",
+).replace("overlay_dir=.repotrial-overlays", "overlay_dir=.repotrial-accepted")
+_ACCEPTED_COMPOSE_ADAPTER_SHA256 = (
+    "8f9d8bf5428ce0fc984efb1de416ce5c810671ed07ea466ddf570463253a1c4b"
 )
 
 
@@ -213,6 +233,34 @@ async def materialize_guest_experiment_overlay(
         adapter_sha256=_EXPERIMENT_ADAPTER_SHA256,
         purpose="experiment_overlay_materialization",
         command_name="repotrial-experiment-overlay",
+    )
+
+
+async def materialize_guest_accepted_compose(
+    provider: SandboxProvider,
+    sandbox_id: str,
+    *,
+    host_artifact_path: Path,
+    relative_path: str,
+    expected_sha256: str,
+    evidence_path: Path,
+) -> None:
+    """Copy one generated accepted Compose file to its matching guest path."""
+
+    if not _ACCEPTED_COMPOSE_PATTERN.fullmatch(relative_path):
+        raise CompatibilityError("guest_path_invalid")
+    await _materialize_guest_overlay(
+        provider,
+        sandbox_id,
+        host_artifact_path=host_artifact_path,
+        relative_path=relative_path,
+        expected_sha256=expected_sha256,
+        evidence_path=evidence_path,
+        expected_relative_path=relative_path,
+        adapter_script=_ACCEPTED_COMPOSE_ADAPTER_SCRIPT,
+        adapter_sha256=_ACCEPTED_COMPOSE_ADAPTER_SHA256,
+        purpose="accepted_compose_materialization",
+        command_name="repotrial-accepted-compose",
     )
 
 
@@ -544,6 +592,25 @@ async def verify_guest_experiment_overlay(
         provider,
         sandbox_id,
         relative_path=_EXPERIMENT_RELATIVE_PATH,
+        expected_sha256=expected_sha256,
+    )
+
+
+async def verify_guest_accepted_compose(
+    provider: SandboxProvider,
+    sandbox_id: str,
+    *,
+    relative_path: str,
+    expected_sha256: str,
+) -> None:
+    """Verify one generated accepted Compose file at its fixed guest path."""
+
+    if not _ACCEPTED_COMPOSE_PATTERN.fullmatch(relative_path):
+        raise CompatibilityError("guest_path_invalid")
+    await _verify_guest_overlay(
+        provider,
+        sandbox_id,
+        relative_path=relative_path,
         expected_sha256=expected_sha256,
     )
 

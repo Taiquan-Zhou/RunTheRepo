@@ -92,6 +92,7 @@ class RecordingProvider(FakeSandboxProvider):
         self.expected_overlay = expected_overlay
         self.overlay_at_create: str | None = None
         self.experiment_sha256: str | None = None
+        self.accepted_sha256: str | None = None
         self.source_env = source_env
         self.publish_failure = publish_failure
         self.destroy_failure = destroy_failure
@@ -112,6 +113,7 @@ class RecordingProvider(FakeSandboxProvider):
         if any(
             command in snapshot
             for command in (
+                "repotrial-accepted-compose",
                 "repotrial-compatibility-overlay",
                 "repotrial-experiment-overlay",
             )
@@ -121,6 +123,8 @@ class RecordingProvider(FakeSandboxProvider):
             expected_sha256 = snapshot[-2]
             if "repotrial-experiment-overlay" in snapshot:
                 self.experiment_sha256 = expected_sha256
+            if "repotrial-accepted-compose" in snapshot:
+                self.accepted_sha256 = expected_sha256
             return ExecResult(
                 exit_code=0,
                 stdout=(
@@ -139,6 +143,13 @@ class RecordingProvider(FakeSandboxProvider):
             assert self.experiment_sha256 is not None
             self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
             return _exec_result(stdout=f"{self.experiment_sha256}  {snapshot[-1]}\n")
+        if (
+            len(snapshot) == 3
+            and snapshot[:2] == ("sha256sum", "--")
+            and snapshot[-1].startswith(".repotrial-accepted/")
+        ):
+            assert self.accepted_sha256 is not None
+            return _exec_result(stdout=f"{self.accepted_sha256}  {snapshot[-1]}\n")
         return await super().exec(sandbox_id, argv, timeout_s)
 
     async def publish_port(self, sandbox_id: str, container_port: int) -> int:
@@ -168,6 +179,7 @@ class StartupInputProvider(RecordingProvider):
         if any(
             command in snapshot
             for command in (
+                "repotrial-accepted-compose",
                 "repotrial-compatibility-overlay",
                 "repotrial-experiment-overlay",
             )
@@ -176,6 +188,8 @@ class StartupInputProvider(RecordingProvider):
             expected_sha256 = snapshot[-2]
             if "repotrial-experiment-overlay" in snapshot:
                 self.experiment_sha256 = expected_sha256
+            if "repotrial-accepted-compose" in snapshot:
+                self.accepted_sha256 = expected_sha256
             return ExecResult(
                 exit_code=0,
                 stdout=(
@@ -194,6 +208,13 @@ class StartupInputProvider(RecordingProvider):
             assert self.experiment_sha256 is not None
             self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
             return _exec_result(stdout=f"{self.experiment_sha256}  {snapshot[-1]}\n")
+        if (
+            len(snapshot) == 3
+            and snapshot[:2] == ("sha256sum", "--")
+            and snapshot[-1].startswith(".repotrial-accepted/")
+        ):
+            assert self.accepted_sha256 is not None
+            return _exec_result(stdout=f"{self.accepted_sha256}  {snapshot[-1]}\n")
         if "repotrial-startup-input" in snapshot:
             return ExecResult(
                 exit_code=self.adapter_exit_code,
@@ -871,7 +892,7 @@ def test_later_candidate_keeps_clone_root_startup_identity_after_accepted_compos
 
     accepted_dir = first_context.workspace / ".repotrial-accepted"
     accepted_dir.mkdir()
-    accepted = accepted_dir / "accepted-0001.compose.yaml"
+    accepted = accepted_dir / "accepted-source.compose.yaml"
     accepted.write_text(
         "services:\n"
         "  web:\n"
@@ -887,11 +908,14 @@ def test_later_candidate_keeps_clone_root_startup_identity_after_accepted_compos
             canonical_compose_json(load_compose(accepted)).encode("utf-8")
         ).hexdigest()
     )
+    accepted = accepted_dir / f"accepted-0001-{accepted_hash[7:23]}.compose.yaml"
+    (accepted_dir / "accepted-source.compose.yaml").rename(accepted)
     second_state = state.model_copy(
         deep=True,
         update={
             "compose_path": accepted.relative_to(first_context.workspace).as_posix(),
             "current_config_hash": accepted_hash,
+            "experiments": [first_record],
         },
     )
     second_mutation = Mutation(
@@ -937,6 +961,51 @@ def test_later_candidate_keeps_clone_root_startup_identity_after_accepted_compos
         accepted.relative_to(first_context.workspace).as_posix() in argv
         for argv in second_compose_calls
     )
+    second_exec_calls = [call[2] for call in second_provider.calls if call[0] == "exec"]
+    accepted_materialize_index = next(
+        index
+        for index, argv in enumerate(second_exec_calls)
+        if "repotrial-accepted-compose" in argv
+    )
+    accepted_verify_index = next(
+        index
+        for index, argv in enumerate(second_exec_calls)
+        if argv[:3]
+        == (
+            "sha256sum",
+            "--",
+            accepted.relative_to(first_context.workspace).as_posix(),
+        )
+    )
+    experiment_materialize_index = next(
+        index
+        for index, argv in enumerate(second_exec_calls)
+        if "repotrial-experiment-overlay" in argv
+    )
+    experiment_verify_index = next(
+        index
+        for index, argv in enumerate(second_exec_calls)
+        if argv[:3]
+        == ("sha256sum", "--", ".repotrial-overlays/experiment.overlay.yaml")
+    )
+    startup_index = next(
+        index
+        for index, argv in enumerate(second_exec_calls)
+        if "repotrial-startup-input" in argv
+    )
+    compose_index = next(
+        index
+        for index, argv in enumerate(second_exec_calls)
+        if "docker" in argv and "compose" in argv
+    )
+    assert (
+        accepted_materialize_index
+        < accepted_verify_index
+        < experiment_materialize_index
+        < experiment_verify_index
+        < startup_index
+        < compose_index
+    )
 
 
 def test_conflicting_recorded_parent_hash_stops_before_overlay_and_sandbox(
@@ -950,6 +1019,25 @@ def test_conflicting_recorded_parent_hash_stops_before_overlay_and_sandbox(
 
     assert record.verdict is ExperimentVerdict.STOP
     assert record.reason == "parent_hash_mismatch"
+    assert provider.calls == []
+    assert not context.overlay_path.exists()
+
+
+def test_unmatched_accepted_compose_stops_before_overlay_and_sandbox(
+    tmp_path: Path,
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    accepted_dir = context.workspace / ".repotrial-accepted"
+    accepted_dir.mkdir()
+    accepted = accepted_dir / "accepted-0001-0000000000000000.compose.yaml"
+    accepted.write_text(_compose_text(), encoding="utf-8")
+    state.compose_path = accepted.relative_to(context.workspace).as_posix()
+    provider = RecordingProvider()
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.verdict is ExperimentVerdict.STOP
+    assert record.reason == "accepted_compose_materialization_failed"
     assert provider.calls == []
     assert not context.overlay_path.exists()
 

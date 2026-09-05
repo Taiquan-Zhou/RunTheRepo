@@ -27,10 +27,13 @@ from repotrial.sandbox.docker_sbx import DockerSbxError
 from repotrial.sandbox.lifecycle import CleanupError, managed_sandbox
 from repotrial.trial.boot import _validated_env_prefix, boot_compose
 from repotrial.trial.compatibility import (
+    _ACCEPTED_COMPOSE_PATTERN,
     _EXPERIMENT_RELATIVE_PATH,
     fingerprint_host_artifact,
+    materialize_guest_accepted_compose,
     materialize_guest_compatibility_overlay,
     materialize_guest_experiment_overlay,
+    verify_guest_accepted_compose,
     verify_guest_compatibility_overlay,
     verify_guest_experiment_overlay,
 )
@@ -86,6 +89,9 @@ class ExperimentContext:
 @dataclass(frozen=True, slots=True)
 class _PreparedExperiment:
     compose_path: str
+    compose_file: Path
+    accepted_compose_evidence_path: Path | None
+    accepted_compose_error: str | None
     overlay_path: Path
     compatibility_overlay_path: Path | None
     overlay_relative: str
@@ -126,6 +132,15 @@ async def run_experiment(
             boot=Verdict.UNSUPPORTED,
             verdict=ExperimentVerdict.STOP,
             reason=prepared.baseline_error,
+        )
+    if prepared.accepted_compose_error is not None:
+        return _record(
+            state,
+            mutation,
+            prepared,
+            boot=Verdict.UNSUPPORTED,
+            verdict=ExperimentVerdict.STOP,
+            reason=prepared.accepted_compose_error,
         )
 
     recorded_parent = state.current_config_hash
@@ -179,6 +194,19 @@ async def run_experiment(
             verdict=ExperimentVerdict.STOP,
             reason="candidate_overlay_materialization_failed",
         )
+    accepted_compose_sha256: str | None = None
+    if prepared.accepted_compose_evidence_path is not None:
+        try:
+            accepted_compose_sha256 = fingerprint_host_artifact(prepared.compose_file)
+        except _ORDINARY_STAGE_ERRORS:
+            return _record(
+                state,
+                mutation,
+                prepared,
+                boot=Verdict.UNSUPPORTED,
+                verdict=ExperimentVerdict.STOP,
+                reason="accepted_compose_materialization_failed",
+            )
 
     try:
         async with managed_sandbox(
@@ -195,6 +223,7 @@ async def run_experiment(
                 prepared,
                 sandbox_id,
                 experiment_overlay_sha256,
+                accepted_compose_sha256,
             )
     except CleanupError:
         raise
@@ -240,6 +269,20 @@ def _prepare(
     artifact_dir = _real_directory(context.artifact_dir, "artifact_dir")
     if artifact_dir.is_relative_to(workspace):
         raise ValueError("artifact_dir must resolve outside workspace")
+    accepted_compose_error: str | None = None
+    accepted_compose_evidence_path: Path | None = None
+    if isinstance(state.compose_path, str) and state.compose_path.startswith(
+        ".repotrial-accepted/"
+    ):
+        expected = _expected_accepted_compose_path(state)
+        if expected != compose_path or not _ACCEPTED_COMPOSE_PATTERN.fullmatch(
+            compose_path
+        ):
+            accepted_compose_error = "accepted_compose_materialization_failed"
+        else:
+            accepted_compose_evidence_path = artifact_dir / (
+                "accepted-compose-materialization.jsonl"
+            )
     if type(context.container_port) is not int:
         raise TypeError("container_port must be an integer")
     if not 1 <= context.container_port <= 65_535:
@@ -290,6 +333,9 @@ def _prepare(
     token = candidate_hash.removeprefix("sha256:")[:16]
     return _PreparedExperiment(
         compose_path=compose_path,
+        compose_file=compose_file,
+        accepted_compose_evidence_path=accepted_compose_evidence_path,
+        accepted_compose_error=accepted_compose_error,
         overlay_path=overlay_path,
         compatibility_overlay_path=compatibility_overlay_path,
         overlay_relative=overlay_relative,
@@ -316,6 +362,26 @@ def _prepare(
         ),
         sandbox_name=f"repotrial-candidate-{token}",
     )
+
+
+def _expected_accepted_compose_path(state: RunState) -> str | None:
+    if not state.experiments:
+        return None
+    for index in range(len(state.experiments) - 1, -1, -1):
+        record = state.experiments[index]
+        if record.verdict is not ExperimentVerdict.KEEP:
+            continue
+        if state.current_config_hash != record.candidate_config_hash:
+            return None
+        digest = record.candidate_config_hash.removeprefix("sha256:")
+        if len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            return None
+        return (
+            f".repotrial-accepted/accepted-{index + 1:04d}-{digest[:16]}.compose.yaml"
+        )
+    return None
 
 
 def _select_baseline_journeys(
@@ -472,6 +538,8 @@ def _validate_artifact_targets(prepared: _PreparedExperiment) -> None:
         targets.extend([prepared.startup_input_evidence, prepared.observation_evidence])
     if prepared.compatibility_overlay_evidence_path is not None:
         targets.append(prepared.compatibility_overlay_evidence_path)
+    if prepared.accepted_compose_evidence_path is not None:
+        targets.append(prepared.accepted_compose_evidence_path)
     targets.append(prepared.experiment_overlay_evidence_path)
     for target in targets:
         if target.exists() or target.is_symlink():
@@ -496,7 +564,56 @@ async def _run_candidate(
     prepared: _PreparedExperiment,
     sandbox_id: str,
     experiment_overlay_sha256: str,
+    accepted_compose_sha256: str | None,
 ) -> ExperimentRecord:
+    if prepared.accepted_compose_error is not None:
+        return _record(
+            state,
+            mutation,
+            prepared,
+            boot=Verdict.UNSUPPORTED,
+            verdict=ExperimentVerdict.STOP,
+            reason=prepared.accepted_compose_error,
+        )
+    if (
+        prepared.accepted_compose_evidence_path is not None
+        and accepted_compose_sha256 is None
+    ):
+        return _record(
+            state,
+            mutation,
+            prepared,
+            boot=Verdict.UNSUPPORTED,
+            verdict=ExperimentVerdict.STOP,
+            reason="accepted_compose_materialization_failed",
+        )
+    if prepared.accepted_compose_evidence_path is not None:
+        try:
+            await materialize_guest_accepted_compose(
+                provider,
+                sandbox_id,
+                host_artifact_path=prepared.compose_file,
+                relative_path=prepared.compose_path,
+                expected_sha256=accepted_compose_sha256 or "",
+                evidence_path=prepared.accepted_compose_evidence_path,
+            )
+            await verify_guest_accepted_compose(
+                provider,
+                sandbox_id,
+                relative_path=prepared.compose_path,
+                expected_sha256=accepted_compose_sha256 or "",
+            )
+        except CleanupError:
+            raise
+        except _ORDINARY_STAGE_ERRORS:
+            return _record(
+                state,
+                mutation,
+                prepared,
+                boot=Verdict.UNSUPPORTED,
+                verdict=ExperimentVerdict.STOP,
+                reason="accepted_compose_materialization_failed",
+            )
     if prepared.compatibility_overlay_relative is not None:
         host_artifact_path = prepared.compatibility_overlay_path
         if (

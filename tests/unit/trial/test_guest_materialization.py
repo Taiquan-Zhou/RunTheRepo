@@ -11,13 +11,18 @@ from repotrial.compose.compatibility import CompatibilityError
 from repotrial.sandbox.base import ExecResult, SandboxProvider
 from repotrial.sandbox.fake import FakeSandboxProvider
 from repotrial.trial.compatibility import (
+    materialize_guest_accepted_compose,
     materialize_guest_compatibility_overlay,
     materialize_guest_experiment_overlay,
+    verify_guest_accepted_compose,
     verify_guest_experiment_overlay,
 )
 
 _RELATIVE_PATH = ".repotrial-overlays/compatibility.overlay.yaml"
 _EXPERIMENT_RELATIVE_PATH = ".repotrial-overlays/experiment.overlay.yaml"
+_ACCEPTED_RELATIVE_PATH = (
+    ".repotrial-accepted/accepted-0003-f08ee44905eeb655.compose.yaml"
+)
 
 
 class RecordingProvider(SandboxProvider):
@@ -208,6 +213,59 @@ def test_experiment_verifier_cannot_be_redirected_to_compatibility_path() -> Non
         ("sha256sum", "--", _EXPERIMENT_RELATIVE_PATH),
         30,
     )
+
+
+def test_accepted_compose_materializer_uses_strict_generated_path(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "accepted.compose.yaml"
+    payload = b"services: {}\n"
+    artifact.write_bytes(payload)
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    provider = RecordingProvider(
+        ExecResult(
+            exit_code=0,
+            stdout=(
+                "root=/workspace\n"
+                f"path={_ACCEPTED_RELATIVE_PATH}\n"
+                "mode=600\n"
+                f"sha256={expected_sha256}\n"
+            ),
+            stderr="",
+        )
+    )
+    evidence = tmp_path / "accepted-materialization.jsonl"
+
+    asyncio.run(
+        materialize_guest_accepted_compose(
+            provider,
+            "sandbox-1",
+            host_artifact_path=artifact,
+            relative_path=_ACCEPTED_RELATIVE_PATH,
+            expected_sha256=expected_sha256,
+            evidence_path=evidence,
+        )
+    )
+
+    _, argv, timeout_s = provider.calls[0]
+    assert argv[4] == "repotrial-accepted-compose"
+    assert argv[5] == _ACCEPTED_RELATIVE_PATH
+    assert timeout_s == 30
+    rows = [json.loads(line) for line in evidence.read_text().splitlines()]
+    assert rows[-1]["purpose"] == "accepted_compose_materialization"
+    assert "services: {}" not in evidence.read_text()
+
+
+def test_accepted_compose_verifier_rejects_non_generated_path() -> None:
+    with pytest.raises(CompatibilityError, match="guest_path_invalid"):
+        asyncio.run(
+            verify_guest_accepted_compose(
+                FakeSandboxProvider(),
+                "sandbox-1",
+                relative_path=".repotrial-accepted/compose.yaml",
+                expected_sha256="a" * 64,
+            )
+        )
 
 
 def test_host_hash_mismatch_fails_before_provider_transport(tmp_path: Path) -> None:
