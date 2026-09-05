@@ -70,7 +70,14 @@ def _healthy_doctor(
         kvm_checker=lambda: True,
         executable_lookup=executable_lookup or (lambda name: f"/usr/bin/{name}"),
         path_is_executable=path_is_executable
-        or (lambda path: path.as_posix().endswith("/chrome-linux64/chrome")),
+        or (
+            lambda path: (
+                path.as_posix().endswith("/chrome-linux64/chrome")
+                or path.as_posix().endswith(
+                    "/chrome-headless-shell-linux64/chrome-headless-shell"
+                )
+            )
+        ),
         playwright_python="python",
     )
 
@@ -222,6 +229,30 @@ def test_diagnose_failures_are_fail_closed(result: CommandResult) -> None:
     assert check.remediation
 
 
+def test_diagnose_allows_only_reviewed_binary_version_warning() -> None:
+    payload = json.loads(
+        _diagnose_json(
+            statuses=("warn",) + ("pass",) * 11,
+            summary={"pass": 11, "warn": 1, "fail": 0, "skip": 0},
+        )
+    )
+    payload["checks"][0]["name"] = "Binary version"
+    runner = _healthy_runner()
+    runner.responses[("sbx", "diagnose", "--output", "json")] = CommandResult(
+        0, json.dumps(payload), ""
+    )
+
+    check = next(
+        check
+        for check in _healthy_doctor(runner).run().checks
+        if check.name == "sbx_diagnose"
+    )
+
+    assert check.status == "PASS"
+    assert check.blocking is True
+    assert "remote version check warning" in check.detail
+
+
 @pytest.mark.parametrize(
     "output,expected",
     [
@@ -229,6 +260,10 @@ def test_diagnose_failures_are_fail_closed(result: CommandResult) -> None:
         ("No sandboxes found.\nLaunch one: sbx run claude\n", True),
         ("sandbox-1\n", False),
         ("No sandboxes found.\nunexpected\n", False),
+        ("No sandboxes found.", False),
+        ("No sandboxes found.\nLaunch one:\n", False),
+        ("No sandboxes found.\nLaunch one: arbitrary\n", False),
+        ("No sandboxes found.\r\n", False),
     ],
 )
 def test_inventory_parser_accepts_only_reviewed_empty_forms(
@@ -270,6 +305,23 @@ def test_missing_playwright_executable_fails_without_browser_launch() -> None:
         "uv run playwright install --with-deps chromium."
     )
     assert not any("sync_playwright" in argv for argv, _timeout in command_runner.calls)
+
+
+def test_missing_headless_shell_executable_is_blocking() -> None:
+    command_runner = _healthy_runner()
+    doctor = _healthy_doctor(
+        command_runner,
+        path_is_executable=lambda path: path.as_posix().endswith(
+            "/chrome-linux64/chrome"
+        ),
+    )
+
+    check = next(
+        check for check in doctor.run().checks if check.name == "playwright_chromium"
+    )
+
+    assert check.status == "FAIL"
+    assert check.blocking is True
 
 
 def test_command_adapter_uses_argv_timeout_and_bounded_utf8_output() -> None:
@@ -328,4 +380,21 @@ def test_command_adapter_does_not_wait_for_descendant_holding_pipe() -> None:
     )
 
     assert result.timed_out is True
+    assert time.monotonic() - started < 1.0
+
+
+def test_command_adapter_keeps_timeout_after_process_closes_pipes() -> None:
+    adapter = BoundedCommandRunner(timeout_s=0.05, max_output_bytes=1024)
+    started = time.monotonic()
+
+    result = adapter.run(
+        [
+            sys.executable,
+            "-c",
+            "import os, time; os.close(1); os.close(2); time.sleep(2)",
+        ]
+    )
+
+    assert result.timed_out is True
+    assert result.returncode is not None
     assert time.monotonic() - started < 1.0

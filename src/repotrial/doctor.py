@@ -134,7 +134,7 @@ class BoundedCommandRunner:
         deadline = time.monotonic() + timeout
         timed_out = False
         try:
-            while selector.get_map():
+            while selector.get_map() or process.poll() is None:
                 process_done = process.poll() is not None
                 if not process_done:
                     remaining = deadline - time.monotonic()
@@ -257,12 +257,10 @@ def render_human(report: DoctorReport) -> str:
 def parse_inventory_output(output: str) -> bool:
     """Accept only the reviewed official empty ``sbx list`` forms."""
 
-    lines = output.splitlines()
-    if not lines or lines[0] != "No sandboxes found.":
-        return False
-    if len(lines) == 1:
-        return True
-    return len(lines) == 2 and lines[1].startswith("Launch one:")
+    return output in {
+        "No sandboxes found.\n",
+        "No sandboxes found.\nLaunch one: sbx run claude\n",
+    }
 
 
 def _read_pid1() -> str:
@@ -295,7 +293,7 @@ _HEADLESS_RE = re.compile(r"^/[\S]+/chromium_headless_shell-[0-9]+$")
 _FFMPEG_RE = re.compile(r"^/[\S]+/ffmpeg-[0-9]+$")
 
 
-def _playwright_chromium_root(output: str) -> Path | None:
+def _playwright_chromium_roots(output: str) -> tuple[Path, Path] | None:
     lines = [line.strip() for line in output.splitlines() if line.strip()]
     if not lines or not _PLAYWRIGHT_VERSION_RE.fullmatch(lines[0]):
         return None
@@ -311,21 +309,27 @@ def _playwright_chromium_root(output: str) -> Path | None:
     if not entries:
         return None
     chromium_roots: list[Path] = []
+    headless_roots: list[Path] = []
     for entry in entries:
         if _CHROMIUM_RE.fullmatch(entry):
             root = Path(entry)
             if ".." not in root.parts:
                 chromium_roots.append(root)
             continue
-        if _HEADLESS_RE.fullmatch(entry) or _FFMPEG_RE.fullmatch(entry):
+        if _HEADLESS_RE.fullmatch(entry):
+            root = Path(entry)
+            if ".." not in root.parts:
+                headless_roots.append(root)
+            continue
+        if _FFMPEG_RE.fullmatch(entry):
             continue
         return None
-    if len(chromium_roots) != 1:
+    if len(chromium_roots) != 1 or len(headless_roots) != 1:
         return None
-    return chromium_roots[0]
+    return chromium_roots[0], headless_roots[0]
 
 
-def _diagnose_is_healthy(output: str) -> int | None:
+def _diagnose_is_healthy(output: str) -> tuple[int, int] | None:
     try:
         payload = json.loads(output)
     except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
@@ -337,12 +341,23 @@ def _diagnose_is_healthy(output: str) -> int | None:
     if not isinstance(checks, list) or not checks or not isinstance(summary, dict):
         return None
     required_check_keys = {"name", "status", "message", "detail", "hint"}
+    seen_names: set[str] = set()
+    pass_count = 0
+    reviewed_warning_count = 0
     for check in checks:
         if not isinstance(check, dict) or not required_check_keys.issubset(check):
             return None
         if any(not isinstance(check[key], str) for key in required_check_keys):
             return None
-        if check["status"] != "pass":
+        name = check["name"]
+        if name in seen_names:
+            return None
+        seen_names.add(name)
+        if check["status"] == "pass":
+            pass_count += 1
+        elif check["status"] == "warn" and name == "Binary version":
+            reviewed_warning_count += 1
+        else:
             return None
     required_summary_keys = {"pass", "warn", "fail", "skip"}
     if not required_summary_keys.issubset(summary):
@@ -354,13 +369,14 @@ def _diagnose_is_healthy(output: str) -> int | None:
             return None
         summary_values[key] = value
     if (
-        summary_values["pass"] != len(checks)
-        or summary_values["warn"] != 0
+        summary_values["pass"] != pass_count
+        or summary_values["warn"] != reviewed_warning_count
         or summary_values["fail"] != 0
         or summary_values["skip"] != 0
+        or pass_count + reviewed_warning_count != len(checks)
     ):
         return None
-    return len(checks)
+    return pass_count, reviewed_warning_count
 
 
 class Doctor:
@@ -494,13 +510,17 @@ class Doctor:
                 "sbx diagnostics did not complete successfully",
                 "Run sbx diagnose --output json and resolve the blocking runtime checks.",
             )
-        count = _diagnose_is_healthy(result.stdout)
-        if count is not None:
+        counts = _diagnose_is_healthy(result.stdout)
+        if counts is not None:
+            pass_count, reviewed_warning_count = counts
+            detail = f"{pass_count} sbx diagnostic checks passed"
+            if reviewed_warning_count:
+                detail += "; 1 remote version check warning is non-blocking"
             return DoctorCheck(
                 "sbx_diagnose",
                 "PASS",
                 True,
-                f"{count} sbx diagnostic checks passed",
+                detail,
                 None,
             )
         return DoctorCheck(
@@ -543,18 +563,25 @@ class Doctor:
                 "--list",
             )
         )
-        root = (
-            _playwright_chromium_root(result.stdout)
+        roots = (
+            _playwright_chromium_roots(result.stdout)
             if _is_successful_command(result)
             else None
         )
-        executable = False
-        if root is not None:
-            executable = any(
-                self._path_is_executable(root / relative)
+        executables_ready = False
+        if roots is not None:
+            chromium_root, headless_root = roots
+            chromium_executable = any(
+                self._path_is_executable(chromium_root / relative)
                 for relative in ("chrome-linux64/chrome", "chrome-linux/chrome")
             )
-        if executable:
+            headless_executable = self._path_is_executable(
+                headless_root
+                / "chrome-headless-shell-linux64"
+                / "chrome-headless-shell"
+            )
+            executables_ready = chromium_executable and headless_executable
+        if executables_ready:
             return DoctorCheck(
                 "playwright_chromium",
                 "PASS",
