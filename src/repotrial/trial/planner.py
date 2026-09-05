@@ -291,17 +291,17 @@ async def _plan_journeys(
             return []
         except (ValidationError, TypeError, ValueError):
             _record_model_failure(recorder, "policy_rejected")
-            return []
+            return [_minimal_get_journey(1, "/")]
         if not isinstance(proposal, _JourneyProposal):
             _record_model_failure(recorder, "planner_timeout")
             return []
         journeys = _materialize_journey_proposal(proposal)
         if journeys is None:
             _record_model_failure(recorder, "policy_rejected")
-            return []
+            return [_minimal_get_journey(1, "/")]
         if not _model_journeys_are_executable(journeys):
             _record_model_failure(recorder, "policy_rejected")
-            return []
+            return [_minimal_get_journey(1, "/")]
         trusted = _filter_trusted_model_journeys(journeys, readme_excerpt)
         if not trusted:
             _record_model_failure(recorder, "policy_rejected")

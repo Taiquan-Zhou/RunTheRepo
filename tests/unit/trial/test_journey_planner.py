@@ -709,7 +709,7 @@ def test_model_journey_policy_rejection_is_recorded_without_raw_model_output(
         )
     )
 
-    assert journeys == []
+    assert journeys == [planner_module._minimal_get_journey(1, "/")]
     evidence_path = next(evidence_dir.glob("baseline-model-attempt-*.jsonl"))
     content = evidence_path.read_text(encoding="utf-8")
     assert json.loads(content.splitlines()[-1])["outcome"] == "policy_rejected"
@@ -766,7 +766,7 @@ def test_model_proposal_with_http_and_browser_journeys_is_rejected_as_a_whole(
         )
     )
 
-    assert journeys == []
+    assert journeys == [planner_module._minimal_get_journey(1, "/")]
     evidence_path = next(evidence_dir.glob("baseline-model-attempt-*.jsonl"))
     rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
     assert rows[-1]["phase"] == "terminal"
@@ -876,7 +876,9 @@ def test_mixed_tool_model_journey_is_rejected(tmp_path: Path) -> None:
         }
     )
 
-    assert _plan(tmp_path, model=FakeModelAdapter([proposed])) == []
+    assert _plan(tmp_path, model=FakeModelAdapter([proposed])) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 @pytest.mark.parametrize(
@@ -901,7 +903,9 @@ def test_mixed_tool_model_journey_is_rejected(tmp_path: Path) -> None:
 def test_model_journeys_without_a_deterministic_success_condition_are_rejected(
     tmp_path: Path, proposed: dict[str, object]
 ) -> None:
-    assert _plan(tmp_path, model=FakeModelAdapter([proposed])) == []
+    assert _plan(tmp_path, model=FakeModelAdapter([proposed])) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 def test_declared_browser_journey_uses_its_bounded_action_dsl_without_step_assertions(
@@ -940,20 +944,20 @@ def test_declared_browser_journey_uses_its_bounded_action_dsl_without_step_asser
     ]
 
 
-def test_model_browser_journey_is_policy_rejected_with_evidence(
+def test_structurally_valid_browser_model_journey_falls_back_with_policy_evidence(
     tmp_path: Path,
 ) -> None:
     evidence_dir = tmp_path / "evidence"
     evidence_dir.mkdir()
     proposed = {
         "journey_id": "browser-model",
-        "name": "Browser model proposal",
+        "name": "Browser model proposal browser-secret",
         "steps": [
             {
                 "step_id": "goto",
                 "tool": "browser",
                 "action": "goto",
-                "params": {"path": "/"},
+                "params": {"path": "/browser-secret"},
                 "assertions": [],
             }
         ],
@@ -968,10 +972,11 @@ def test_model_browser_journey_is_policy_rejected_with_evidence(
         )
     )
 
-    assert journeys == []
+    assert journeys == [planner_module._minimal_get_journey(1, "/")]
     evidence_path = next(evidence_dir.glob("baseline-model-attempt-*.jsonl"))
     rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
     assert rows[-1]["outcome"] == "policy_rejected"
+    assert "browser-secret" not in evidence_path.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
@@ -1007,7 +1012,7 @@ def test_model_shell_javascript_and_unknown_actions_are_rejected(
         [{"journey_id": "unsafe", "name": "Unsafe", "steps": [step]}]
     )
 
-    assert _plan(tmp_path, model=model) == []
+    assert _plan(tmp_path, model=model) == [planner_module._minimal_get_journey(1, "/")]
     assert model.calls == 1
 
 
@@ -1018,8 +1023,12 @@ def test_planner_rejects_output_exceeding_journey_or_step_limits(
     too_many_steps = _http_journey()
     too_many_steps["steps"] = [_http_step(f"/{index}") for index in range(9)]
 
-    assert _plan(tmp_path, model=FakeModelAdapter(too_many_journeys)) == []
-    assert _plan(tmp_path, model=FakeModelAdapter([too_many_steps])) == []
+    assert _plan(tmp_path, model=FakeModelAdapter(too_many_journeys)) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
+    assert _plan(tmp_path, model=FakeModelAdapter([too_many_steps])) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1077,7 +1086,9 @@ def test_planner_rejects_output_exceeding_journey_or_step_limits(
 def test_model_output_with_invalid_params_assertions_or_schema_is_rejected(
     tmp_path: Path, journey: dict[str, object]
 ) -> None:
-    assert _plan(tmp_path, model=FakeModelAdapter([journey])) == []
+    assert _plan(tmp_path, model=FakeModelAdapter([journey])) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 def test_browser_goto_query_is_rejected_to_match_runner_policy(tmp_path: Path) -> None:
@@ -1099,7 +1110,7 @@ def test_browser_goto_query_is_rejected_to_match_runner_policy(tmp_path: Path) -
         ]
     )
 
-    assert _plan(tmp_path, model=model) == []
+    assert _plan(tmp_path, model=model) == [planner_module._minimal_get_journey(1, "/")]
 
 
 def test_oversized_readme_is_rejected_before_model_invocation(tmp_path: Path) -> None:
@@ -1187,7 +1198,7 @@ def test_deep_declaration_json_is_normalized_to_fixed_value_error(
 def test_deep_model_json_fails_closed_without_recursion_error(tmp_path: Path) -> None:
     model = FakeModelAdapter([_journey_with_json_body(_nested_json(1_500))])
 
-    assert _plan(tmp_path, model=model) == []
+    assert _plan(tmp_path, model=model) == [planner_module._minimal_get_journey(1, "/")]
 
 
 def test_json_body_depth_boundary_is_exact(tmp_path: Path) -> None:
@@ -1195,7 +1206,9 @@ def test_json_body_depth_boundary_is_exact(tmp_path: Path) -> None:
     above_limit = FakeModelAdapter([_journey_with_json_body(_nested_json(17))])
 
     assert _plan(tmp_path, model=at_limit)
-    assert _plan(tmp_path, model=above_limit) == []
+    assert _plan(tmp_path, model=above_limit) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 def test_json_body_node_and_container_boundaries_are_exact(tmp_path: Path) -> None:
@@ -1209,9 +1222,13 @@ def test_json_body_node_and_container_boundaries_are_exact(tmp_path: Path) -> No
     )
 
     assert _plan(tmp_path, model=at_container_limit)
-    assert _plan(tmp_path, model=above_container_limit) == []
+    assert _plan(tmp_path, model=above_container_limit) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
     assert _plan(tmp_path, model=at_node_limit)
-    assert _plan(tmp_path, model=above_node_limit) == []
+    assert _plan(tmp_path, model=above_node_limit) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 def test_json_body_aggregate_content_boundary_is_exact(tmp_path: Path) -> None:
@@ -1219,7 +1236,9 @@ def test_json_body_aggregate_content_boundary_is_exact(tmp_path: Path) -> None:
     above_limit = FakeModelAdapter([_journey_with_json_body(["x" * 4_096] * 4 + ["x"])])
 
     assert _plan(tmp_path, model=at_limit)
-    assert _plan(tmp_path, model=above_limit) == []
+    assert _plan(tmp_path, model=above_limit) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 def test_model_schema_has_strict_nested_journey_and_step_definitions(
@@ -1293,7 +1312,9 @@ def test_over_limit_journeys_are_rejected_before_later_values_are_accessed(
         journeys=[valid_journey] * 5 + [exploding_journey]
     )
 
-    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == []
+    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 @pytest.mark.parametrize("over_limit", ["steps", "assertions", "params"])
@@ -1328,7 +1349,9 @@ def test_nested_transport_collection_limits_fail_closed(
     )
     proposal = planner_module._JourneyProposal.model_construct(journeys=[journey])
 
-    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == []
+    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 def test_model_construct_bypass_is_revalidated_before_materialization() -> None:
@@ -1381,7 +1404,9 @@ def test_nested_model_construct_bypass_fails_closed(
     journey = planner_module._JourneyTransport.model_construct(**journey_values)
     proposal = planner_module._JourneyProposal.model_construct(journeys=[journey])
 
-    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == []
+    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 @pytest.mark.parametrize("extra_on", ["proposal", "journey", "step", "assertion"])
@@ -1410,7 +1435,9 @@ def test_nested_model_construct_extra_fields_fail_closed(
         extra_on
     ].__dict__["unexpected"] = {"tool": "shell"}
 
-    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == []
+    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 def test_model_timeout_fails_closed_and_cancels_inner_task(
