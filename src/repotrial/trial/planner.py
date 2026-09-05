@@ -25,6 +25,11 @@ _MISSING_ENV = re.compile(
     r"\b([A-Za-z_][A-Za-z0-9_]*)\s+(?:is\s+)?(?:required|missing)\b",
     re.IGNORECASE,
 )
+_MISSING_SECRET_ENV = re.compile(
+    r'\benvironment variable "([A-Za-z_][A-Za-z0-9_]*)" required by secret '
+    r'"[^"\r\n]+" is not set\b',
+    re.IGNORECASE,
+)
 _CONTROL_ENV_KEYS = {
     "HOME",
     "PATH",
@@ -1163,8 +1168,12 @@ def _bounded_authority(allowed_env_keys: set[str]) -> frozenset[str] | None:
 def _deterministic_action(
     evidence: str, allowed_env_keys: frozenset[str]
 ) -> RecoveryAction | None:
-    for match in _MISSING_ENV.finditer(evidence):
-        key = match.group(1)
+    matches = [
+        (match.start(), match.group(1))
+        for pattern in (_MISSING_ENV, _MISSING_SECRET_ENV)
+        for match in pattern.finditer(evidence)
+    ]
+    for _, key in sorted(matches):
         if key in allowed_env_keys and _is_safe_env_key(key):
             return RecoveryAction(
                 action="set_env",

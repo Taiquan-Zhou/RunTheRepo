@@ -179,6 +179,72 @@ def test_derivation_collects_compose_forms_and_env_example_names_without_values(
     assert "also-secret" not in context.model_dump_json()
 
 
+def test_derivation_collects_top_level_secret_environment_names_only(
+    tmp_path: Path,
+) -> None:
+    _write(
+        tmp_path / "compose.yml",
+        "services:\n"
+        "  web:\n"
+        "    environment:\n"
+        "      NESTED_NAME: NESTED_VALUE\n"
+        "secrets:\n"
+        "  db_password:\n"
+        "    environment: WAKAPI_DB_PASSWORD\n"
+        "  unrelated:\n"
+        "    environment:\n"
+        "      nested: NOT_AUTHORIZED\n"
+        "top_level_environment: NOT_AUTHORIZED\n",
+    )
+
+    context = derive_recovery_context(tmp_path, "compose.yml")
+
+    assert context.allowed_env_keys == frozenset({"WAKAPI_DB_PASSWORD"})
+    assert [(item.key, item.relative_path) for item in context.declarations] == [
+        ("WAKAPI_DB_PASSWORD", "compose.yml")
+    ]
+
+
+def test_derivation_does_not_authorize_secret_environment_aliases_or_tags(
+    tmp_path: Path,
+) -> None:
+    _write(
+        tmp_path / "compose.yml",
+        "shared: &shared\n"
+        "  environment: ALIAS_NOT_AUTHORIZED\n"
+        "secrets:\n"
+        "  aliased: *shared\n"
+        "  tagged:\n"
+        "    environment: !custom TAG_NOT_AUTHORIZED\n"
+        "  tagged_mapping: !custom\n"
+        "    environment: MAPPING_TAG_NOT_AUTHORIZED\n"
+        "  tagged_key:\n"
+        "    !!str environment: KEY_TAG_NOT_AUTHORIZED\n"
+        '  "":\n'
+        "    environment: EMPTY_SECRET_NAME_NOT_AUTHORIZED\n"
+        "  list_value:\n"
+        "    environment: [LIST_NOT_AUTHORIZED]\n",
+    )
+
+    context = derive_recovery_context(tmp_path, "compose.yml")
+
+    assert context.allowed_env_keys == frozenset()
+    assert context.declarations == ()
+
+
+def test_derivation_rejects_duplicate_yaml_mapping_keys(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "compose.yml",
+        "secrets:\n"
+        "  db_password:\n"
+        "    environment: FIRST_KEY\n"
+        "    environment: SECOND_KEY\n",
+    )
+
+    with pytest.raises(ValueError, match="duplicate"):
+        derive_recovery_context(tmp_path, "compose.yml")
+
+
 def test_derivation_reads_interpolations_only_from_yaml_values_and_honors_escape(
     tmp_path: Path,
 ) -> None:

@@ -611,7 +611,7 @@ def _project_run(
         destroyed_runners=len(provider.destroyed_ids),
         cleanup_successes=cleanup,
         allowed_env_keys=sorted(fixture.ground_truth.allowed_env_keys),
-        recovery_env_keys=sorted(state.recovery_env),
+        recovery_env_keys=sorted(run.recovery_env_keys),
         unexpected_commands=list(provider.unexpected_commands),
         verdict_projection=projection,
     )

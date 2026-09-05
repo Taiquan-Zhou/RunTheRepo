@@ -99,6 +99,17 @@ def test_run_state_roundtrip_json_with_every_declared_field() -> None:
     assert restored == state
 
 
+def test_run_state_records_recovery_environment_key_names_without_values() -> None:
+    state = RunState(
+        run_id="run-recovery",
+        repo_url="https://github.com/acme/demo",
+        recovery_env_keys=["APP_TOKEN"],
+    )
+
+    assert state.recovery_env_keys == ["APP_TOKEN"]
+    assert "repotrial-synthetic-value" not in state.model_dump_json()
+
+
 def test_risk_finding_rejects_severity_above_100() -> None:
     with pytest.raises(ValueError):
         RiskFinding(

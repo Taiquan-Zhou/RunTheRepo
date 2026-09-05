@@ -594,6 +594,59 @@ def test_boot_derives_declared_environment_after_intake_without_readme_expansion
     assert context.readme_excerpt == "${README_MUST_NOT_AUTHORIZE}"
 
 
+def test_boot_recovers_quoted_compose_secret_environment_and_deduplicates_keys(
+    tmp_path: Path,
+) -> None:
+    provider = GraphProvider(
+        baseline_boots=[
+            (
+                False,
+                (
+                    'environment variable "WAKAPI_DB_PASSWORD" required by secret '
+                    '"workspace_db_password" is not set'
+                ),
+            ),
+            (
+                False,
+                (
+                    'environment variable "WAKAPI_DB_PASSWORD" required by secret '
+                    '"workspace_db_password" is not set'
+                ),
+            ),
+            (True, ""),
+        ]
+    )
+    context, source = _context(tmp_path, provider, journeys=[])
+    source.write_text(
+        _compose_text(())
+        + "secrets:\n"
+        + "  workspace_db_password:\n"
+        + "    environment: WAKAPI_DB_PASSWORD\n",
+        encoding="utf-8",
+    )
+    context = replace(context, allowed_env_keys=frozenset())
+
+    result = _run(_state(source.parent), context)
+
+    up_commands = [
+        call[2]
+        for call in provider.calls
+        if call[0] == "exec"
+        and call[2][-5:] == ("up", "-d", "--wait", "--wait-timeout", "60")
+    ]
+    assert len(up_commands) == 3
+    assert up_commands[1][:2] == (
+        "env",
+        "WAKAPI_DB_PASSWORD=repotrial-synthetic-value",
+    )
+    assert up_commands[2][:2] == (
+        "env",
+        "WAKAPI_DB_PASSWORD=repotrial-synthetic-value",
+    )
+    assert result.recovery_env == {"WAKAPI_DB_PASSWORD": "repotrial-synthetic-value"}
+    assert result.run.recovery_env_keys == ["WAKAPI_DB_PASSWORD"]
+
+
 def test_explicit_allowed_environment_keys_override_pinned_declarations(
     tmp_path: Path,
 ) -> None:

@@ -101,6 +101,7 @@ class RunState(BaseModel):
     sandbox_id: str | None = None
     baseline_config_hash: str | None = None
     current_config_hash: str | None = None
+    recovery_env_keys: list[str] = Field(default_factory=list, max_length=32)
     risk_findings: list[RiskFinding] = Field(default_factory=list)
     journeys: list[Journey] = Field(default_factory=list)
     baseline_journey_results: list[JourneyResult] = Field(default_factory=list)

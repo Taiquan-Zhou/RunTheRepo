@@ -61,6 +61,7 @@ def _project(state: RunState) -> dict[str, object]:
         },
         "coverage": coverage,
         "stop_reason": state.stop_reason,
+        "recovery_env_keys": list(state.recovery_env_keys),
         "baseline_risk_findings": [
             finding.model_dump(mode="json") for finding in state.risk_findings
         ],

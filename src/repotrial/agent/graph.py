@@ -619,7 +619,11 @@ async def _apply_recovery(
             raise ValueError("validated set_env action is malformed")
         recovery_env = dict(state.recovery_env)
         recovery_env[key] = value
+        recovery_env_keys = sorted({*state.run.recovery_env_keys, *recovery_env})
         update["recovery_env"] = recovery_env
+        update["run"] = state.run.model_copy(
+            update={"recovery_env_keys": recovery_env_keys}
+        )
         return
     raise ValueError("validated recovery action is unsupported")
 

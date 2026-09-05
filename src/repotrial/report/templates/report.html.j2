@@ -23,6 +23,9 @@
     {% endfor %}
   </ul>
 
+  <h2>Synthetic recovery environment keys</h2>
+  <ul>{% for key in report.recovery_env_keys %}<li>{{ key }}</li>{% endfor %}</ul>
+
   <h2>Baseline risk findings</h2>
   <ul>{% for finding in report.baseline_risk_findings %}<li>{{ finding }}</li>{% endfor %}</ul>
   <h2>Baseline observation</h2>

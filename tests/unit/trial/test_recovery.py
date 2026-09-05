@@ -201,10 +201,32 @@ def test_missing_allowlisted_env_proposes_fixed_synthetic_value() -> None:
         logs={"logs": "RuntimeError: APP_REQUIRED_TOKEN is required"},
         allowed_env_keys={"APP_REQUIRED_TOKEN"},
     )
+
     assert action == RecoveryAction(
         action="set_env",
         params={
             "key": "APP_REQUIRED_TOKEN",
+            "value": "repotrial-synthetic-value",
+        },
+        reason="missing allowlisted environment variable",
+    )
+
+
+def test_quoted_compose_missing_secret_env_proposes_fixed_synthetic_value() -> None:
+    action = _propose(
+        logs={
+            "up": (
+                'environment variable "WAKAPI_DB_PASSWORD" required by secret '
+                '"workspace_db_password" is not set'
+            )
+        },
+        allowed_env_keys={"WAKAPI_DB_PASSWORD"},
+    )
+
+    assert action == RecoveryAction(
+        action="set_env",
+        params={
+            "key": "WAKAPI_DB_PASSWORD",
             "value": "repotrial-synthetic-value",
         },
         reason="missing allowlisted environment variable",

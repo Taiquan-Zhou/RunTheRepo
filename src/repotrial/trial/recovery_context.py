@@ -6,7 +6,9 @@ import re
 import stat
 import unicodedata
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 from ruamel.yaml import YAML
@@ -60,6 +62,17 @@ class RecoveryRepositoryContext(BaseModel):
 
     allowed_env_keys: frozenset[str]
     declarations: tuple[DeclaredEnvSource, ...]
+
+
+@dataclass
+class _YamlCollection:
+    kind: Literal["mapping", "sequence"]
+    path: tuple[str, ...] | None
+    expect_key: bool = True
+    pending_key: str | None = None
+    pending_path_key: str | None = None
+    seen_keys: set[str] = field(default_factory=set)
+    anchor: str | None = None
 
 
 def project_recovery_evidence(logs: Mapping[str, str]) -> RecoveryEvidenceView:
@@ -267,20 +280,24 @@ def _read_utf8_source(workspace: Path, source: Path, label: str) -> tuple[str, s
 
 
 def _compose_value_keys(content: str, label: str) -> list[str]:
-    values = _yaml_scalar_values(content, label)
+    values, secret_environment_keys = _yaml_values(content, label)
     return [
         key
         for value, style in values
         if style != "'"
         for key in _interpolation_keys(value)
-    ]
+    ] + secret_environment_keys
 
 
-def _yaml_scalar_values(content: str, label: str) -> list[tuple[str, str | None]]:
+def _yaml_values(
+    content: str, label: str
+) -> tuple[list[tuple[str, str | None]], list[str]]:
     yaml = YAML(typ="rt", pure=True)
     yaml.allow_duplicate_keys = False
     values: list[tuple[str, str | None]] = []
-    collections: list[list[object]] = []
+    secret_environment_keys: list[str] = []
+    collections: list[_YamlCollection] = []
+    active_anchors: dict[str, int] = {}
     document_count = 0
     node_count = 0
     try:
@@ -296,53 +313,108 @@ def _yaml_scalar_values(content: str, label: str) -> list[tuple[str, str | None]
                 if node_count > _MAX_YAML_NODES:
                     raise ValueError(f"{label} exceeds YAML resource limit")
             if isinstance(event, (MappingStartEvent, SequenceStartEvent)):
-                _begin_collection_value(collections, label)
+                parent = collections[-1] if collections else None
+                if parent is not None and parent.kind == "mapping":
+                    if parent.expect_key:
+                        raise ValueError(f"{label} contains an unsupported YAML key")
+                    child_path = _mapping_value_path(parent)
+                else:
+                    child_path = None
                 if len(collections) >= _MAX_YAML_DEPTH:
                     raise ValueError(f"{label} exceeds YAML resource limit")
-                collections.append(
-                    [
+                collection = _YamlCollection(
+                    kind=(
                         "mapping"
                         if isinstance(event, MappingStartEvent)
-                        else "sequence",
-                        True,
-                    ]
+                        else "sequence"
+                    ),
+                    path=(
+                        None
+                        if event.tag is not None
+                        else (() if not collections else child_path)
+                    ),
+                    anchor=event.anchor,
                 )
+                collections.append(collection)
+                if event.anchor is not None:
+                    active_anchors[event.anchor] = (
+                        active_anchors.get(event.anchor, 0) + 1
+                    )
             elif isinstance(event, ScalarEvent):
-                if _scalar_is_mapping_key(collections):
-                    collections[-1][1] = False
+                if _yaml_scalar_is_mapping_key(collections):
+                    collection = collections[-1]
+                    if event.value in collection.seen_keys:
+                        raise ValueError(f"{label} contains duplicate YAML keys")
+                    collection.seen_keys.add(event.value)
+                    collection.pending_key = event.value
+                    collection.pending_path_key = (
+                        event.value if event.tag is None else None
+                    )
+                    collection.expect_key = False
                 else:
                     values.append((event.value, event.style))
-                    _complete_collection_value(collections)
+                    if _is_secret_environment_value(collections, event):
+                        secret_environment_keys.append(event.value)
+                    _complete_yaml_value(collections)
             elif isinstance(event, AliasEvent):
-                if _scalar_is_mapping_key(collections):
+                if _yaml_scalar_is_mapping_key(collections):
                     raise ValueError(f"{label} contains an unsupported YAML key")
-                _complete_collection_value(collections)
+                if event.anchor is not None and event.anchor in active_anchors:
+                    raise ValueError(f"{label} contains a cyclic YAML alias")
+                _complete_yaml_value(collections)
             elif isinstance(event, (MappingEndEvent, SequenceEndEvent)):
                 if not collections:
                     raise ValueError(f"{label} must be valid YAML")
-                collections.pop()
+                completed = collections.pop()
+                if completed.anchor is not None:
+                    active_count = active_anchors[completed.anchor]
+                    if active_count == 1:
+                        del active_anchors[completed.anchor]
+                    else:
+                        active_anchors[completed.anchor] = active_count - 1
+                _complete_yaml_value(collections)
     except (OverflowError, RecursionError, UnicodeError, YAMLError):
         raise ValueError(f"{label} must be valid YAML") from None
     if document_count != 1 or collections:
         raise ValueError(f"{label} must be valid YAML")
-    return values
+    return values, secret_environment_keys
 
 
-def _begin_collection_value(collections: list[list[object]], label: str) -> None:
-    if not collections:
-        return
-    if _scalar_is_mapping_key(collections):
-        raise ValueError(f"{label} contains an unsupported YAML key")
-    _complete_collection_value(collections)
+def _mapping_value_path(collection: _YamlCollection) -> tuple[str, ...] | None:
+    if collection.path is None or collection.pending_path_key is None:
+        return None
+    return (*collection.path, collection.pending_path_key)
 
 
-def _scalar_is_mapping_key(collections: list[list[object]]) -> bool:
-    return bool(collections and collections[-1][0] == "mapping" and collections[-1][1])
+def _is_secret_environment_value(
+    collections: list[_YamlCollection], event: ScalarEvent
+) -> bool:
+    if event.tag is not None or not collections:
+        return False
+    collection = collections[-1]
+    if (
+        collection.kind != "mapping"
+        or collection.path is None
+        or collection.path[:1] != ("secrets",)
+        or len(collection.path) != 2
+        or not collection.path[1]
+        or collection.pending_path_key != "environment"
+    ):
+        return False
+    return _PORTABLE_ENV_KEY.fullmatch(event.value) is not None
 
 
-def _complete_collection_value(collections: list[list[object]]) -> None:
-    if collections and collections[-1][0] == "mapping":
-        collections[-1][1] = True
+def _yaml_scalar_is_mapping_key(collections: list[_YamlCollection]) -> bool:
+    return bool(
+        collections and collections[-1].kind == "mapping" and collections[-1].expect_key
+    )
+
+
+def _complete_yaml_value(collections: list[_YamlCollection]) -> None:
+    if collections and collections[-1].kind == "mapping":
+        collections[-1].expect_key = True
+        collections[-1].pending_key = None
+        collections[-1].pending_path_key = None
 
 
 def _interpolation_keys(value: str) -> list[str]:

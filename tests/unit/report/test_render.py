@@ -131,7 +131,10 @@ def _render(state: RunState, output_dir: Path):
 
 
 def test_renderer_writes_complete_stable_json_and_html_snapshot(tmp_path: Path) -> None:
-    paths = _render(_state(), tmp_path)
+    state = _state().model_copy(
+        update={"recovery_env_keys": ["APP_TOKEN", "WAKAPI_DB_PASSWORD"]}
+    )
+    paths = _render(state, tmp_path)
 
     report = json.loads(paths.json_path.read_text(encoding="utf-8"))
     html = paths.html_path.read_text(encoding="utf-8")
@@ -148,6 +151,7 @@ def test_renderer_writes_complete_stable_json_and_html_snapshot(tmp_path: Path) 
     }
     assert report["coverage"]["summary"] == "4/4 journeys"
     assert report["stop_reason"] == "no_remaining_mutations"
+    assert report["recovery_env_keys"] == ["APP_TOKEN", "WAKAPI_DB_PASSWORD"]
     assert [item["classification"] for item in report["coverage"]["journeys"]] == [
         "PASS",
         "PASS",
@@ -175,6 +179,12 @@ def test_renderer_writes_complete_stable_json_and_html_snapshot(tmp_path: Path) 
     assert "KEEP" in html
     assert "ROLLBACK" in html
     assert "not a security proof" in html
+    assert "APP_TOKEN" in html
+    assert "WAKAPI_DB_PASSWORD" in html
+    assert "repotrial-synthetic-value" not in paths.json_path.read_text(
+        encoding="utf-8"
+    )
+    assert "repotrial-synthetic-value" not in html
 
 
 def test_renderer_keeps_untested_and_unsupported_coverage_distinct(
