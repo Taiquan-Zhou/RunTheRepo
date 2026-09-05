@@ -205,3 +205,85 @@ def test_mutable_default_collections_are_independent() -> None:
     assert second_state.baseline_journey_results == []
     assert second_state.experiments == []
     assert second_state.artifacts == []
+
+
+def test_run_state_normalizes_recovery_environment_key_names() -> None:
+    state = RunState(
+        run_id="run-recovery",
+        repo_url="https://github.com/acme/demo",
+        recovery_env_keys=["Z_KEY", "A_KEY", "Z_KEY"],
+    )
+
+    assert state.recovery_env_keys == ["A_KEY", "Z_KEY"]
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "bad-key",
+        "1KEY",
+        "repotrial-synthetic-value",
+        "HOME",
+        "PATH",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "XDG_CONFIG_HOME",
+        "path",
+        "COMPOSE_PROJECT_NAME",
+        "DOCKER_HOST",
+        "DYLD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "compose_project_name",
+    ],
+)
+def test_run_state_rejects_unsafe_recovery_environment_key_names(key: str) -> None:
+    with pytest.raises(ValueError):
+        RunState(
+            run_id="run-recovery",
+            repo_url="https://github.com/acme/demo",
+            recovery_env_keys=[key],
+        )
+
+
+@pytest.mark.parametrize("value", [None, 1, {"APP_KEY": "value"}, "APP_KEY"])
+def test_run_state_rejects_non_collection_recovery_environment_keys(
+    value: object,
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        RunState(
+            run_id="run-recovery",
+            repo_url="https://github.com/acme/demo",
+            recovery_env_keys=value,
+        )
+
+
+def test_run_state_accepts_duplicate_overflow_after_normalization() -> None:
+    keys = [f"APP_{index}" for index in range(32)]
+    keys.append("APP_0")
+
+    state = RunState(
+        run_id="run-recovery",
+        repo_url="https://github.com/acme/demo",
+        recovery_env_keys=keys,
+    )
+
+    assert state.recovery_env_keys == sorted(set(keys))
+
+
+def test_run_state_rejects_more_than_32_unique_recovery_environment_keys() -> None:
+    keys = [f"APP_{index}" for index in range(33)]
+
+    with pytest.raises(ValueError):
+        RunState(
+            run_id="run-recovery",
+            repo_url="https://github.com/acme/demo",
+            recovery_env_keys=keys,
+        )
+
+
+def test_run_state_missing_recovery_environment_keys_defaults_empty() -> None:
+    state = RunState.model_validate_json(
+        '{"run_id":"legacy","repo_url":"https://github.com/acme/demo"}'
+    )
+
+    assert state.recovery_env_keys == []

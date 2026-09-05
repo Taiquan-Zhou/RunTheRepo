@@ -1,10 +1,18 @@
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .enums import ExperimentVerdict, MutationType, Verdict
+
+_MAX_RECOVERY_ENV_KEYS = 32
+_RECOVERY_ENV_KEY_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_RECOVERY_CONTROL_ENV_KEYS = frozenset(
+    {"HOME", "PATH", "PYTHONHOME", "PYTHONPATH", "XDG_CONFIG_HOME"}
+)
+_RECOVERY_CONTROL_ENV_PREFIXES = ("COMPOSE_", "DOCKER_", "DYLD_", "LD_")
 
 
 class RepoRef(BaseModel):
@@ -101,7 +109,9 @@ class RunState(BaseModel):
     sandbox_id: str | None = None
     baseline_config_hash: str | None = None
     current_config_hash: str | None = None
-    recovery_env_keys: list[str] = Field(default_factory=list, max_length=32)
+    recovery_env_keys: list[str] = Field(
+        default_factory=list, max_length=_MAX_RECOVERY_ENV_KEYS
+    )
     risk_findings: list[RiskFinding] = Field(default_factory=list)
     journeys: list[Journey] = Field(default_factory=list)
     baseline_journey_results: list[JourneyResult] = Field(default_factory=list)
@@ -124,6 +134,27 @@ class RunState(BaseModel):
                     "compatibility overlay path and sha256 must be provided together"
                 )
         super().__setattr__(name, value)
+
+    @field_validator("recovery_env_keys", mode="before")
+    @classmethod
+    def _normalize_recovery_env_keys(cls, value: object) -> list[str]:
+        if not isinstance(value, (list, tuple, set, frozenset)):
+            raise TypeError("recovery_env_keys must be a collection of key names")
+        keys = list(value)
+        if any(not isinstance(key, str) for key in keys):
+            raise TypeError("recovery_env_keys must contain only strings")
+        normalized = sorted(set(keys))
+        if len(normalized) > _MAX_RECOVERY_ENV_KEYS:
+            raise ValueError("recovery_env_keys exceeds the maximum size")
+        for key in normalized:
+            normalized_key = key.upper()
+            if (
+                _RECOVERY_ENV_KEY_PATTERN.fullmatch(key) is None
+                or normalized_key in _RECOVERY_CONTROL_ENV_KEYS
+                or normalized_key.startswith(_RECOVERY_CONTROL_ENV_PREFIXES)
+            ):
+                raise ValueError("recovery_env_keys contains an unsafe key name")
+        return normalized
 
     @model_validator(mode="after")
     def _validate_compatibility_identity(self) -> Self:

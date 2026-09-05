@@ -22,6 +22,7 @@ from ruamel.yaml.events import (
     SequenceEndEvent,
     SequenceStartEvent,
 )
+from ruamel.yaml.nodes import ScalarNode
 
 _MAX_SOURCE_BYTES = 65_536
 _MAX_ENV_KEYS = 32
@@ -34,6 +35,7 @@ _MIN_TRUNCATED_FIELD_LENGTH = len(_TRUNCATION_MARKER) + 2
 _MAX_YAML_NODES = 4_096
 _MAX_YAML_DEPTH = 128
 _PORTABLE_ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_YAML_STRING_TAG = "tag:yaml.org,2002:str"
 _COMPOSE_INTERPOLATION = re.compile(
     r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(?::-|-|:\?|\?)[^}]*)?\}"
 )
@@ -353,7 +355,7 @@ def _yaml_values(
                     collection.expect_key = False
                 else:
                     values.append((event.value, event.style))
-                    if _is_secret_environment_value(collections, event):
+                    if _is_secret_environment_value(yaml, collections, event):
                         secret_environment_keys.append(event.value)
                     _complete_yaml_value(collections)
             elif isinstance(event, AliasEvent):
@@ -387,9 +389,16 @@ def _mapping_value_path(collection: _YamlCollection) -> tuple[str, ...] | None:
 
 
 def _is_secret_environment_value(
-    collections: list[_YamlCollection], event: ScalarEvent
+    yaml: YAML,
+    collections: list[_YamlCollection],
+    event: ScalarEvent,
 ) -> bool:
-    if event.tag is not None or not collections:
+    if (
+        event.tag is not None
+        or not collections
+        or yaml.resolver.resolve(ScalarNode, event.value, event.implicit)
+        != _YAML_STRING_TAG
+    ):
         return False
     collection = collections[-1]
     if (

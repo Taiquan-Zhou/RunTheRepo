@@ -438,3 +438,27 @@ def test_derivation_rejects_source_replaced_between_path_check_and_open(
 
     with pytest.raises(ValueError, match="compose"):
         derive_recovery_context(tmp_path, "compose.yml")
+
+
+@pytest.mark.parametrize(
+    ("environment_value", "expected"),
+    [
+        ("true", frozenset()),
+        ("false", frozenset()),
+        ("null", frozenset()),
+        ('"true"', frozenset({"true"})),
+    ],
+)
+def test_secret_environment_requires_string_scalar(
+    tmp_path: Path,
+    environment_value: str,
+    expected: frozenset[str],
+) -> None:
+    _write(
+        tmp_path / "compose.yml",
+        "secrets:\n  db_password:\n    environment: " + environment_value + "\n",
+    )
+
+    context = derive_recovery_context(tmp_path, "compose.yml")
+
+    assert context.allowed_env_keys == expected
