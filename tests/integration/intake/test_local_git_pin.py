@@ -436,6 +436,78 @@ def test_git_reader_timeout_kills_and_reaps_process(
     assert process.wait_calls >= 1
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+def test_git_timeout_terminates_descendant_and_closes_real_asyncio_pipes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pid_file = tmp_path / "child.pid"
+    shell_script = 'sleep 1 & child=$!; printf \'%s\\n\' "$child" > "$1"; wait'
+    real_create_subprocess_exec = github.asyncio.create_subprocess_exec
+
+    async def spawn_controlled_shell(
+        executable: str, *_arguments: str, **keywords: object
+    ) -> asyncio.subprocess.Process:
+        assert executable == "git"
+        return await real_create_subprocess_exec(
+            "/bin/sh",
+            "-c",
+            shell_script,
+            "repotrial-test",
+            str(pid_file),
+            **keywords,
+        )
+
+    monkeypatch.setattr(
+        github.asyncio, "create_subprocess_exec", spawn_controlled_shell
+    )
+    monkeypatch.setattr(github, "COMMAND_TIMEOUT_SECONDS", 0.05)
+
+    async def probe() -> tuple[bool, bool, str]:
+        loop = asyncio.get_running_loop()
+        operation = asyncio.create_task(github._run_git("clone"))
+        try:
+            pid_deadline = loop.time() + 0.5
+            while not pid_file.exists() and loop.time() < pid_deadline:
+                await asyncio.sleep(0.01)
+            assert pid_file.exists()
+            child_pid = int(pid_file.read_text(encoding="ascii"))
+
+            completion_deadline = loop.time() + 0.75
+            while not operation.done() and loop.time() < completion_deadline:
+                await asyncio.sleep(0.01)
+            completed_within_bound = operation.done()
+
+            def child_is_alive() -> bool:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    return False
+                except PermissionError:
+                    return True
+                return True
+
+            child_exit_deadline = loop.time() + 0.5
+            while child_is_alive() and loop.time() < child_exit_deadline:
+                await asyncio.sleep(0.01)
+            child_exited = not child_is_alive()
+
+            with pytest.raises(github.RepoIntakeError) as raised:
+                await operation
+            return completed_within_bound, child_exited, raised.value.operation
+        finally:
+            if not operation.done():
+                try:
+                    await operation
+                except github.RepoIntakeError:
+                    pass
+
+    completed_within_bound, child_exited, operation = asyncio.run(probe())
+
+    assert operation == "clone_timeout"
+    assert completed_within_bound
+    assert child_exited
+
+
 def test_git_reader_cancellation_kills_and_reaps_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

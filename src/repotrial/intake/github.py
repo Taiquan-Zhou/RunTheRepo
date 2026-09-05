@@ -3,6 +3,7 @@
 import asyncio
 import os
 import re
+import signal
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -421,6 +422,7 @@ async def _run_git(operation: str, *arguments: str) -> bytes:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=_git_environment(),
+                    start_new_session=(os.name == "posix"),
                 )
             except FileNotFoundError:
                 failure_operation = "git_unavailable"
@@ -460,13 +462,23 @@ async def _run_git(operation: str, *arguments: str) -> bytes:
 
 async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
     if process.returncode is None:
-        try:
-            process.kill()
-        except (OSError, ProcessLookupError):
-            pass
+        _kill_process_group(process)
     try:
         await asyncio.wait_for(process.wait(), timeout=REAP_TIMEOUT_SECONDS)
     except (OSError, ProcessLookupError, TimeoutError):
+        pass
+
+
+def _kill_process_group(process: asyncio.subprocess.Process) -> None:
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            return
+        except (AttributeError, OSError, ProcessLookupError):
+            pass
+    try:
+        process.kill()
+    except (OSError, ProcessLookupError):
         pass
 
 
