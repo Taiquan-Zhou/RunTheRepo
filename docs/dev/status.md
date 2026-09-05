@@ -885,7 +885,8 @@ NO_DAEMON_LIFECYCLE_MUTATION=true
 - Execution HEAD: `4c13b8b9521427b9491e0de8a9f77e64169754ac`; the two final
   representative runs below use this same HEAD. This section appends the
   closeout and does not rewrite earlier records.
-- Earlier diagnostic run `a60ee5d8...` recorded `policy_rejected` with
+- Earlier diagnostic run `a60ee5d8-cca5-4147-a1e8-157eee5ba7fb` recorded
+  `policy_rejected` with
   `journeys=[]` and final `insufficient_coverage`. The generic planner fix now
   limits autonomous retention to evidence-supported `GET` journeys, treats
   invalid structured output as policy fallback, and uses fixed `GET /` with

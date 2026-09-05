@@ -112,10 +112,11 @@ output is narrower: RepoTrial retains only evidence-supported `GET` journeys.
 External links, images, file paths, and generalized API prose do not authorize a
 route.
 
-When model output is absent, untrusted, or policy-invalid, no model-proposed
-request is executed; the fallback is fixed `GET /` with expected status `200`.
-Model transport failures and timeouts can still end a run with
-`insufficient_coverage`; the recorded `stop_reason` is preserved.
+When a configured model returns an empty proposal or policy-invalid output, no
+model-proposed request is executed; the fallback is fixed `GET /` with expected
+status `200`. Model transport failures, timeouts, or an unconfigured model can
+still end a run with `insufficient_coverage`; the recorded `stop_reason` is
+preserved.
 
 ## Proxy networks (TUN optional; Rule or Global)
 
@@ -140,9 +141,14 @@ upstream proxy or its credentials into the untrusted target workload.
 
 ## Troubleshooting
 
-- **GitHub, registry, JWKS, model, or `uv` downloads hang:** verify the proxy is
-  reachable from WSL by its gateway IP. Do not use `localhost` for a Windows
-  proxy under WSL NAT.
+- **GitHub, registry, JWKS, or `uv` downloads hang:** for clients that honor the
+  standard proxy variables, verify the proxy is reachable from WSL by its
+  gateway IP. Do not use `localhost` for a Windows proxy under WSL NAT.
+- **The model attempt records `transport_error`:** the model client does not
+  inherit `HTTP_PROXY` or `HTTPS_PROXY`. Verify direct or network-layer routing
+  (for example, an approved TUN/VPN route) from WSL to the configured endpoint,
+  or select an approved, directly reachable OpenAI-compatible
+  `--model-endpoint`. Never put model credentials in the endpoint URL.
 - **`sbx diagnose` fails or `sbx list` is non-empty:** stop new trials, retain
   the exact output and lifecycle evidence, and investigate the owned sandbox
   ID. Do not hide the failure with reset/restart loops.
