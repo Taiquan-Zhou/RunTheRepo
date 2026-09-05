@@ -281,6 +281,9 @@ async def _plan_journeys(
         try:
             proposal = await _journey_proposal_before_deadline(model, readme_excerpt)
         except ModelAdapterError as error:
+            if error.reason_code == "structured_response_invalid":
+                _record_model_failure(recorder, "policy_rejected")
+                return [_minimal_get_journey(1, "/")]
             _record_model_failure(recorder, error.reason_code)
             return []
         except TimeoutError:

@@ -677,6 +677,37 @@ def test_model_journey_failure_records_the_adapter_reason_without_changing_fail_
     assert rows[-1]["outcome"] == "transport_error"
 
 
+def test_invalid_structured_model_response_falls_back_with_policy_evidence(
+    tmp_path: Path,
+) -> None:
+    class InvalidStructuredAdapter:
+        async def structured(
+            self, *, system: str, user: str, schema: type[BaseModel]
+        ) -> BaseModel:
+            del system, user, schema
+            raise ModelAdapterError(
+                "invalid structured response",
+                reason_code="structured_response_invalid",
+            )
+
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+
+    journeys = asyncio.run(
+        planner_module._plan_journeys_with_evidence(
+            tmp_path,
+            "no safe markdown links",
+            InvalidStructuredAdapter(),
+            evidence_dir=evidence_dir,
+        )
+    )
+
+    assert journeys == [planner_module._minimal_get_journey(1, "/")]
+    evidence_path = next(evidence_dir.glob("baseline-model-attempt-*.jsonl"))
+    rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    assert rows[-1]["outcome"] == "policy_rejected"
+
+
 def test_model_journey_policy_rejection_is_recorded_without_raw_model_output(
     tmp_path: Path,
 ) -> None:
