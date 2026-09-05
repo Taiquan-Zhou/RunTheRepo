@@ -77,6 +77,13 @@ class _ExperimentSandboxFailure(RuntimeError):
         self.after = after
 
 
+def _stage_failure_reason(error: DockerSbxError, fallback: str) -> str:
+    """Preserve the bounded provider deadline reason at the public boundary."""
+    if error.reason == "total_duration_exhausted":
+        return error.reason
+    return fallback
+
+
 @dataclass(frozen=True, slots=True)
 class ExperimentContext:
     workspace: Path
@@ -724,7 +731,7 @@ async def _run_candidate(
             )
     except DockerSbxError as error:
         raise _ExperimentSandboxFailure(
-            "boot_failed",
+            _stage_failure_reason(error, "boot_failed"),
             boot=Verdict.UNSUPPORTED,
         ) from error
     except CleanupError:
@@ -776,7 +783,7 @@ async def _run_candidate(
         raise
     except DockerSbxError as error:
         raise _ExperimentSandboxFailure(
-            "observation_failed",
+            _stage_failure_reason(error, "observation_failed"),
             boot=boot.verdict,
         ) from error
     except _ORDINARY_STAGE_ERRORS:
@@ -795,7 +802,7 @@ async def _run_candidate(
         raise
     except DockerSbxError as error:
         raise _ExperimentSandboxFailure(
-            "publish_failed",
+            _stage_failure_reason(error, "publish_failed"),
             boot=boot.verdict,
             after=after,
         ) from error

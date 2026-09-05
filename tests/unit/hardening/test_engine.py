@@ -1283,27 +1283,36 @@ def test_observation_failure_stops_with_boot_pass_and_cleanup(
 
 
 @pytest.mark.parametrize(
-    ("stage", "expected_reason"),
+    ("stage", "provider_reason", "expected_reason"),
     [
-        ("boot", "boot_failed"),
-        ("observation", "observation_failed"),
-        ("publish", "publish_failed"),
+        ("boot", "total_duration_exhausted", "total_duration_exhausted"),
+        (
+            "observation",
+            "total_duration_exhausted",
+            "total_duration_exhausted",
+        ),
+        ("publish", "total_duration_exhausted", "total_duration_exhausted"),
+        ("boot", "provider_failed", "boot_failed"),
+        ("observation", "provider_failed", "observation_failed"),
+        ("publish", "provider_failed", "publish_failed"),
     ],
 )
 def test_candidate_provider_failure_reaches_lifecycle_and_keeps_public_reason(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     stage: str,
+    provider_reason: str,
     expected_reason: str,
 ) -> None:
     state, mutation, context = _case(tmp_path)
     provider_error = DockerSbxError(
         stage,
-        "total_duration_exhausted",
+        provider_reason,
+        stderr="private-stage-error",
         failure_evidence=SandboxFailureEvidence(
             operation=stage,
-            reason="total_duration_exhausted",
-            deadline_limited=True,
+            reason=provider_reason,
+            deadline_limited=provider_reason == "total_duration_exhausted",
             subprocess_started=False,
         ),
     )
@@ -1331,7 +1340,8 @@ def test_candidate_provider_failure_reaches_lifecycle_and_keeps_public_reason(
     provider_event = next(
         event for event in events if event["event"] == "provider_failure"
     )
-    assert provider_event["failure"]["reason"] == "total_duration_exhausted"
+    assert provider_event["failure"]["reason"] == provider_reason
+    assert "private-stage-error" not in json.dumps(events)
     assert events[-1]["event"] == "destroy_success"
 
 
