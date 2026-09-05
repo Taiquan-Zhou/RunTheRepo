@@ -16,6 +16,7 @@ from repotrial.sandbox.base import ExecResult, NetworkLogResult, SandboxProvider
 from repotrial.trial.observer import (
     ObservationCollectionError,
     ObservationParseError,
+    _collect_observation_with_evidence,
     collect_observation,
 )
 
@@ -38,6 +39,22 @@ OVERLAY_DISCOVERY_ARGV = (
     "compose",
     "-f",
     "compose.yaml",
+    "-f",
+    "candidate.overlay.yml",
+    "ps",
+    "--all",
+    "--no-trunc",
+    "--orphans=false",
+    "--format",
+    "json",
+)
+COMPATIBILITY_OVERLAY_DISCOVERY_ARGV = (
+    "docker",
+    "compose",
+    "-f",
+    "compose.yaml",
+    "-f",
+    "compatibility.overlay.yml",
     "-f",
     "candidate.overlay.yml",
     "ps",
@@ -144,7 +161,8 @@ def test_public_collect_observation_signature_remains_unchanged() -> None:
     assert str(inspect.signature(collect_observation)) == (
         "(provider: repotrial.sandbox.base.SandboxProvider, sandbox_id: str, "
         "compose_path: str, artifact_path: pathlib.Path, *, "
-        "overlay_path: str | None = None) -> "
+        "overlay_path: str | None = None, "
+        "compatibility_overlay_path: str | None = None) -> "
         "repotrial.domain.models.ObservationSnapshot"
     )
 
@@ -157,6 +175,69 @@ def test_public_collection_without_diagnostics_creates_only_audit_artifact(
     _collect(ScriptedProvider(_scripts_for([])), artifact_path)
 
     assert list(tmp_path.iterdir()) == [artifact_path]
+
+
+def test_internal_observer_uses_startup_input_compose_prefix(tmp_path: Path) -> None:
+    prefix = (
+        "env",
+        "-u",
+        "APP_MODE",
+        "-u",
+        "LD_HOST_PORT",
+        "APP_MODE=test",
+    )
+    discovery = (
+        *prefix,
+        "docker",
+        "compose",
+        "--project-directory",
+        ".",
+        "-f",
+        "compose.yaml",
+        "ps",
+        "--all",
+        "--no-trunc",
+        "--orphans=false",
+        "--format",
+        "json",
+    )
+    provider = ScriptedProvider({discovery: _result()})
+    artifact_path = tmp_path / "observation.json"
+    evidence_path = tmp_path / "observation-evidence.jsonl"
+
+    asyncio.run(
+        _collect_observation_with_evidence(
+            provider,
+            "sandbox-1",
+            "compose.yaml",
+            artifact_path,
+            evidence_path=evidence_path,
+            env={"APP_MODE": "test"},
+            unset_env_keys=("LD_HOST_PORT", "APP_MODE"),
+            project_directory=".",
+        )
+    )
+
+    assert provider.calls[0] == ("exec", "sandbox-1", discovery, 30)
+    rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    redacted_discovery = tuple(
+        "APP_MODE=[REDACTED]" if item == "APP_MODE=test" else item for item in discovery
+    )
+    expected_hash = hashlib.sha256(
+        json.dumps(
+            list(redacted_discovery), ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    raw_hash = hashlib.sha256(
+        json.dumps(list(discovery), ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    assert rows[0]["argv_sha256"] == expected_hash
+    assert rows[0]["argv_sha256"] != raw_hash
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert "APP_MODE=test" not in artifact_path.read_text(encoding="utf-8")
+    assert artifact["discovery"]["argv"] == list(redacted_discovery)
 
 
 def _assert_parse_failure(
@@ -455,6 +536,30 @@ def test_overlay_discovery_uses_base_then_overlay_in_exact_order(
     ]
     audit = json.loads(artifact_path.read_text(encoding="utf-8"))
     assert audit["discovery"]["argv"] == list(OVERLAY_DISCOVERY_ARGV)
+
+
+def test_compatibility_discovery_precedes_candidate_in_exact_order(
+    tmp_path: Path,
+) -> None:
+    provider = ScriptedProvider({COMPATIBILITY_OVERLAY_DISCOVERY_ARGV: _result()})
+    artifact_path = tmp_path / "observation.json"
+
+    snapshot = asyncio.run(
+        collect_observation(
+            provider,
+            "sandbox-1",
+            "compose.yaml",
+            artifact_path,
+            compatibility_overlay_path="compatibility.overlay.yml",
+            overlay_path="candidate.overlay.yml",
+        )
+    )
+
+    assert snapshot == ObservationSnapshot()
+    assert provider.calls == [
+        ("exec", "sandbox-1", COMPATIBILITY_OVERLAY_DISCOVERY_ARGV, 30),
+        ("network_log", "sandbox-1"),
+    ]
 
 
 @pytest.mark.parametrize("overlay_path", [cast(str, 7), "bad\0overlay.yml"])

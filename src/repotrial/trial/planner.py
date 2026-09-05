@@ -58,6 +58,7 @@ _MARKDOWN_LINK = re.compile(r"(?<!!)\[[^\]\r\n]*\]\(([^()\s]+)\)")
 _MARKDOWN_IMAGE_DESTINATION = re.compile(
     r"!\[[^\]\r\n]*\]\((?P<destination>[^()\s]+)\)"
 )
+_INLINE_CODE_PATH = re.compile(r"(?<!`)`(?P<path>[^`\r\n]+)`(?!`)")
 _PLAIN_URL_TOKEN = re.compile(
     r"""(?P<prefix>^|[\s(<\[{\'"`])(?P<url>https?://[^\s]+)""",
     re.IGNORECASE,
@@ -280,6 +281,9 @@ async def _plan_journeys(
         try:
             proposal = await _journey_proposal_before_deadline(model, readme_excerpt)
         except ModelAdapterError as error:
+            if error.reason_code == "structured_response_invalid":
+                _record_model_failure(recorder, "policy_rejected")
+                return [_minimal_get_journey(1, "/")]
             _record_model_failure(recorder, error.reason_code)
             return []
         except TimeoutError:
@@ -290,20 +294,27 @@ async def _plan_journeys(
             return []
         except (ValidationError, TypeError, ValueError):
             _record_model_failure(recorder, "policy_rejected")
-            return []
+            return [_minimal_get_journey(1, "/")]
         if not isinstance(proposal, _JourneyProposal):
             _record_model_failure(recorder, "planner_timeout")
             return []
         journeys = _materialize_journey_proposal(proposal)
-        if journeys is None or not _model_journeys_are_executable(journeys):
+        if journeys is None:
             _record_model_failure(recorder, "policy_rejected")
-            return []
+            return [_minimal_get_journey(1, "/")]
+        if not _model_journeys_are_executable(journeys):
+            _record_model_failure(recorder, "policy_rejected")
+            return [_minimal_get_journey(1, "/")]
+        trusted = _filter_trusted_model_journeys(journeys, readme_excerpt)
+        if not trusted:
+            _record_model_failure(recorder, "policy_rejected")
+            return [_minimal_get_journey(1, "/")]
         _record_model_success(
             recorder,
-            [journey.model_dump(mode="json") for journey in journeys],
-            len(journeys),
+            [journey.model_dump(mode="json") for journey in trusted],
+            len(trusted),
         )
-        return journeys
+        return trusted
     finally:
         _close_model_recorder(recorder)
 
@@ -400,6 +411,19 @@ def _journeys_from_readme(readme_excerpt: str) -> list[Journey]:
         if len(paths) == _MAX_JOURNEYS:
             break
     return [_minimal_get_journey(index, path) for index, path in enumerate(paths, 1)]
+
+
+def _readme_evidence_paths(readme_excerpt: str) -> frozenset[str]:
+    paths = {"/"}
+    for match in _MARKDOWN_LINK.finditer(readme_excerpt):
+        path = match.group(1)
+        if _valid_root_relative_path(path):
+            paths.add(path)
+    for match in _INLINE_CODE_PATH.finditer(readme_excerpt):
+        path = match.group("path")
+        if _valid_root_relative_path(path):
+            paths.add(path)
+    return frozenset(paths)
 
 
 def _loopback_root_path(token: str, *, opening_delimiter: str = "") -> str | None:
@@ -720,12 +744,34 @@ def _materialize_journey_proposal(proposal: _JourneyProposal) -> list[Journey] |
     return _parse_journey_collection(collection)
 
 
+def _model_journey_is_read_only_get(journey: Journey) -> bool:
+    return bool(journey.steps) and all(
+        step.tool in _MODEL_SUPPORTED_TOOLS
+        and step.action == "request"
+        and step.params.get("method") == "GET"
+        for step in journey.steps
+    )
+
+
 def _model_journeys_are_executable(journeys: list[Journey]) -> bool:
-    return bool(journeys) and all(
+    return all(
         step.tool in _MODEL_SUPPORTED_TOOLS
         for journey in journeys
         for step in journey.steps
     )
+
+
+def _filter_trusted_model_journeys(
+    journeys: list[Journey], readme_excerpt: str
+) -> list[Journey]:
+    evidence_paths = _readme_evidence_paths(readme_excerpt)
+    trusted = [
+        journey
+        for journey in journeys
+        if _model_journey_is_read_only_get(journey)
+        and all(step.params.get("path") in evidence_paths for step in journey.steps)
+    ]
+    return trusted
 
 
 def _parse_journey_collection(value: object) -> list[Journey] | None:
@@ -1156,10 +1202,12 @@ def _journey_system_prompt() -> str:
         "characters, and contain no Unicode category-C characters.\n"
         "- Autonomous model proposals may use only the currently executable HTTP "
         "tool/action pair: tool http with action request. Its "
-        "params contain method GET|POST|DELETE, a root-relative path, and optional "
+        "params contain method GET only, a root-relative path, and optional "
         "bounded JSON json. HTTP paths are ASCII, at most 2048 characters, begin "
         "with exactly one /, and contain no fragment, backslash, dot segment, "
         "unsafe decoded segment, or unsafe query character.\n"
+        "- The root path / is always the basic deployment journey. Retain a non-root path only when README_EXCERPT explicitly contains the same-app root-relative link or path; external absolute URLs and generic prose are not evidence.\n"
+        "- Never propose POST or DELETE journeys; they are not retained from autonomous output.\n"
         "- HTTP assertions are exactly: status_code on response.status with an "
         "integer expected; text_contains on response.text with a text expected; or "
         "json_path_equals on a dotted response-JSON path with bounded JSON "

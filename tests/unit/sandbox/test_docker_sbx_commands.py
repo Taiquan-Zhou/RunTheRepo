@@ -67,6 +67,12 @@ PROBE_CALLS = [
 ]
 HOST_HEAD = b"0123456789abcdef0123456789abcdef01234567\n"
 GUEST_WORKSPACE = b"/workspace\n"
+OBSERVED_ABSENCE_STDERR = (
+    b"WARN: could not acquire docker hub refresh lock, proceeding without cross-process lock: "
+    b"context deadline exceeded\n"
+    b"Error: sandbox \x27sandbox-17\x27 not found "
+    b"(run \x27sbx ls\x27 to see your sandboxes)\n"
+)
 
 
 @dataclass(frozen=True)
@@ -166,11 +172,16 @@ class _SbxSpawner:
             None
         )
         self.before_spawn: Callable[[tuple[str, ...]], None] | None = None
+        self.before_spawn_with_kwargs: (
+            Callable[[tuple[str, ...], dict[str, object]], None] | None
+        ) = None
 
     async def __call__(self, *argv: str, **kwargs: object) -> _FakeProcess:
         command = tuple(argv)
         if self.before_spawn is not None:
             self.before_spawn(command)
+        if self.before_spawn_with_kwargs is not None:
+            self.before_spawn_with_kwargs(command, kwargs)
         self.calls.append(command)
         self.kwargs.append(kwargs)
         outcome: _Outcome | BaseException
@@ -336,6 +347,13 @@ def _actual_create_call(spawner: _SbxSpawner) -> tuple[str, ...]:
         for call in spawner.calls
         if call[:2] == ("sbx", "create") and call[-1] != "--help"
     )
+
+
+def _actual_create_config_path(spawner: _SbxSpawner) -> Path:
+    create_call = _actual_create_call(spawner)
+    create_index = spawner.calls.index(create_call)
+    environment = cast(dict[str, str], spawner.kwargs[create_index]["env"])
+    return Path(environment["DOCKER_CONFIG"])
 
 
 def _guest_verification_outcome(command: tuple[str, ...]) -> _Outcome:
@@ -1277,8 +1295,29 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
     }
     for key in disk_keys:
         monkeypatch.setenv(key, "host-value-must-not-leak")
+    host_docker_config = tmp_path / "host-docker-config"
+    host_docker_config.mkdir()
+    (host_docker_config / "config.json").write_text(
+        '{"auths":{"registry.example":{"auth":"must-not-leak"}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DOCKER_CONFIG", str(host_docker_config))
+    monkeypatch.setenv("DOCKER_AUTH_CONFIG", "host-auth-must-not-leak")
+    monkeypatch.setenv("REGISTRY_AUTH_FILE", "host-registry-auth-must-not-leak")
     monkeypatch.setenv("REPOTRIAL_TEST_SENTINEL", "preserved")
     spawner = _SbxSpawner()
+
+    def assert_anonymous_config_is_live_and_empty(
+        command: tuple[str, ...], kwargs: dict[str, object]
+    ) -> None:
+        if command[:2] != ("sbx", "create") or command[-1] == "--help":
+            return
+        environment = cast(dict[str, str], kwargs["env"])
+        docker_config = Path(environment["DOCKER_CONFIG"])
+        assert docker_config.is_dir()
+        assert list(docker_config.iterdir()) == []
+
+    spawner.before_spawn_with_kwargs = assert_anonymous_config_is_live_and_empty
     provider = _provider(monkeypatch, spawner)
 
     sandbox_id = _create(provider, tmp_path)
@@ -1344,18 +1383,174 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
     assert create_env["DOCKER_SANDBOXES_ROOT_SIZE"] == "1m"
     assert create_env["DOCKER_SANDBOXES_DOCKER_SIZE"] == "1919m"
     assert create_env["DOCKER_SANDBOXES_CLONED_WORKSPACE_SIZE"] == "128m"
+    anonymous_docker_config = Path(create_env["DOCKER_CONFIG"])
+    assert anonymous_docker_config != host_docker_config
+    assert anonymous_docker_config.name.startswith("repotrial-docker-config-")
+    assert not anonymous_docker_config.exists()
+    assert "DOCKER_AUTH_CONFIG" not in create_env
+    assert "REGISTRY_AUTH_FILE" not in create_env
     assert create_env["REPOTRIAL_TEST_SENTINEL"] == "preserved"
     for index, kwargs in enumerate(spawner.kwargs):
         if index == create_index:
             continue
         environment = cast(dict[str, str], kwargs.get("env"))
         assert environment["REPOTRIAL_TEST_SENTINEL"] == "preserved"
+        assert environment["DOCKER_CONFIG"] == str(host_docker_config)
+        assert environment["DOCKER_AUTH_CONFIG"] == "host-auth-must-not-leak"
+        assert environment["REGISTRY_AUTH_FILE"] == "host-registry-auth-must-not-leak"
         assert disk_keys.isdisjoint(environment)
     assert not any(
         call[:2] == ("sbx", "exec")
         and any("df -B1 -P" in argument for argument in call)
         for call in spawner.calls
     )
+
+
+def test_anonymous_config_creation_failure_is_structured_before_pending_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+
+    def fail_mkdtemp(*_args: object, **_kwargs: object) -> str:
+        raise OSError("anonymous config unavailable")
+
+    monkeypatch.setattr(docker_sbx.tempfile, "mkdtemp", fail_mkdtemp)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert (raised.value.operation, raised.value.reason) == (
+        "create",
+        "anonymous_config_io",
+    )
+    assert _non_help_create_calls(spawner) == []
+    assert provider._sandbox_states == {}
+
+
+def test_unreaped_create_retains_anonymous_config_and_reports_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    anonymous_config = tmp_path / "retained-anonymous-config"
+
+    def make_known_config(*_args: object, **_kwargs: object) -> str:
+        anonymous_config.mkdir()
+        return str(anonymous_config)
+
+    monkeypatch.setattr(docker_sbx.tempfile, "mkdtemp", make_known_config)
+    monkeypatch.setattr(docker_sbx, "REAP_TIMEOUT_SECONDS", 0.01)
+    spawner = _SbxSpawner()
+    spawner.handler = lambda command: (
+        _Outcome(hang=True, reap_hang=True)
+        if command[:2] == ("sbx", "create") and command[-1] != "--help"
+        else _Outcome()
+    )
+    provider = _provider(monkeypatch, spawner, command_timeout_s=0.05)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert raised.value.reason == "process_cleanup_unconfirmed"
+    assert anonymous_config.is_dir()
+    assert "anonymous Docker config retained" in " ".join(raised.value.__notes__)
+    anonymous_config.rmdir()
+
+
+def test_cancelled_unreaped_create_retains_anonymous_config_and_reports_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    anonymous_config = tmp_path / "retained-anonymous-config"
+
+    def make_known_config(*_args: object, **_kwargs: object) -> str:
+        anonymous_config.mkdir()
+        return str(anonymous_config)
+
+    monkeypatch.setattr(docker_sbx.tempfile, "mkdtemp", make_known_config)
+    monkeypatch.setattr(docker_sbx, "REAP_TIMEOUT_SECONDS", 0.01)
+    spawner = _SbxSpawner()
+    spawner.handler = lambda command: (
+        _Outcome(hang=True, kill_error=OSError("kill denied"))
+        if command[:2] == ("sbx", "create") and command[-1] != "--help"
+        else _Outcome()
+    )
+    provider = _provider(monkeypatch, spawner)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(provider.create(tmp_path, "trial"))
+        while not _non_help_create_calls(spawner):
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        notes = " ".join(raised.value.__notes__)
+        assert "process cleanup unconfirmed" in notes
+        assert "anonymous Docker config retained" in notes
+
+    asyncio.run(exercise())
+
+    assert anonymous_config.is_dir()
+    anonymous_config.rmdir()
+
+
+def test_anonymous_config_cleanup_failure_aborts_and_cleans_partial_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    anonymous_config = tmp_path / "anonymous-config"
+
+    def make_known_config(*_args: object, **_kwargs: object) -> str:
+        anonymous_config.mkdir()
+        return str(anonymous_config)
+
+    def fail_cleanup(_path: Path) -> None:
+        raise OSError("cleanup denied")
+
+    monkeypatch.setattr(docker_sbx.tempfile, "mkdtemp", make_known_config)
+    monkeypatch.setattr(docker_sbx.shutil, "rmtree", fail_cleanup)
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    create_call = _actual_create_call(spawner)
+    sandbox_id = create_call[create_call.index("--name") + 1]
+    assert (raised.value.operation, raised.value.reason) == (
+        "create",
+        "anonymous_config_cleanup",
+    )
+    assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
+    assert provider._sandbox_states[sandbox_id] is docker_sbx._SandboxState.CLEANED
+    anonymous_config.rmdir()
+
+
+def test_anonymous_config_cleanup_failure_does_not_mask_create_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    anonymous_config = tmp_path / "anonymous-config"
+
+    def make_known_config(*_args: object, **_kwargs: object) -> str:
+        anonymous_config.mkdir()
+        return str(anonymous_config)
+
+    def fail_cleanup(_path: Path) -> None:
+        raise OSError("cleanup denied")
+
+    monkeypatch.setattr(docker_sbx.tempfile, "mkdtemp", make_known_config)
+    monkeypatch.setattr(docker_sbx.shutil, "rmtree", fail_cleanup)
+    spawner = _SbxSpawner()
+    spawner.handler = lambda command: (
+        _Outcome(returncode=7, stderr=b"create failed")
+        if command[:2] == ("sbx", "create") and command[-1] != "--help"
+        else _Outcome()
+    )
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert raised.value.reason == "nonzero_exit"
+    assert "anonymous Docker config cleanup failed" in " ".join(raised.value.__notes__)
+    anonymous_config.rmdir()
 
 
 @pytest.mark.parametrize(
@@ -1518,6 +1713,7 @@ def test_failed_create_force_removes_pending_id_and_cleaned_destroy_is_noop(
     sandbox_id = create_call[create_call.index("--name") + 1]
     remove_call = ("sbx", "rm", "--force", sandbox_id)
     assert raised.value.reason == "nonzero_exit"
+    assert not _actual_create_config_path(spawner).exists()
     assert spawner.calls[-1] == remove_call
     calls_before_destroy = len(spawner.calls)
     asyncio.run(provider.destroy(sandbox_id))
@@ -1603,6 +1799,7 @@ def test_cancelled_create_force_removes_pending_id_and_preserves_cancellation(
     create_index = spawner.calls.index(create_call)
     assert spawner.processes[create_index].killed is True
     assert spawner.processes[create_index].waited is True
+    assert not _actual_create_config_path(spawner).exists()
 
 
 @pytest.mark.parametrize("failure", ["timeout", "io_error"])
@@ -1625,6 +1822,7 @@ def test_create_timeout_or_io_error_force_removes_pending_id(
     create_call = _actual_create_call(spawner)
     sandbox_id = create_call[create_call.index("--name") + 1]
     assert raised.value.reason == failure
+    assert not _actual_create_config_path(spawner).exists()
     assert spawner.calls[-1] == ("sbx", "rm", "--force", sandbox_id)
 
 
@@ -2311,6 +2509,96 @@ def test_failed_destroy_keeps_provider_state_for_retry(
     asyncio.run(provider.destroy(sandbox_id))
 
     assert spawner.calls[-2:] == [remove_command, remove_command]
+
+
+@pytest.mark.parametrize(
+    ("case", "stdout", "stderr", "should_clean"),
+    [
+        (
+            "observed exact-ID absence",
+            b"",
+            OBSERVED_ABSENCE_STDERR,
+            True,
+        ),
+        (
+            "wrong ID",
+            b"",
+            (
+                b"WARN: could not acquire docker hub refresh lock, proceeding without cross-process lock: "
+                b"context deadline exceeded\n"
+                b"Error: sandbox \x27other-id\x27 not found "
+                b"(run \x27sbx ls\x27 to see your sandboxes)\n"
+            ),
+            False,
+        ),
+        (
+            "generic not-found",
+            b"",
+            b"Error: sandbox not found\n",
+            False,
+        ),
+        (
+            "ambiguous suffix",
+            b"",
+            b"Error: sandbox \x27sandbox-17\x27 not found or unavailable\n",
+            False,
+        ),
+        ("other error", b"", b"cleanup failed\n", False),
+        (
+            "invalid stderr",
+            b"",
+            b"Error: sandbox \x27sandbox-17\x27 not found\xff\n",
+            False,
+        ),
+        ("nonempty stdout", b"unexpected\n", OBSERVED_ABSENCE_STDERR, False),
+        ("invalid stdout", b"\xff", OBSERVED_ABSENCE_STDERR, False),
+        (
+            "extra error line",
+            b"",
+            OBSERVED_ABSENCE_STDERR + b"Error: cleanup failed\n",
+            False,
+        ),
+        (
+            "cross-line token",
+            b"",
+            b"Error: sandbox\n\x27sandbox-17\x27 not found\n",
+            False,
+        ),
+    ],
+)
+def test_destroy_requires_strict_exact_id_absence_result(
+    case: str,
+    stdout: bytes,
+    stderr: bytes,
+    should_clean: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert case
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(monkeypatch, spawner)
+    remove_command = ("sbx", "rm", "--force", sandbox_id)
+    spawner.overrides[remove_command] = _Outcome(
+        returncode=1, stdout=stdout, stderr=stderr
+    )
+
+    if should_clean:
+        asyncio.run(provider.destroy(sandbox_id))
+        assert provider._sandbox_states[sandbox_id] is docker_sbx._SandboxState.CLEANED
+        calls_before_destroy = len(spawner.calls)
+        asyncio.run(provider.destroy(sandbox_id))
+        assert len(spawner.calls) == calls_before_destroy
+    else:
+        with pytest.raises(DockerSbxError) as raised:
+            asyncio.run(provider.destroy(sandbox_id))
+        assert raised.value.reason == "nonzero_exit"
+        assert (
+            provider._sandbox_states[sandbox_id]
+            is docker_sbx._SandboxState.CLEANUP_UNSAFE
+        )
+        del spawner.overrides[remove_command]
+        asyncio.run(provider.destroy(sandbox_id))
+        assert provider._sandbox_states[sandbox_id] is docker_sbx._SandboxState.CLEANED
+        assert spawner.calls[-2:] == [remove_command, remove_command]
 
 
 def test_nonzero_command_error_has_deterministically_truncated_stderr(

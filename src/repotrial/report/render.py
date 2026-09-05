@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
+from pydantic import ValidationError
 
 from repotrial.domain.models import ObservationSnapshot, RunState
 
@@ -43,6 +44,7 @@ def render_trial_report(state: RunState, output_dir: Path) -> TrialReportPaths:
 
 
 def _project(state: RunState) -> dict[str, object]:
+    state = _validated_state(state)
     coverage = _coverage(state)
     return {
         "disclaimer": (
@@ -87,8 +89,13 @@ def _project(state: RunState) -> dict[str, object]:
                 reference
                 for reference in state.artifacts
                 if reference != state.compose_path
+                and reference != state.compatibility_overlay_path
                 and reference.lower().endswith((".overlay.yaml", ".overlay.yml"))
             ],
+            "compatibility_overlay": {
+                "reference": state.compatibility_overlay_path,
+                "sha256": state.compatibility_overlay_sha256,
+            },
             "accepted_configuration": {
                 "compose_reference": state.compose_path,
                 "config_hash": state.current_config_hash,
@@ -99,6 +106,13 @@ def _project(state: RunState) -> dict[str, object]:
             },
         },
     }
+
+
+def _validated_state(state: RunState) -> RunState:
+    try:
+        return RunState.model_validate(state)
+    except ValidationError:
+        raise ValueError("invalid run state") from None
 
 
 def _coverage(state: RunState) -> dict[str, object]:

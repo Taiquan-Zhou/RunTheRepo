@@ -3,13 +3,17 @@ import json
 import math
 import re
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
 from repotrial.domain.models import ObservationSnapshot
 from repotrial.sandbox.base import ExecResult, NetworkLogResult, SandboxProvider
+from repotrial.trial.boot import (
+    _validate_project_directory,
+    _validated_compose_env_prefix,
+)
 from repotrial.trial.observation_evidence import (
     ObservationEvidenceError,
     ObservationEvidenceRecorder,
@@ -151,14 +155,25 @@ async def collect_observation(
     artifact_path: Path,
     *,
     overlay_path: str | None = None,
+    compatibility_overlay_path: str | None = None,
 ) -> ObservationSnapshot:
-    _validate_inputs(sandbox_id, compose_path, artifact_path, overlay_path)
+    _validate_inputs(
+        sandbox_id,
+        compose_path,
+        artifact_path,
+        overlay_path,
+        compatibility_overlay_path,
+    )
     return await _collect_observation(
         provider,
         sandbox_id,
         compose_path,
         artifact_path,
         overlay_path=overlay_path,
+        compatibility_overlay_path=compatibility_overlay_path,
+        env={},
+        unset_env_keys=(),
+        project_directory=None,
         recorder=None,
     )
 
@@ -170,9 +185,21 @@ async def _collect_observation_with_evidence(
     artifact_path: Path,
     *,
     overlay_path: str | None = None,
+    compatibility_overlay_path: str | None = None,
     evidence_path: Path,
+    env: Mapping[str, str] | None = None,
+    unset_env_keys: Sequence[str] = (),
+    project_directory: str | None = None,
 ) -> ObservationSnapshot:
-    _validate_inputs(sandbox_id, compose_path, artifact_path, overlay_path)
+    _validate_inputs(
+        sandbox_id,
+        compose_path,
+        artifact_path,
+        overlay_path,
+        compatibility_overlay_path,
+    )
+    if project_directory is not None:
+        _validate_project_directory(project_directory)
     if not isinstance(evidence_path, Path):
         raise TypeError("observation evidence path must be a Path")
     if evidence_path == artifact_path:
@@ -187,6 +214,10 @@ async def _collect_observation_with_evidence(
             compose_path,
             artifact_path,
             overlay_path=overlay_path,
+            compatibility_overlay_path=compatibility_overlay_path,
+            env={} if env is None else env,
+            unset_env_keys=unset_env_keys,
+            project_directory=project_directory,
             recorder=recorder,
         )
     except BaseException as error:
@@ -203,15 +234,24 @@ async def _collect_observation(
     artifact_path: Path,
     *,
     overlay_path: str | None,
+    compatibility_overlay_path: str | None,
+    env: Mapping[str, str],
+    unset_env_keys: Sequence[str],
+    project_directory: str | None,
     recorder: ObservationEvidenceRecorder | None,
 ) -> ObservationSnapshot:
     budget = _CollectionBudget()
+    prefix = _validated_compose_env_prefix(compose_path, env, unset_env_keys)
     discovery_argv = [
+        *prefix,
         "docker",
         "compose",
-        "-f",
-        compose_path,
     ]
+    if project_directory is not None:
+        discovery_argv.extend(["--project-directory", project_directory])
+    discovery_argv.extend(["-f", compose_path])
+    if compatibility_overlay_path is not None:
+        discovery_argv.extend(["-f", compatibility_overlay_path])
     if overlay_path is not None:
         discovery_argv.extend(["-f", overlay_path])
     discovery_argv.extend(
@@ -224,6 +264,10 @@ async def _collect_observation(
             "json",
         ]
     )
+    recorded_discovery_argv = [
+        *_redacted_compose_prefix(prefix),
+        *discovery_argv[len(prefix) :],
+    ]
     discovery_result, containers = await _collect_exec_operation(
         provider,
         sandbox_id,
@@ -232,6 +276,7 @@ async def _collect_observation(
         operation="discovery",
         parser=_parse_discovery,
         recorder=recorder,
+        evidence_argv=recorded_discovery_argv,
     )
 
     inspect_by_service: dict[str, list[dict[str, object]]] = {}
@@ -368,7 +413,7 @@ async def _collect_observation(
         audit = {
             "schema_version": 1,
             "discovery": _command_audit(
-                discovery_argv,
+                recorded_discovery_argv,
                 discovery_result.stdout,
                 [
                     {"service": service, "container_id": container_id}
@@ -434,12 +479,15 @@ def _validate_inputs(
     compose_path: str,
     artifact_path: Path,
     overlay_path: str | None,
+    compatibility_overlay_path: str | None,
 ) -> None:
     if not isinstance(sandbox_id, str):
         raise TypeError("sandbox_id must be a string")
     if not sandbox_id:
         raise ValueError("sandbox_id must not be empty")
     _validate_compose_path(compose_path, "compose_path")
+    if compatibility_overlay_path is not None:
+        _validate_compose_path(compatibility_overlay_path, "compatibility_overlay_path")
     if overlay_path is not None:
         _validate_compose_path(overlay_path, "overlay_path")
     if not isinstance(artifact_path, Path):
@@ -470,9 +518,11 @@ async def _collect_exec_operation[ParsedT](
     operation: ObservationOperation,
     parser: Callable[[str, _CollectionBudget], ParsedT],
     recorder: ObservationEvidenceRecorder | None,
+    evidence_argv: list[str] | None = None,
 ) -> tuple[ExecResult, ParsedT]:
+    recorded_argv = argv if evidence_argv is None else evidence_argv
     if recorder is not None:
-        recorder.record_start(operation, argv)
+        recorder.record_start(operation, recorded_argv)
     try:
         result = await provider.exec(
             sandbox_id,
@@ -483,7 +533,7 @@ async def _collect_exec_operation[ParsedT](
         if recorder is not None:
             recorder.record_terminal_preserving_primary(
                 operation,
-                argv,
+                recorded_argv,
                 phase="provider_execution",
                 reason="provider_exception",
                 result=None,
@@ -502,7 +552,7 @@ async def _collect_exec_operation[ParsedT](
         if recorder is not None:
             recorder.record_terminal_preserving_primary(
                 operation,
-                argv,
+                recorded_argv,
                 phase="result_validation",
                 reason="malformed_exec_result",
                 result=None,
@@ -514,7 +564,7 @@ async def _collect_exec_operation[ParsedT](
         if recorder is not None:
             recorder.record_terminal_preserving_primary(
                 operation,
-                argv,
+                recorded_argv,
                 phase="result_validation",
                 reason="nonzero_exit",
                 result=result,
@@ -528,7 +578,7 @@ async def _collect_exec_operation[ParsedT](
         if recorder is not None:
             recorder.record_terminal_preserving_primary(
                 operation,
-                argv,
+                recorded_argv,
                 phase="parsing",
                 reason=(
                     "resource_limit_exceeded"
@@ -543,7 +593,7 @@ async def _collect_exec_operation[ParsedT](
         if recorder is not None:
             recorder.record_terminal_preserving_primary(
                 operation,
-                argv,
+                recorded_argv,
                 phase="parsing",
                 reason="parse_failure",
                 result=result,
@@ -553,13 +603,32 @@ async def _collect_exec_operation[ParsedT](
     if recorder is not None:
         recorder.record_terminal(
             operation,
-            argv,
+            recorded_argv,
             phase="parsing",
             outcome="success",
             reason="collector_succeeded",
             result=result,
         )
     return result, parsed
+
+
+def _redacted_compose_prefix(prefix: list[str]) -> list[str]:
+    if not prefix:
+        return []
+    redacted = [prefix[0]]
+    index = 1
+    while index < len(prefix):
+        item = prefix[index]
+        if item == "-u":
+            redacted.extend(prefix[index : index + 2])
+            index += 2
+            continue
+        key, separator, _ = item.partition("=")
+        if not separator:
+            raise ValueError("invalid Compose environment prefix")
+        redacted.append(f"{key}={_REDACTION}")
+        index += 1
+    return redacted
 
 
 async def _collect_network_operation(

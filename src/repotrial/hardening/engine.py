@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from repotrial.compose.compatibility import CompatibilityError
 from repotrial.compose.mutations import MutationError, apply_mutation
 from repotrial.compose.overlay import write_overlay
 from repotrial.compose.parser import canonical_compose_json, load_compose
@@ -25,7 +26,24 @@ from repotrial.sandbox.base import SandboxProvider
 from repotrial.sandbox.docker_sbx import DockerSbxError
 from repotrial.sandbox.lifecycle import CleanupError, managed_sandbox
 from repotrial.trial.boot import _validated_env_prefix, boot_compose
-from repotrial.trial.observer import collect_observation
+from repotrial.trial.compatibility import (
+    materialize_guest_compatibility_overlay,
+    verify_guest_compatibility_overlay,
+)
+from repotrial.trial.observer import (
+    _collect_observation_with_evidence,
+    collect_observation,
+)
+from repotrial.trial.startup_inputs import (
+    _ADAPTER_SHA256,
+    StartupInputPlan,
+    StartupInputUnsupported,
+    materialize_startup_input,
+    plan_startup_input,
+    record_startup_input_rejection,
+    verify_startup_input_attempt_history,
+    verify_startup_input_identity,
+)
 
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
 _ORDINARY_STAGE_ERRORS = (RuntimeError, OSError, ValueError, TypeError, KeyError)
@@ -54,13 +72,21 @@ class ExperimentContext:
     artifact_dir: Path
     env: Mapping[str, str]
     container_port: int
+    prior_attempt_directories: tuple[Path, ...] = ()
+    startup_input_identity_path: Path | None = None
+    compatibility_overlay_path: Path | None = None
+    compatibility_overlay_sha256: str | None = None
+    compatibility_overlay_evidence_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class _PreparedExperiment:
     compose_path: str
     overlay_path: Path
+    compatibility_overlay_path: Path | None
     overlay_relative: str
+    compatibility_overlay_relative: str | None
+    compatibility_overlay_evidence_path: Path | None
     env: dict[str, str]
     parent_hash: str
     candidate_hash: str
@@ -70,6 +96,10 @@ class _PreparedExperiment:
     baseline_error: str | None
     lifecycle_artifact: Path
     observation_artifact: Path
+    observation_evidence: Path
+    startup_input_evidence: Path
+    startup_input_plan: StartupInputPlan | None
+    startup_input_error: str | None
     evidence_dirs: tuple[Path, ...]
     sandbox_name: str
 
@@ -105,6 +135,21 @@ async def run_experiment(
             reason="parent_hash_mismatch",
         )
 
+    if prepared.startup_input_error is not None:
+        record_startup_input_rejection(
+            prepared.startup_input_evidence,
+            compose_relative_path=prepared.compose_path,
+            reason=prepared.startup_input_error,
+        )
+        return _record(
+            state,
+            mutation,
+            prepared,
+            boot=Verdict.UNSUPPORTED,
+            verdict=ExperimentVerdict.STOP,
+            reason="startup_input_unsupported",
+        )
+
     _validate_artifact_targets(prepared)
     try:
         write_overlay(prepared.base, prepared.candidate, prepared.overlay_path)
@@ -135,6 +180,8 @@ async def run_experiment(
             )
     except CleanupError:
         raise
+    except CompatibilityError:
+        raise
     except _ExperimentSandboxFailure as failure:
         return _record(
             state,
@@ -163,6 +210,15 @@ def _prepare(
     workspace = _real_directory(context.workspace, "workspace")
     compose_path, compose_file = _compose_file(workspace, state.compose_path)
     overlay_path, overlay_relative = _overlay_target(workspace, context.overlay_path)
+    compatibility_target = _compatibility_target_details(
+        workspace, context.compatibility_overlay_path
+    )
+    compatibility_overlay_path = (
+        None if compatibility_target is None else compatibility_target[1]
+    )
+    compatibility_overlay_relative = (
+        None if compatibility_target is None else compatibility_target[0]
+    )
     artifact_dir = _real_directory(context.artifact_dir, "artifact_dir")
     if artifact_dir.is_relative_to(workspace):
         raise ValueError("artifact_dir must resolve outside workspace")
@@ -170,6 +226,13 @@ def _prepare(
         raise TypeError("container_port must be an integer")
     if not 1 <= context.container_port <= 65_535:
         raise ValueError("container_port is outside the valid range")
+    compatibility_overlay_evidence_path = (
+        None
+        if compatibility_overlay_relative is None
+        else _compatibility_evidence_target(
+            artifact_dir, context.compatibility_overlay_evidence_path
+        )
+    )
     env = _snapshot_env(context.env)
     _validated_env_prefix(compose_path, env)
 
@@ -177,12 +240,39 @@ def _prepare(
     candidate = apply_mutation(base, mutation)
     parent_hash = _compose_hash(base)
     candidate_hash = _compose_hash(candidate)
+    startup_input_plan: StartupInputPlan | None = None
+    startup_input_error: str | None = None
+    try:
+        startup_input_plan = plan_startup_input(workspace, compose_path)
+        if startup_input_plan is not None:
+            if f"sha256:{startup_input_plan.compose_config_hash}" != parent_hash:
+                raise StartupInputUnsupported("compose_identity_mismatch")
+            if context.startup_input_identity_path is None:
+                raise StartupInputUnsupported("startup_identity_missing")
+            verify_startup_input_identity(
+                context.startup_input_identity_path,
+                startup_input_plan,
+                adapter_sha256=_ADAPTER_SHA256,
+            )
+            verify_startup_input_attempt_history(
+                context.prior_attempt_directories, startup_input_plan
+            )
+        elif context.startup_input_identity_path is not None and (
+            context.startup_input_identity_path.exists()
+            or context.startup_input_identity_path.is_symlink()
+        ):
+            raise StartupInputUnsupported("startup_identity_missing_plan")
+    except StartupInputUnsupported as error:
+        startup_input_error = error.reason
     journeys, baseline_error = _select_baseline_journeys(state)
     token = candidate_hash.removeprefix("sha256:")[:16]
     return _PreparedExperiment(
         compose_path=compose_path,
         overlay_path=overlay_path,
+        compatibility_overlay_path=compatibility_overlay_path,
         overlay_relative=overlay_relative,
+        compatibility_overlay_relative=compatibility_overlay_relative,
+        compatibility_overlay_evidence_path=compatibility_overlay_evidence_path,
         env=env,
         parent_hash=parent_hash,
         candidate_hash=candidate_hash,
@@ -192,6 +282,10 @@ def _prepare(
         baseline_error=baseline_error,
         lifecycle_artifact=artifact_dir / f"candidate-{token}-lifecycle.jsonl",
         observation_artifact=artifact_dir / f"candidate-{token}-observation.json",
+        observation_evidence=(artifact_dir / "candidate-observation-boundary.jsonl"),
+        startup_input_evidence=artifact_dir / "startup-input-attempt.jsonl",
+        startup_input_plan=startup_input_plan,
+        startup_input_error=startup_input_error,
         evidence_dirs=tuple(
             artifact_dir / f"candidate-{token}-journey-{index:04d}"
             for index in range(len(journeys))
@@ -279,6 +373,55 @@ def _overlay_target(workspace: Path, value: object) -> tuple[Path, str]:
     return normalized, normalized.relative_to(workspace).as_posix()
 
 
+def _compatibility_target(workspace: Path, value: object) -> str | None:
+    target = _compatibility_target_details(workspace, value)
+    return None if target is None else target[0]
+
+
+def _compatibility_target_details(
+    workspace: Path, value: object
+) -> tuple[str, Path] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Path):
+        raise TypeError("compatibility_overlay_path must be a Path")
+    target = value if value.is_absolute() else workspace / value
+    try:
+        target_stat = target.lstat()
+        parent = target.parent.resolve(strict=True)
+        resolved = target.resolve(strict=True)
+    except OSError:
+        raise ValueError(
+            "compatibility_overlay_path must be an existing regular file"
+        ) from None
+    if (
+        _is_link(target, target_stat)
+        or not stat.S_ISREG(target_stat.st_mode)
+        or not parent.is_relative_to(workspace)
+        or not resolved.is_relative_to(workspace)
+    ):
+        raise ValueError("compatibility_overlay_path must be an existing regular file")
+    return resolved.relative_to(workspace).as_posix(), resolved
+
+
+def _compatibility_evidence_target(artifact_dir: Path, value: Path | None) -> Path:
+    target = (
+        artifact_dir / "compatibility-materialization.jsonl" if value is None else value
+    )
+    if not isinstance(target, Path):
+        raise TypeError("compatibility_overlay_evidence_path must be a Path")
+    if not target.is_absolute():
+        target = artifact_dir / target
+    if (
+        target.parent != artifact_dir
+        or target.name != "compatibility-materialization.jsonl"
+    ):
+        raise ValueError("compatibility overlay evidence path must be in artifact_dir")
+    if target.exists() or target.is_symlink():
+        raise ValueError("compatibility overlay evidence target is already in use")
+    return target
+
+
 def _snapshot_env(value: object) -> dict[str, str]:
     if not isinstance(value, Mapping):
         raise TypeError("env must be a mapping")
@@ -296,11 +439,16 @@ def _compose_hash(compose: dict[str, object]) -> str:
 
 
 def _validate_artifact_targets(prepared: _PreparedExperiment) -> None:
-    for target in (
+    targets = [
         prepared.lifecycle_artifact,
         prepared.observation_artifact,
         *prepared.evidence_dirs,
-    ):
+    ]
+    if prepared.startup_input_plan is not None:
+        targets.extend([prepared.startup_input_evidence, prepared.observation_evidence])
+    if prepared.compatibility_overlay_evidence_path is not None:
+        targets.append(prepared.compatibility_overlay_evidence_path)
+    for target in targets:
         if target.exists() or target.is_symlink():
             raise ValueError("experiment artifact target is already in use")
 
@@ -323,15 +471,75 @@ async def _run_candidate(
     prepared: _PreparedExperiment,
     sandbox_id: str,
 ) -> ExperimentRecord:
-    try:
-        boot = await boot_compose(
+    if prepared.compatibility_overlay_relative is not None:
+        host_artifact_path = prepared.compatibility_overlay_path
+        if (
+            context.compatibility_overlay_path is None
+            or host_artifact_path is None
+            or prepared.compatibility_overlay_evidence_path is None
+        ):
+            raise CompatibilityError("identity_incomplete")
+        await materialize_guest_compatibility_overlay(
             provider,
             sandbox_id,
-            prepared.compose_path,
-            prepared.env,
-            attempt=1,
-            overlay_path=prepared.overlay_relative,
+            host_artifact_path=host_artifact_path,
+            relative_path=prepared.compatibility_overlay_relative,
+            expected_sha256=context.compatibility_overlay_sha256 or "",
+            evidence_path=prepared.compatibility_overlay_evidence_path,
         )
+        await verify_guest_compatibility_overlay(
+            provider,
+            sandbox_id,
+            relative_path=prepared.compatibility_overlay_relative,
+            expected_sha256=context.compatibility_overlay_sha256 or "",
+        )
+    startup_plan = prepared.startup_input_plan
+    if startup_plan is not None:
+        try:
+            await materialize_startup_input(
+                provider,
+                sandbox_id,
+                startup_plan,
+                compose_path=prepared.compose_path,
+                compose_env=prepared.env,
+                evidence_path=prepared.startup_input_evidence,
+                compatibility_overlay_path=prepared.compatibility_overlay_relative,
+                overlay_path=prepared.overlay_relative,
+            )
+        except CleanupError:
+            raise
+        except _ORDINARY_STAGE_ERRORS:
+            return _record(
+                state,
+                mutation,
+                prepared,
+                boot=Verdict.UNSUPPORTED,
+                verdict=ExperimentVerdict.STOP,
+                reason="startup_input_unsupported",
+            )
+    try:
+        if startup_plan is None:
+            boot = await boot_compose(
+                provider,
+                sandbox_id,
+                prepared.compose_path,
+                prepared.env,
+                attempt=1,
+                compatibility_overlay_path=prepared.compatibility_overlay_relative,
+                overlay_path=prepared.overlay_relative,
+            )
+        else:
+            boot = await boot_compose(
+                provider,
+                sandbox_id,
+                prepared.compose_path,
+                prepared.env,
+                attempt=1,
+                compatibility_overlay_path=prepared.compatibility_overlay_relative,
+                overlay_path=prepared.overlay_relative,
+                unset_env_keys=startup_plan.all_source_key_names,
+                project_directory=".",
+            )
     except DockerSbxError as error:
         raise _ExperimentSandboxFailure(
             "boot_failed",
@@ -357,13 +565,28 @@ async def _run_candidate(
         )
 
     try:
-        after = await collect_observation(
-            provider,
-            sandbox_id,
-            prepared.compose_path,
-            prepared.observation_artifact,
-            overlay_path=prepared.overlay_relative,
-        )
+        if startup_plan is None:
+            after = await collect_observation(
+                provider,
+                sandbox_id,
+                prepared.compose_path,
+                prepared.observation_artifact,
+                compatibility_overlay_path=prepared.compatibility_overlay_relative,
+                overlay_path=prepared.overlay_relative,
+            )
+        else:
+            after = await _collect_observation_with_evidence(
+                provider,
+                sandbox_id,
+                prepared.compose_path,
+                prepared.observation_artifact,
+                compatibility_overlay_path=prepared.compatibility_overlay_relative,
+                overlay_path=prepared.overlay_relative,
+                evidence_path=prepared.observation_evidence,
+                env=prepared.env,
+                unset_env_keys=startup_plan.all_source_key_names,
+                project_directory=".",
+            )
     except CleanupError:
         raise
     except DockerSbxError as error:

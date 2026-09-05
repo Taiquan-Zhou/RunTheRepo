@@ -1,76 +1,191 @@
 # RepoTrial
 
-RepoTrial is an experimental deployment-trial and least-privilege validation tool
-for public GitHub Docker Compose web applications. It pins a repository commit,
-runs the workload through a disposable `SandboxProvider`, executes deterministic
-journeys, evaluates hardening mutations with KEEP/ROLLBACK semantics, and renders
-JSON/HTML evidence.
+RepoTrial trials an untrusted public GitHub Docker Compose web application at an
+exact commit inside a disposable Docker Sandbox. It boots the application,
+runs deterministic journeys, tests least-privilege mutations with
+KEEP/ROLLBACK semantics, writes JSON/HTML evidence, and attempts forced
+destruction of every sandbox. Cleanup is fail-closed when destruction cannot be
+verified.
 
 ## Current status
 
-M0–M7.4 and the M7.5 sandbox prerequisites are implemented locally. The latest
-recovered metric-bearing M7.5 canary covered repositories #1–#3, but did **not**
-meet its release gate:
+This branch is a demo-ready release candidate; it is not a published or tagged
+release. On execution HEAD
+`4c13b8b9521427b9491e0de8a9f77e64169754ac`, two representative public
+repositories completed the full URL -> exact SHA -> sandbox -> Compose ->
+journey -> report -> cleanup path:
 
-- canary success: `0/3` (required `>=2/3`);
-- healthy Boot + observer + report: `2/3`;
-- exact pinned SHA and cleanup: `3/3`;
-- repositories #4–#10: not run after the canary gate failed.
+| Repository | Pinned commit | Result | Run ID |
+| --- | --- | --- | --- |
+| changedetection.io | `5d9c7c6da76340597243e8163c4f2439237fa0e8` | `exit_code=0`; `completed` / `no_remaining_mutations`; `GET /` -> `200` assertion passed; JSON+HTML; create/destroy success; inventory empty | `f883cb75-405c-4f01-b99c-b30c0cb2c8d0` |
+| Listmonk | `670c01717d48647093335cc23a6be6f4b79c3b6b` | `exit_code=0`; `completed` / `consecutive_failures`; baseline `GET /` -> `200` assertion passed; JSON+HTML; create/destroy success; inventory empty | `df30728a-ab0a-4eec-b251-afd407400d71` |
 
-All `3/3` repositories produced no non-empty Journey set. Umami and Listmonk
-completed healthy Boot, observation, and report generation, but both ended with
-model `policy_rejected` and `0/0` Journeys. changedetection.io received a
-successful model response with an accepted empty Journey set, then timed out
-during bounded Compose startup before a final Boot verdict. These are failed Pilot
-results, not successful or safety claims. See
-[`docs/dev/pilot-report.md`](docs/dev/pilot-report.md) for the frozen cohort,
-attempt ledger, evidence references, and limitation analysis.
+Both runs exited with code 0, produced JSON and HTML reports, and recorded
+successful create/destroy lifecycle events for every created sandbox. The
+official `sbx list` was empty after each run. The Listmonk
+`consecutive_failures` stop reason is from rolled-back hardening candidates
+after the baseline Journey passed; it is not a baseline failure.
 
-`M7.5 PILOT COMPLETE — MVP LIMITATIONS IDENTIFIED`
+Fresh quality gates: `1794 passed, 11 skipped, 1 warning`; branch coverage is
+86.07% (`>=85%`). Ruff check, Ruff format (140 files), mypy (47 files), and
+pre-commit all-files pass. `uv lock --check`, `uv build` (sdist + wheel), a
+fresh wheel install, and `repotrial --help` smoke also pass.
 
-## Safety scope
+## Fastest supported setup
 
-- Target Compose workloads must execute only through a disposable sandbox
-  provider. There is no host Docker fallback.
-- Real production secrets, personal credentials, SSH keys, cloud tokens, and the
-  host Docker socket are not exposed to target workloads.
-- CPU, memory, disk, and host-side whole-trial duration bounds are applied by the
-  current Docker Sandboxes provider.
-- Docker Sandboxes v0.39.0 does not provide the frozen PID hard bound. Every Pilot
-  attempt discloses `pid_hard_bound_unsupported`; RepoTrial does not claim
-  fork-bomb/PID hard protection.
-- Reports describe only tested-journey/workload-conditioned hardened candidates.
-  They are not global safety or least-privilege proofs.
+The tested topology is Windows 11 -> dedicated Ubuntu 24.04 WSL2 distro ->
+official Linux Docker Sandboxes v0.39.0 -> disposable Linux sandbox. The
+checkout must be on the distro's ext4 filesystem. Target Compose workloads must
+never run through host Docker or Docker Desktop.
 
-## Supported execution
+Prerequisites:
 
-On the current Windows machine, the official Windows-hosted `sbx.exe` CLI/daemon
-v0.39.0 (`C:\Users\zztq\AppData\Local\DockerSandboxes\bin\sbx.exe`, invoked as
-`sbx.exe daemon start`) is healthy and was the actual execution path for the
-recovered M7.5 canary. `sbx diagnose` reported `12/12` PASS, with
-`WHvCapabilityCodeHypervisorPresent=true`; target workloads still run inside a
-disposable Linux sandbox. Earlier Windows/WSL recovery and calibration records are
-historical or alternative evidence only, and the WSL2 setup is not required for
-the current canary. This execution path does not claim a PID hard bound; the
-known `pid_hard_bound_unsupported` limitation remains disclosed.
+- WSL2 with systemd, nested KVM, and `/dev/kvm` available;
+- Docker Sandboxes v0.39.0 installed, authenticated, and running with the
+  reviewed default-deny network policy;
+- Git and network access to GitHub, the selected model endpoint, and required
+  container registries.
 
-RepoTrial never falls back to Windows Docker Desktop, a host Docker Engine, or
-host-side Compose. The [WSL2 Linux SBX setup guide](docs/dev/wsl2-linux-sbx-setup.md)
-and [accepted calibration evidence](docs/dev/pilot-evidence/wsl2-linux-sbx-calibration.md)
-are retained as alternative/historical reference material.
+Install `uv` directly if it is missing, then create the locked environment:
 
-## Development
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+cd /path/to/RepoTrial
+uv sync --locked --all-groups
+uv run playwright install chromium
+```
 
-Use the locked environment and run the repository gates:
+The complete one-time WSL/SBX setup, including the pinned SBX package hash and
+Playwright OS dependencies, is in
+[`docs/dev/wsl2-linux-sbx-setup.md`](docs/dev/wsl2-linux-sbx-setup.md).
+
+Before a real run, require a healthy runtime and empty inventory:
+
+```bash
+sbx version
+sbx diagnose --output json
+sbx policy ls --type network --json
+sbx list
+```
+
+Provide the model key only through the process environment. This prompt avoids
+putting the key in shell history or repository files:
+
+```bash
+read -rsp 'Model API key: ' REPOTRIAL_MODEL_API_KEY && echo
+export REPOTRIAL_MODEL_API_KEY
+```
+
+Run one commit-pinned, auditable trial. Replace every placeholder with values
+for the target repository; `--container-port` is the application's internal
+web port, not a random host port.
+
+```bash
+uv run repotrial inspect https://github.com/OWNER/REPOSITORY \
+  --provider docker-sbx \
+  --commit-sha 0123456789abcdef0123456789abcdef01234567 \
+  --container-port 8080 \
+  --compose-path docker-compose.yml \
+  --model-endpoint https://MODEL-ENDPOINT/v1 \
+  --model-name MODEL_NAME
+```
+
+RepoTrial prints a `run_id` and artifact directory. The primary outputs are:
 
 ```text
-uv sync --all-groups --locked
+artifacts/<run_id>/attempt-result.json
+artifacts/<run_id>/report/trial-report.json
+artifacts/<run_id>/report/trial-report.html
+artifacts/<run_id>/evidence/
+```
+
+A trustworthy successful run has matching `expected_sha` and
+`actual_verified_sha`, `exit_code: 0`, complete reports, successful lifecycle
+destroy events, and an empty `sbx list`. Inventory emptiness alone is not proof
+that cleanup succeeded.
+
+## Journey and model boundary
+
+An explicit repository Journey declaration may contain write methods; it remains
+subject to schema validation and deterministic verifiers. Autonomous model
+output is narrower: RepoTrial retains only evidence-supported `GET` journeys.
+External links, images, file paths, and generalized API prose do not authorize a
+route.
+
+When a configured model returns an empty proposal or policy-invalid output, no
+model-proposed request is executed; the fallback is fixed `GET /` with expected
+status `200`. Model transport failures, timeouts, or an unconfigured model can
+still end a run with `insufficient_coverage`; the recorded `stop_reason` is
+preserved.
+
+## Proxy networks (TUN optional; Rule or Global)
+
+TUN mode is not required. Windows Rule or Global mode is acceptable when WSL,
+the SBX daemon, the disposable sandbox, and the RepoTrial client all have the
+required connectivity. With WSL's default NAT networking, a Windows proxy
+listening on `localhost` is not automatically reachable inside WSL. Use the
+Windows host's WSL-reachable LAN/gateway IP and keep loopback in `NO_PROXY`:
+
+```bash
+export HTTP_PROXY='http://<windows-host-gateway-ip>:<port>'
+export HTTPS_PROXY="$HTTP_PROXY"
+export NO_PROXY='localhost,127.0.0.1'
+export http_proxy="$HTTP_PROXY"
+export https_proxy="$HTTPS_PROXY"
+export no_proxy="$NO_PROXY"
+```
+
+Docker Sandboxes has separate daemon and sandbox proxy settings; configure them
+during initial SBX setup as documented in the WSL guide. Do not inject the
+upstream proxy or its credentials into the untrusted target workload.
+
+## Troubleshooting
+
+- **GitHub, registry, JWKS, or `uv` downloads hang:** for clients that honor the
+  standard proxy variables, verify the proxy is reachable from WSL by its
+  gateway IP. Do not use `localhost` for a Windows proxy under WSL NAT.
+- **The model attempt records `transport_error`:** the model client does not
+  inherit `HTTP_PROXY` or `HTTPS_PROXY`. Verify direct or network-layer routing
+  (for example, an approved TUN/VPN route) from WSL to the configured endpoint,
+  or select an approved, directly reachable OpenAI-compatible
+  `--model-endpoint`. Never put model credentials in the endpoint URL.
+- **`sbx diagnose` fails or `sbx list` is non-empty:** stop new trials, retain
+  the exact output and lifecycle evidence, and investigate the owned sandbox
+  ID. Do not hide the failure with reset/restart loops.
+- **No report is produced:** inspect `attempt-result.json`, then the referenced
+  evidence. The nonzero exit and `stop_reason` are intentional fail-closed
+  diagnostics.
+- **Boot cannot find the service:** verify the repository's Compose filename
+  and internal HTTP port, then pass the correct `--compose-path` and
+  `--container-port`.
+- **`/dev/kvm` or systemd is unavailable:** the host is unsupported; do not
+  bypass isolation or fall back to host Docker.
+
+## Safety scope and known limitation
+
+- Every real repository requires a full 40-character commit SHA; requested and
+  resolved SHAs are recorded.
+- Target workloads run only through `SandboxProvider` in disposable sandboxes;
+  there is no host Docker/Compose fallback. Cleanup is fail-closed: a cleanup
+  failure remains a failed run, and an empty inventory is not cleanup success.
+- CPU, memory, disk, and host-side total-duration bounds remain enforced by the
+  current provider path.
+- Docker Sandboxes v0.39.0 does not expose the required PID hard bound.
+  RepoTrial records `pid_hard_bound_unsupported` and does not claim fork-bomb
+  protection.
+- Model keys are supplied through the process environment only; never print or
+  record them.
+- Reports are tested-journey/workload-conditioned results, not proof that a
+  repository is globally safe or globally least-privileged.
+
+## Development gates
+
+```bash
+uv lock --check
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src/repotrial
-uv run pytest -q --cov=repotrial --cov-branch --cov-fail-under=85
+uv run pytest -q --cov=repotrial --cov-branch --cov-report=term-missing
+uvx pre-commit run --all-files
+uv build
 ```
-
-The real-repository Pilot requires a healthy, authenticated Docker Sandboxes
-daemon and exact manifest commit SHAs. Do not execute an untrusted target Compose
-directly on the host.

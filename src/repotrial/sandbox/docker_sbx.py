@@ -6,6 +6,8 @@ import json
 import math
 import os
 import re
+import shutil
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -84,6 +86,11 @@ _NETWORK_PROXIES = {
     "network",
     "browser-open",
 }
+_PROCESS_CLEANUP_UNCONFIRMED_NOTE_PREFIX = "process cleanup unconfirmed:"
+_ANONYMOUS_CONFIG_RETAINED_NOTE = (
+    "anonymous Docker config retained because process cleanup is unconfirmed"
+)
+_ANONYMOUS_CONFIG_CLEANUP_FAILED_NOTE = "anonymous Docker config cleanup failed"
 
 MANDATORY_DENY_NETWORK = frozenset(
     {
@@ -334,6 +341,21 @@ class DockerSbxProvider(SandboxProvider):
         )
         if await self._host_head(resolved_workspace, deadline) != host_head:
             raise DockerSbxError("clone_verification", "host_head_changed")
+        try:
+            docker_config = Path(tempfile.mkdtemp(prefix="repotrial-docker-config-"))
+        except OSError as error:
+            raise DockerSbxError(
+                "create",
+                "anonymous_config_io",
+                failure_evidence=self._command_failure_evidence(
+                    "create",
+                    "anonymous_config_io",
+                    deadline=deadline,
+                    deadline_limited=False,
+                    subprocess_started=False,
+                    sandbox_id=None,
+                ),
+            ) from error
         sandbox_id = _new_sandbox_id(name)
         self._sandbox_states[sandbox_id] = _SandboxState.PENDING
         arguments = [
@@ -350,15 +372,51 @@ class DockerSbxProvider(SandboxProvider):
             arguments.extend(("--deny-network", resource))
         arguments.extend(("shell", str(resolved_workspace)))
         try:
-            result = await self._run(
-                "create",
-                arguments,
-                self._command_timeout_s,
-                env=self._disk_environment(allocation),
-                deadline=deadline,
-                sandbox_id=sandbox_id,
-            )
-            _require_success("create", result)
+            create_error: DockerSbxError | asyncio.CancelledError | None = None
+            try:
+                create_environment = self._disk_environment(allocation)
+                create_environment.pop("DOCKER_AUTH_CONFIG", None)
+                create_environment.pop("REGISTRY_AUTH_FILE", None)
+                create_environment["DOCKER_CONFIG"] = str(docker_config)
+                result = await self._run(
+                    "create",
+                    arguments,
+                    self._command_timeout_s,
+                    env=create_environment,
+                    deadline=deadline,
+                    sandbox_id=sandbox_id,
+                )
+                _require_success("create", result)
+            except (DockerSbxError, asyncio.CancelledError) as error:
+                create_error = error
+                raise
+            finally:
+                if create_error is not None and _process_cleanup_unconfirmed(
+                    create_error
+                ):
+                    create_error.add_note(_ANONYMOUS_CONFIG_RETAINED_NOTE)
+                else:
+                    try:
+                        shutil.rmtree(docker_config)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as error:
+                        if create_error is not None:
+                            create_error.add_note(_ANONYMOUS_CONFIG_CLEANUP_FAILED_NOTE)
+                        else:
+                            raise DockerSbxError(
+                                "create",
+                                "anonymous_config_cleanup",
+                                sandbox_id=sandbox_id,
+                                failure_evidence=self._command_failure_evidence(
+                                    "create",
+                                    "anonymous_config_cleanup",
+                                    deadline=deadline,
+                                    deadline_limited=False,
+                                    subprocess_started=True,
+                                    sandbox_id=sandbox_id,
+                                ),
+                            ) from error
             await self._verify_guest_clone(
                 sandbox_id,
                 host_head,
@@ -863,7 +921,8 @@ class DockerSbxProvider(SandboxProvider):
             self._command_timeout_s,
             sandbox_id=sandbox_id,
         )
-        _require_success(operation, result)
+        if result.returncode != 0 and not _is_exact_sandbox_absence(result, sandbox_id):
+            _require_success(operation, result)
         self._sandbox_states[sandbox_id] = _SandboxState.CLEANED
         self._sandbox_deadlines.pop(sandbox_id, None)
         self._network_log_sandboxes.discard(sandbox_id)
@@ -1429,6 +1488,26 @@ def _require_success(operation: str, result: _CommandResult) -> None:
         )
 
 
+def _is_exact_sandbox_absence(result: _CommandResult, sandbox_id: str) -> bool:
+    if result.stdout != b"":
+        return False
+    exact_error = (
+        f"Error: sandbox \x27{sandbox_id}\x27 not found "
+        "(run \x27sbx ls\x27 to see your sandboxes)"
+    ).encode()
+    warning = (
+        b"WARN: could not acquire docker hub refresh lock, proceeding without "
+        b"cross-process lock: context deadline exceeded"
+    )
+    allowed_stderr = (
+        exact_error,
+        exact_error + b"\n",
+        warning + b"\n" + exact_error,
+        warning + b"\n" + exact_error + b"\n",
+    )
+    return result.stderr in allowed_stderr
+
+
 def _has_token(output: bytes, token: str) -> bool:
     try:
         decoded = output.decode("utf-8")
@@ -1723,6 +1802,15 @@ def _new_sandbox_id(name: str) -> str:
     if not safe_name:
         safe_name = "trial"
     return f"repotrial-{safe_name}-{uuid.uuid4().hex[:12]}"
+
+
+def _process_cleanup_unconfirmed(error: BaseException) -> bool:
+    if isinstance(error, DockerSbxError):
+        return error.reason == "process_cleanup_unconfirmed"
+    return any(
+        note.startswith(_PROCESS_CLEANUP_UNCONFIRMED_NOTE_PREFIX)
+        for note in getattr(error, "__notes__", ())
+    )
 
 
 def _parse_published_port(output: bytes, container_port: int) -> int:

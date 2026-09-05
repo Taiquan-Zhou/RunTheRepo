@@ -143,6 +143,19 @@ def _http_journey(path: str = "/health") -> dict[str, object]:
     return {"journey_id": "health", "name": "Health", "steps": [_http_step(path)]}
 
 
+def _http_journey_with_method(
+    path: str, method: str, *, journey_id: str = "health"
+) -> dict[str, object]:
+    journey = _http_journey(path)
+    journey["journey_id"] = journey_id
+    step = journey["steps"][0]
+    assert isinstance(step, dict)
+    params = step["params"]
+    assert isinstance(params, dict)
+    params["method"] = method
+    return journey
+
+
 def _journey_with_json_body(body: object) -> dict[str, object]:
     journey = _http_journey()
     journey["steps"] = [_http_step()]
@@ -245,7 +258,7 @@ def test_readme_images_and_encoded_command_text_do_not_block_model_fallback(
         model,
     )
 
-    assert [journey.steps[0].params["path"] for journey in journeys] == ["/from-model"]
+    assert [journey.steps[0].params["path"] for journey in journeys] == ["/"]
     assert model.calls == 1
 
 
@@ -303,14 +316,14 @@ def test_readme_links_and_loopback_urls_preserve_order_and_dedupe(
         "http://localhost/curl%20https%3A%2F%2Fevil.example",
     ],
 )
-def test_unsafe_or_non_root_loopback_urls_fall_back_to_model(
+def test_unsafe_or_non_root_loopback_urls_fall_back_to_root(
     tmp_path: Path, url: str
 ) -> None:
     model = FakeModelAdapter([_http_journey("/from-model")])
 
     journeys = _plan(tmp_path, url, model)
 
-    assert [journey.steps[0].params["path"] for journey in journeys] == ["/from-model"]
+    assert [journey.steps[0].params["path"] for journey in journeys] == ["/"]
     assert model.calls == 1
 
 
@@ -346,7 +359,7 @@ def test_loopback_authority_suffixes_do_not_prefix_match(
 
     journeys = _plan(tmp_path, url, model)
 
-    assert [journey.steps[0].params["path"] for journey in journeys] == ["/from-model"]
+    assert [journey.steps[0].params["path"] for journey in journeys] == ["/"]
     assert model.calls == 1
 
 
@@ -368,7 +381,7 @@ def test_nested_http_tokens_do_not_expose_loopback_url(
 
     journeys = _plan(tmp_path, readme, model)
 
-    assert [journey.steps[0].params["path"] for journey in journeys] == ["/from-model"]
+    assert [journey.steps[0].params["path"] for journey in journeys] == ["/"]
     assert model.calls == 1
 
 
@@ -427,7 +440,7 @@ def test_markdown_image_destinations_do_not_become_plain_loopback_journeys(
 
     journeys = _plan(tmp_path, readme, model)
 
-    assert [journey.steps[0].params["path"] for journey in journeys] == ["/from-model"]
+    assert [journey.steps[0].params["path"] for journey in journeys] == ["/"]
     assert model.calls == 1
 
 
@@ -472,6 +485,126 @@ def test_loopback_root_urls_strip_only_safe_trailing_delimiters(
     assert model.calls == 0
 
 
+def test_external_absolute_url_does_not_evidence_its_local_path(
+    tmp_path: Path,
+) -> None:
+    model = FakeModelAdapter([_http_journey("/tutorials")])
+
+    journeys = _plan(tmp_path, "[Tutorials](https://example.test/tutorials)", model)
+
+    assert [
+        (
+            journey.steps[0].params["method"],
+            journey.steps[0].params["path"],
+            journey.steps[0].assertions[0].expected,
+        )
+        for journey in journeys
+    ] == [("GET", "/", 200)]
+    assert model.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("readme", "model_path"),
+    [
+        ("[External](https://example.test/?next=/admin)", "/admin"),
+        ("[External](https://example.test/#/admin)", "/admin"),
+        ('![shot](/admin "preview")', "/admin"),
+        ("Mount /var/lib/app...", "/var/lib/app..."),
+        ("Run " + chr(96) + "cat /admin" + chr(96), "/admin"),
+    ],
+)
+def test_unstructured_readme_paths_do_not_authorize_model_routes(
+    tmp_path: Path, readme: str, model_path: str
+) -> None:
+    model = FakeModelAdapter([_http_journey(model_path)])
+
+    journeys = _plan(tmp_path, readme, model)
+
+    assert [journey.steps[0].params["path"] for journey in journeys] == ["/"]
+    assert model.calls == 1
+
+
+def test_api_prose_does_not_evidence_a_guessed_api_endpoint(
+    tmp_path: Path,
+) -> None:
+    model = FakeModelAdapter([_http_journey("/api/v1/watch")])
+
+    journeys = _plan(tmp_path, "This app supports an API for watching media.", model)
+
+    assert [journey.steps[0].params["path"] for journey in journeys] == ["/"]
+    assert model.calls == 1
+
+
+def test_model_post_and_delete_journeys_are_excluded(
+    tmp_path: Path,
+) -> None:
+    proposed_post = _http_journey_with_method("/create", "POST", journey_id="create")
+    proposed_delete = _http_journey_with_method(
+        "/delete", "DELETE", journey_id="delete"
+    )
+    proposed_root = _http_journey_with_method("/", "GET", journey_id="root-model")
+    model = FakeModelAdapter([proposed_post, proposed_delete, proposed_root])
+
+    journeys = _plan(tmp_path, "", model)
+
+    assert [journey.journey_id for journey in journeys] == ["root-model"]
+    assert journeys[0].steps[0].params["method"] == "GET"
+
+
+def test_explicit_root_relative_readme_path_can_retain_model_get_journey(
+    tmp_path: Path,
+) -> None:
+    model = FakeModelAdapter(
+        [
+            _http_journey_with_method("/watch", "GET", journey_id="watch-model"),
+            _http_journey_with_method("/invented", "GET", journey_id="invented-model"),
+        ]
+    )
+
+    journeys = _plan(tmp_path, "The documented same-app route is `/watch`.", model)
+
+    assert [journey.journey_id for journey in journeys] == ["watch-model"]
+    assert journeys[0].steps[0].params["path"] == "/watch"
+    assert journeys[0].steps[0].params["method"] == "GET"
+    assert model.calls == 1
+
+
+def test_empty_trusted_model_result_falls_back_to_root_get_journey(
+    tmp_path: Path,
+) -> None:
+    model = FakeModelAdapter([])
+
+    journeys = _plan(tmp_path, "No explicit application route is documented.", model)
+
+    assert [
+        (
+            journey.steps[0].params["method"],
+            journey.steps[0].params["path"],
+            journey.steps[0].assertions[0].expected,
+        )
+        for journey in journeys
+    ] == [("GET", "/", 200)]
+    assert model.calls == 1
+
+
+def test_declared_journeys_preserve_non_get_methods(
+    tmp_path: Path,
+) -> None:
+    declared = _http_journey_with_method(
+        "/create", "POST", journey_id="declared-create"
+    )
+    (tmp_path / "repotrial.journeys.json").write_text(
+        json.dumps({"journeys": [declared]}), encoding="utf-8"
+    )
+    model = FakeModelAdapter([_http_journey("/model")])
+
+    journeys = _plan(tmp_path, "", model)
+
+    assert [journey.journey_id for journey in journeys] == ["declared-create"]
+    assert journeys[0].steps[0].params == {"method": "POST", "path": "/create"}
+    assert model.calls == 0
+
+
 def test_valid_model_output_is_materialized_only_when_other_sources_are_empty(
     tmp_path: Path,
 ) -> None:
@@ -479,7 +612,7 @@ def test_valid_model_output_is_materialized_only_when_other_sources_are_empty(
 
     journeys = _plan(tmp_path, "no safe markdown links", model)
 
-    assert journeys[0].steps[0].params["path"] == "/from-model"
+    assert journeys[0].steps[0].params["path"] == "/"
     assert model.calls == 1
     assert "no safe markdown links" in model.user
 
@@ -489,27 +622,7 @@ def test_model_response_after_former_planner_deadline_is_accepted(
 ) -> None:
     journeys = asyncio.run(plan_journeys(tmp_path, "", DelayedJourneyModelAdapter()))
 
-    assert journeys == [
-        Journey(
-            journey_id="health",
-            name="Health",
-            steps=[
-                JourneyStep(
-                    step_id="request-health",
-                    tool="http",
-                    action="request",
-                    params={"method": "GET", "path": "/health"},
-                    assertions=[
-                        JourneyAssertion(
-                            kind="status_code",
-                            target="response.status",
-                            expected=200,
-                        )
-                    ],
-                )
-            ],
-        )
-    ]
+    assert journeys == [planner_module._minimal_get_journey(1, "/")]
 
 
 def test_planner_outer_model_deadline_includes_adapter_cleanup_margin() -> None:
@@ -519,12 +632,14 @@ def test_planner_outer_model_deadline_includes_adapter_cleanup_margin() -> None:
 def test_model_prompt_advertises_only_executable_http_journeys(tmp_path: Path) -> None:
     model = FakeModelAdapter([])
 
-    assert _plan(tmp_path, model=model) == []
+    assert _plan(tmp_path, model=model) == [planner_module._minimal_get_journey(1, "/")]
 
     expected_matrix = """Supported autonomous Journey tools (this list grants no additional authority):
 - Return at most 5 journeys. Each journey uses exactly one tool type and contains 1-8 steps.
 - journey_id, name, and every step_id are non-empty, at most 4096 characters, and contain no Unicode category-C characters.
-- Autonomous model proposals may use only the currently executable HTTP tool/action pair: tool http with action request. Its params contain method GET|POST|DELETE, a root-relative path, and optional bounded JSON json. HTTP paths are ASCII, at most 2048 characters, begin with exactly one /, and contain no fragment, backslash, dot segment, unsafe decoded segment, or unsafe query character.
+- Autonomous model proposals may use only the currently executable HTTP tool/action pair: tool http with action request. Its params contain method GET only, a root-relative path, and optional bounded JSON json. HTTP paths are ASCII, at most 2048 characters, begin with exactly one /, and contain no fragment, backslash, dot segment, unsafe decoded segment, or unsafe query character.
+- The root path / is always the basic deployment journey. Retain a non-root path only when README_EXCERPT explicitly contains the same-app root-relative link or path; external absolute URLs and generic prose are not evidence.
+- Never propose POST or DELETE journeys; they are not retained from autonomous output.
 - HTTP assertions are exactly: status_code on response.status with an integer expected; text_contains on response.text with a text expected; or json_path_equals on a dotted response-JSON path with bounded JSON expected. An HTTP journey has at least one assertion across its steps.
 - No other tool type is executable for autonomous model proposals."""
     assert expected_matrix in model.system
@@ -562,6 +677,37 @@ def test_model_journey_failure_records_the_adapter_reason_without_changing_fail_
     assert rows[-1]["outcome"] == "transport_error"
 
 
+def test_invalid_structured_model_response_falls_back_with_policy_evidence(
+    tmp_path: Path,
+) -> None:
+    class InvalidStructuredAdapter:
+        async def structured(
+            self, *, system: str, user: str, schema: type[BaseModel]
+        ) -> BaseModel:
+            del system, user, schema
+            raise ModelAdapterError(
+                "invalid structured response",
+                reason_code="structured_response_invalid",
+            )
+
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+
+    journeys = asyncio.run(
+        planner_module._plan_journeys_with_evidence(
+            tmp_path,
+            "no safe markdown links",
+            InvalidStructuredAdapter(),
+            evidence_dir=evidence_dir,
+        )
+    )
+
+    assert journeys == [planner_module._minimal_get_journey(1, "/")]
+    evidence_path = next(evidence_dir.glob("baseline-model-attempt-*.jsonl"))
+    rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    assert rows[-1]["outcome"] == "policy_rejected"
+
+
 def test_model_journey_policy_rejection_is_recorded_without_raw_model_output(
     tmp_path: Path,
 ) -> None:
@@ -594,7 +740,7 @@ def test_model_journey_policy_rejection_is_recorded_without_raw_model_output(
         )
     )
 
-    assert journeys == []
+    assert journeys == [planner_module._minimal_get_journey(1, "/")]
     evidence_path = next(evidence_dir.glob("baseline-model-attempt-*.jsonl"))
     content = evidence_path.read_text(encoding="utf-8")
     assert json.loads(content.splitlines()[-1])["outcome"] == "policy_rejected"
@@ -616,7 +762,7 @@ def test_empty_model_journey_proposal_is_policy_rejected_with_evidence(
         )
     )
 
-    assert journeys == []
+    assert journeys == [planner_module._minimal_get_journey(1, "/")]
     evidence_path = next(evidence_dir.glob("baseline-model-attempt-*.jsonl"))
     rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
     assert rows[-1]["phase"] == "terminal"
@@ -651,7 +797,7 @@ def test_model_proposal_with_http_and_browser_journeys_is_rejected_as_a_whole(
         )
     )
 
-    assert journeys == []
+    assert journeys == [planner_module._minimal_get_journey(1, "/")]
     evidence_path = next(evidence_dir.glob("baseline-model-attempt-*.jsonl"))
     rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
     assert rows[-1]["phase"] == "terminal"
@@ -761,7 +907,9 @@ def test_mixed_tool_model_journey_is_rejected(tmp_path: Path) -> None:
         }
     )
 
-    assert _plan(tmp_path, model=FakeModelAdapter([proposed])) == []
+    assert _plan(tmp_path, model=FakeModelAdapter([proposed])) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 @pytest.mark.parametrize(
@@ -786,7 +934,9 @@ def test_mixed_tool_model_journey_is_rejected(tmp_path: Path) -> None:
 def test_model_journeys_without_a_deterministic_success_condition_are_rejected(
     tmp_path: Path, proposed: dict[str, object]
 ) -> None:
-    assert _plan(tmp_path, model=FakeModelAdapter([proposed])) == []
+    assert _plan(tmp_path, model=FakeModelAdapter([proposed])) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 def test_declared_browser_journey_uses_its_bounded_action_dsl_without_step_assertions(
@@ -825,20 +975,20 @@ def test_declared_browser_journey_uses_its_bounded_action_dsl_without_step_asser
     ]
 
 
-def test_model_browser_journey_is_policy_rejected_with_evidence(
+def test_structurally_valid_browser_model_journey_falls_back_with_policy_evidence(
     tmp_path: Path,
 ) -> None:
     evidence_dir = tmp_path / "evidence"
     evidence_dir.mkdir()
     proposed = {
         "journey_id": "browser-model",
-        "name": "Browser model proposal",
+        "name": "Browser model proposal browser-secret",
         "steps": [
             {
                 "step_id": "goto",
                 "tool": "browser",
                 "action": "goto",
-                "params": {"path": "/"},
+                "params": {"path": "/browser-secret"},
                 "assertions": [],
             }
         ],
@@ -853,10 +1003,11 @@ def test_model_browser_journey_is_policy_rejected_with_evidence(
         )
     )
 
-    assert journeys == []
+    assert journeys == [planner_module._minimal_get_journey(1, "/")]
     evidence_path = next(evidence_dir.glob("baseline-model-attempt-*.jsonl"))
     rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
     assert rows[-1]["outcome"] == "policy_rejected"
+    assert "browser-secret" not in evidence_path.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
@@ -892,7 +1043,7 @@ def test_model_shell_javascript_and_unknown_actions_are_rejected(
         [{"journey_id": "unsafe", "name": "Unsafe", "steps": [step]}]
     )
 
-    assert _plan(tmp_path, model=model) == []
+    assert _plan(tmp_path, model=model) == [planner_module._minimal_get_journey(1, "/")]
     assert model.calls == 1
 
 
@@ -903,8 +1054,12 @@ def test_planner_rejects_output_exceeding_journey_or_step_limits(
     too_many_steps = _http_journey()
     too_many_steps["steps"] = [_http_step(f"/{index}") for index in range(9)]
 
-    assert _plan(tmp_path, model=FakeModelAdapter(too_many_journeys)) == []
-    assert _plan(tmp_path, model=FakeModelAdapter([too_many_steps])) == []
+    assert _plan(tmp_path, model=FakeModelAdapter(too_many_journeys)) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
+    assert _plan(tmp_path, model=FakeModelAdapter([too_many_steps])) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 @pytest.mark.parametrize(
@@ -962,7 +1117,9 @@ def test_planner_rejects_output_exceeding_journey_or_step_limits(
 def test_model_output_with_invalid_params_assertions_or_schema_is_rejected(
     tmp_path: Path, journey: dict[str, object]
 ) -> None:
-    assert _plan(tmp_path, model=FakeModelAdapter([journey])) == []
+    assert _plan(tmp_path, model=FakeModelAdapter([journey])) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 def test_browser_goto_query_is_rejected_to_match_runner_policy(tmp_path: Path) -> None:
@@ -984,7 +1141,7 @@ def test_browser_goto_query_is_rejected_to_match_runner_policy(tmp_path: Path) -
         ]
     )
 
-    assert _plan(tmp_path, model=model) == []
+    assert _plan(tmp_path, model=model) == [planner_module._minimal_get_journey(1, "/")]
 
 
 def test_oversized_readme_is_rejected_before_model_invocation(tmp_path: Path) -> None:
@@ -1072,7 +1229,7 @@ def test_deep_declaration_json_is_normalized_to_fixed_value_error(
 def test_deep_model_json_fails_closed_without_recursion_error(tmp_path: Path) -> None:
     model = FakeModelAdapter([_journey_with_json_body(_nested_json(1_500))])
 
-    assert _plan(tmp_path, model=model) == []
+    assert _plan(tmp_path, model=model) == [planner_module._minimal_get_journey(1, "/")]
 
 
 def test_json_body_depth_boundary_is_exact(tmp_path: Path) -> None:
@@ -1080,7 +1237,9 @@ def test_json_body_depth_boundary_is_exact(tmp_path: Path) -> None:
     above_limit = FakeModelAdapter([_journey_with_json_body(_nested_json(17))])
 
     assert _plan(tmp_path, model=at_limit)
-    assert _plan(tmp_path, model=above_limit) == []
+    assert _plan(tmp_path, model=above_limit) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 def test_json_body_node_and_container_boundaries_are_exact(tmp_path: Path) -> None:
@@ -1094,9 +1253,13 @@ def test_json_body_node_and_container_boundaries_are_exact(tmp_path: Path) -> No
     )
 
     assert _plan(tmp_path, model=at_container_limit)
-    assert _plan(tmp_path, model=above_container_limit) == []
+    assert _plan(tmp_path, model=above_container_limit) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
     assert _plan(tmp_path, model=at_node_limit)
-    assert _plan(tmp_path, model=above_node_limit) == []
+    assert _plan(tmp_path, model=above_node_limit) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 def test_json_body_aggregate_content_boundary_is_exact(tmp_path: Path) -> None:
@@ -1104,7 +1267,9 @@ def test_json_body_aggregate_content_boundary_is_exact(tmp_path: Path) -> None:
     above_limit = FakeModelAdapter([_journey_with_json_body(["x" * 4_096] * 4 + ["x"])])
 
     assert _plan(tmp_path, model=at_limit)
-    assert _plan(tmp_path, model=above_limit) == []
+    assert _plan(tmp_path, model=above_limit) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 def test_model_schema_has_strict_nested_journey_and_step_definitions(
@@ -1112,7 +1277,7 @@ def test_model_schema_has_strict_nested_journey_and_step_definitions(
 ) -> None:
     model = FakeModelAdapter([])
 
-    assert _plan(tmp_path, model=model) == []
+    assert _plan(tmp_path, model=model) == [planner_module._minimal_get_journey(1, "/")]
     assert model.schema is not None
     schema = model.schema
     journey_items = schema.model_json_schema()["properties"]["journeys"]["items"]
@@ -1135,7 +1300,7 @@ def test_model_schema_has_strict_nested_journey_and_step_definitions(
 def test_model_schema_exposes_transport_collection_bounds(tmp_path: Path) -> None:
     model = FakeModelAdapter([])
 
-    assert _plan(tmp_path, model=model) == []
+    assert _plan(tmp_path, model=model) == [planner_module._minimal_get_journey(1, "/")]
     assert model.schema is not None
     schema = model.schema.model_json_schema()
     definitions = schema["$defs"]
@@ -1178,7 +1343,9 @@ def test_over_limit_journeys_are_rejected_before_later_values_are_accessed(
         journeys=[valid_journey] * 5 + [exploding_journey]
     )
 
-    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == []
+    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 @pytest.mark.parametrize("over_limit", ["steps", "assertions", "params"])
@@ -1213,7 +1380,9 @@ def test_nested_transport_collection_limits_fail_closed(
     )
     proposal = planner_module._JourneyProposal.model_construct(journeys=[journey])
 
-    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == []
+    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 def test_model_construct_bypass_is_revalidated_before_materialization() -> None:
@@ -1266,7 +1435,9 @@ def test_nested_model_construct_bypass_fails_closed(
     journey = planner_module._JourneyTransport.model_construct(**journey_values)
     proposal = planner_module._JourneyProposal.model_construct(journeys=[journey])
 
-    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == []
+    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 @pytest.mark.parametrize("extra_on", ["proposal", "journey", "step", "assertion"])
@@ -1295,7 +1466,9 @@ def test_nested_model_construct_extra_fields_fail_closed(
         extra_on
     ].__dict__["unexpected"] = {"tool": "shell"}
 
-    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == []
+    assert _plan(tmp_path, model=ExactProposalModelAdapter(proposal)) == [
+        planner_module._minimal_get_journey(1, "/")
+    ]
 
 
 def test_model_timeout_fails_closed_and_cancels_inner_task(

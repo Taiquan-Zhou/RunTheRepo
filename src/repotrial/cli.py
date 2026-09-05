@@ -60,7 +60,7 @@ _DEFAULT_DOCKER_SBX_POLICY = DockerSbxPolicy(
     cpus=1,
     memory_mb=1024,
     pids_limit=64,
-    disk_mb=2048,
+    disk_mb=8192,
     total_duration_s=900,
 )
 
@@ -71,7 +71,10 @@ def create_app(
     provider_factory: ProviderFactory | None = None,
     model: ModelAdapter | None = None,
 ) -> typer.Typer:
-    app = typer.Typer()
+    # Keep validation errors readable in captured and non-interactive output.
+    # Typer forces Rich terminal rendering in GitHub Actions, where narrow
+    # capture widths can crop the actual error message to an ellipsis.
+    app = typer.Typer(rich_markup_mode=None)
 
     @app.command()
     def doctor() -> None:

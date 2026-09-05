@@ -239,6 +239,25 @@
 
 **M7.5 COMPATIBILITY CANARY FAILED**
 
+## M7.5 Task 2 - RG1 Docker-data capacity calibration
+
+- Controller completed the bounded RG1 diagnostic at `4096 MiB` and
+  `8192 MiB` for the exact Uptime Kuma and n8n pinned repositories, strictly
+  serially, using the reviewed diagnostic runner.
+- Uptime Kuma booted at both capacities but had insufficient Journey
+  coverage. n8n retained Docker-data `no space left on device` during 4096 MiB
+  extraction and timed out during the 8192 MiB bounded run. All four runs
+  cleaned up successfully and ended with empty sandbox inventory.
+- Evidence and runner commit: `032e4d9` (`docs: record M7.5 RG1 disk capacity
+  calibration`).
+- Evidence field completion commit: `813733a` (per-run UTC intervals, exact
+  argv, R/D/W allocations, observed admission/after df+du, explicit
+  `not_observed` markers for guest/peak samples, numeric reserve calculation).
+- Gate: `RG1_CAPACITY_GATE=FAIL no_common_bounded_total_through_8192`.
+  The default `2048 MiB` policy and public CLI/API remain unchanged; no RG1
+  policy design was created. Implementer/reviewer relay failures are recorded
+  as process deviations, not as task approval.
+
 ## M7.5 recovered metric-bearing canary — latest status
 
 This section supersedes the older `M7.5 environment recovery — WSL2 Linux Docker
@@ -474,4 +493,424 @@ Full current-epoch evidence and run IDs are recorded in
 [`pilot-report.md`](pilot-report.md) and
 [`pilot-evidence/m7.5-compatibility-diagnostic.md`](pilot-evidence/m7.5-compatibility-diagnostic.md).
 
+## M7.5 release-gap closure - Task 1 status
+
+- Implementation base: `b19dd13f632255caeee7338d773f84a4b3eef97e`; clean ext4 worktree established at `/home/repotrial/src/RepoTrial-m7.5-release-gap`.
+- Result: `ENVIRONMENT_BLOCKED`. Ubuntu/WSL/ext4/SBX versions and frozen manifest hash match, and official SBX inventory is empty; locked quality gates pass except Ruff format on the approved plan Markdown, and trusted calibration returned `2 passed / 1 failed`.
+- `uv 0.11.5` was taken from the task-local Linux tool path; both model variables were SET. No real repositories were run, and no Windows `.venv`, target Compose, or production code was touched.
+- Exact non-secret fingerprints and the blocking command matrix are recorded in [`pilot-evidence/m7.5-release-gap-closure.md`](pilot-evidence/m7.5-release-gap-closure.md).
+
 **M7.5 PILOT COMPLETE — MVP LIMITATIONS IDENTIFIED**
+
+## M7.5 release-gap closure - Task 1 corrected rerun/ruling (append-only)
+
+- task_id: `Task 1`; BASE_SHA:
+  `b19dd13f632255caeee7338d773f84a4b3eef97e`; HEAD_SHA:
+  `ece0b206dd42151b1c84c07a7177c3cfa92bb78b`; corrected rerun parent:
+  `ece0b206dd42151b1c84c07a7177c3cfa92bb78b`.
+- changed_files: evidence ledger, this status append, and ignored Task 1 report
+  artifact only; production source, tests, manifest, README, target Compose,
+  and real repositories unchanged.
+- Result remains `ENVIRONMENT_BLOCKED`. Python `/usr/bin/python3.12` is
+  `3.12.3`; guest Compose fingerprint is `v5.5.0`; immutable global network
+  policy fingerprint is
+  `e745ff8da1066eba64b0bbf7865ff91a308b0b216f81c5c375091e0a13b46d8b`.
+  Current `free -m` is Mem `7804/724/6794/3/480/7079`, Swap
+  `2048/0/2048`; current state-volume `df -Pm` is `/dev/sdd`, total `120380`,
+  used `7430`, available `106791`, `7%` for `/`, `/home/repotrial`, and
+  `/home/repotrial/.local/state/sandboxes`.
+- Full gates: locked sync, Ruff lint, mypy, adjusted-PATH pytest
+  (`1519 passed, 6 skipped, 1 warning`), and adjusted-PATH branch coverage
+  (`87.29%`) passed; Ruff format failed on approved plan lines `274-307`;
+  initial default-PATH pytest failed to spawn `uv` (`1518 passed, 6 skipped,
+  1 failed`, exit `1`).
+- SBX/model: `sbx version` and current read-only diagnose (`12 passed`) passed;
+  `sbx list` was exactly empty; model variables were SET with
+  `public OpenAI-compatible` / `deepseek-v4-flash`; no secrets or daemon
+  lifecycle mutation.
+- Marker ruling: brief `REPOTRIAL_RUN_REAL_SBX=1` produced `3 skipped in
+  0.03s` (exit `0`), while code marker
+  `REPOTRIAL_RUN_WSL2_SBX_CALIBRATION=1` produced `1 failed, 2 passed in
+  397.58s` (exit `1`), failing
+  `test_wsl2_linux_sbx_timeout_calibration` with
+  `clone_verification failed: total_duration_exhausted` and a Docker Hub
+  refresh-lock deadline warning.
+- Review disposition: Important evidence omissions are addressed in the
+  append-only corrected report and ledger; historical attempts remain intact.
+  Known limitations and exact controller ruling are recorded in the Task 1
+  artifacts. Controller ruling: preserve evidence and stop before real
+  repositories; no release-readiness claim.
+
+## M7.5 release-gap closure - Task 1 proxy-causal rerun (append-only)
+
+- Parent HEAD `5c8265987fc85613f0247755b32ede3a5371570f`; production files
+  unchanged.
+- Root cause confirmed: host `sbx` Docker Hub refresh/network calls were
+  launched without the configured WSL proxy, causing refresh-lock waits and
+  consuming the calibration total-duration budget. Direct Docker Hub access
+  timed out without proxy; `172.24.64.1:7890` returned expected responses.
+- With `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` set to
+  `http://172.24.64.1:7890`, primary calibration passed (`1 passed, 2
+  deselected, 115.61s`) and the complete calibration passed (`3 passed,
+  270.40s`). SBX daemon remained healthy and inventory empty.
+- Controller ruling: retain the earlier no-proxy failure as historical
+  evidence; supported WSL calibration/canary execution must export the
+  configured proxy. No production retry/proxy behavior was added.
+
+## M7.5 release-gap closure - Task 1 final gate ruling (append-only)
+
+- Final reviewed controller HEAD: `ebaa984418addeeea55875308f9913d57fd293bb`.
+- Fresh Linux quality gates passed: locked sync, Ruff lint/format, mypy, and
+  full pytest (`1519 passed, 6 skipped, 1 warning`). SBX diagnose passed and
+  inventory is empty.
+- Proxy-backed trusted calibration passed all three tests (`3 passed in
+  270.40s`).
+- Independent review service returned HTTP `502/503` three times before a
+  report was produced; no reviewer success is claimed. Controller diff review
+  found no Critical/Important issue in the evidence-only append.
+- Ruling: Task 1 is accepted for execution under the explicit proxy-backed
+  WSL environment; the review-service outage remains a process deviation and
+  must be revisited before final integration. Continue to Task 2 without
+  production code changes.
+
+## M7.5 release-gap closure - RG1 superseding status (append-only; 2026-09-03)
+
+The prior Task 2 `RG1_CAPACITY_GATE=FAIL` interpretation is superseded by
+independent review of the retained raw evidence. At `4096 MiB`, Uptime Kuma
+crossed the capacity boundary while n8n hit Docker-data `ENOSPC`. At
+`8192 MiB`, both Uptime Kuma and n8n crossed image pull/extraction; n8n
+`Boot up`, `ps`, and `logs` each exited `0`. The later n8n
+`sandbox:exec:timeout` was a post-Boot `docker diff` observation failure: it
+cannot negate capacity, but the overall n8n trial still failed and is not
+autonomous success. The final capacity verdict is `PASS`.
+
+```text
+RG1_CAPACITY_GATE=PASS common_total_mib=8192
+DISK DEFAULT CHANGE PROPOSED - OWNER DECISION REQUIRED
+current_default_mib=2048
+proven_candidate_mib=8192
+state_volume_required_mib=10426
+maximum_supported_concurrent_target_sandboxes=1
+choices=retain-2048 | approve-global-proven-candidate | retain-2048-and-request-separate-per-run-design
+```
+
+The `10426 MiB` state-volume value is a conservative admission/reserve upper
+bound, not a live peak (`2234 MiB` measured state baseline plus `8192 MiB`
+selected total). Live peak state-volume usage, guest `df`, and independent
+fixed SBX overhead remain `not_observed`.
+
+Task 1 independent review is recorded as `content APPROVE`, while its
+historical review-service/process deviation is retained. Task 2's original
+review verdict was `CHANGES REQUESTED`; this evidence-only append corrects
+the erroneous interpretation only and still requires an independent review.
+No RG1 policy plan is created, and no CLI/API default is changed.
+
+## M7.5 release-gap closure - RG1 default policy and affected canary
+
+- Owner approved the common proven `8192 MiB` candidate. Implementation commit
+  `811fd25a5416433e3db587d71d4032ae66be3e40` changes only the CLI/API Docker
+  SBX default and their two unit assertions from `2048` to `8192`; provider,
+  allocator, public interfaces, frozen manifest, and README are unchanged.
+- RED proved both old entry points still emitted `2048`; GREEN passed the
+  focused pair, both complete entry-point unit files (`128 passed`), explicit
+  policy/allocation/environment checks, Ruff lint/format, mypy, full pytest
+  (`1519 passed, 6 skipped`), and branch coverage (`87.29%`).
+- Same execution HEAD affected canary ran strictly serially. Uptime Kuma run
+  `05c34388-3da0-4c10-8951-09cf3904c626` passed exact SHA, Boot, Observer,
+  report, and cleanup, but its single Journey received `302` rather than
+  expected `200`; stop reason `insufficient_coverage`.
+- n8n run `41332b89-9090-4e61-8036-1f59dfdcd6ec` passed exact SHA and Boot,
+  then retained a post-Boot Observer `diff` per-command timeout with about
+  `665s` of whole-trial budget remaining; no report was produced. Cleanup
+  succeeded and final inventory was empty.
+- RG1 default/capacity objective is verified, but same-HEAD autonomous recovery
+  is `0/2`. Uptime redirect verification and n8n Observer timeout are separate
+  generic compatibility gaps for later bounded tasks. PID hard bound remains
+  unsupported/disclosed; no host fallback or daemon lifecycle command occurred.
+- Full append-only run facts and artifact hashes are in
+  [`pilot-evidence/m7.5-release-gap-closure.md`](pilot-evidence/m7.5-release-gap-closure.md).
+
+## M7.5 release-gap closure - RG4 timeout diagnosis (append-only; 2026-09-03)
+
+- Diagnostic HEAD `22af2736dd3cf24259f83372ab1c7b2942b72505`; no production,
+  manifest, README, provider, or frozen-contract change.
+- A pinned trusted slow-Compose fixture reproducibly crossed the current
+  `240s` Boot-operation boundary; the owned host child was killed/reaped and
+  cleanup succeeded. Instrumentation asserted the exact argv, actual `240s`
+  provider argument, `240.101603s` operation elapsed, negative child return
+  code, and output-unavailable status. The same fixture completed healthy in
+  `256.528070s` with a `300s` operation budget. Strengthened real diagnostic:
+  `2 passed in 573.72s`; final inventory empty.
+- Exact Wakapi run `b14277fb-2ec9-42b3-bceb-8162e322d70c` again reached
+  `sandbox:exec:timeout` with about `632.23s` of whole-trial budget remaining;
+  exact SHA and cleanup passed.
+- A bounded non-metric diagnostic of the same fixed Wakapi Compose-up category
+  returned in `333.088104s`, after pull/build/container start, rather than
+  hanging. Compose returned nonzero with Wakapi reported `unhealthy`; the
+  immediate follow-up state showed it `starting`. That later condition is not
+  reclassified or fixed by RG4.
+- Independent review requested changes: the timed-out Wakapi attempt lacks
+  exact host argv, child kill/reap, post-timeout Compose state, and partial
+  stdout, while the single bounded probe did not return success or prove a
+  repeatable successful interval. Ruling corrected to
+  `RG4_ENTRY_GATE=NOT_PROVEN`; no production timeout plan or implementation is
+  authorized. Continue the frozen sequence to RG5. Generic provider timeouts,
+  readiness semantics, retries, and repository-specific logic remain frozen.
+
+## M7.5 release-gap closure - RG5 clone diagnosis (append-only; 2026-09-03)
+
+- Diagnostic HEAD `bf230cf957bea0a1f6292749ed4f197c94378415`; no production,
+  provider, manifest, README, or frozen-contract change.
+- Exact Paperless run `285c7f1f-5a62-4f6e-855c-93909a8af82d` verified the
+  frozen SHA and passed clone verification. The former malformed/truncated
+  `guest_status_not_clean` evidence did not reproduce, so no deterministic
+  tracked-path or Git-configuration representation exists to normalize.
+- The attempt later failed Boot because `PAPERLESS_SECRET_KEY` was absent or
+  remained the default value; recovery then reached the existing `180s` model
+  timeout. Terminal result: `trial_failed` / `boot_recovery_stopped`, report
+  present, no experiment, cleanup success. Before any subsequent sandbox
+  creation, a timestamped official inventory check was persisted as exactly
+  empty.
+- Ruling: `RG5_ENTRY_GATE=FAIL`; no normalization plan or code change is
+  authorized. Preserve the later Boot/recovery failure separately and continue
+  the frozen sequence to RG6.
+
+## M7.5 release-gap closure - RG6 readiness diagnosis (2026-09-03)
+
+- Diagnostic HEAD `c975ad113466098d602f74f5f38af54e757fedfb`; no production,
+  provider, manifest, README, or frozen-contract change.
+- Final trusted fixture has no service host bind and passed the real two-window
+  diagnostic: the current 60-second path returned nonzero before `db` became
+  healthy at `80.970207s`; a fresh 120-second path returned zero at
+  `86.890421s` with both services healthy. Both sandboxes were destroyed and
+  final inventory was exactly empty.
+- The one frozen NetBox rerun, run
+  `1c794f9e-af12-4742-b2a2-8cc7eb0f80d3`, passed exact SHA but retained
+  `up=1`, `netbox=exited`, and `boot_recovery_stopped`. Its migration process
+  was killed before schema completion; no trusted kernel evidence narrows that
+  kill further. Other dependency services were running/healthy. Cleanup passed
+  and final inventory was exactly empty.
+- Ruling: `RG6_ENTRY_GATE=FAIL`. NetBox did not become healthy in the required
+  bounded interval and has migration/data-state evidence, so the frozen gate
+  does not authorize a readiness-window production change. Continue to RG2
+  startup-input diagnosis.
+
+## M7.5 release-gap closure - RG2 startup-input diagnosis (2026-09-03)
+
+- Diagnostic HEAD `0ff11abb7b01ceb0bde14e423cbca1a8b0a3ff16`; no production,
+  graph/state, provider, manifest, README, or frozen identity change.
+- Ten-case content-addressed fixture corpus passed `3/3` focused tests; its
+  oversized recipe independently reconstructs 65 assignments and 65,650 bytes.
+- Production-path guest inspection proved Linkding's required service-level
+  `.env` is absent, `.env.sample` is regular/non-linked/UTF-8/2090 bytes, its
+  target is confined to the verified clone, and all retained values classify
+  as local defaults without recording values. No guest file was created;
+  cleanup and empty inventory passed.
+- Exact run `5383344b-bcb7-4b2c-9cc0-ffffb8350d01` reproduced `.env not found`,
+  then safely stopped recovery; exact SHA and cleanup passed.
+- Ruling: `RG2_DIAGNOSTIC_GATE=PASS`, but implementation is
+  `BLOCKED_PENDING_OWNER_POLICY_DECISION`: every Linkding key starts `LD_`,
+  while the frozen deferred rule rejects all `LD_*`. The separate design now
+  offers either strict whole-template rejection or closed-prefix omission from
+  a guest-only file, with Compose interpolation explicitly validated. No
+  implementation plan or RED is authorized until the Owner chooses one.
+
+- Owner decision (2026-09-03): Option B approved. Proceed with a separate
+  RED-first implementation plan for closed-prefix omission in the guest file,
+  unchanged host-environment restrictions, and pre-Boot resolved-Compose
+  validation. No production implementation has yet been committed.
+
+## M7.5 release-gap closure - RG2 implementation status (2026-09-04)
+
+- Option B is implemented through execution HEAD
+  `0c7c44678d81b9889c683bde8aae8dcbf93b7553`: host planning, guest-only
+  `0600` materialization, closed control-key omission, resolved-Compose
+  validation, complete terminal evidence, and baseline/candidate identity
+  parity are present without changing frozen graph/state/public contracts.
+- A real SBX compatibility correction replaced the invalid fixed
+  `/workspace` assumption with a dynamically reported clone root that must be
+  absolute, normalized, non-root, and exactly equal to the guest Git top-level.
+- Trusted real-SBX verification on the final code snapshot passed `2/2` in
+  `248.42s`: pinned unprivileged fixture create -> materialize -> healthy Boot
+  on `8080` -> `echo ok` -> destroy. Evidence retained no values, target mode
+  was `0600`, and official inventory was empty before and after.
+- The sole valid frozen Linkding canary is run
+  `8f4b9f78-e1de-46d6-b1c2-98ffa464c232`. It stopped before checkout/sandbox
+  at `intake:clone_timeout` after `125.083775s`; exact SHA was requested but
+  not verified, no workload started, and final inventory was empty. It used
+  the public OpenAI-compatible DeepSeek endpoint class and model
+  `deepseek-v4-flash`; no credential is recorded. Therefore Linkding is not
+  recovered and the same-HEAD recovery count is unchanged.
+- Current ruling: generic startup-input materialization is proven in real SBX;
+  Linkding recovery remains unproven because intake did not reach the feature.
+  Continue the frozen release-gap sequence; do not claim the four-recovery
+  release gate from this result.
+- Independent focused review: APPROVED with zero Critical/Important findings.
+  Both Minor findings were closed before commit by rejecting Unicode `Cc`/`Cf`
+  characters in the dynamic root parser and recording the canary endpoint/model
+  attribution without credentials.
+- Final gates: focused `322 passed, 1 skipped`; full
+  `1629 passed, 9 skipped, 1 warning`; branch coverage `87.13%`; Ruff,
+  formatting, mypy, pre-commit, diff-check, secret-pattern scan, and final
+  empty SBX inventory all PASS.
+
+## M7.5 release-gap closure - RG3 loopback diagnosis (2026-09-04)
+
+- A pinned, unprivileged trusted fixture proved the specific boundary:
+  target-container and sandbox-guest loopback both passed;
+  `SandboxProvider.publish_port()` returned a host port, after which the fixed
+  host-loopback HTTP request was reset. Real-SBX fixture verification passed
+  and cleanup left official inventory exactly empty.
+- The one frozen changedetection.io diagnostic requested SHA
+  `5d9c7c6da76340597243e8163c4f2439237fa0e8` but stopped in the 120-second
+  production intake clone window before SHA verification, sandbox creation,
+  Boot, or any target probe. No target observation artifact exists.
+- Ruling: `RG3_ENTRY_GATE=NOT_PROVEN`, recovery increment `0`. The trusted
+  fixture result is not sufficient to infer the target result. No production
+  compatibility change or separate design is authorized; proceed to the
+  frozen same-HEAD Stage 1 recovery recomputation.
+- Independent review found that generic Provider failures and post-publication
+  HTTP failures needed distinct bounded classifications. A fake-provider RED
+  now proves deadline errors cannot match the topology signature; the trusted
+  fixture also verifies the exact marker and uses bounded, isolated Git setup.
+  The strengthened real-SBX fixture passed in `89.94s`, reproduced the same
+  observation hash, cleaned successfully, and left inventory empty. The RG3
+  ruling remains `NOT_PROVEN` because target probes were not observed.
+- A second independent review found that the default host HTTP client could
+  follow an untrusted redirect away from loopback. The diagnostic now forbids
+  redirects, accepts only a valid Provider host port, explicitly classifies
+  network errors, validates evidence before file creation, and requires the
+  full trusted topology signature. The final strengthened real fixture passed
+  in `79.39s` and cleaned to empty inventory. Production remains unchanged and
+  the target gate remains `NOT_PROVEN`.
+- Final code HEAD `edd7ad3eb76638e1f53f55358b6678fcd1d002d1`
+  treats every same-origin HTTP status as endpoint reachability while only
+  explicit transport failures may match the topology signature. Focused tests
+  are `9 passed, 2 skipped`; full pytest is `1638 passed, 11 skipped`, coverage
+  `87.13%`; Ruff, format, mypy, pre-commit, diff-check, SBX diagnose 12/12,
+  cleanup, and empty inventory pass. Final independent review remains pending.
+
+## M7.5 release-gap closure - Task 7/8 final ruling (2026-09-04)
+
+- Task 7 final independent review: `APPROVE`, zero Critical/Important findings,
+  for code HEAD `edd7ad3e` and evidence closure `b981cae7`; provenance is
+  retained in pilot evidence under reviewer task
+  `01a06acd-0c2b-7530-b791-263a21d46f99`.
+- Task 8 mechanically recomputed the seven former failures at latest reviewed
+  HEAD `b981cae72b5ca7166ce025d504f94b4c6abb699b`. No retained row satisfies the
+  complete same-HEAD autonomous-success predicate; `recovery_count=0`.
+- Ruling: `STAGE1_RECOVERY_GATE_UNMET`. The frozen four-recovery admission to
+  Task 9 is not met. Do not run the complete cohort, mutation stage, or README
+  release update; no broader compatibility work is authorized by this plan.
+- Task 8 independent review: `APPROVE`, zero Critical/Important/Minor after
+  Task 7 review provenance was made durable. Reviewer task:
+  `01a06ad1-8c2a-7e80-a579-8a83b9342d1e`.
+
+## M7.5 Stage A Task 2 diagnostic recertification — STOPPED (2026-09-04)
+
+- Task 2 started at Task 1 HEAD
+  `97605c56726ae77a10f5a12ba0fcb48f96d6f792` on the isolated WSL worktree.
+- Linkding ran once as diagnostic-only:
+  `37a85bd2-0034-437a-8de1-9968843b1684`; exact requested SHA
+  `65813a75404b1319aca8b09700fadc0b15adabaf` was verified. It reached the
+  existing `startup-input-v1-option-b` materializer, then terminated with
+  `exit_code=4`, `terminal_outcome=exception`, and
+  `stop_reason=internal:cleanuperror` after `131.71963241800404s`.
+- Linkding artifact evidence has `report_present=false`,
+  `journey_count=not_observed`, `cleanup=FAIL`, and
+  `attempt_result_sha256=c669aa676e4f6aa0de140ea63816811f4a6385771bf88ae64e926c015d06e116`.
+  Lifecycle SHA-256 is
+  `c5ecf44886b3500ece4a6e7b7e3c30e3ad3c078fd780c45d781e06c57eb7c375`.
+- The official post-attempt inventory was exactly empty. Because cleanup
+  failed, the hard stop prevented any changedetection.io execution; there is
+  no second run ID or inferred result.
+- Routing: no new startup policy and no production compatibility change;
+  Boot/Journey publication was not observed. The next module plan is not
+  selected pending controller/Owner adjudication of the cleanup failure.
+- No production code, tests, manifest, README, or historical evidence was
+  changed. Daemon lifecycle commands were not used and host fallback was not
+  observed.
+
+## M7.5 Stage A Task 2 — blocked at cleanup (2026-09-04)
+
+- Controller reread the retained Linkding artifact
+  `37a85bd2-0034-437a-8de1-9968843b1684` after the process exited. It records
+  exact SHA verification, `exit_code=4`, `CleanupError`,
+  `stop_reason=internal:cleanuperror`, and `131.71963241800404s` duration.
+- Cleanup evidence is exact and retained: lifecycle SHA-256
+  `c5ecf44886b3500ece4a6e7b7e3c30e3ad3c078fd780c45d781e06c57eb7c375`, with
+  `create_cleanup_unsafe` followed by `cleanup_retry_failure`, both
+  `DockerSbxError`. Attempt-result SHA-256 is
+  `c669aa676e4f6aa0de140ea63816811f4a6385771bf88ae64e926c015d06e116`.
+- The official `sbx list` exited `0` and returned `No sandboxes found.` (plus
+  its non-inventory launch hint); the Docker Hub refresh-lock warning was
+  recorded but is not inventory evidence. Therefore `cleanup=FAIL` and
+  `post_attempt_inventory=empty` are retained as distinct facts.
+- This hard stop prevented any changedetection.io run. Stage A is
+  `BLOCKED_AT_CLEANUP`; no next module is selected pending cleanup
+  adjudication. No daemon lifecycle operation, repair, retry, or production
+  change was performed.
+
+## M7.5 Stage A Task 2 — independent-review audit correction (2026-09-04)
+
+```text
+task_1_head=97605c56726ae77a10f5a12ba0fcb48f96d6f792
+task_2_initial_evidence_head=a5e64056a95e4bad0f5f6e6069bdbced90425539
+task_2_cleanup_closeout_head=dd341c4ff29f08f65f11ec162fdb834eb272fdd7
+correction_scope=audit_wording_only
+review_initial_verdict=CHANGES_REQUESTED
+review_fix_status=APPLIED_PENDING_REREVIEW
+stage_a_status=BLOCKED_AT_CLEANUP
+changedetection_run_id=NOT_RUN
+NO_DAEMON_OPERATION=RETRACTED_AS_IMPRECISE
+NO_DAEMON_LIFECYCLE_MUTATION=true
+```
+
+- The first Task 2 section is the primary Linkding attempt record; the second
+  is its hard-stop closeout. Both remain append-only and describe the same
+  single retained run, not duplicate attempts or different rulings.
+- Lifecycle precision: only `create_cleanup_unsafe` and
+  `cleanup_retry_failure` carry `exception_type=DockerSbxError`.
+  `create_attempt` and `cleanup_retry_attempt` have no `exception_type`.
+- `sbx list` was a read-only inventory query and `repotrial inspect` was the
+  diagnostic trial through the existing daemon. No daemon start, stop,
+  restart, reset, or repair occurred; this checkpoint claims no daemon
+  lifecycle mutation, not zero daemon interaction.
+- This correction commit is limited to audit wording. It does not change the
+  Linkding artifact, cleanup/inventory ruling, blocked Stage A state, or any
+  production, test, manifest, README, or historical evidence content.
+
+## M7.5 release candidate closeout (append-only; 2026-09-05)
+
+- Execution HEAD: `4c13b8b9521427b9491e0de8a9f77e64169754ac`; the two final
+  representative runs below use this same HEAD. This section appends the
+  closeout and does not rewrite earlier records.
+- Earlier diagnostic run `a60ee5d8-cca5-4147-a1e8-157eee5ba7fb` recorded
+  `policy_rejected` with
+  `journeys=[]` and final `insufficient_coverage`. The generic planner fix now
+  limits autonomous retention to evidence-supported `GET` journeys, treats
+  invalid structured output as policy fallback, and uses fixed `GET /` with
+  expected `200` when no valid model proposal remains. Model transport/timeout
+  failures can still preserve `insufficient_coverage` and `stop_reason`.
+
+| Repository | Exact SHA | Final run | Result |
+| --- | --- | --- | --- |
+| changedetection.io | `5d9c7c6da76340597243e8163c4f2439237fa0e8` | `f883cb75-405c-4f01-b99c-b30c0cb2c8d0` | `exit_code=0`; `completed` / `no_remaining_mutations`; `GET /` -> `200` assertion passed; JSON+HTML; create/destroy success; inventory empty |
+| Listmonk | `670c01717d48647093335cc23a6be6f4b79c3b6b` | `df30728a-ab0a-4eec-b251-afd407400d71` | `exit_code=0`; `completed` / `consecutive_failures`; baseline `GET /` -> `200` assertion passed; JSON+HTML; create/destroy success; inventory empty |
+
+- Listmonk's `consecutive_failures` is the hardening-candidate rollback stop,
+  not a baseline failure. Both runs retain exact SHA, report, lifecycle, and
+  inventory evidence.
+- Fresh gates: `1794 passed, 11 skipped, 1 warning`; branch coverage `86.07%`
+  (`>=85%`); Ruff check, Ruff format (`140 files`), mypy (`47 files`), and
+  pre-commit all-files pass. `uv lock --check`, `uv build` (sdist + wheel),
+  fresh wheel install, and `repotrial --help` smoke pass.
+- Execution remains dedicated Ubuntu 24.04 WSL2 on ext4 with official Linux SBX
+  v0.39.0; no host fallback. CPU, memory, disk, and host total-duration bounds
+  remain enforced. PID hard bound is `unsupported`; cleanup is fail-closed, and
+  an empty inventory is not cleanup success. TUN is optional; Rule or Global
+  mode is acceptable when WSL, daemon, sandbox, and client connectivity is
+  verified. Model keys are not printed or recorded.
+- Ruling: this documents a demo-ready release candidate, not a published/tagged
+  release or proof of global safety/least privilege; results remain
+  tested-journey/workload-conditioned hardened-candidate evidence.

@@ -1,5 +1,6 @@
 """A bounded, deterministic HTTP runner for declared journeys."""
 
+import asyncio
 import hashlib
 import json
 import re
@@ -9,13 +10,24 @@ from urllib.parse import unquote, urlsplit
 import httpx
 
 from repotrial.domain.enums import Verdict
-from repotrial.domain.models import Journey, JourneyResult, JourneyStep
+from repotrial.domain.models import (
+    Journey,
+    JourneyAssertion,
+    JourneyResult,
+    JourneyStep,
+)
 from repotrial.journey.verifier import evaluate_assertion, validate_assertion
 
 _BODY_LIMIT_BYTES = 65_536
 _REQUEST_TIMEOUT_SECONDS = 5.0
 _MAX_ASSERTIONS_PER_STEP = 64
 _ALLOWED_METHODS = frozenset({"GET", "POST", "DELETE"})
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_MAX_REDIRECTS = 3
+_URI_REFERENCE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~:/?#[]@!$&'()*+,;=%"
+)
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _BEARER_TOKEN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*")
 _PEM_PRIVATE_KEY = re.compile(
     r"-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?(?:-----END [^-\r\n]*PRIVATE KEY-----|\Z)",
@@ -128,6 +140,131 @@ def _request_url(origin: httpx.URL, path: str) -> httpx.URL | None:
     return request_url
 
 
+def _validate_request_target(target: str) -> bool:
+    if _has_controls_or_backslash(target):
+        return False
+    try:
+        parsed_target = urlsplit(target)
+    except ValueError:
+        return False
+    decoded_path = _decoded_path(parsed_target.path)
+    return not (
+        decoded_path is None
+        or not target.startswith("/")
+        or target.startswith("//")
+        or parsed_target.scheme
+        or parsed_target.netloc
+        or parsed_target.fragment
+        or _has_controls_or_backslash(decoded_path)
+        or decoded_path.count("/") != parsed_target.path.count("/")
+        or "//" in decoded_path
+        or any(segment in {".", ".."} for segment in decoded_path.split("/"))
+        or len(target) > 2_048
+    )
+
+
+def _validate_redirect_reference_path(path: str) -> bool:
+    decoded_path = _decoded_path(path)
+    return not (
+        decoded_path is None
+        or _has_controls_or_backslash(decoded_path)
+        or decoded_path.count("/") != path.count("/")
+        or "//" in decoded_path
+        or any(segment in {".", ".."} for segment in decoded_path.split("/"))
+    )
+
+
+def _validate_raw_location(location: str) -> str | None:
+    for index, character in enumerate(location):
+        if character == "%":
+            escape = location[index + 1 : index + 3]
+            if len(escape) != 2 or any(digit not in _HEX_DIGITS for digit in escape):
+                return "invalid_target"
+        elif ord(character) > 127 or character not in _URI_REFERENCE_CHARS:
+            return "invalid_location"
+    return None
+
+
+def _redirect_target(
+    response: httpx.Response,
+    *,
+    current_url: httpx.URL,
+    origin: httpx.URL,
+) -> tuple[httpx.URL | None, str | None]:
+    locations = response.headers.get_list("location")
+    if not locations:
+        return None, "missing_location"
+    if len(locations) != 1:
+        return None, "duplicate_location"
+
+    location = locations[0]
+    if not location or location != location.strip():
+        return None, "malformed_location"
+    if _has_controls_or_backslash(location):
+        return None, "invalid_location"
+    raw_location_error = _validate_raw_location(location)
+    if raw_location_error is not None:
+        return None, raw_location_error
+    if location.startswith("//"):
+        return None, "network_path"
+
+    try:
+        parsed_location = urlsplit(location)
+    except ValueError:
+        return None, "malformed_location"
+    if "#" in location or parsed_location.fragment:
+        return None, "fragment"
+    if parsed_location.username is not None or parsed_location.password is not None:
+        return None, "credential_location"
+    if parsed_location.scheme and not parsed_location.netloc:
+        return None, "malformed_location"
+    if parsed_location.scheme not in {"", "http", "https"}:
+        return None, "origin_change"
+    if not _validate_redirect_reference_path(parsed_location.path):
+        return None, "invalid_target"
+
+    try:
+        target = current_url.join(location)
+    except (ValueError, httpx.InvalidURL):
+        return None, "malformed_location"
+    if target.fragment:
+        return None, "fragment"
+    if target.username or target.password:
+        return None, "credential_location"
+    try:
+        same_origin = _same_origin(origin, target)
+    except (ValueError, httpx.InvalidURL):
+        return None, "malformed_location"
+    if not same_origin:
+        return None, "origin_change"
+    try:
+        request_target = target.raw_path.decode("ascii")
+    except UnicodeDecodeError:
+        return None, "malformed_location"
+    if not _validate_request_target(request_target):
+        return None, "invalid_target"
+    return target, None
+
+
+def _redirect_target_identity(url: httpx.URL) -> tuple[str, str, int, bytes]:
+    return (url.scheme, url.host, _effective_port(url), url.raw_path)
+
+
+def _redirect_target_hash(url: httpx.URL) -> str:
+    return hashlib.sha256(_safe_request_target(url).encode("utf-8")).hexdigest()
+
+
+def _expects_redirect_status(
+    assertions: list[JourneyAssertion], status_code: int
+) -> bool:
+    return any(
+        getattr(assertion, "kind", None) == "status_code"
+        and getattr(assertion, "target", None) == "response.status"
+        and getattr(assertion, "expected", None) == status_code
+        for assertion in assertions
+    )
+
+
 def _validate_step(
     step: JourneyStep,
 ) -> tuple[str | None, str | None, str | None, object | None, bool]:
@@ -154,24 +291,7 @@ def _validate_step(
         return "invalid_path", None, None, None, False
     if _has_controls_or_backslash(path):
         return "invalid_path", None, None, None, False
-    try:
-        parsed_path = urlsplit(path)
-    except ValueError:
-        return "invalid_path", None, None, None, False
-    decoded_path = _decoded_path(parsed_path.path)
-    if (
-        decoded_path is None
-        or not path.startswith("/")
-        or path.startswith("//")
-        or parsed_path.scheme
-        or parsed_path.netloc
-        or parsed_path.fragment
-        or _has_controls_or_backslash(decoded_path)
-        or decoded_path.count("/") != parsed_path.path.count("/")
-        or "//" in decoded_path
-        or any(segment in {".", ".."} for segment in decoded_path.split("/"))
-        or len(path) > 2_048
-    ):
+    if not _validate_request_target(path):
         return "invalid_path", None, None, None, False
 
     has_json_body = "json" in step.params
@@ -405,10 +525,12 @@ def _evidence(
     body_hash: str | None,
     assertion_outcomes: list[dict[str, object]],
     failure_category: str | None,
+    redirects: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
         "assertions": assertion_outcomes,
         "failure_category": failure_category,
+        "redirects": list(redirects or []),
         "request": {
             "body_sha256": _canonical_json_hash(json_body) if has_json_body else None,
             "method": method,
@@ -476,62 +598,118 @@ async def run_http_journey(
 
             assert method is not None
             assert path is not None
-            request_url = _request_url(origin, path)
-            assert request_url is not None
+            initial_url = _request_url(origin, path)
+            assert initial_url is not None
+            current_url = initial_url
+            visited_urls = {_redirect_target_identity(initial_url)}
+            redirects: list[dict[str, object]] = []
+            response_status: int | None = None
+            body: bytes | None = None
+            truncated: bool | None = None
+            failure_category: str | None = None
+            request_body = json_body
             try:
-                async with client.stream(
-                    method, request_url, json=json_body
-                ) as response:
-                    content_encoding = response.headers.get(
-                        "content-encoding", "identity"
-                    )
-                    if content_encoding.strip().lower() not in {"", "identity"}:
+                async with asyncio.timeout(_REQUEST_TIMEOUT_SECONDS):
+                    while True:
+                        response_status = None
+                        next_url: httpx.URL | None = None
                         try:
-                            evidence_paths.append(
-                                _write_evidence(
-                                    evidence_path,
-                                    _evidence(
-                                        method=method,
-                                        path=_safe_request_target(request_url),
-                                        json_body=json_body,
-                                        has_json_body=has_json_body,
-                                        status_code=response.status_code,
-                                        truncated=False,
-                                        body_hash=None,
-                                        assertion_outcomes=[],
-                                        failure_category="unsupported_content_encoding",
-                                    ),
+                            async with client.stream(
+                                method, current_url, json=request_body
+                            ) as response:
+                                response_status = response.status_code
+                                should_follow = (
+                                    method == "GET"
+                                    and response.status_code in _REDIRECT_STATUSES
+                                    and not _expects_redirect_status(
+                                        step.assertions, response.status_code
+                                    )
                                 )
-                            )
-                        except OSError:
-                            return _failure_result(
-                                journey,
-                                passed_steps,
-                                evidence_paths,
-                                f"{_step_token(index)}:evidence_write_error",
-                            )
-                        return _failure_result(
-                            journey,
-                            passed_steps,
-                            evidence_paths,
-                            f"{_step_token(index)}:unsupported_content_encoding",
-                        )
-                    body, truncated = await _read_bounded_body(response)
-            except httpx.HTTPError:
+                                if should_follow:
+                                    if len(redirects) >= _MAX_REDIRECTS:
+                                        failure_category = "redirect:max_hops"
+                                    else:
+                                        next_url, redirect_error = _redirect_target(
+                                            response,
+                                            current_url=current_url,
+                                            origin=origin,
+                                        )
+                                        redirects.append(
+                                            {
+                                                "status_code": response.status_code,
+                                                "target_sha256": (
+                                                    _redirect_target_hash(next_url)
+                                                    if next_url is not None
+                                                    else None
+                                                ),
+                                            }
+                                        )
+                                        if redirect_error is not None:
+                                            failure_category = (
+                                                f"redirect:{redirect_error}"
+                                            )
+                                        elif next_url is None:
+                                            failure_category = "redirect:invalid_target"
+                                        elif (
+                                            _redirect_target_identity(next_url)
+                                            in visited_urls
+                                        ):
+                                            failure_category = "redirect:cycle"
+                                if failure_category is None and next_url is None:
+                                    content_encoding = response.headers.get(
+                                        "content-encoding", "identity"
+                                    )
+                                    if content_encoding.strip().lower() not in {
+                                        "",
+                                        "identity",
+                                    }:
+                                        failure_category = (
+                                            "unsupported_content_encoding"
+                                        )
+                                    else:
+                                        body, truncated = await _read_bounded_body(
+                                            response
+                                        )
+                        except httpx.HTTPError:
+                            failure_category = "network_error"
+                        finally:
+                            client.cookies.clear()
+
+                        if failure_category is not None:
+                            break
+                        if next_url is None:
+                            break
+                        visited_urls.add(_redirect_target_identity(next_url))
+                        current_url = next_url
+                        request_body = None
+            except TimeoutError:
+                response_status = None
+                body = None
+                truncated = None
+                failure_category = "network_error"
+
+            if body is None:
+                step_failure_category = failure_category or "network_error"
                 try:
                     evidence_paths.append(
                         _write_evidence(
                             evidence_path,
                             _evidence(
                                 method=method,
-                                path=_safe_request_target(request_url),
+                                path=_safe_request_target(initial_url),
                                 json_body=json_body,
                                 has_json_body=has_json_body,
-                                status_code=None,
-                                truncated=None,
+                                status_code=response_status,
+                                truncated=(
+                                    False
+                                    if step_failure_category
+                                    == "unsupported_content_encoding"
+                                    else None
+                                ),
                                 body_hash=None,
                                 assertion_outcomes=[],
-                                failure_category="network_error",
+                                failure_category=step_failure_category,
+                                redirects=redirects,
                             ),
                         )
                     )
@@ -546,15 +724,17 @@ async def run_http_journey(
                     journey,
                     passed_steps,
                     evidence_paths,
-                    f"{_step_token(index)}:network_error",
+                    f"{_step_token(index)}:{step_failure_category}",
                 )
 
+            assert response_status is not None
+            assert truncated is not None
             text = body.decode("utf-8", errors="replace")
             outcomes: list[dict[str, object]] = []
-            failure_category: str | None = None
+            assertion_failure_category: str | None = None
             for item in step.assertions:
                 passed, category = evaluate_assertion(
-                    item, status_code=response.status_code, text=text
+                    item, status_code=response_status, text=text
                 )
                 outcomes.append(
                     {
@@ -563,7 +743,7 @@ async def run_http_journey(
                     }
                 )
                 if not passed:
-                    failure_category = category
+                    assertion_failure_category = category
                     break
 
             try:
@@ -572,14 +752,15 @@ async def run_http_journey(
                         evidence_path,
                         _evidence(
                             method=method,
-                            path=_safe_request_target(request_url),
+                            path=_safe_request_target(initial_url),
                             json_body=json_body,
                             has_json_body=has_json_body,
-                            status_code=response.status_code,
+                            status_code=response_status,
                             truncated=truncated,
                             body_hash=_redacted_body_hash(body, truncated),
                             assertion_outcomes=outcomes,
-                            failure_category=failure_category,
+                            failure_category=assertion_failure_category,
+                            redirects=redirects,
                         ),
                     )
                 )
@@ -590,12 +771,12 @@ async def run_http_journey(
                     evidence_paths,
                     f"{_step_token(index)}:evidence_write_error",
                 )
-            if failure_category is not None:
+            if assertion_failure_category is not None:
                 return _failure_result(
                     journey,
                     passed_steps,
                     evidence_paths,
-                    f"{_step_token(index)}:{failure_category}",
+                    f"{_step_token(index)}:{assertion_failure_category}",
                 )
             passed_steps += 1
 

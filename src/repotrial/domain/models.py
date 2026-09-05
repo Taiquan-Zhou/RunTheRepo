@@ -1,7 +1,8 @@
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .enums import ExperimentVerdict, MutationType, Verdict
 
@@ -86,10 +87,17 @@ class ExperimentRecord(BaseModel):
 
 
 class RunState(BaseModel):
+    model_config = ConfigDict(
+        validate_assignment=True,
+        revalidate_instances="always",
+    )
+
     run_id: str
     repo_url: str
     commit_sha: str | None = None
     compose_path: str | None = None
+    compatibility_overlay_path: str | None = None
+    compatibility_overlay_sha256: str | None = None
     sandbox_id: str | None = None
     baseline_config_hash: str | None = None
     current_config_hash: str | None = None
@@ -100,3 +108,34 @@ class RunState(BaseModel):
     experiments: list[ExperimentRecord] = Field(default_factory=list)
     artifacts: list[str] = Field(default_factory=list)
     stop_reason: str | None = None
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "compatibility_overlay_path":
+            current_sha256 = self.__dict__.get("compatibility_overlay_sha256")
+            if (value is None) != (current_sha256 is None):
+                raise ValueError(
+                    "compatibility overlay path and sha256 must be provided together"
+                )
+        elif name == "compatibility_overlay_sha256":
+            current_path = self.__dict__.get("compatibility_overlay_path")
+            if (value is None) != (current_path is None):
+                raise ValueError(
+                    "compatibility overlay path and sha256 must be provided together"
+                )
+        super().__setattr__(name, value)
+
+    @model_validator(mode="after")
+    def _validate_compatibility_identity(self) -> Self:
+        if (self.compatibility_overlay_path is None) != (
+            self.compatibility_overlay_sha256 is None
+        ):
+            raise ValueError(
+                "compatibility overlay path and sha256 must be provided together"
+            )
+        return self
+
+    def model_copy(
+        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
+    ) -> Self:
+        copied = super().model_copy(update=update, deep=deep)
+        return type(self).model_validate(copied)

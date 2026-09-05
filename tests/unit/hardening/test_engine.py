@@ -30,6 +30,11 @@ from repotrial.sandbox.fake import FakeSandboxProvider
 from repotrial.sandbox.lifecycle import CleanupError
 from repotrial.trial.boot import BootResult
 from repotrial.trial.observer import ObservationCollectionError
+from repotrial.trial.startup_inputs import (
+    _ADAPTER_SHA256,
+    plan_startup_input,
+    write_or_verify_startup_input_identity,
+)
 
 
 def _exec_result(*, exit_code: int = 0, stdout: str = "") -> ExecResult:
@@ -97,6 +102,27 @@ class RecordingProvider(FakeSandboxProvider):
             self.source_env["APP_MODE"] = "mutated-after-first-await"
         return await super().create(workspace, name)
 
+    async def exec(
+        self, sandbox_id: str, argv: list[str], timeout_s: int = 60
+    ) -> ExecResult:
+        self._require_active(sandbox_id)
+        snapshot = tuple(argv)
+        if "repotrial-compatibility-overlay" in snapshot:
+            self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+            relative_path = snapshot[-3]
+            expected_sha256 = snapshot[-2]
+            return ExecResult(
+                exit_code=0,
+                stdout=(
+                    "root=/workspace\n"
+                    f"path={relative_path}\n"
+                    "mode=600\n"
+                    f"sha256={expected_sha256}\n"
+                ),
+                stderr="",
+            )
+        return await super().exec(sandbox_id, argv, timeout_s)
+
     async def publish_port(self, sandbox_id: str, container_port: int) -> int:
         if self.publish_failure is not None:
             self.calls.append(("publish_port", sandbox_id, container_port))
@@ -108,6 +134,71 @@ class RecordingProvider(FakeSandboxProvider):
             self.calls.append(("destroy", sandbox_id))
             raise self.destroy_failure
         await super().destroy(sandbox_id)
+
+
+class StartupInputProvider(RecordingProvider):
+    def __init__(self, *, adapter_exit_code: int = 0) -> None:
+        super().__init__(ports={8080: 45123})
+        self.adapter_exit_code = adapter_exit_code
+
+    async def exec(
+        self, sandbox_id: str, argv: list[str], timeout_s: int = 60
+    ) -> ExecResult:
+        self._require_active(sandbox_id)
+        snapshot = tuple(argv)
+        self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+        if "repotrial-compatibility-overlay" in snapshot:
+            relative_path = snapshot[-3]
+            expected_sha256 = snapshot[-2]
+            return ExecResult(
+                exit_code=0,
+                stdout=(
+                    "root=/workspace\n"
+                    f"path={relative_path}\n"
+                    "mode=600\n"
+                    f"sha256={expected_sha256}\n"
+                ),
+                stderr="",
+            )
+        if "repotrial-startup-input" in snapshot:
+            return ExecResult(
+                exit_code=self.adapter_exit_code,
+                stdout=(
+                    "root=/workspace\nmode=600\n" if self.adapter_exit_code == 0 else ""
+                ),
+                stderr="",
+            )
+        if snapshot[-3:] == ("config", "--format", "json"):
+            return _exec_result(
+                stdout=json.dumps(
+                    {"services": {"web": {"image": "example/web:1", "read_only": True}}}
+                )
+            )
+        if snapshot[-5:] == ("up", "-d", "--wait", "--wait-timeout", "60"):
+            return _exec_result()
+        if snapshot[-4:] == ("ps", "--all", "--format", "json"):
+            return _exec_result(
+                stdout=json.dumps(
+                    {
+                        "Service": "web",
+                        "State": "running",
+                        "Health": "healthy",
+                        "ExitCode": 0,
+                    }
+                )
+            )
+        if snapshot[-4:] == ("logs", "--no-color", "--tail", "200"):
+            return _exec_result()
+        if snapshot[-6:] == (
+            "ps",
+            "--all",
+            "--no-trunc",
+            "--orphans=false",
+            "--format",
+            "json",
+        ):
+            return _exec_result()
+        raise AssertionError(f"unexpected provider command: {snapshot!r}")
 
 
 def _compose_text() -> str:
@@ -154,13 +245,32 @@ def _case(
     return state, mutation, context
 
 
+def _establish_startup_identity(context: ExperimentContext) -> ExperimentContext:
+    plan = plan_startup_input(context.workspace, "compose.yaml")
+    assert plan is not None
+    identity_dir = context.workspace.parent / "run-evidence"
+    identity_dir.mkdir(exist_ok=True)
+    identity_path = identity_dir / "startup-input-identity.json"
+    write_or_verify_startup_input_identity(
+        identity_path, plan, adapter_sha256=_ADAPTER_SHA256
+    )
+    return replace(context, startup_input_identity_path=identity_path)
+
+
 def _compose_argv(
     context: ExperimentContext, env: dict[str, str] | None = None
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     prefix: tuple[str, ...] = ()
     if env:
         prefix = ("env", *(f"{key}={value}" for key, value in sorted(env.items())))
-    base = ("docker", "compose", "-f", "compose.yaml", "-f", context.overlay_path.name)
+    compose_files = ("-f", "compose.yaml")
+    compatibility_path = getattr(context, "compatibility_overlay_path", None)
+    if compatibility_path is not None:
+        compose_files += (
+            "-f",
+            compatibility_path.relative_to(context.workspace).as_posix(),
+        )
+    base = ("docker", "compose", *compose_files, "-f", context.overlay_path.name)
     return (
         (*prefix, *base, "up", "-d", "--wait", "--wait-timeout", "60"),
         (*prefix, *base, "ps", "--all", "--format", "json"),
@@ -181,7 +291,7 @@ def _healthy_scripts(
     context: ExperimentContext, env: dict[str, str] | None = None
 ) -> dict[tuple[str, ...], ExecResult]:
     up, ps, logs, discovery = _compose_argv(context, env)
-    return {
+    scripts = {
         up: _exec_result(),
         ps: _exec_result(
             stdout=json.dumps(
@@ -196,6 +306,14 @@ def _healthy_scripts(
         logs: _exec_result(),
         discovery: _exec_result(),
     }
+    compatibility_path = getattr(context, "compatibility_overlay_path", None)
+    if compatibility_path is not None:
+        relative = compatibility_path.relative_to(context.workspace).as_posix()
+        digest = hashlib.sha256(compatibility_path.read_bytes()).hexdigest()
+        scripts[("sha256sum", "--", relative)] = _exec_result(
+            stdout=f"{digest}  {relative}\n"
+        )
+    return scripts
 
 
 def _install_http_runner(
@@ -389,6 +507,396 @@ def test_real_overlay_hashes_ordered_replay_and_environment_snapshot_yield_keep(
     assert mutation == mutation_before
 
 
+def test_candidate_threads_compatibility_before_hardening_overlay_without_hash_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    compatibility_dir = context.workspace / ".repotrial-overlays"
+    compatibility_dir.mkdir()
+    compatibility = compatibility_dir / "compatibility.overlay.yaml"
+    compatibility.write_text("services: {}\n", encoding="utf-8")
+    context = replace(
+        context,
+        compatibility_overlay_path=compatibility,
+        compatibility_overlay_sha256=hashlib.sha256(
+            compatibility.read_bytes()
+        ).hexdigest(),
+    )
+    provider = RecordingProvider(
+        scripts=_healthy_scripts(context),
+        ports={8080: 45123},
+        expected_overlay=context.overlay_path,
+    )
+    boundary_calls: list[tuple[str, str | None, str | None]] = []
+
+    async def fake_boot(
+        provider: FakeSandboxProvider,
+        sandbox_id: str,
+        compose_path: str,
+        env: dict[str, str],
+        attempt: int,
+        *,
+        overlay_path: str | None = None,
+        compatibility_overlay_path: str | None = None,
+    ) -> BootResult:
+        del provider, sandbox_id, compose_path, env, attempt
+        boundary_calls.append(("boot", compatibility_overlay_path, overlay_path))
+        return BootResult(verdict=Verdict.PASS, service_states={}, logs={}, attempt=1)
+
+    async def fake_observer(
+        provider: FakeSandboxProvider,
+        sandbox_id: str,
+        compose_path: str,
+        artifact_path: Path,
+        *,
+        overlay_path: str | None = None,
+        compatibility_overlay_path: str | None = None,
+    ) -> ObservationSnapshot:
+        del provider, sandbox_id, compose_path
+        boundary_calls.append(("observation", compatibility_overlay_path, overlay_path))
+        artifact_path.write_text("observed", encoding="utf-8")
+        return ObservationSnapshot()
+
+    monkeypatch.setattr(engine_module, "boot_compose", fake_boot)
+    monkeypatch.setattr(engine_module, "collect_observation", fake_observer)
+    _install_http_runner(monkeypatch, {"health": Verdict.PASS}, [], provider)
+    base = load_compose(context.workspace / "compose.yaml")
+    candidate = apply_mutation(base, mutation)
+    expected_parent = (
+        "sha256:"
+        + hashlib.sha256(canonical_compose_json(base).encode("utf-8")).hexdigest()
+    )
+    expected_candidate = (
+        "sha256:"
+        + hashlib.sha256(canonical_compose_json(candidate).encode("utf-8")).hexdigest()
+    )
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.verdict is ExperimentVerdict.KEEP
+    assert record.parent_config_hash == expected_parent
+    assert record.candidate_config_hash == expected_candidate
+    assert boundary_calls == [
+        (
+            "boot",
+            compatibility.relative_to(context.workspace).as_posix(),
+            context.overlay_path.name,
+        ),
+        (
+            "observation",
+            compatibility.relative_to(context.workspace).as_posix(),
+            context.overlay_path.name,
+        ),
+    ]
+
+
+def test_candidate_materializes_relative_compatibility_from_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    compatibility_dir = context.workspace / ".repotrial-overlays"
+    compatibility_dir.mkdir()
+    compatibility = compatibility_dir / "compatibility.overlay.yaml"
+    compatibility.write_text("services: {}\n", encoding="utf-8")
+    relative_compatibility = Path(".repotrial-overlays/compatibility.overlay.yaml")
+    absolute_context = replace(
+        context,
+        compatibility_overlay_path=compatibility,
+        compatibility_overlay_sha256=hashlib.sha256(
+            compatibility.read_bytes()
+        ).hexdigest(),
+    )
+    context = replace(
+        absolute_context, compatibility_overlay_path=relative_compatibility
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    provider = RecordingProvider(
+        scripts=_healthy_scripts(absolute_context),
+        ports={8080: 45123},
+        expected_overlay=context.overlay_path,
+    )
+    _install_http_runner(monkeypatch, {"health": Verdict.PASS}, [], provider)
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.verdict is ExperimentVerdict.KEEP
+    compatibility_index = next(
+        index
+        for index, call in enumerate(provider.calls)
+        if call[0] == "exec" and "repotrial-compatibility-overlay" in call[2]
+    )
+    verify_index = next(
+        index
+        for index, call in enumerate(provider.calls)
+        if call[0] == "exec" and call[2][:2] == ("sha256sum", "--")
+    )
+    compose_index = next(
+        index
+        for index, call in enumerate(provider.calls)
+        if call[0] == "exec" and "docker" in call[2] and "compose" in call[2]
+    )
+    assert compatibility_index < verify_index < compose_index
+
+
+def test_candidate_materializes_startup_input_before_boot_with_shared_compose_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, mutation, context = _case(tmp_path, env={"APP_MODE": "explicit"})
+    (context.workspace / "compose.yaml").write_text(
+        "services:\n  web:\n    image: example/web:1\n    env_file:\n      - .env\n",
+        encoding="utf-8",
+    )
+    (context.workspace / ".env.sample").write_text(
+        "APP_MODE=sample\nAPP_TOKEN=secret-value\nLD_HOST_PORT=9090\n",
+        encoding="utf-8",
+    )
+    context = _establish_startup_identity(context)
+    provider = StartupInputProvider()
+    runner_calls: list[tuple[str, str, Path, tuple[tuple[object, ...], ...]]] = []
+    _install_http_runner(monkeypatch, {"health": Verdict.PASS}, runner_calls, provider)
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.verdict is ExperimentVerdict.KEEP
+    calls = provider.calls
+    create_index = next(
+        index for index, call in enumerate(calls) if call[0] == "create"
+    )
+    adapter_index = next(
+        index
+        for index, call in enumerate(calls)
+        if call[0] == "exec" and "repotrial-startup-input" in call[2]
+    )
+    config_index = next(
+        index
+        for index, call in enumerate(calls)
+        if call[0] == "exec" and call[2][-3:] == ("config", "--format", "json")
+    )
+    up_index = next(
+        index
+        for index, call in enumerate(calls)
+        if call[0] == "exec"
+        and call[2][-5:] == ("up", "-d", "--wait", "--wait-timeout", "60")
+    )
+    destroy_index = next(
+        index for index, call in enumerate(calls) if call[0] == "destroy"
+    )
+    assert create_index < adapter_index < config_index < up_index < destroy_index
+    compose_calls = [
+        call[2]
+        for call in calls
+        if call[0] == "exec" and "docker" in call[2] and "compose" in call[2]
+    ]
+    expected_prefix = (
+        "env",
+        "-u",
+        "APP_MODE",
+        "-u",
+        "APP_TOKEN",
+        "-u",
+        "LD_HOST_PORT",
+        "APP_MODE=explicit",
+        "docker",
+        "compose",
+        "--project-directory",
+        ".",
+    )
+    assert compose_calls
+    assert all(
+        argv[: len(expected_prefix)] == expected_prefix for argv in compose_calls
+    )
+    assert (context.artifact_dir / "startup-input-attempt.jsonl").is_file()
+    assert (context.artifact_dir / "candidate-observation-boundary.jsonl").is_file()
+
+
+def test_candidate_startup_input_failure_stops_and_cleans_without_boot(
+    tmp_path: Path,
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    (context.workspace / "compose.yaml").write_text(
+        _compose_text() + "    env_file:\n      - .env\n", encoding="utf-8"
+    )
+    (context.workspace / ".env.sample").write_text("APP_MODE=test\n", encoding="utf-8")
+    context = _establish_startup_identity(context)
+    provider = StartupInputProvider(adapter_exit_code=25)
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.verdict is ExperimentVerdict.STOP
+    assert record.boot is Verdict.UNSUPPORTED
+    assert record.reason == "startup_input_unsupported"
+    assert len([call for call in provider.calls if call[0] == "create"]) == 1
+    assert len([call for call in provider.calls if call[0] == "destroy"]) == 1
+    assert not any(
+        call[0] == "exec"
+        and call[2][-5:] == ("up", "-d", "--wait", "--wait-timeout", "60")
+        for call in provider.calls
+    )
+
+
+def test_candidate_startup_planning_rejection_stops_before_overlay_and_create(
+    tmp_path: Path,
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    (context.workspace / "compose.yaml").write_text(
+        _compose_text() + "    env_file:\n      - .env\n", encoding="utf-8"
+    )
+    (context.workspace / ".env.sample").write_text("APP_MODE=test\n", encoding="utf-8")
+    (context.workspace / ".env").write_text("APP_MODE=host\n", encoding="utf-8")
+    provider = StartupInputProvider()
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.verdict is ExperimentVerdict.STOP
+    assert record.boot is Verdict.UNSUPPORTED
+    assert record.reason == "startup_input_unsupported"
+    assert provider.calls == []
+    assert not context.overlay_path.exists()
+    evidence = _read_jsonl(context.artifact_dir / "startup-input-attempt.jsonl")
+    assert [row["outcome"] for row in evidence] == ["start", "terminal"]
+    assert evidence[-1]["reason"] == "target_preexisting"
+
+
+def test_candidate_reentry_rejects_incomplete_prior_attempt_before_create(
+    tmp_path: Path,
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    (context.workspace / "compose.yaml").write_text(
+        _compose_text() + "    env_file:\n      - .env\n", encoding="utf-8"
+    )
+    (context.workspace / ".env.sample").write_text("APP_MODE=test\n", encoding="utf-8")
+    prior_attempt = tmp_path / "prior-attempt"
+    prior_attempt.mkdir()
+    context = replace(
+        _establish_startup_identity(context),
+        prior_attempt_directories=(prior_attempt,),
+    )
+    provider = StartupInputProvider()
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.verdict is ExperimentVerdict.STOP
+    assert record.reason == "startup_input_unsupported"
+    assert provider.calls == []
+    assert not context.overlay_path.exists()
+    evidence = _read_jsonl(context.artifact_dir / "startup-input-attempt.jsonl")
+    assert evidence[-1]["reason"] == "attempt_history_incomplete"
+
+
+def test_candidate_rejects_source_drift_from_baseline_identity_before_create(
+    tmp_path: Path,
+) -> None:
+    state, mutation, context = _case(tmp_path)
+    (context.workspace / "compose.yaml").write_text(
+        _compose_text() + "    env_file:\n      - .env\n", encoding="utf-8"
+    )
+    sample = context.workspace / ".env.sample"
+    sample.write_text("APP_MODE=baseline\n", encoding="utf-8")
+    context = _establish_startup_identity(context)
+    sample.write_text("APP_MODE=changed\n", encoding="utf-8")
+    provider = StartupInputProvider()
+
+    record = _run(state, mutation, provider, context)
+
+    assert record.verdict is ExperimentVerdict.STOP
+    assert record.reason == "startup_input_unsupported"
+    assert provider.calls == []
+    evidence = _read_jsonl(context.artifact_dir / "startup-input-attempt.jsonl")
+    assert evidence[-1]["reason"] == "startup_identity_mismatch"
+
+
+def test_later_candidate_keeps_clone_root_startup_identity_after_accepted_compose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, first_mutation, first_context = _case(tmp_path)
+    (first_context.workspace / "compose.yaml").write_text(
+        _compose_text() + "    env_file:\n      - .env\n", encoding="utf-8"
+    )
+    (first_context.workspace / ".env.sample").write_text(
+        "APP_MODE=test\nAPP_TOKEN=secret-value\n", encoding="utf-8"
+    )
+    first_context = _establish_startup_identity(first_context)
+    first_provider = StartupInputProvider()
+    first_runner_calls: list[tuple[str, str, Path, tuple[tuple[object, ...], ...]]] = []
+    _install_http_runner(
+        monkeypatch, {"health": Verdict.PASS}, first_runner_calls, first_provider
+    )
+
+    first_record = _run(state, first_mutation, first_provider, first_context)
+    assert first_record.verdict is ExperimentVerdict.KEEP
+
+    accepted_dir = first_context.workspace / ".repotrial-accepted"
+    accepted_dir.mkdir()
+    accepted = accepted_dir / "accepted-0001.compose.yaml"
+    accepted.write_text(
+        "services:\n"
+        "  web:\n"
+        "    image: example/web:1\n"
+        "    read_only: true\n"
+        "    env_file:\n"
+        "      - .env\n",
+        encoding="utf-8",
+    )
+    accepted_hash = (
+        "sha256:"
+        + hashlib.sha256(
+            canonical_compose_json(load_compose(accepted)).encode("utf-8")
+        ).hexdigest()
+    )
+    second_state = state.model_copy(
+        deep=True,
+        update={
+            "compose_path": accepted.relative_to(first_context.workspace).as_posix(),
+            "current_config_hash": accepted_hash,
+        },
+    )
+    second_mutation = Mutation(
+        mutation_id="mutation-drop-caps",
+        type=MutationType.DROP_ALL_CAPS,
+        service="web",
+    )
+    second_artifacts = tmp_path / "second-artifacts"
+    second_artifacts.mkdir()
+    second_context = replace(
+        first_context,
+        overlay_path=first_context.workspace / "second-candidate.overlay.yaml",
+        artifact_dir=second_artifacts,
+    )
+    second_provider = StartupInputProvider()
+    second_runner_calls: list[
+        tuple[str, str, Path, tuple[tuple[object, ...], ...]]
+    ] = []
+    _install_http_runner(
+        monkeypatch, {"health": Verdict.PASS}, second_runner_calls, second_provider
+    )
+
+    second_record = _run(second_state, second_mutation, second_provider, second_context)
+
+    assert second_record.verdict is ExperimentVerdict.KEEP
+    first_terminal = _read_jsonl(
+        first_context.artifact_dir / "startup-input-attempt.jsonl"
+    )[-1]
+    second_terminal = _read_jsonl(
+        second_context.artifact_dir / "startup-input-attempt.jsonl"
+    )[-1]
+    assert second_terminal["source_relative_path"] == ".env.sample"
+    assert second_terminal["target_relative_path"] == ".env"
+    assert second_terminal["source_sha256"] == first_terminal["source_sha256"]
+    assert second_terminal["output_sha256"] == first_terminal["output_sha256"]
+    second_compose_calls = [
+        call[2]
+        for call in second_provider.calls
+        if call[0] == "exec" and "docker" in call[2] and "compose" in call[2]
+    ]
+    assert all("--project-directory" in argv for argv in second_compose_calls)
+    assert all(
+        accepted.relative_to(first_context.workspace).as_posix() in argv
+        for argv in second_compose_calls
+    )
+
+
 def test_conflicting_recorded_parent_hash_stops_before_overlay_and_sandbox(
     tmp_path: Path,
 ) -> None:
@@ -417,8 +925,9 @@ def _patch_boot(
         attempt: int,
         *,
         overlay_path: str | None = None,
+        compatibility_overlay_path: str | None = None,
     ) -> BootResult:
-        del provider, sandbox_id, env, attempt
+        del provider, sandbox_id, env, attempt, compatibility_overlay_path
         calls.append((compose_path, overlay_path))
         return BootResult(verdict=verdict, service_states={}, logs={}, attempt=1)
 
@@ -435,8 +944,17 @@ def _patch_boot_error(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> 
         attempt: int,
         *,
         overlay_path: str | None = None,
+        compatibility_overlay_path: str | None = None,
     ) -> BootResult:
-        del provider, sandbox_id, compose_path, env, attempt, overlay_path
+        del (
+            provider,
+            sandbox_id,
+            compose_path,
+            env,
+            attempt,
+            overlay_path,
+            compatibility_overlay_path,
+        )
         raise error
 
     monkeypatch.setattr(engine_module, "boot_compose", fake_boot)
@@ -455,8 +973,9 @@ def _patch_observer(
         artifact_path: Path,
         *,
         overlay_path: str | None = None,
+        compatibility_overlay_path: str | None = None,
     ) -> ObservationSnapshot:
-        del provider, sandbox_id
+        del provider, sandbox_id, compatibility_overlay_path
         calls.append((compose_path, overlay_path, artifact_path))
         if isinstance(snapshot, BaseException):
             raise snapshot
