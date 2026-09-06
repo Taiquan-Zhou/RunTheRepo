@@ -18,6 +18,7 @@ from repotrial.sandbox.base import (
     serialize_sandbox_failure_evidence,
 )
 from repotrial.sandbox.docker_sbx import (
+    _RUNTIME_TEMPLATE_TAG,
     DOCKER_FLOOR_MB,
     MANDATORY_DENY_NETWORK,
     ROOT_FLOOR_MB,
@@ -40,7 +41,7 @@ CREATE_FLAGS = (
 )
 HELP_OUTPUTS = {
     ("sbx", "create", "--help"): "Usage: sbx create [flags] AGENT PATH\n"
-    + " ".join(CREATE_FLAGS),
+    + " ".join((*CREATE_FLAGS, "--template")),
     ("sbx", "create", "shell", "--help"): ("Usage: sbx create [flags] shell [PATH]"),
     ("sbx", "exec", "--help"): "Usage: sbx exec SANDBOX -- COMMAND [ARG...]",
     ("sbx", "ports", "--help"): "Usage: sbx ports SANDBOX [--publish PORT] [--json]",
@@ -53,6 +54,9 @@ HELP_OUTPUTS = {
     ("sbx", "policy", "log", "--help"): (
         "Usage: sbx policy log SANDBOX --type network --json"
     ),
+    ("sbx", "template", "save", "--help"): "Usage: sbx template save IMAGE",
+    ("sbx", "template", "ls", "--help"): "Usage: sbx template ls --json",
+    ("sbx", "template", "rm", "--help"): "Usage: sbx template rm IMAGE",
 }
 PROBE_CALLS = [
     ("sbx", "version"),
@@ -63,6 +67,9 @@ PROBE_CALLS = [
     ("sbx", "cp", "--help"),
     ("sbx", "rm", "--help"),
     ("sbx", "policy", "allow", "network", "--help"),
+    ("sbx", "template", "save", "--help"),
+    ("sbx", "template", "ls", "--help"),
+    ("sbx", "template", "rm", "--help"),
     ("sbx", "policy", "log", "--help"),
 ]
 HOST_HEAD = b"0123456789abcdef0123456789abcdef01234567\n"
@@ -1283,6 +1290,148 @@ def test_supported_capabilities_allow_create_without_pid_hard_bound(
     _create(provider, tmp_path)
 
     assert len(_non_help_create_calls(spawner)) == 1
+
+
+def test_runtime_template_probe_requires_all_template_help_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+
+    assert asyncio.run(provider._probe(time.monotonic() + 300.0)) is True
+
+    assert ("sbx", "create", "--help") in spawner.calls
+    assert ("sbx", "template", "save", "--help") in spawner.calls
+    assert ("sbx", "template", "ls", "--help") in spawner.calls
+    assert ("sbx", "template", "rm", "--help") in spawner.calls
+
+
+def test_runtime_template_lifecycle_uses_owned_tag_and_exact_image_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch,
+        spawner,
+        deadline=time.monotonic() + 300.0,
+    )
+    image_id = "sha256:" + "a" * 64
+    saved_tag: str | None = None
+    template_saved = False
+
+    def template_handler(command: tuple[str, ...]) -> _Outcome:
+        nonlocal saved_tag, template_saved
+        if command == ("sbx", "template", "ls", "--json"):
+            if not template_saved:
+                return _Outcome(stdout=b"[]")
+            assert saved_tag is not None
+            payload = json.dumps(
+                [{"repository": "repotrial-runtime", "tag": saved_tag, "id": image_id}]
+            ).encode()
+            return _Outcome(stdout=payload)
+        if command[:3] == ("sbx", "template", "save"):
+            saved_tag = command[-1]
+            template_saved = True
+            return _Outcome()
+        if command[:3] == ("sbx", "template", "rm"):
+            assert command[-1] == image_id or command[-1] == saved_tag
+            template_saved = False
+            return _Outcome()
+        return _Outcome()
+
+    spawner.handler = template_handler
+
+    async def exercise() -> None:
+        await provider.activate_runtime_template(sandbox_id, "b" * 64)
+        assert provider.expected_image_identity_sha256() == "b" * 64
+        await provider.finalize_runtime_template()
+
+    asyncio.run(exercise())
+
+    template_calls = [call for call in spawner.calls if call[:2] == ("sbx", "template")]
+    assert template_calls[0] == ("sbx", "template", "ls", "--json")
+    assert template_calls[1][:3] == ("sbx", "template", "save")
+    assert template_calls[1][-1] == saved_tag
+    assert template_calls[2] == ("sbx", "template", "ls", "--json")
+    assert template_calls[3] == ("sbx", "template", "rm", image_id)
+    assert template_calls[4] == ("sbx", "template", "ls", "--json")
+    assert saved_tag is not None and _RUNTIME_TEMPLATE_TAG.fullmatch(saved_tag)
+    assert provider.expected_image_identity_sha256() is None
+
+
+def test_create_uses_active_runtime_template_with_clone_and_policy_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    provider, _ = _active_provider(
+        monkeypatch,
+        spawner,
+        deadline=time.monotonic() + 300.0,
+    )
+    provider._runtime_template_tag = "repotrial-runtime:" + "c" * 32
+
+    sandbox_id = _create(provider, tmp_path)
+
+    create_call = _actual_create_call(spawner)
+    assert create_call[4] == "--clone"
+    assert ("--template", provider._runtime_template_tag) == create_call[-4:-2]
+    assert create_call[-2:] == ("shell", str(tmp_path))
+    assert sandbox_id in create_call
+
+
+def test_runtime_template_rejects_preexisting_owned_tag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch,
+        spawner,
+        deadline=time.monotonic() + 300.0,
+    )
+    monkeypatch.setattr(
+        docker_sbx.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="d" * 32),
+    )
+    existing = json.dumps(
+        [
+            {
+                "repository": "repotrial-runtime",
+                "tag": "d" * 32,
+                "id": "sha256:" + "a" * 64,
+            }
+        ]
+    ).encode()
+    spawner.handler = lambda command: (
+        _Outcome(stdout=existing)
+        if command == ("sbx", "template", "ls", "--json")
+        else _Outcome()
+    )
+
+    with pytest.raises(DockerSbxError, match="template_tag_collision"):
+        asyncio.run(provider.activate_runtime_template(sandbox_id, "b" * 64))
+
+    assert ("sbx", "template", "save", sandbox_id) not in spawner.calls
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        b"{",
+        b'[{"repository":"repotrial-runtime","tag":"x","id":"bad"}]',
+        (
+            b'[{"repository":"repotrial-runtime","tag":"x","id":"'
+            b"sha256:"
+            b'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            b'"id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'
+        ),
+    ],
+)
+def test_runtime_template_listing_rejects_malformed_or_duplicate_records(
+    output: bytes,
+) -> None:
+    with pytest.raises(DockerSbxError, match="template_list_invalid"):
+        docker_sbx._parse_runtime_templates(output)
 
 
 def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
@@ -3263,18 +3412,18 @@ def test_create_deadline_starts_before_probes_and_limits_create_subprocess(
         monkeypatch,
         spawner,
         command_timeout_s=30,
-        total_duration_s=20,
+        total_duration_s=23,
     )
 
     sandbox_id = _create(provider, tmp_path)
 
     timed_commands = _timeouts_by_command(spawner, recorder)
     assert timed_commands[0][0][:2] == ("git", "-C")
-    assert timed_commands[0][1] == 20.0
+    assert timed_commands[0][1] == 23.0
     assert timed_commands[1 : len(PROBE_CALLS) + 1] == list(
         zip(
             PROBE_CALLS,
-            (19.0, 18.0, 17.0, 16.0, 15.0, 14.0, 13.0, 12.0, 11.0),
+            (22.0, 21.0, 20.0, 19.0, 18.0, 17.0, 16.0, 15.0, 14.0, 13.0, 12.0, 11.0),
             strict=True,
         )
     )
@@ -3337,7 +3486,7 @@ def test_create_deadline_starts_before_probes_and_limits_create_subprocess(
         ),
         ("sbx", "policy", "allow", "network", "--sandbox", sandbox_id, "**"),
     ]
-    assert provider._sandbox_deadlines == {sandbox_id: 20.0}
+    assert provider._sandbox_deadlines == {sandbox_id: 23.0}
 
 
 @pytest.mark.parametrize(

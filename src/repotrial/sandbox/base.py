@@ -256,3 +256,19 @@ class SandboxProvider(ABC):
     async def destroy(self, sandbox_id: str) -> None:
         """Retry-safe cleanup for owned IDs; unknown or unowned IDs fail closed."""
         ...
+
+    @property
+    def supports_runtime_templates(self) -> bool:
+        return False
+
+    async def activate_runtime_template(
+        self, sandbox_id: str, image_identity_sha256: str
+    ) -> None:
+        del sandbox_id, image_identity_sha256
+        raise RuntimeError("runtime templates are unsupported")
+
+    def expected_image_identity_sha256(self) -> str | None:
+        return None
+
+    async def finalize_runtime_template(self) -> None:
+        return None

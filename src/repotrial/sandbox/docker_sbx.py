@@ -65,6 +65,8 @@ _CREATE_FLAGS = (
     "--memory",
     "--deny-network",
 )
+_RUNTIME_TEMPLATE_TAG = re.compile(r"repotrial-runtime:[0-9a-f]{32}\Z")
+_IMAGE_ID = re.compile(r"(?:sha256:)?[0-9a-f]{64}\Z")
 PID_HARD_BOUND_LIMITATION = "pid_hard_bound_unsupported"
 _PORT_KEYS = {"host_ip", "host_port", "sandbox_port", "protocol"}
 _NETWORK_LOG_KEYS = {"blocked_hosts", "allowed_hosts"}
@@ -301,6 +303,13 @@ class _DuplicateJsonKeyError(ValueError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class _RuntimeTemplate:
+    repository: str
+    tag: str
+    image_id: str
+
+
 class DockerSbxProvider(SandboxProvider):
     """Run Docker Sandboxes only after an exact capability probe succeeds."""
 
@@ -324,6 +333,95 @@ class DockerSbxProvider(SandboxProvider):
         self._sandbox_deadlines: dict[str, float] = {}
         self._trial_deadline: float | None = None
         self._network_log_sandboxes: set[str] = set()
+        self._runtime_template_tag: str | None = None
+        self._runtime_template_image_id: str | None = None
+        self._runtime_template_expected_identity: str | None = None
+
+    @property
+    def supports_runtime_templates(self) -> bool:
+        return True
+
+    def expected_image_identity_sha256(self) -> str | None:
+        return self._runtime_template_expected_identity
+
+    async def activate_runtime_template(
+        self, sandbox_id: str, image_identity_sha256: str
+    ) -> None:
+        self._require_active(sandbox_id)
+        if (
+            not isinstance(image_identity_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", image_identity_sha256) is None
+        ):
+            raise ValueError("image_identity_sha256 must be 64 lowercase hex digits")
+        if self._runtime_template_tag is not None:
+            raise RuntimeError("runtime template is already active")
+        deadline = self._require_deadline(sandbox_id)
+        tag = f"repotrial-runtime:{uuid.uuid4().hex}"
+        before = await self._list_runtime_templates(deadline)
+        if any(_runtime_template_matches(item, tag) for item in before):
+            raise DockerSbxError("template_save", "template_tag_collision")
+
+        save_attempted = False
+        try:
+            save_attempted = True
+            result = await self._run(
+                "template_save",
+                ["template", "save", sandbox_id, tag],
+                self._command_timeout_s,
+                deadline=deadline,
+            )
+            _require_success("template_save", result)
+            after = await self._list_runtime_templates(deadline)
+            matches = [item for item in after if _runtime_template_matches(item, tag)]
+            if len(matches) != 1:
+                raise DockerSbxError("template_save", "template_identity_invalid")
+            self._runtime_template_tag = tag
+            self._runtime_template_image_id = matches[0].image_id
+            self._runtime_template_expected_identity = image_identity_sha256
+        except (DockerSbxError, asyncio.CancelledError) as primary_error:
+            if save_attempted:
+                try:
+                    await self._remove_runtime_template(tag, deadline=deadline)
+                except (DockerSbxError, asyncio.CancelledError) as cleanup_error:
+                    primary_error.add_note("runtime template cleanup unconfirmed")
+                    primary_error.__context__ = cleanup_error
+            raise
+
+    async def finalize_runtime_template(self) -> None:
+        tag = self._runtime_template_tag
+        image_id = self._runtime_template_image_id
+        if tag is None or image_id is None:
+            return
+        await self._remove_runtime_template(image_id, deadline=None)
+        remaining = await self._list_runtime_templates(deadline=None)
+        if any(item.image_id == image_id for item in remaining):
+            raise DockerSbxError("template_finalize", "template_still_present")
+        self._runtime_template_tag = None
+        self._runtime_template_image_id = None
+        self._runtime_template_expected_identity = None
+
+    async def _remove_runtime_template(
+        self, reference: str, *, deadline: float | None
+    ) -> None:
+        result = await self._run(
+            "template_rm",
+            ["template", "rm", reference],
+            self._command_timeout_s,
+            deadline=deadline,
+        )
+        _require_success("template_rm", result)
+
+    async def _list_runtime_templates(
+        self, deadline: float | None
+    ) -> tuple[_RuntimeTemplate, ...]:
+        result = await self._run(
+            "template_ls",
+            ["template", "ls", "--json"],
+            self._command_timeout_s,
+            deadline=deadline,
+        )
+        _require_success("template_ls", result)
+        return _parse_runtime_templates(result.stdout)
 
     async def create(self, workspace: Path, name: str) -> str:
         deadline = self._trial_deadline
@@ -370,6 +468,8 @@ class DockerSbxProvider(SandboxProvider):
         ]
         for resource in sorted(self._policy.deny_network):
             arguments.extend(("--deny-network", resource))
+        if self._runtime_template_tag is not None:
+            arguments.extend(("--template", self._runtime_template_tag))
         arguments.extend(("shell", str(resolved_workspace)))
         try:
             create_error: DockerSbxError | asyncio.CancelledError | None = None
@@ -1016,7 +1116,7 @@ class DockerSbxProvider(SandboxProvider):
             )
 
         required_help = (
-            ("create", ["create", "--help"], _CREATE_FLAGS),
+            ("create", ["create", "--help"], (*_CREATE_FLAGS, "--template")),
             ("create_shell", ["create", "shell", "--help"], ("PATH",)),
             ("exec", ["exec", "--help"], ()),
             ("ports", ["ports", "--help"], ("--publish", "--json")),
@@ -1027,6 +1127,9 @@ class DockerSbxProvider(SandboxProvider):
                 ["policy", "allow", "network", "--help"],
                 ("--sandbox", '"**"'),
             ),
+            ("template_save", ["template", "save", "--help"], ()),
+            ("template_ls", ["template", "ls", "--help"], ("--json",)),
+            ("template_rm", ["template", "rm", "--help"], ()),
         )
         for capability, arguments, tokens in required_help:
             result = await self._probe_call(capability, arguments, deadline)
@@ -1810,6 +1913,57 @@ def _process_cleanup_unconfirmed(error: BaseException) -> bool:
     return any(
         note.startswith(_PROCESS_CLEANUP_UNCONFIRMED_NOTE_PREFIX)
         for note in getattr(error, "__notes__", ())
+    )
+
+
+def _parse_runtime_templates(output: bytes) -> tuple[_RuntimeTemplate, ...]:
+    try:
+        text = output.decode("utf-8")
+        decoded: Any = json.loads(
+            text,
+            object_pairs_hook=_strict_json_object_from_pairs,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateJsonKeyError):
+        raise DockerSbxError("template_ls", "template_list_invalid") from None
+    if not isinstance(decoded, list) or len(decoded) > 128:
+        raise DockerSbxError("template_ls", "template_list_invalid")
+    templates: list[_RuntimeTemplate] = []
+    for item in decoded:
+        if not isinstance(item, dict):
+            raise DockerSbxError("template_ls", "template_list_invalid")
+        if set(item) == {"repository", "tag", "id"}:
+            image_id_key = "id"
+        elif set(item) == {"repository", "tag", "image_id"}:
+            image_id_key = "image_id"
+        else:
+            raise DockerSbxError("template_ls", "template_list_invalid")
+        repository = item["repository"]
+        tag = item["tag"]
+        image_id = item[image_id_key]
+        if (
+            not isinstance(repository, str)
+            or not isinstance(tag, str)
+            or not isinstance(image_id, str)
+            or not repository
+            or not tag
+            or _IMAGE_ID.fullmatch(image_id) is None
+        ):
+            raise DockerSbxError("template_ls", "template_list_invalid")
+        templates.append(
+            _RuntimeTemplate(
+                repository=repository,
+                tag=tag,
+                image_id=image_id,
+            )
+        )
+    return tuple(templates)
+
+
+def _runtime_template_matches(template: _RuntimeTemplate, tag: str) -> bool:
+    return (
+        template.repository == "repotrial-runtime"
+        and (template.tag == tag or template.tag == tag.split(":", 1)[1])
+        and _RUNTIME_TEMPLATE_TAG.fullmatch(tag) is not None
     )
 
 

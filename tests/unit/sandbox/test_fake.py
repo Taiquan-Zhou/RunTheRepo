@@ -42,6 +42,13 @@ def test_sandbox_provider_exposes_the_frozen_async_contract() -> None:
     assert NetworkLogResult(supported=True).events == []
 
 
+def test_fake_provider_does_not_claim_runtime_template_support() -> None:
+    provider = FakeSandboxProvider()
+
+    assert provider.supports_runtime_templates is False
+    assert provider.expected_image_identity_sha256() is None
+
+
 def test_fake_provider_runs_a_full_lifecycle_with_an_ordered_call_ledger(
     tmp_path: Path,
 ) -> None:

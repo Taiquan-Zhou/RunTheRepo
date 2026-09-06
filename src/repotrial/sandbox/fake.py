@@ -23,6 +23,10 @@ class FakeSandboxProvider(SandboxProvider):
         self._next_sandbox_number = 1
         self.calls: list[tuple[object, ...]] = []
 
+    @property
+    def supports_runtime_templates(self) -> bool:
+        return False
+
     async def create(self, workspace: Path, name: str) -> str:
         self.calls.append(("create", workspace, name))
         sandbox_id = f"sandbox-{self._next_sandbox_number}"
