@@ -87,6 +87,22 @@ def _experiment_materialization_argv(
     ]
 
 
+def _accepted_compose_materialization_argv(
+    payload: bytes,
+    relative_path: str,
+) -> list[str]:
+    return [
+        "sh",
+        "-eu",
+        "-c",
+        import_module("repotrial.trial.compatibility")._ACCEPTED_COMPOSE_ADAPTER_SCRIPT,
+        "repotrial-accepted-compose",
+        relative_path,
+        hashlib.sha256(payload).hexdigest(),
+        base64.b64encode(payload).decode("ascii"),
+    ]
+
+
 def _run_fixture_command(provider: Any, workspace: Path, argv: list[str]) -> Any:
     async def exercise() -> object:
         sandbox_id = await provider.create(workspace, "experiment-materialization")
@@ -260,6 +276,52 @@ def test_fixture_provider_observer_reuses_active_allowlisted_environment(
     assert observer.exit_code == 0
     assert json.loads(observer.stdout)["ID"]
     _assert_unexpected(mismatch, provider)
+
+
+def test_fixture_provider_compose_up_uses_only_materialized_accepted_guest_bytes(
+    tmp_path: Path,
+) -> None:
+    provider, source = _fixture_provider("redundant_privileged")
+    workspace = tmp_path / "sandbox"
+    workspace.mkdir()
+    compose = (source / "compose.yml").read_bytes()
+    accepted_relative = (
+        ".repotrial-accepted/accepted-0001-0123456789abcdef.compose.yaml"
+    )
+    accepted_host = workspace / accepted_relative
+    accepted_host.parent.mkdir()
+    accepted_host.write_bytes(compose)
+    up_argv = [
+        "docker",
+        "compose",
+        "-f",
+        accepted_relative,
+        "up",
+        "-d",
+        "--wait",
+        "--wait-timeout",
+        "60",
+    ]
+
+    async def exercise() -> tuple[Any, Any, Any]:
+        sandbox_id = await provider.create(workspace, "accepted-compose")
+        try:
+            missing = await provider.exec(sandbox_id, up_argv)
+            materialized = await provider.exec(
+                sandbox_id,
+                _accepted_compose_materialization_argv(compose, accepted_relative),
+            )
+            accepted_host.write_bytes(b"not a compose document")
+            after_host_tamper = await provider.exec(sandbox_id, up_argv)
+            return missing, materialized, after_host_tamper
+        finally:
+            await provider.destroy(sandbox_id)
+
+    missing, materialized, after_host_tamper = asyncio.run(exercise())
+
+    _assert_unexpected(missing, provider)
+    assert materialized.exit_code == 0
+    assert after_host_tamper.exit_code == 0
 
 
 def _isolated_fixture_project(

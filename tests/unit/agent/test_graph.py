@@ -4,7 +4,10 @@ import binascii
 import hashlib
 import json
 import os
+import posixpath
+import re
 import threading
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,6 +15,7 @@ from pathlib import Path
 from typing import TypeVar
 
 import pytest
+from fixture_harness import parse_fixture_materialization
 from langgraph.errors import NodeCancelledError
 from pydantic import BaseModel
 from ruamel.yaml import YAML
@@ -43,10 +47,90 @@ from repotrial.sandbox.base import (
 from repotrial.sandbox.docker_sbx import DockerSbxError
 from repotrial.sandbox.fake import FakeSandboxProvider
 from repotrial.sandbox.lifecycle import CleanupError
+from repotrial.trial import compatibility as _compatibility
+from repotrial.trial import startup_inputs as _startup_inputs
 from repotrial.trial.image_template import ImageTemplateError
 from repotrial.trial.journey_artifact import JourneyArtifactError
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+_GRAPH_ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=(.*)\Z")
+_GRAPH_ALLOWED_ENV_KEYS = frozenset(
+    {
+        "APP_DECLARED_TOKEN",
+        "APP_MODE",
+        "APP_REQUIRED_TOKEN",
+        "PINNED_TOKEN",
+        "PUBLIC_DSN",
+        "WAKAPI_DB_PASSWORD",
+    }
+)
+_GRAPH_COMPOSE_ROUTES = {
+    ("config", "--format", "json"): "config_format",
+    ("config", "--quiet"): "config_quiet",
+    ("up", "-d", "--wait", "--wait-timeout", "60"): "up",
+    (
+        "up",
+        "-d",
+        "--wait",
+        "--wait-timeout",
+        "60",
+        "--no-build",
+        "--no-recreate",
+    ): "up",
+    ("ps", "--all", "--format", "json"): "boot_ps",
+    (
+        "ps",
+        "--all",
+        "--no-trunc",
+        "--orphans=false",
+        "--format",
+        "json",
+    ): "observer_ps",
+    ("logs", "--no-color", "--tail", "200"): "logs",
+}
+
+
+def _graph_safe_relative_path(value: str) -> bool:
+    return (
+        bool(value)
+        and not value.startswith("/")
+        and "\\" not in value
+        and posixpath.normpath(value) == value
+        and all(part not in {"", ".", ".."} for part in value.split("/"))
+        and not any(
+            unicodedata.category(character).startswith("C") for character in value
+        )
+    )
+
+
+def _split_graph_env_prefix(
+    snapshot: tuple[str, ...],
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    if not snapshot or snapshot[0] != "env":
+        return (), snapshot
+    index = 1
+    seen: set[str] = set()
+    while index < len(snapshot) and snapshot[index] == "-u":
+        if index + 1 >= len(snapshot):
+            return None
+        key = snapshot[index + 1]
+        if key not in _GRAPH_ALLOWED_ENV_KEYS or key in seen:
+            return None
+        seen.add(key)
+        index += 2
+    while index < len(snapshot):
+        assignment = snapshot[index]
+        match = _GRAPH_ENV_ASSIGNMENT.fullmatch(assignment)
+        if match is None:
+            break
+        key, _ = assignment.split("=", 1)
+        if key not in _GRAPH_ALLOWED_ENV_KEYS or key in seen:
+            return None
+        seen.add(key)
+        index += 1
+    if index == 1 or index >= len(snapshot):
+        return None
+    return snapshot[:index], snapshot[index:]
 
 
 def _journey(*, expected_status: int = 200) -> Journey:
@@ -97,6 +181,25 @@ def _compose_text(risks: tuple[str, ...]) -> str:
     )
 
 
+def _graph_experiment_argv(
+    payload: bytes,
+    *,
+    adapter_script: str | None = None,
+) -> list[str]:
+    return [
+        "sh",
+        "-eu",
+        "-c",
+        _compatibility._EXPERIMENT_ADAPTER_SCRIPT
+        if adapter_script is None
+        else adapter_script,
+        "repotrial-experiment-overlay",
+        _compatibility._EXPERIMENT_RELATIVE_PATH,
+        hashlib.sha256(payload).hexdigest(),
+        base64.b64encode(payload).decode("ascii"),
+    ]
+
+
 def _state(workspace: Path, *, run_id: str = "run-1") -> RunState:
     del workspace
     return RunState(
@@ -145,7 +248,9 @@ class GraphProvider(FakeSandboxProvider):
         self._roles: dict[str, str] = {}
         self._workspaces: dict[str, Path] = {}
         self._experiment_expected_sha256: dict[str, str] = {}
-        self._accepted_expected_sha256: dict[str, str] = {}
+        self._accepted_expected_sha256: dict[str, dict[str, str]] = {}
+        self._compatibility_guest_files: dict[str, bytes] = {}
+        self._experiment_guest_files: dict[str, bytes] = {}
         self._accepted_guest_files: dict[str, dict[str, bytes]] = {}
 
     async def create(self, workspace: Path, name: str) -> str:
@@ -167,84 +272,12 @@ class GraphProvider(FakeSandboxProvider):
         self._require_active(sandbox_id)
         snapshot = tuple(argv)
         self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
-        if "repotrial-compatibility-overlay" in snapshot:
-            relative_path = snapshot[-3]
-            expected_sha256 = snapshot[-2]
-            if self._roles[sandbox_id] in self.compatibility_swap_roles:
-                (self._workspaces[sandbox_id] / relative_path).write_bytes(
-                    b"guest-clone-tampered"
-                )
-            return ExecResult(
-                exit_code=0,
-                stdout=(
-                    "root=/workspace\n"
-                    f"path={relative_path}\n"
-                    "mode=600\n"
-                    f"sha256={expected_sha256}\n"
-                ),
-                stderr="",
-            )
-        if "repotrial-accepted-compose" in snapshot:
-            relative_path = snapshot[-3]
-            expected_sha256 = snapshot[-2]
-            payload = snapshot[-1]
-            if not relative_path.startswith(".repotrial-accepted/"):
-                raise AssertionError("accepted compose path must be fixed")
-            try:
-                content = base64.b64decode(payload, validate=True)
-            except (ValueError, binascii.Error) as error:
-                raise AssertionError("accepted payload must be valid base64") from error
-            if hashlib.sha256(content).hexdigest() != expected_sha256:
-                raise AssertionError("accepted payload hash mismatch")
-            guest_files = self._accepted_guest_files.setdefault(sandbox_id, {})
-            if relative_path in guest_files:
-                return ExecResult(exit_code=24, stdout="", stderr="")
-            guest_files[relative_path] = content
-            self._accepted_expected_sha256[sandbox_id] = expected_sha256
-            return ExecResult(
-                exit_code=0,
-                stdout=(
-                    "root=/workspace\n"
-                    f"path={relative_path}\n"
-                    "mode=600\n"
-                    f"sha256={expected_sha256}\n"
-                ),
-                stderr="",
-            )
-        if "repotrial-experiment-overlay" in snapshot:
-            relative_path = snapshot[-3]
-            expected_sha256 = snapshot[-2]
-            payload = snapshot[-1]
-            if relative_path != ".repotrial-overlays/experiment.overlay.yaml":
-                raise AssertionError("experiment adapter path must be fixed")
-            try:
-                content = base64.b64decode(payload, validate=True)
-            except (ValueError, binascii.Error) as error:
-                raise AssertionError(
-                    "experiment payload must be valid base64"
-                ) from error
-            if hashlib.sha256(content).hexdigest() != expected_sha256:
-                raise AssertionError("experiment payload hash mismatch")
-            target = self._workspaces[sandbox_id] / relative_path
-            target.parent.mkdir(exist_ok=True)
-            if target.exists() or target.is_symlink():
-                return ExecResult(exit_code=24, stdout="", stderr="")
-            target.write_bytes(content)
-            target.chmod(0o600)
-            self._experiment_expected_sha256[sandbox_id] = expected_sha256
-            return ExecResult(
-                exit_code=0,
-                stdout=(
-                    "root=/workspace\n"
-                    f"path={relative_path}\n"
-                    "mode=600\n"
-                    f"sha256={expected_sha256}\n"
-                ),
-                stderr="",
-            )
-        if "repotrial-startup-input" in snapshot:
+        materialization = self._guest_materialization(sandbox_id, snapshot)
+        if materialization is not None:
+            return materialization
+        if self._is_startup_input(snapshot):
             return self.startup_adapter_result
-        if snapshot[:2] == ("sha256sum", "--"):
+        if len(snapshot) == 3 and snapshot[:2] == ("sha256sum", "--"):
             relative_path = snapshot[2]
             if (
                 relative_path == ".repotrial-overlays/compatibility.overlay.yaml"
@@ -252,7 +285,21 @@ class GraphProvider(FakeSandboxProvider):
             ):
                 digest = "0" * 64
             else:
-                if relative_path.startswith(".repotrial-accepted/"):
+                if relative_path == _compatibility._COMPATIBILITY_RELATIVE_PATH:
+                    try:
+                        content = self._compatibility_guest_files[sandbox_id]
+                    except KeyError as error:
+                        raise AssertionError(
+                            "compatibility guest target was not materialized"
+                        ) from error
+                elif relative_path == _compatibility._EXPERIMENT_RELATIVE_PATH:
+                    try:
+                        content = self._experiment_guest_files[sandbox_id]
+                    except KeyError as error:
+                        raise AssertionError(
+                            "experiment guest target was not materialized"
+                        ) from error
+                elif relative_path.startswith(".repotrial-accepted/"):
                     try:
                         content = self._accepted_guest_files[sandbox_id][relative_path]
                     except KeyError as error:
@@ -274,7 +321,10 @@ class GraphProvider(FakeSandboxProvider):
                     raise AssertionError("experiment verifier hash mismatch")
                 if (
                     relative_path.startswith(".repotrial-accepted/")
-                    and self._accepted_expected_sha256.get(sandbox_id) != digest
+                    and self._accepted_expected_sha256.get(sandbox_id, {}).get(
+                        relative_path
+                    )
+                    != digest
                 ):
                     raise AssertionError("accepted verifier hash mismatch")
             return ExecResult(
@@ -282,65 +332,118 @@ class GraphProvider(FakeSandboxProvider):
                 stdout=f"{digest}  {relative_path}\n",
                 stderr="",
             )
-        if "docker" in snapshot and "compose" in snapshot:
-            compose_files = [
-                snapshot[index + 1]
-                for index, item in enumerate(snapshot[:-1])
-                if item == "-f"
-            ]
-            for relative_path in compose_files:
-                if relative_path.startswith(
-                    ".repotrial-accepted/"
-                ) and relative_path not in self._accepted_guest_files.get(
-                    sandbox_id, {}
-                ):
-                    raise AssertionError(
-                        "accepted compose was not materialized in guest"
-                    )
-        if snapshot[-3:] == ("config", "--format", "json"):
-            return ExecResult(
-                exit_code=0,
-                stdout=json.dumps({"services": {"web": {"image": "example/web:1"}}}),
-                stderr="",
-            )
-        healthy = self._healthy[sandbox_id]
-        if snapshot[-2:] == ("config", "--quiet"):
-            return ExecResult(
-                exit_code=0 if healthy else 1,
-                stdout="",
-                stderr="" if healthy else self._logs[sandbox_id],
-            )
-        if snapshot[-5:] == ("up", "-d", "--wait", "--wait-timeout", "60"):
-            return ExecResult(exit_code=0 if healthy else 1, stdout="", stderr="")
-        if snapshot[-4:] == ("ps", "--all", "--format", "json"):
-            return ExecResult(
-                exit_code=0,
-                stdout=json.dumps(
-                    {
-                        "Service": "web",
-                        "State": "running" if healthy else "exited",
-                        "Health": "healthy" if healthy else "",
-                        "ExitCode": 0 if healthy else 1,
-                    }
-                ),
-                stderr="",
-            )
-        if snapshot[-4:] == ("logs", "--no-color", "--tail", "200"):
-            return ExecResult(
-                exit_code=0,
-                stdout=self._logs[sandbox_id],
-                stderr="",
-            )
-        if snapshot[-6:] == (
-            "ps",
-            "--all",
-            "--no-trunc",
-            "--orphans=false",
-            "--format",
-            "json",
-        ):
-            return ExecResult(exit_code=0, stdout="", stderr="")
+        route = self._route_compose_command(sandbox_id, snapshot)
+        if route is not None:
+            route_name, _compose_files, _prefix = route
+            if route_name == "config_format":
+                return ExecResult(
+                    exit_code=0,
+                    stdout=json.dumps(
+                        {"services": {"web": {"image": "example/web:1"}}}
+                    ),
+                    stderr="",
+                )
+            healthy = self._healthy[sandbox_id]
+            if route_name == "config_quiet":
+                return ExecResult(
+                    exit_code=0 if healthy else 1,
+                    stdout="",
+                    stderr="" if healthy else self._logs[sandbox_id],
+                )
+            if route_name == "up":
+                return ExecResult(exit_code=0 if healthy else 1, stdout="", stderr="")
+            if route_name == "boot_ps":
+                return ExecResult(
+                    exit_code=0,
+                    stdout=json.dumps(
+                        {
+                            "Service": "web",
+                            "State": "running" if healthy else "exited",
+                            "Health": "healthy" if healthy else "",
+                            "ExitCode": 0 if healthy else 1,
+                        }
+                    ),
+                    stderr="",
+                )
+            if route_name == "logs":
+                return ExecResult(
+                    exit_code=0,
+                    stdout=self._logs[sandbox_id],
+                    stderr="",
+                )
+            if route_name == "observer_ps":
+                return ExecResult(exit_code=0, stdout="", stderr="")
         raise AssertionError(f"unexpected provider command: {snapshot!r}")
+
+    def _route_compose_command(
+        self, sandbox_id: str, snapshot: tuple[str, ...]
+    ) -> tuple[str, tuple[str, ...], tuple[str, ...]] | None:
+        split = _split_graph_env_prefix(snapshot)
+        if split is None:
+            return None
+        prefix, command = split
+        if command[:2] != ("docker", "compose"):
+            return None
+        index = 2
+        if command[index : index + 2] == ("--project-directory", "."):
+            index += 2
+        compose_files: list[str] = []
+        while index < len(command) and command[index] == "-f":
+            if index + 1 >= len(command) or not _graph_safe_relative_path(
+                command[index + 1]
+            ):
+                return None
+            compose_files.append(command[index + 1])
+            index += 2
+        if len(compose_files) not in {1, 2, 3} or len(compose_files) != len(
+            set(compose_files)
+        ):
+            return None
+        route_name = _GRAPH_COMPOSE_ROUTES.get(tuple(command[index:]))
+        if route_name is None:
+            return None
+        files = tuple(compose_files)
+        for relative_path in files:
+            if relative_path.startswith(".repotrial-accepted/") and (
+                _compatibility._ACCEPTED_COMPOSE_PATTERN.fullmatch(relative_path)
+                is None
+                or relative_path not in self._accepted_guest_files.get(sandbox_id, {})
+            ):
+                raise AssertionError("accepted compose was not materialized in guest")
+        return route_name, files, prefix
+
+    @staticmethod
+    def _is_startup_input(snapshot: tuple[str, ...]) -> bool:
+        split = _split_graph_env_prefix(snapshot)
+        if split is None:
+            return False
+        _prefix, command = split
+        if len(command) != 10 or command[:5] != (
+            "sh",
+            "-eu",
+            "-c",
+            _startup_inputs._ADAPTER_SCRIPT,
+            "repotrial-startup-input",
+        ):
+            return False
+        source_path, target_path, source_sha256, output_sha256, payload = command[5:]
+        if source_path != ".env.sample" or target_path != ".env":
+            return False
+        if (
+            _compatibility._SHA256_PATTERN.fullmatch(source_sha256) is None
+            or _compatibility._SHA256_PATTERN.fullmatch(output_sha256) is None
+        ):
+            return False
+        if payload == _startup_inputs._EMPTY_PAYLOAD_SENTINEL:
+            decoded = b""
+        else:
+            if len(payload) > _startup_inputs._MAX_PAYLOAD_BYTES:
+                return False
+            try:
+                decoded = base64.b64decode(payload, validate=True)
+            except (UnicodeError, ValueError, binascii.Error):
+                return False
+        return hashlib.sha256(decoded).hexdigest() == output_sha256
 
     async def publish_port(self, sandbox_id: str, container_port: int) -> int:
         if self._roles[sandbox_id] == "candidate" and not self.candidate_publish:
@@ -349,13 +452,135 @@ class GraphProvider(FakeSandboxProvider):
         return await super().publish_port(sandbox_id, container_port)
 
     async def destroy(self, sandbox_id: str) -> None:
-        workspace = self._workspaces.get(sandbox_id)
-        if workspace is not None:
-            (workspace / ".repotrial-overlays/experiment.overlay.yaml").unlink(
-                missing_ok=True
-            )
+        self._compatibility_guest_files.pop(sandbox_id, None)
+        self._experiment_guest_files.pop(sandbox_id, None)
+        self._experiment_expected_sha256.pop(sandbox_id, None)
+        self._accepted_expected_sha256.pop(sandbox_id, None)
         self._accepted_guest_files.pop(sandbox_id, None)
         await super().destroy(sandbox_id)
+
+    def _guest_materialization(
+        self, sandbox_id: str, snapshot: tuple[str, ...]
+    ) -> ExecResult | None:
+        parsed = parse_fixture_materialization(snapshot)
+        if parsed is None:
+            return None
+        if isinstance(parsed, int):
+            return ExecResult(exit_code=parsed, stdout="", stderr="")
+        command_name, relative_path, expected_sha256, content = parsed
+
+        if command_name == "repotrial-compatibility-overlay":
+            if sandbox_id in self._compatibility_guest_files:
+                return ExecResult(exit_code=24, stdout="", stderr="")
+            if self._roles[sandbox_id] in self.compatibility_swap_roles:
+                self._compatibility_guest_files[sandbox_id] = b"guest-clone-tampered"
+            else:
+                self._compatibility_guest_files[sandbox_id] = content
+        elif command_name == "repotrial-experiment-overlay":
+            if sandbox_id in self._experiment_guest_files:
+                return ExecResult(exit_code=24, stdout="", stderr="")
+            self._experiment_guest_files[sandbox_id] = content
+            self._experiment_expected_sha256[sandbox_id] = expected_sha256
+        else:
+            guest_files = self._accepted_guest_files.setdefault(sandbox_id, {})
+            if relative_path in guest_files:
+                return ExecResult(exit_code=24, stdout="", stderr="")
+            guest_files[relative_path] = content
+            self._accepted_expected_sha256.setdefault(sandbox_id, {})[relative_path] = (
+                expected_sha256
+            )
+        return ExecResult(
+            exit_code=0,
+            stdout=(
+                "root=/workspace\n"
+                f"path={relative_path}\n"
+                "mode=600\n"
+                f"sha256={expected_sha256}\n"
+            ),
+            stderr="",
+        )
+
+
+def test_graph_fixture_provider_rejects_marker_with_untrusted_script(
+    tmp_path: Path,
+) -> None:
+    provider = GraphProvider()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    payload = b"services:\n  web:\n    image: example/web:1\n"
+
+    async def exercise() -> None:
+        sandbox_id = await provider.create(workspace, "candidate-marker")
+        try:
+            with pytest.raises(AssertionError, match="unexpected provider command"):
+                await provider.exec(
+                    sandbox_id,
+                    _graph_experiment_argv(payload, adapter_script="printf marker"),
+                )
+        finally:
+            await provider.destroy(sandbox_id)
+
+    asyncio.run(exercise())
+
+
+def test_graph_fixture_provider_keeps_experiment_guest_state_per_sandbox(
+    tmp_path: Path,
+) -> None:
+    provider = GraphProvider()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.yaml"
+    target = workspace / _compatibility._EXPERIMENT_RELATIVE_PATH
+    target.parent.mkdir()
+    target.symlink_to(outside)
+    first_payload = b"first graph candidate"
+    second_payload = b"second graph candidate"
+
+    async def exercise() -> tuple[ExecResult, ExecResult, ExecResult, ExecResult]:
+        first = await provider.create(workspace, "candidate-first")
+        second = await provider.create(workspace, "candidate-second")
+        try:
+            first_result = await provider.exec(
+                first, _graph_experiment_argv(first_payload)
+            )
+            second_result = await provider.exec(
+                second, _graph_experiment_argv(second_payload)
+            )
+            first_verify = await provider.exec(
+                first, ["sha256sum", "--", _compatibility._EXPERIMENT_RELATIVE_PATH]
+            )
+            second_verify = await provider.exec(
+                second, ["sha256sum", "--", _compatibility._EXPERIMENT_RELATIVE_PATH]
+            )
+            assert second_verify.stdout == (
+                f"{hashlib.sha256(second_payload).hexdigest()}  "
+                f"{_compatibility._EXPERIMENT_RELATIVE_PATH}\n"
+            )
+            await provider.destroy(first)
+            second_after_destroy = await provider.exec(
+                second, ["sha256sum", "--", _compatibility._EXPERIMENT_RELATIVE_PATH]
+            )
+            return first_result, second_result, first_verify, second_after_destroy
+        finally:
+            if second in provider._active_sandboxes:
+                await provider.destroy(second)
+
+    first_result, second_result, first_verify, second_after_destroy = asyncio.run(
+        exercise()
+    )
+
+    assert first_result.exit_code == 0
+    assert second_result.exit_code == 0
+    assert first_verify.stdout == (
+        f"{hashlib.sha256(first_payload).hexdigest()}  "
+        f"{_compatibility._EXPERIMENT_RELATIVE_PATH}\n"
+    )
+    assert second_after_destroy.stdout == (
+        f"{hashlib.sha256(second_payload).hexdigest()}  "
+        f"{_compatibility._EXPERIMENT_RELATIVE_PATH}\n"
+    )
+    assert target.is_symlink()
+    assert not outside.exists()
 
 
 class PreflightObservationProvider(GraphProvider):

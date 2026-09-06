@@ -28,7 +28,7 @@ from pydantic import (
 
 from repotrial.agent.graph import ainvoke_run, build_run_graph
 from repotrial.agent.state import GraphContext, GraphState, StageName
-from repotrial.compose.parser import ComposeParseError, load_compose
+from repotrial.compose.parser import ComposeParseError, load_compose, load_compose_bytes
 from repotrial.domain.enums import ExperimentVerdict, MutationType, Verdict
 from repotrial.domain.models import ExperimentRecord, RunState
 from repotrial.eval.metrics import (
@@ -493,7 +493,7 @@ class _FixtureProvider(SandboxProvider):
     ) -> ExecResult:
         if command.route == "compose_up":
             sandbox.active_config = _effective_service_config(
-                sandbox.workspace,
+                sandbox,
                 command.compose_files,
                 self._ground_truth.service,
             )
@@ -1205,17 +1205,26 @@ def _route_fixture_command(
         if route is None:
             return None
         compose_files = tuple(files)
-        if route == "compose_observer_ps":
+        if route == "compose_observer_ps" and (
+            compose_files != sandbox.active_compose_files
+            or sandbox.active_env is None
+            or env != sandbox.active_env
+        ):
+            return None
+        if route == "compose_up":
+            for relative_path in compose_files:
+                if relative_path.startswith(".repotrial-accepted/") and (
+                    _compatibility._ACCEPTED_COMPOSE_PATTERN.fullmatch(relative_path)
+                    is None
+                    or relative_path not in sandbox.accepted_guest_files
+                ):
+                    return None
+        else:
             if (
                 compose_files != sandbox.active_compose_files
-                or sandbox.active_env is None
                 or env != sandbox.active_env
             ):
                 return None
-        elif route != "compose_up" and (
-            compose_files != sandbox.active_compose_files or env != sandbox.active_env
-        ):
-            return None
         return _FixtureCommand(
             route=route,
             compose_files=compose_files,
@@ -1252,21 +1261,35 @@ def _fixture_materialization_failure(exit_code: int) -> ExecResult:
 
 
 def _effective_service_config(
-    workspace: Path, compose_files: Sequence[str], service: str
+    sandbox: _SandboxState, compose_files: Sequence[str], service: str
 ) -> dict[str, object]:
     if not compose_files:
         raise ValueError("compose invocation has no file")
     effective: dict[str, object] = {}
     for relative_text in compose_files:
         _validate_relative_path_text(relative_text)
-        path = workspace / Path(relative_text)
-        try:
-            resolved = path.resolve(strict=True)
-        except OSError:
-            raise ValueError("fixture compose path is invalid") from None
-        if not resolved.is_relative_to(workspace):
-            raise ValueError("fixture compose path escapes workspace")
-        compose = load_compose(resolved)
+        if relative_text.startswith(".repotrial-accepted/"):
+            if (
+                _compatibility._ACCEPTED_COMPOSE_PATTERN.fullmatch(relative_text)
+                is None
+            ):
+                raise ValueError("fixture accepted compose path is invalid")
+            try:
+                accepted_bytes = sandbox.accepted_guest_files[relative_text]
+            except KeyError:
+                raise ValueError(
+                    "fixture accepted compose is not materialized"
+                ) from None
+            compose = load_compose_bytes(accepted_bytes)
+        else:
+            path = sandbox.workspace / Path(relative_text)
+            try:
+                resolved = path.resolve(strict=True)
+            except OSError:
+                raise ValueError("fixture compose path is invalid") from None
+            if not resolved.is_relative_to(sandbox.workspace):
+                raise ValueError("fixture compose path escapes workspace")
+            compose = load_compose(resolved)
         services = compose.get("services")
         if not isinstance(services, Mapping):
             raise TypeError("fixture compose services are invalid")

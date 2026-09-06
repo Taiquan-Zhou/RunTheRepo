@@ -1,10 +1,12 @@
 import asyncio
 import base64
-import binascii
 import hashlib
 import json
+import posixpath
+import re
 import subprocess
 import threading
+import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -14,6 +16,7 @@ from types import SimpleNamespace
 from typing import TypeVar
 
 import pytest
+from fixture_harness import parse_fixture_materialization
 from pydantic import BaseModel
 from typer.testing import CliRunner
 
@@ -38,6 +41,34 @@ from repotrial.trial import compatibility as _compatibility
 ModelT = TypeVar("ModelT", bound=BaseModel)
 FIXED_RUN_ID = "11111111-1111-4111-8111-111111111111"
 CONTAINER_ID = "a" * 12
+_CLI_ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=(.*)\Z")
+_CLI_ALLOWED_ENV_KEYS = frozenset({"APP_MODE"})
+_CLI_COMPOSE_ROUTES = {
+    ("up", "-d", "--wait", "--wait-timeout", "60"): "up",
+    ("ps", "--all", "--format", "json"): "boot_ps",
+    (
+        "ps",
+        "--all",
+        "--no-trunc",
+        "--orphans=false",
+        "--format",
+        "json",
+    ): "observer_ps",
+    ("logs", "--no-color", "--tail", "200"): "logs",
+}
+
+
+def _cli_safe_relative_path(value: str) -> bool:
+    return (
+        bool(value)
+        and not value.startswith("/")
+        and "\\" not in value
+        and posixpath.normpath(value) == value
+        and all(part not in {"", ".", ".."} for part in value.split("/"))
+        and not any(
+            unicodedata.category(character).startswith("C") for character in value
+        )
+    )
 
 
 class FakeModelAdapter:
@@ -67,6 +98,10 @@ class FixtureProvider(FakeSandboxProvider):
         self.roles: dict[str, str] = {}
         self.workspaces: dict[str, Path] = {}
         self.materialized_experiments: set[str] = set()
+        self.experiment_guest_files: dict[str, bytes] = {}
+        self.active_compose_files: dict[str, tuple[str, ...]] = {}
+        self.active_env: dict[str, dict[str, str]] = {}
+        self.discovered_container_ids: dict[str, str] = {}
         self.active_sandboxes: set[str] = set()
 
     async def create(self, workspace: Path, name: str) -> str:
@@ -85,6 +120,10 @@ class FixtureProvider(FakeSandboxProvider):
         self.active_sandboxes.discard(sandbox_id)
         self.workspaces.pop(sandbox_id, None)
         self.materialized_experiments.discard(sandbox_id)
+        self.experiment_guest_files.pop(sandbox_id, None)
+        self.active_compose_files.pop(sandbox_id, None)
+        self.active_env.pop(sandbox_id, None)
+        self.discovered_container_ids.pop(sandbox_id, None)
 
     async def exec(
         self, sandbox_id: str, argv: list[str], timeout_s: int = 60
@@ -98,52 +137,75 @@ class FixtureProvider(FakeSandboxProvider):
         verification = self._experiment_verification(sandbox_id, argv)
         if verification is not None:
             return verification
+        route = self._route_compose_command(sandbox_id, argv)
+        if route is not None:
+            route_name, compose_files, active_env = route
+            if route_name == "up":
+                self.active_compose_files[sandbox_id] = compose_files
+                self.active_env[sandbox_id] = active_env
+                if (
+                    self.roles[sandbox_id] == "candidate"
+                    and self.candidate_boot_unavailable
+                ):
+                    raise KeyError("candidate backend capability is unavailable")
+            elif (
+                self.active_compose_files.get(sandbox_id) != compose_files
+                or self.active_env.get(sandbox_id) != active_env
+            ):
+                raise AssertionError(
+                    "compose readiness/observer command does not match active state"
+                )
+
+            healthy = self.baseline_healthy or self.roles[sandbox_id] == "candidate"
+            if route_name == "up":
+                return ExecResult(exit_code=0 if healthy else 1, stdout="", stderr="")
+            if route_name == "boot_ps":
+                return ExecResult(
+                    exit_code=0,
+                    stdout=json.dumps(
+                        {
+                            "Service": "web",
+                            "State": "running" if healthy else "exited",
+                            "Health": "healthy" if healthy else "",
+                            "ExitCode": 0 if healthy else 1,
+                        }
+                    ),
+                    stderr="",
+                )
+            if route_name == "logs":
+                return ExecResult(exit_code=0, stdout="", stderr="")
+            if route_name == "observer_ps":
+                self.discovered_container_ids[sandbox_id] = CONTAINER_ID
+                return ExecResult(
+                    exit_code=0,
+                    stdout=json.dumps({"Service": "web", "ID": CONTAINER_ID}),
+                    stderr="",
+                )
         if (
-            self.roles[sandbox_id] == "candidate"
-            and self.candidate_boot_unavailable
-            and command[-5:] == ("up", "-d", "--wait", "--wait-timeout", "60")
+            command == ("docker", "inspect", CONTAINER_ID)
+            and self.discovered_container_ids.get(sandbox_id) == CONTAINER_ID
         ):
-            raise KeyError("candidate backend capability is unavailable")
-        healthy = self.baseline_healthy or self.roles[sandbox_id] == "candidate"
-        if command[-5:] == ("up", "-d", "--wait", "--wait-timeout", "60"):
-            return ExecResult(exit_code=0 if healthy else 1, stdout="", stderr="")
-        if command[-4:] == ("ps", "--all", "--format", "json"):
-            return ExecResult(
-                exit_code=0,
-                stdout=json.dumps(
-                    {
-                        "Service": "web",
-                        "State": "running" if healthy else "exited",
-                        "Health": "healthy" if healthy else "",
-                        "ExitCode": 0 if healthy else 1,
-                    }
-                ),
-                stderr="",
-            )
-        if command[-4:] == ("logs", "--no-color", "--tail", "200"):
-            return ExecResult(exit_code=0, stdout="", stderr="")
-        if command[-6:] == (
-            "ps",
-            "--all",
-            "--no-trunc",
-            "--orphans=false",
-            "--format",
-            "json",
-        ):
-            return ExecResult(
-                exit_code=0,
-                stdout=json.dumps({"Service": "web", "ID": CONTAINER_ID}),
-                stderr="",
-            )
-        if command == ("docker", "inspect", CONTAINER_ID):
             return ExecResult(
                 exit_code=0,
                 stdout=json.dumps([{"Config": {"Env": []}}]),
                 stderr="",
             )
-        if command == ("docker", "diff", CONTAINER_ID):
+        if (
+            command == ("docker", "diff", CONTAINER_ID)
+            and self.discovered_container_ids.get(sandbox_id) == CONTAINER_ID
+        ):
             return ExecResult(exit_code=0, stdout="", stderr="")
-        if command == ("docker", "top", CONTAINER_ID, "-eo", "pid,ppid,user,comm"):
+        if (
+            command
+            == (
+                "docker",
+                "top",
+                CONTAINER_ID,
+                "-eo",
+                "pid,ppid,user,comm",
+            )
+            and self.discovered_container_ids.get(sandbox_id) == CONTAINER_ID
+        ):
             return ExecResult(
                 exit_code=0,
                 stdout="PID PPID USER COMMAND\n",
@@ -151,59 +213,66 @@ class FixtureProvider(FakeSandboxProvider):
             )
         raise AssertionError(f"unexpected provider command: {command!r}")
 
+    def _route_compose_command(
+        self, sandbox_id: str, argv: list[str]
+    ) -> tuple[str, tuple[str, ...], dict[str, str]] | None:
+        if not argv or any(not isinstance(item, str) for item in argv):
+            return None
+        command = list(argv)
+        active_env: dict[str, str] = {}
+        if command[0] == "env":
+            try:
+                docker_index = command.index("docker", 1)
+            except ValueError:
+                return None
+            assignments = command[1:docker_index]
+            if not assignments:
+                return None
+            for assignment in assignments:
+                match = _CLI_ENV_ASSIGNMENT.fullmatch(assignment)
+                if match is None:
+                    return None
+                key, value = assignment.split("=", 1)
+                if key not in _CLI_ALLOWED_ENV_KEYS or key in active_env:
+                    return None
+                active_env[key] = value
+            command = command[docker_index:]
+        if command[:2] != ["docker", "compose"]:
+            return None
+        compose_files: list[str] = []
+        index = 2
+        while index < len(command) and command[index] == "-f":
+            if index + 1 >= len(command) or not _cli_safe_relative_path(
+                command[index + 1]
+            ):
+                return None
+            compose_files.append(command[index + 1])
+            index += 2
+        if len(compose_files) not in {1, 2} or len(compose_files) != len(
+            set(compose_files)
+        ):
+            return None
+        route_name = _CLI_COMPOSE_ROUTES.get(tuple(command[index:]))
+        if route_name is None:
+            return None
+        return route_name, tuple(compose_files), active_env
+
     def _experiment_materialization(
         self, sandbox_id: str, argv: list[str]
     ) -> ExecResult | None:
-        if len(argv) != 8 or any(not isinstance(item, str) for item in argv):
+        if len(argv) < 5 or argv[4] != "repotrial-experiment-overlay":
             return None
-        if argv[:5] != [
-            "sh",
-            "-eu",
-            "-c",
-            _compatibility._EXPERIMENT_ADAPTER_SCRIPT,
-            "repotrial-experiment-overlay",
-        ]:
+        parsed = parse_fixture_materialization(argv)
+        if parsed is None:
             return None
-        relative_path, expected_sha256, encoded_payload = argv[5:]
-        if relative_path != _compatibility._EXPERIMENT_RELATIVE_PATH:
-            return self._materialization_failure(22)
-        if len(encoded_payload) > _compatibility._MAX_COMPATIBILITY_PAYLOAD_BYTES:
-            return self._materialization_failure(25)
-        try:
-            payload = base64.b64decode(encoded_payload, validate=True)
-        except (UnicodeEncodeError, binascii.Error, ValueError):
-            return self._materialization_failure(26)
-        if (
-            _compatibility._SHA256_PATTERN.fullmatch(expected_sha256) is None
-            or hashlib.sha256(payload).hexdigest() != expected_sha256
-        ):
-            return self._materialization_failure(31)
-
-        workspace = self.workspaces[sandbox_id]
-        if not workspace.is_dir() or workspace.is_symlink():
-            return self._materialization_failure(21)
-        target = workspace / Path(_compatibility._EXPERIMENT_RELATIVE_PATH)
-        try:
-            target.parent.mkdir(exist_ok=True)
-        except OSError:
-            return self._materialization_failure(23)
-        if not target.parent.is_dir() or target.parent.is_symlink():
-            return self._materialization_failure(23)
-        if target.exists() or target.is_symlink():
+        if isinstance(parsed, int):
+            return self._materialization_failure(parsed)
+        _command_name, relative_path, expected_sha256, payload = parsed
+        if sandbox_id in self.materialized_experiments:
             return self._materialization_failure(24)
-        try:
-            with target.open("xb") as output:
-                output.write(payload)
-                output.flush()
-            target.chmod(0o600)
-        except FileExistsError:
-            return self._materialization_failure(24)
-        except OSError:
-            return self._materialization_failure(23)
+        self.experiment_guest_files[sandbox_id] = payload
         self.materialized_experiments.add(sandbox_id)
-        return self._materialization_success(
-            _compatibility._EXPERIMENT_RELATIVE_PATH, expected_sha256
-        )
+        return self._materialization_success(relative_path, expected_sha256)
 
     def _experiment_verification(
         self, sandbox_id: str, argv: list[str]
@@ -215,12 +284,9 @@ class FixtureProvider(FakeSandboxProvider):
             return None
         if sandbox_id not in self.materialized_experiments:
             return None
-        target = self.workspaces[sandbox_id] / Path(relative_path)
         try:
-            if target.is_symlink() or not target.is_file():
-                return self._materialization_failure(1)
-            payload = target.read_bytes()
-        except OSError:
+            payload = self.experiment_guest_files[sandbox_id]
+        except KeyError:
             return self._materialization_failure(1)
         return ExecResult(
             exit_code=0,
@@ -246,6 +312,168 @@ class FixtureProvider(FakeSandboxProvider):
             ),
             stderr="",
         )
+
+
+def _cli_compose_argv(*command: str, env: tuple[str, ...] = ()) -> list[str]:
+    return [
+        *env,
+        "docker",
+        "compose",
+        "-f",
+        "compose.yml",
+        *command,
+    ]
+
+
+def _cli_experiment_argv(payload: bytes) -> list[str]:
+    return [
+        "sh",
+        "-eu",
+        "-c",
+        _compatibility._EXPERIMENT_ADAPTER_SCRIPT,
+        "repotrial-experiment-overlay",
+        _compatibility._EXPERIMENT_RELATIVE_PATH,
+        hashlib.sha256(payload).hexdigest(),
+        base64.b64encode(payload).decode("ascii"),
+    ]
+
+
+def test_cli_fixture_rejects_shell_wrapped_compose_up_and_unallowlisted_env(
+    tmp_path: Path,
+) -> None:
+    provider = FixtureProvider()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    async def exercise() -> None:
+        sandbox_id = await provider.create(workspace, "candidate-shell-router")
+        try:
+            with pytest.raises(AssertionError, match="unexpected provider command"):
+                await provider.exec(
+                    sandbox_id,
+                    [
+                        "sh",
+                        "-c",
+                        "docker compose -f compose.yml",
+                        "up",
+                        "-d",
+                        "--wait",
+                        "--wait-timeout",
+                        "60",
+                    ],
+                )
+            with pytest.raises(AssertionError, match="unexpected provider command"):
+                await provider.exec(
+                    sandbox_id,
+                    _cli_compose_argv(
+                        "up",
+                        "-d",
+                        "--wait",
+                        "--wait-timeout",
+                        "60",
+                        env=("env", "APP_MODE=fixture", "HOST_SSH_KEY=secret"),
+                    ),
+                )
+        finally:
+            await provider.destroy(sandbox_id)
+
+    asyncio.run(exercise())
+
+
+def test_cli_fixture_observer_requires_the_active_environment(
+    tmp_path: Path,
+) -> None:
+    provider = FixtureProvider()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    async def exercise() -> None:
+        sandbox_id = await provider.create(workspace, "candidate-observer-router")
+        try:
+            up = await provider.exec(
+                sandbox_id,
+                _cli_compose_argv(
+                    "up",
+                    "-d",
+                    "--wait",
+                    "--wait-timeout",
+                    "60",
+                    env=("env", "APP_MODE=fixture"),
+                ),
+            )
+            assert up.exit_code == 0
+            with pytest.raises(
+                AssertionError, match="active state|unexpected provider command"
+            ):
+                await provider.exec(
+                    sandbox_id,
+                    _cli_compose_argv(
+                        "ps",
+                        "--all",
+                        "--no-trunc",
+                        "--orphans=false",
+                        "--format",
+                        "json",
+                    ),
+                )
+        finally:
+            await provider.destroy(sandbox_id)
+
+    asyncio.run(exercise())
+
+
+def test_cli_fixture_keeps_experiment_overlay_state_per_sandbox(
+    tmp_path: Path,
+) -> None:
+    provider = FixtureProvider()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    host_target = workspace / _compatibility._EXPERIMENT_RELATIVE_PATH
+    host_target.parent.mkdir()
+    host_target.write_bytes(b"pre-existing host artifact")
+    first_payload = b"first candidate overlay"
+    second_payload = b"second candidate overlay"
+
+    async def exercise() -> tuple[ExecResult, ExecResult, ExecResult, ExecResult]:
+        first = await provider.create(workspace, "candidate-first")
+        second = await provider.create(workspace, "candidate-second")
+        try:
+            first_result = await provider.exec(
+                first, _cli_experiment_argv(first_payload)
+            )
+            second_result = await provider.exec(
+                second, _cli_experiment_argv(second_payload)
+            )
+            first_verify = await provider.exec(
+                first, ["sha256sum", "--", _compatibility._EXPERIMENT_RELATIVE_PATH]
+            )
+            await provider.exec(
+                second, ["sha256sum", "--", _compatibility._EXPERIMENT_RELATIVE_PATH]
+            )
+            await provider.destroy(first)
+            after_first_destroy = await provider.exec(
+                second, ["sha256sum", "--", _compatibility._EXPERIMENT_RELATIVE_PATH]
+            )
+            return first_result, second_result, first_verify, after_first_destroy
+        finally:
+            if second in provider.active_sandboxes:
+                await provider.destroy(second)
+
+    first_result, second_result, first_verify, second_after_destroy = asyncio.run(
+        exercise()
+    )
+
+    assert first_result.exit_code == 0
+    assert second_result.exit_code == 0
+    assert first_verify.stdout == (
+        f"{hashlib.sha256(first_payload).hexdigest()}  "
+        f"{_compatibility._EXPERIMENT_RELATIVE_PATH}\n"
+    )
+    assert second_after_destroy.stdout == (
+        f"{hashlib.sha256(second_payload).hexdigest()}  "
+        f"{_compatibility._EXPERIMENT_RELATIVE_PATH}\n"
+    )
+    assert host_target.read_bytes() == b"pre-existing host artifact"
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
