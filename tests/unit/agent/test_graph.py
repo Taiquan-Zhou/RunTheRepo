@@ -35,6 +35,8 @@ from repotrial.domain.models import (
 from repotrial.models.base import RecoveryAction
 from repotrial.sandbox.base import ExecResult, SandboxProvider
 from repotrial.sandbox.fake import FakeSandboxProvider
+from repotrial.sandbox.lifecycle import CleanupError
+from repotrial.trial.image_template import ImageTemplateError
 from repotrial.trial.journey_artifact import JourneyArtifactError
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -2492,10 +2494,14 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         *,
         host_port: int | None = None,
         fail_prepare: bool = False,
+        fail_warmup_destroy: bool = False,
+        cancel_prepare: bool = False,
     ) -> None:
         super().__init__(host_port=host_port)
         self.events: list[str] = []
         self.fail_prepare = fail_prepare
+        self.fail_warmup_destroy = fail_warmup_destroy
+        self.cancel_prepare = cancel_prepare
         self._template_identity: str | None = None
         self._warmup_prepared = False
 
@@ -2543,6 +2549,8 @@ class RuntimeTemplateGraphProvider(GraphProvider):
             if "pull" in snapshot and "--ignore-buildable" in snapshot:
                 self._require_active(sandbox_id)
                 self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+                if self.cancel_prepare:
+                    raise asyncio.CancelledError("warmup cancelled")
                 if self.fail_prepare:
                     return ExecResult(exit_code=1, stdout="", stderr="")
                 self.events.append("prepare")
@@ -2573,6 +2581,8 @@ class RuntimeTemplateGraphProvider(GraphProvider):
     async def destroy(self, sandbox_id: str) -> None:
         if self._roles.get(sandbox_id) == "warmup":
             self.events.append("warmup_destroy")
+            if self.fail_warmup_destroy:
+                raise RuntimeError("warmup destroy failed")
         await super().destroy(sandbox_id)
 
     async def finalize_runtime_template(self) -> None:
@@ -2664,3 +2674,96 @@ def test_runtime_template_warmup_failure_stops_before_baseline(
     assert result.run.stop_reason == "image_prepare_failed"
     assert provider.events == ["warmup_create", "warmup_destroy"]
     assert not any(event == "baseline_create" for event in provider.events)
+    evidence = list(context.artifact_dir.glob("baseline-*/image-template.jsonl"))
+    rows = [json.loads(line) for line in evidence[0].read_text().splitlines()]
+    assert ("prepare", "failure") in {(row["event"], row["outcome"]) for row in rows}
+    assert ("warmup_destroy", "failure") not in {
+        (row["event"], row["outcome"]) for row in rows
+    }
+
+
+def test_runtime_template_resume_without_active_identity_fails_closed(
+    tmp_path: Path,
+) -> None:
+    provider = RuntimeTemplateGraphProvider()
+    context, source = _context(tmp_path, provider, journeys=[])
+    graph = build_run_graph(interrupt_after=("boot",))
+    state = _state(source.parent, run_id="runtime-template-resume")
+
+    interrupted = asyncio.run(ainvoke_run(graph, state, context=context))
+    assert interrupted.run.run_id == state.run_id
+
+    with pytest.raises(ImageTemplateError, match="runtime_template_resume_unsupported"):
+        asyncio.run(aresume_run(graph, state.run_id, context=context))
+    assert provider.events[-1] == "template_remove"
+
+
+def test_runtime_template_destroy_failure_preserves_cleanup_error(
+    tmp_path: Path,
+) -> None:
+    provider = RuntimeTemplateGraphProvider(
+        fail_warmup_destroy=True,
+        cancel_prepare=True,
+    )
+    context, source = _context(tmp_path, provider, journeys=[])
+
+    with pytest.raises(CleanupError) as caught:
+        _run(_state(source.parent, run_id="runtime-template-cleanup"), context)
+
+    assert isinstance(caught.value.body_failure, asyncio.CancelledError)
+    assert isinstance(caught.value.destroy_failure, RuntimeError)
+    assert not any(event == "baseline_create" for event in provider.events)
+
+
+def test_runtime_template_finalization_evidence_is_run_scoped_and_classified(
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    first = (
+        artifact_dir
+        / f"baseline-{graph_module._run_token('run-a')}-0000-attempt-01"
+        / "image-template.jsonl"
+    )
+    second = (
+        artifact_dir
+        / f"baseline-{graph_module._run_token('run-b')}-0000-attempt-01"
+        / "image-template.jsonl"
+    )
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.write_text('{"event":"prepare"}\n', encoding="utf-8")
+    second.write_text('{"event":"prepare"}\n', encoding="utf-8")
+
+    graph_module._append_template_finalization_evidence(
+        artifact_dir,
+        "run-a",
+        body_failure=ValueError("graph failed"),
+    )
+    graph_module._append_template_finalization_evidence(
+        artifact_dir,
+        "run-b",
+        cleanup_failure=RuntimeError("cleanup failed"),
+    )
+
+    first_rows = [json.loads(line) for line in first.read_text().splitlines()]
+    second_rows = [json.loads(line) for line in second.read_text().splitlines()]
+    assert first_rows[-1]["outcome"] == "body_failure"
+    assert second_rows[-1]["outcome"] == "cleanup_failure"
+
+
+def test_image_template_evidence_is_atomic_no_clobber_and_mode_bounded(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "image-template.jsonl"
+    path.write_text("sentinel\n", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        graph_module._ImageTemplateEvidence(path)
+    assert path.read_text(encoding="utf-8") == "sentinel\n"
+
+    path.unlink()
+    evidence = graph_module._ImageTemplateEvidence(path)
+    assert path.stat().st_mode & 0o777 == 0o600
+    evidence.record("prepare", "started")
+    evidence.close()
+    assert json.loads(path.read_text(encoding="utf-8"))["event"] == "prepare"

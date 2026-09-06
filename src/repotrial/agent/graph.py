@@ -180,10 +180,20 @@ async def _invoke_graph_with_finalization(
     try:
         async with managed_runtime_template(context.provider):
             result = await invoke()
-    except BaseException as error:
-        _append_template_finalization_evidence(context.artifact_dir, error)
+    except RuntimeTemplateCleanupError as error:
+        _append_template_finalization_evidence(
+            context.artifact_dir,
+            run_id,
+            body_failure=error.body_failure,
+            cleanup_failure=error.cleanup_failure,
+        )
         raise
-    _append_template_finalization_evidence(context.artifact_dir, None)
+    except BaseException as error:
+        _append_template_finalization_evidence(
+            context.artifact_dir, run_id, body_failure=error
+        )
+        raise
+    _append_template_finalization_evidence(context.artifact_dir, run_id)
     return result
 
 
@@ -212,6 +222,11 @@ async def aresume_run(
 ) -> GraphState:
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("run_id must be a non-empty string")
+    if (
+        context.provider.supports_runtime_templates
+        and context.provider.expected_image_identity_sha256() is None
+    ):
+        raise ImageTemplateError("runtime_template_resume_unsupported")
     return await _invoke_graph_with_finalization(
         graph, None, run_id, context=context, config=config
     )
@@ -498,7 +513,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
     ):
         template_evidence = attempt_dir / "image-template.jsonl"
         artifact_root = _real_directory(context.artifact_dir, "artifact_dir")
-        template_artifact_relative = template_evidence.relative_to(
+        template_evidence_relative = template_evidence.relative_to(
             artifact_root
         ).as_posix()
         try:
@@ -518,17 +533,21 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                     state.run.compatibility_overlay_sha256 or ""
                 ),
             )
+            template_artifact_relative = template_evidence_relative
         except asyncio.CancelledError:
+            raise
+        except CleanupError:
             raise
         except (
             AssertionError,
-            CleanupError,
             ImageTemplateError,
             OSError,
             RuntimeError,
             TypeError,
             ValueError,
         ) as error:
+            if template_evidence.is_file() and not template_evidence.is_symlink():
+                template_artifact_relative = template_evidence_relative
             return {
                 "boot_attempt": attempt,
                 "boot_verdict": Verdict.UNSUPPORTED,
@@ -1708,12 +1727,23 @@ async def _prepare_runtime_template(
                 identity_sha256=inventory.sha256,
             )
         template_evidence.record("warmup_destroy", "success", sandbox_id=warmup_id)
-    except BaseException as error:
+    except CleanupError as error:
+        if error.body_failure is not None:
+            template_evidence.record(
+                "prepare", "failure", sandbox_id=warmup_id, error=error.body_failure
+            )
         template_evidence.record(
             "warmup_destroy",
             "failure",
             sandbox_id=warmup_id,
-            error=error,
+            error=error.destroy_failure,
+        )
+        raise
+    except BaseException as error:
+        if warmup_id is not None:
+            template_evidence.record("warmup_destroy", "success", sandbox_id=warmup_id)
+        template_evidence.record(
+            "prepare", "failure", sandbox_id=warmup_id, error=error
         )
         raise
     finally:
@@ -1739,11 +1769,25 @@ def _validated_result(result: object, run_id: str) -> GraphState:
 class _ImageTemplateEvidence:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self._artifact = path.open("x", encoding="utf-8", newline="\n")
+        descriptor: int | None = None
         try:
-            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
-        except OSError:
-            self._artifact.close()
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
+            os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
+            self._artifact = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
+        except (OSError, ValueError):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
             raise
         self._size = 0
 
@@ -1767,14 +1811,20 @@ class _ImageTemplateEvidence:
             json.dumps(record, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
             + "\n"
         ).encode("utf-8")
-        if self._size + len(encoded) > _MAX_IMAGE_TEMPLATE_EVIDENCE_BYTES:
+        try:
+            if self._size + len(encoded) > _MAX_IMAGE_TEMPLATE_EVIDENCE_BYTES:
+                return
+            self._artifact.write(encoded.decode("utf-8"))
+            self._artifact.flush()
+            self._size += len(encoded)
+        except (OSError, UnicodeError):
             return
-        self._artifact.write(encoded.decode("utf-8"))
-        self._artifact.flush()
-        self._size += len(encoded)
 
     def close(self) -> None:
-        self._artifact.close()
+        try:
+            self._artifact.close()
+        except OSError:
+            return
 
 
 def _template_failure_reason(error: BaseException) -> str:
@@ -1856,15 +1906,41 @@ def _template_event_record(
 
 
 def _append_template_finalization_evidence(
-    artifact_dir: Path, error: BaseException | None
+    artifact_dir: Path,
+    run_id: str,
+    *,
+    body_failure: BaseException | None = None,
+    cleanup_failure: BaseException | None = None,
 ) -> None:
-    paths = sorted(artifact_dir.glob("baseline-*/image-template.jsonl"))
+    if not artifact_dir.is_dir():
+        return
+    paths = sorted(
+        artifact_dir.glob(
+            f"baseline-{_run_token(run_id)}-*-attempt-*/image-template.jsonl"
+        )
+    )
     if not paths:
         return
     path = paths[-1]
+    if path.is_symlink() or not path.is_file():
+        return
+    error: BaseException | None
+    if cleanup_failure is not None:
+        error = (
+            RuntimeTemplateCleanupError(cleanup_failure, body_failure)
+            if body_failure is not None
+            else cleanup_failure
+        )
+        outcome = "cleanup_failure"
+    elif body_failure is not None:
+        error = body_failure
+        outcome = "body_failure"
+    else:
+        error = None
+        outcome = "success"
     record = _template_event_record(
         "template_remove",
-        "failure" if error is not None else "success",
+        outcome,
         error=error,
     )
     encoded = (
