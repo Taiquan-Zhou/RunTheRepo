@@ -67,13 +67,16 @@ Add safe default behavior to `SandboxProvider` so existing test doubles remain s
 def supports_runtime_templates(self) -> bool:
     return False
 
+
 async def activate_runtime_template(
     self, sandbox_id: str, image_identity_sha256: str
 ) -> None:
     raise RuntimeError("runtime templates are unsupported")
 
+
 def expected_image_identity_sha256(self) -> str | None:
     return None
+
 
 async def finalize_runtime_template(self) -> None:
     return None
@@ -216,8 +219,13 @@ Cover exactly-one preparation for a capable provider, no behavior change for the
 ```python
 result = await ainvoke_run(graph, state, context=context)
 assert provider.events == [
-    "warmup_create", "prepare", "activate", "warmup_destroy",
-    "baseline_create", "candidate_create", "template_remove",
+    "warmup_create",
+    "prepare",
+    "activate",
+    "warmup_destroy",
+    "baseline_create",
+    "candidate_create",
+    "template_remove",
 ]
 ```
 
