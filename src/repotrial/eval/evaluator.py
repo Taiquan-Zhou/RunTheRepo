@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -38,6 +40,7 @@ from repotrial.eval.metrics import (
     unnecessary_privilege_removal_recall,
 )
 from repotrial.sandbox.base import ExecResult, NetworkLogResult, SandboxProvider
+from repotrial.trial import compatibility as _compatibility
 
 type MetricValue = float | Literal["unavailable"]
 type FixtureStatus = Literal["completed", "failed", "unavailable"]
@@ -81,6 +84,7 @@ _COMPOSE_ROUTES: dict[tuple[str, ...], _FixtureCommandRoute] = {
     ("logs", "--no-color", "--tail", "200"): "compose_logs",
 }
 _TOP_FORMAT = "pid,ppid,user,comm"
+_EXPERIMENT_COMMAND_NAME = "repotrial-experiment-overlay"
 
 
 class _StrictModel(BaseModel):
@@ -217,6 +221,8 @@ class _SandboxState:
     active_env: dict[str, str] | None = None
     discovered_container_id: str | None = None
     readiness_failure: str | None = None
+    materialized_experiment_overlay: Path | None = None
+    accepted_guest_files: dict[str, bytes] = field(default_factory=dict)
     server: asyncio.AbstractServer | None = None
     port: int | None = None
 
@@ -257,6 +263,12 @@ class _FixtureProvider(SandboxProvider):
     ) -> ExecResult:
         del timeout_s
         sandbox = self._owned_sandbox(sandbox_id)
+        materialization = self._fixture_materialization(sandbox, argv)
+        if materialization is not None:
+            return materialization
+        verification = self._fixture_artifact_verification(sandbox, argv)
+        if verification is not None:
+            return verification
         command = _route_fixture_command(sandbox, self._ground_truth, argv)
         if command is None:
             return self._unexpected(argv)
@@ -322,6 +334,12 @@ class _FixtureProvider(SandboxProvider):
         if sandbox.server is not None:
             sandbox.server.close()
             await sandbox.server.wait_closed()
+        target = sandbox.materialized_experiment_overlay
+        if target is not None:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError as error:
+                raise ValueError("fixture overlay cleanup failed") from error
         self.destroyed_ids.append(sandbox_id)
         del self._sandboxes[sandbox_id]
 
@@ -330,6 +348,145 @@ class _FixtureProvider(SandboxProvider):
         if sandbox is None:
             raise ValueError("unknown fixture sandbox")
         return sandbox
+
+    def _fixture_materialization(
+        self, sandbox: _SandboxState, argv: Sequence[str]
+    ) -> ExecResult | None:
+        if len(argv) != 8 or any(not isinstance(item, str) for item in argv):
+            return None
+        if argv[:3] != ["sh", "-eu", "-c"]:
+            return None
+        command_name = argv[4]
+        if command_name == _EXPERIMENT_COMMAND_NAME:
+            adapter_script = _compatibility._EXPERIMENT_ADAPTER_SCRIPT
+            path_valid = argv[5] == _compatibility._EXPERIMENT_RELATIVE_PATH
+        elif command_name == "repotrial-accepted-compose":
+            adapter_script = _compatibility._ACCEPTED_COMPOSE_ADAPTER_SCRIPT
+            path_valid = (
+                _compatibility._ACCEPTED_COMPOSE_PATTERN.fullmatch(argv[5]) is not None
+            )
+        else:
+            return None
+        if argv[3] != adapter_script:
+            return None
+        relative_path, expected_sha256, encoded_payload = argv[5:8]
+        if not path_valid:
+            return _fixture_materialization_failure(22)
+        try:
+            if len(encoded_payload) > _compatibility._MAX_COMPATIBILITY_PAYLOAD_BYTES:
+                return _fixture_materialization_failure(25)
+            payload = base64.b64decode(encoded_payload, validate=True)
+        except (UnicodeEncodeError, binascii.Error, ValueError):
+            return _fixture_materialization_failure(26)
+        if (
+            _compatibility._SHA256_PATTERN.fullmatch(expected_sha256) is None
+            or hashlib.sha256(payload).hexdigest() != expected_sha256
+        ):
+            return _fixture_materialization_failure(31)
+        if command_name == "repotrial-accepted-compose":
+            if relative_path in sandbox.accepted_guest_files:
+                return _fixture_materialization_failure(24)
+            sandbox.accepted_guest_files[relative_path] = payload
+            return _materialization_success(relative_path, expected_sha256)
+        return self._write_experiment_overlay(sandbox, payload, expected_sha256)
+
+    def _write_experiment_overlay(
+        self, sandbox: _SandboxState, payload: bytes, expected_sha256: str
+    ) -> ExecResult:
+        workspace = sandbox.workspace
+        try:
+            workspace_stat = workspace.lstat()
+        except OSError:
+            return _fixture_materialization_failure(21)
+        if not stat.S_ISDIR(workspace_stat.st_mode) or _is_link(
+            workspace, workspace_stat
+        ):
+            return _fixture_materialization_failure(21)
+        target = workspace / Path(_compatibility._EXPERIMENT_RELATIVE_PATH)
+        overlay_dir = target.parent
+        try:
+            overlay_dir.mkdir(exist_ok=True)
+            overlay_stat = overlay_dir.lstat()
+        except OSError:
+            return _fixture_materialization_failure(23)
+        if not stat.S_ISDIR(overlay_stat.st_mode) or _is_link(
+            overlay_dir, overlay_stat
+        ):
+            return _fixture_materialization_failure(23)
+        if target.exists() or target.is_symlink():
+            return _fixture_materialization_failure(24)
+
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(descriptor, "wb", closefd=True) as output:
+                descriptor = None
+                output.write(payload)
+                output.flush()
+                os.fchmod(output.fileno(), 0o600)
+        except FileExistsError:
+            return _fixture_materialization_failure(24)
+        except OSError:
+            return _fixture_materialization_failure(23)
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+        try:
+            metadata = target.lstat()
+        except OSError:
+            return _fixture_materialization_failure(28)
+        if (
+            _is_link(target, metadata)
+            or not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            return _fixture_materialization_failure(28)
+        sandbox.materialized_experiment_overlay = target
+        return _materialization_success(
+            _compatibility._EXPERIMENT_RELATIVE_PATH, expected_sha256
+        )
+
+    def _fixture_artifact_verification(
+        self, sandbox: _SandboxState, argv: Sequence[str]
+    ) -> ExecResult | None:
+        if len(argv) != 3 or list(argv[:2]) != ["sha256sum", "--"]:
+            return None
+        relative_path = argv[2]
+        if relative_path == _compatibility._EXPERIMENT_RELATIVE_PATH:
+            target = sandbox.materialized_experiment_overlay
+            if target is None:
+                return None
+            try:
+                payload = _read_regular_bytes(
+                    target,
+                    _compatibility._MAX_COMPATIBILITY_ARTIFACT_BYTES,
+                    "fixture overlay",
+                )
+            except (OSError, ValueError):
+                return ExecResult(exit_code=1, stdout="", stderr="")
+        elif (
+            _compatibility._ACCEPTED_COMPOSE_PATTERN.fullmatch(relative_path)
+            is not None
+        ):
+            try:
+                payload = sandbox.accepted_guest_files[relative_path]
+            except KeyError:
+                return None
+        else:
+            return None
+        return ExecResult(
+            exit_code=0,
+            stdout=(f"{hashlib.sha256(payload).hexdigest()}  {relative_path}\n"),
+            stderr="",
+        )
 
     def _compose_command(
         self, sandbox: _SandboxState, command: _FixtureCommand
@@ -1049,7 +1206,11 @@ def _route_fixture_command(
             return None
         compose_files = tuple(files)
         if route == "compose_observer_ps":
-            if has_env_prefix or compose_files != sandbox.active_compose_files:
+            if (
+                compose_files != sandbox.active_compose_files
+                or sandbox.active_env is None
+                or env != sandbox.active_env
+            ):
                 return None
         elif route != "compose_up" and (
             compose_files != sandbox.active_compose_files or env != sandbox.active_env
@@ -1071,6 +1232,23 @@ def _route_fixture_command(
     if command == ["docker", "top", container_id, "-eo", _TOP_FORMAT]:
         return _FixtureCommand(route="top")
     return None
+
+
+def _materialization_success(relative_path: str, expected_sha256: str) -> ExecResult:
+    return ExecResult(
+        exit_code=0,
+        stdout=(
+            "root=/workspace\n"
+            f"path={relative_path}\n"
+            "mode=600\n"
+            f"sha256={expected_sha256}\n"
+        ),
+        stderr="",
+    )
+
+
+def _fixture_materialization_failure(exit_code: int) -> ExecResult:
+    return ExecResult(exit_code=exit_code, stdout="", stderr="")
 
 
 def _effective_service_config(

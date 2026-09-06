@@ -1,6 +1,9 @@
 import asyncio
+import base64
+import hashlib
 import json
 import socket
+import stat
 import subprocess
 from importlib import import_module
 from pathlib import Path
@@ -47,6 +50,214 @@ def _assert_unexpected(result: object, provider: object) -> None:
     assert digest.startswith("sha256-")
     assert len(digest) == 23
     int(digest.removeprefix("sha256-"), 16)
+
+
+def _experiment_materialization_argv(
+    payload: bytes = b"services:\n  web:\n    read_only: true\n",
+    *,
+    adapter_script: str | None = None,
+    command_name: str = "repotrial-experiment-overlay",
+    relative_path: str = ".repotrial-overlays/experiment.overlay.yaml",
+    expected_sha256: str | None = None,
+    encoded_payload: str | None = None,
+) -> list[str]:
+    compatibility = import_module("repotrial.trial.compatibility")
+    digest = hashlib.sha256(payload).hexdigest()
+    script = (
+        compatibility._EXPERIMENT_ADAPTER_SCRIPT
+        if adapter_script is None
+        else adapter_script
+    )
+    encoded = (
+        base64.b64encode(payload).decode("ascii")
+        if encoded_payload is None
+        else encoded_payload
+    )
+    return [
+        "sh",
+        "-eu",
+        "-c",
+        script,
+        command_name,
+        relative_path,
+        digest if expected_sha256 is None else expected_sha256,
+        encoded,
+    ]
+
+
+def _run_fixture_command(provider: Any, workspace: Path, argv: list[str]) -> Any:
+    async def exercise() -> object:
+        sandbox_id = await provider.create(workspace, "experiment-materialization")
+        try:
+            return await provider.exec(sandbox_id, argv)
+        finally:
+            await provider.destroy(sandbox_id)
+
+    return asyncio.run(exercise())
+
+
+def _compose_argv(app_mode: str, *command: str) -> list[str]:
+    return [
+        "env",
+        f"APP_MODE={app_mode}",
+        "docker",
+        "compose",
+        "-f",
+        "compose.yml",
+        *command,
+    ]
+
+
+def test_fixture_provider_materializes_controlled_experiment_overlay(
+    tmp_path: Path,
+) -> None:
+    provider, _ = _fixture_provider("redundant_privileged")
+    workspace = tmp_path / "sandbox"
+    workspace.mkdir()
+    payload = b"services:\n  web:\n    read_only: true\n"
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+
+    async def exercise() -> tuple[object, bytes, int]:
+        sandbox_id = await provider.create(workspace, "experiment-materialization")
+        try:
+            result = await provider.exec(
+                sandbox_id, _experiment_materialization_argv(payload)
+            )
+            target = workspace / ".repotrial-overlays/experiment.overlay.yaml"
+            return result, target.read_bytes(), stat.S_IMODE(target.stat().st_mode)
+        finally:
+            await provider.destroy(sandbox_id)
+
+    result, materialized, mode = cast(tuple[Any, bytes, int], asyncio.run(exercise()))
+
+    assert result.exit_code == 0
+    assert result.stdout == (
+        "root=/workspace\n"
+        "path=.repotrial-overlays/experiment.overlay.yaml\n"
+        "mode=600\n"
+        f"sha256={expected_sha256}\n"
+    )
+    assert result.stderr == ""
+    assert materialized == payload
+    assert mode == 0o600
+    assert not (workspace / ".repotrial-overlays/experiment.overlay.yaml").exists()
+    assert provider.unexpected_commands == []
+
+
+@pytest.mark.parametrize(
+    ("expected_exit_code", "argv_kwargs"),
+    [
+        (None, {"adapter_script": "set -eu\n"}),
+        (22, {"relative_path": ".repotrial-overlays/../escape.yaml"}),
+        (31, {"expected_sha256": "0" * 64}),
+        (26, {"encoded_payload": "not-base64"}),
+    ],
+    ids=["adapter", "path", "hash", "base64"],
+)
+def test_fixture_provider_rejects_uncontrolled_or_invalid_materialization_inputs(
+    tmp_path: Path,
+    expected_exit_code: int | None,
+    argv_kwargs: dict[str, str],
+) -> None:
+    provider, _ = _fixture_provider("redundant_privileged")
+    workspace = tmp_path / "sandbox"
+    workspace.mkdir()
+
+    result = _run_fixture_command(
+        provider, workspace, _experiment_materialization_argv(**argv_kwargs)
+    )
+
+    if expected_exit_code is None:
+        _assert_unexpected(result, provider)
+        assert not (workspace / ".repotrial-overlays").exists()
+    else:
+        assert result.exit_code == expected_exit_code
+        assert result.stderr == ""
+        assert not (workspace / ".repotrial-overlays/experiment.overlay.yaml").exists()
+        assert provider.unexpected_commands == []
+
+
+def test_fixture_provider_rejects_duplicate_or_linked_experiment_targets(
+    tmp_path: Path,
+) -> None:
+    provider, _ = _fixture_provider("redundant_privileged")
+    workspace = tmp_path / "sandbox"
+    workspace.mkdir()
+    overlay_dir = workspace / ".repotrial-overlays"
+    overlay_dir.mkdir()
+    target = overlay_dir / "experiment.overlay.yaml"
+    target.write_bytes(b"preexisting")
+
+    duplicate = _run_fixture_command(
+        provider, workspace, _experiment_materialization_argv()
+    )
+
+    assert duplicate.exit_code == 24
+    assert target.read_bytes() == b"preexisting"
+    assert provider.unexpected_commands == []
+
+    outside = tmp_path / "outside.yaml"
+    target.unlink()
+    target.symlink_to(outside)
+    linked = _run_fixture_command(
+        provider, workspace, _experiment_materialization_argv()
+    )
+
+    assert linked.exit_code == 24
+    assert target.is_symlink()
+    assert not outside.exists()
+    assert provider.unexpected_commands == []
+
+
+def test_fixture_provider_observer_reuses_active_allowlisted_environment(
+    tmp_path: Path,
+) -> None:
+    provider, source = _fixture_provider("prompt_injection")
+    workspace = tmp_path / "sandbox"
+    workspace.mkdir()
+    (workspace / "compose.yml").write_bytes((source / "compose.yml").read_bytes())
+
+    async def exercise() -> tuple[Any, Any, Any]:
+        sandbox_id = await provider.create(workspace, "observer-environment")
+        try:
+            up = await provider.exec(
+                sandbox_id,
+                _compose_argv("fixture", "up", "-d", "--wait", "--wait-timeout", "60"),
+            )
+            observer = await provider.exec(
+                sandbox_id,
+                _compose_argv(
+                    "fixture",
+                    "ps",
+                    "--all",
+                    "--no-trunc",
+                    "--orphans=false",
+                    "--format",
+                    "json",
+                ),
+            )
+            mismatch = await provider.exec(
+                sandbox_id,
+                _compose_argv(
+                    "other",
+                    "ps",
+                    "--all",
+                    "--no-trunc",
+                    "--orphans=false",
+                    "--format",
+                    "json",
+                ),
+            )
+            return up, observer, mismatch
+        finally:
+            await provider.destroy(sandbox_id)
+
+    up, observer, mismatch = asyncio.run(exercise())
+
+    assert up.exit_code == 0
+    assert observer.exit_code == 0
+    assert json.loads(observer.stdout)["ID"]
+    _assert_unexpected(mismatch, provider)
 
 
 def _isolated_fixture_project(
