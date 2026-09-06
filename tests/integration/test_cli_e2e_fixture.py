@@ -7,7 +7,7 @@ import re
 import subprocess
 import threading
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -42,7 +42,8 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 FIXED_RUN_ID = "11111111-1111-4111-8111-111111111111"
 CONTAINER_ID = "a" * 12
 _CLI_ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=(.*)\Z")
-_CLI_ALLOWED_ENV_KEYS = frozenset({"APP_MODE"})
+_CLI_DEFAULT_COMPOSE_PATH = "compose.yaml"
+_CLI_DEFAULT_ALLOWED_ENV_KEYS = frozenset()
 _CLI_COMPOSE_ROUTES = {
     ("up", "-d", "--wait", "--wait-timeout", "60"): "up",
     ("ps", "--all", "--format", "json"): "boot_ps",
@@ -90,11 +91,15 @@ class FixtureProvider(FakeSandboxProvider):
         baseline_healthy: bool = True,
         candidate_boot_unavailable: bool = False,
         create_error: BaseException | None = None,
+        expected_compose_path: str = _CLI_DEFAULT_COMPOSE_PATH,
+        allowed_env_keys: Collection[str] = _CLI_DEFAULT_ALLOWED_ENV_KEYS,
     ) -> None:
         super().__init__(ports={} if host_port is None else {container_port: host_port})
         self.baseline_healthy = baseline_healthy
         self.candidate_boot_unavailable = candidate_boot_unavailable
         self.create_error = create_error
+        self.expected_compose_path = expected_compose_path
+        self.allowed_env_keys = frozenset(allowed_env_keys)
         self.roles: dict[str, str] = {}
         self.workspaces: dict[str, Path] = {}
         self.materialized_experiments: set[str] = set()
@@ -233,7 +238,7 @@ class FixtureProvider(FakeSandboxProvider):
                 if match is None:
                     return None
                 key, value = assignment.split("=", 1)
-                if key not in _CLI_ALLOWED_ENV_KEYS or key in active_env:
+                if key not in self.allowed_env_keys or key in active_env:
                     return None
                 active_env[key] = value
             command = command[docker_index:]
@@ -250,6 +255,13 @@ class FixtureProvider(FakeSandboxProvider):
             index += 2
         if len(compose_files) not in {1, 2} or len(compose_files) != len(
             set(compose_files)
+        ):
+            return None
+        if compose_files[0] != self.expected_compose_path:
+            return None
+        if len(compose_files) == 2 and (
+            compose_files[1] != _compatibility._EXPERIMENT_RELATIVE_PATH
+            or sandbox_id not in self.materialized_experiments
         ):
             return None
         route_name = _CLI_COMPOSE_ROUTES.get(tuple(command[index:]))
@@ -314,15 +326,16 @@ class FixtureProvider(FakeSandboxProvider):
         )
 
 
-def _cli_compose_argv(*command: str, env: tuple[str, ...] = ()) -> list[str]:
-    return [
-        *env,
-        "docker",
-        "compose",
-        "-f",
-        "compose.yml",
-        *command,
-    ]
+def _cli_compose_argv(
+    *command: str,
+    env: tuple[str, ...] = (),
+    compose_files: tuple[str, ...] = (_CLI_DEFAULT_COMPOSE_PATH,),
+) -> list[str]:
+    argv = [*env, "docker", "compose"]
+    for compose_file in compose_files:
+        argv.extend(("-f", compose_file))
+    argv.extend(command)
+    return argv
 
 
 def _cli_experiment_argv(payload: bytes) -> list[str]:
@@ -398,7 +411,6 @@ def test_cli_fixture_observer_requires_the_active_environment(
                     "--wait",
                     "--wait-timeout",
                     "60",
-                    env=("env", "APP_MODE=fixture"),
                 ),
             )
             assert up.exit_code == 0
@@ -414,6 +426,7 @@ def test_cli_fixture_observer_requires_the_active_environment(
                         "--orphans=false",
                         "--format",
                         "json",
+                        env=("env", "APP_MODE=fixture"),
                     ),
                 )
         finally:
@@ -474,6 +487,120 @@ def test_cli_fixture_keeps_experiment_overlay_state_per_sandbox(
         f"{_compatibility._EXPERIMENT_RELATIVE_PATH}\n"
     )
     assert host_target.read_bytes() == b"pre-existing host artifact"
+
+
+def test_cli_fixture_binds_the_authoritative_empty_environment(
+    tmp_path: Path,
+) -> None:
+    provider = FixtureProvider(
+        expected_compose_path="compose.yaml",
+        allowed_env_keys=frozenset(),
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    async def exercise() -> None:
+        sandbox_id = await provider.create(workspace, "candidate-authority-env")
+        try:
+            up = await provider.exec(
+                sandbox_id,
+                _cli_compose_argv("up", "-d", "--wait", "--wait-timeout", "60"),
+            )
+            assert up.exit_code == 0
+            with pytest.raises(AssertionError):
+                await provider.exec(
+                    sandbox_id,
+                    _cli_compose_argv(
+                        "ps",
+                        "--all",
+                        "--no-trunc",
+                        "--orphans=false",
+                        "--format",
+                        "json",
+                        env=("env", "APP_MODE=fixture"),
+                    ),
+                )
+            with pytest.raises(AssertionError):
+                await provider.exec(
+                    sandbox_id,
+                    _cli_compose_argv(
+                        "up",
+                        "-d",
+                        "--wait",
+                        "--wait-timeout",
+                        "60",
+                        env=("env", "APP_MODE=fixture"),
+                    ),
+                )
+        finally:
+            await provider.destroy(sandbox_id)
+
+    asyncio.run(exercise())
+
+
+def test_cli_fixture_rejects_a_non_authoritative_compose_identity(
+    tmp_path: Path,
+) -> None:
+    provider = FixtureProvider(
+        expected_compose_path="compose.yaml",
+        allowed_env_keys=frozenset(),
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    async def exercise() -> None:
+        sandbox_id = await provider.create(workspace, "candidate-authority-compose")
+        try:
+            with pytest.raises(AssertionError):
+                await provider.exec(
+                    sandbox_id,
+                    _cli_compose_argv(
+                        "up",
+                        "-d",
+                        "--wait",
+                        "--wait-timeout",
+                        "60",
+                        compose_files=("wrong-but-safe.yaml",),
+                    ),
+                )
+        finally:
+            await provider.destroy(sandbox_id)
+
+    asyncio.run(exercise())
+
+
+def test_cli_fixture_rejects_an_unmaterialized_experiment_identity(
+    tmp_path: Path,
+) -> None:
+    provider = FixtureProvider(
+        expected_compose_path="compose.yaml",
+        allowed_env_keys=frozenset(),
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    async def exercise() -> None:
+        sandbox_id = await provider.create(workspace, "candidate-authority-overlay")
+        try:
+            with pytest.raises(AssertionError):
+                await provider.exec(
+                    sandbox_id,
+                    _cli_compose_argv(
+                        "up",
+                        "-d",
+                        "--wait",
+                        "--wait-timeout",
+                        "60",
+                        compose_files=(
+                            "compose.yaml",
+                            _compatibility._EXPERIMENT_RELATIVE_PATH,
+                        ),
+                    ),
+                )
+        finally:
+            await provider.destroy(sandbox_id)
+
+    asyncio.run(exercise())
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
