@@ -1413,6 +1413,41 @@ def test_runtime_template_lifecycle_uses_owned_tag_and_exact_image_id(
 
 
 @pytest.mark.parametrize(
+    "stop_outcome",
+    [_Outcome(returncode=1), _Outcome(hang=True), asyncio.CancelledError()],
+)
+def test_uncertain_stop_failure_blocks_exec_but_allows_destroy(
+    monkeypatch: pytest.MonkeyPatch, stop_outcome: _Outcome | BaseException
+) -> None:
+    spawner = _SbxSpawner()
+    command_timeout_s = (
+        0.01 if isinstance(stop_outcome, _Outcome) and stop_outcome.hang else 5
+    )
+    provider, sandbox_id = _active_provider(
+        monkeypatch,
+        spawner,
+        deadline=time.monotonic() + 300.0,
+        command_timeout_s=command_timeout_s,
+    )
+    spawner.overrides[("sbx", "stop", sandbox_id)] = stop_outcome
+    spawner.handler = lambda command: (
+        _Outcome(stdout=b'{"images":[]}')
+        if command == ("sbx", "template", "ls", "--json")
+        else _Outcome()
+    )
+
+    with pytest.raises((DockerSbxError, asyncio.CancelledError)):
+        asyncio.run(provider.activate_runtime_template(sandbox_id, "b" * 64))
+
+    with pytest.raises(RuntimeError, match="stopped"):
+        asyncio.run(provider.exec(sandbox_id, ["true"]))
+    assert not any(call[:2] == ("sbx", "exec") for call in spawner.calls)
+
+    asyncio.run(provider.destroy(sandbox_id))
+    assert ("sbx", "rm", "--force", sandbox_id) in spawner.calls
+
+
+@pytest.mark.parametrize(
     "stop_outcome", [_Outcome(returncode=1), asyncio.CancelledError()]
 )
 def test_runtime_template_stop_failure_prevents_save(

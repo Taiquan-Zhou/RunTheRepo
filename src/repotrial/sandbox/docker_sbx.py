@@ -452,6 +452,7 @@ class DockerSbxProvider(SandboxProvider):
         return _parse_runtime_templates(result.stdout)
 
     async def _stop_runtime_sandbox(self, sandbox_id: str, deadline: float) -> None:
+        self._stopped_sandboxes.add(sandbox_id)
         result = await self._run(
             "stop",
             ["stop", sandbox_id],
@@ -461,7 +462,6 @@ class DockerSbxProvider(SandboxProvider):
             public_sandbox_id=sandbox_id,
         )
         _require_success("stop", result)
-        self._stopped_sandboxes.add(sandbox_id)
 
     async def create(self, workspace: Path, name: str) -> str:
         deadline = self._trial_deadline
