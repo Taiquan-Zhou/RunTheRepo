@@ -66,7 +66,8 @@ _CREATE_FLAGS = (
     "--deny-network",
 )
 _RUNTIME_TEMPLATE_TAG = re.compile(r"repotrial-runtime:[0-9a-f]{32}\Z")
-_IMAGE_ID = re.compile(r"(?:sha256:)?[0-9a-f]{64}\Z")
+_IMAGE_ID = re.compile(r"[0-9a-f]{12}\Z")
+_RUNTIME_TEMPLATE_REPOSITORY = "docker.io/library/repotrial-runtime"
 PID_HARD_BOUND_LIMITATION = "pid_hard_bound_unsupported"
 _PORT_KEYS = {"host_ip", "host_port", "sandbox_port", "protocol"}
 _NETWORK_LOG_KEYS = {"blocked_hosts", "allowed_hosts"}
@@ -333,6 +334,7 @@ class DockerSbxProvider(SandboxProvider):
         self._sandbox_deadlines: dict[str, float] = {}
         self._trial_deadline: float | None = None
         self._network_log_sandboxes: set[str] = set()
+        self._stopped_sandboxes: set[str] = set()
         self._runtime_template_tag: str | None = None
         self._runtime_template_image_id: str | None = None
         self._runtime_template_expected_identity: str | None = None
@@ -366,6 +368,7 @@ class DockerSbxProvider(SandboxProvider):
         if any(_runtime_template_matches(item, tag) for item in before):
             raise DockerSbxError("template_save", "template_tag_collision")
 
+        await self._stop_runtime_sandbox(sandbox_id, deadline)
         self._runtime_template_pending_tag = tag
         save_attempted = False
         try:
@@ -447,6 +450,18 @@ class DockerSbxProvider(SandboxProvider):
         )
         _require_success("template_ls", result)
         return _parse_runtime_templates(result.stdout)
+
+    async def _stop_runtime_sandbox(self, sandbox_id: str, deadline: float) -> None:
+        result = await self._run(
+            "stop",
+            ["stop", sandbox_id],
+            self._command_timeout_s,
+            deadline=deadline,
+            sandbox_id=sandbox_id,
+            public_sandbox_id=sandbox_id,
+        )
+        _require_success("stop", result)
+        self._stopped_sandboxes.add(sandbox_id)
 
     async def create(self, workspace: Path, name: str) -> str:
         deadline = self._trial_deadline
@@ -934,6 +949,8 @@ class DockerSbxProvider(SandboxProvider):
         ):
             raise ValueError("timeout_s must be a positive integer")
         self._require_active(sandbox_id)
+        if sandbox_id in self._stopped_sandboxes:
+            raise RuntimeError(f"sandbox is stopped: {sandbox_id}")
         result = await self._run(
             "exec",
             ["exec", sandbox_id, "--", *argv],
@@ -1051,6 +1068,7 @@ class DockerSbxProvider(SandboxProvider):
         self._sandbox_states[sandbox_id] = _SandboxState.CLEANED
         self._sandbox_deadlines.pop(sandbox_id, None)
         self._network_log_sandboxes.discard(sandbox_id)
+        self._stopped_sandboxes.discard(sandbox_id)
 
     async def _cleanup_after_uncertain_failure(
         self,
@@ -1159,6 +1177,7 @@ class DockerSbxProvider(SandboxProvider):
             ),
             ("template_ls", ["template", "ls", "--help"], ("--json",)),
             ("template_rm", ["template", "rm", "--help"], ("TAG|ID",)),
+            ("stop", ["stop", "--help"], ("SANDBOX",)),
         )
         for capability, arguments, tokens in required_help:
             result = await self._probe_call(capability, arguments, deadline)
@@ -1954,28 +1973,45 @@ def _parse_runtime_templates(output: bytes) -> tuple[_RuntimeTemplate, ...]:
         )
     except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateJsonKeyError):
         raise DockerSbxError("template_ls", "template_list_invalid") from None
-    if not isinstance(decoded, list) or len(decoded) > 128:
+    if not isinstance(decoded, dict) or set(decoded) != {"images"}:
+        raise DockerSbxError("template_ls", "template_list_invalid")
+    images = decoded["images"]
+    if not isinstance(images, list) or len(images) > 128:
         raise DockerSbxError("template_ls", "template_list_invalid")
     templates: list[_RuntimeTemplate] = []
-    for item in decoded:
-        if not isinstance(item, dict):
+    for item in images:
+        if not isinstance(item, dict) or set(item) != {
+            "id",
+            "repository",
+            "tag",
+            "flavor",
+            "created_at",
+            "size",
+        }:
             raise DockerSbxError("template_ls", "template_list_invalid")
-        if set(item) == {"repository", "tag", "id"}:
-            image_id_key = "id"
-        elif set(item) == {"repository", "tag", "image_id"}:
-            image_id_key = "image_id"
-        else:
-            raise DockerSbxError("template_ls", "template_list_invalid")
+        image_id = item["id"]
         repository = item["repository"]
         tag = item["tag"]
-        image_id = item[image_id_key]
+        flavor = item["flavor"]
+        created_at = item["created_at"]
+        size = item["size"]
         if (
-            not isinstance(repository, str)
-            or not isinstance(tag, str)
-            or not isinstance(image_id, str)
-            or not repository
-            or not tag
+            not isinstance(image_id, str)
             or _IMAGE_ID.fullmatch(image_id) is None
+            or not isinstance(repository, str)
+            or repository == ""
+            or len(repository.encode("utf-8")) > 512
+            or not isinstance(tag, str)
+            or tag == ""
+            or len(tag.encode("utf-8")) > 128
+            or not isinstance(flavor, str)
+            or len(flavor.encode("utf-8")) > 128
+            or not isinstance(created_at, str)
+            or created_at == ""
+            or len(created_at.encode("utf-8")) > 128
+            or type(size) is not int
+            or size < 0
+            or size > 2**63 - 1
         ):
             raise DockerSbxError("template_ls", "template_list_invalid")
         templates.append(
@@ -1989,10 +2025,11 @@ def _parse_runtime_templates(output: bytes) -> tuple[_RuntimeTemplate, ...]:
 
 
 def _runtime_template_matches(template: _RuntimeTemplate, tag: str) -> bool:
+    if _RUNTIME_TEMPLATE_TAG.fullmatch(tag) is None:
+        return False
     return (
-        template.repository == "repotrial-runtime"
-        and (template.tag == tag or template.tag == tag.split(":", 1)[1])
-        and _RUNTIME_TEMPLATE_TAG.fullmatch(tag) is not None
+        template.repository == _RUNTIME_TEMPLATE_REPOSITORY
+        and template.tag == tag.split(":", 1)[1]
     )
 
 

@@ -57,6 +57,7 @@ HELP_OUTPUTS = {
     ("sbx", "template", "save", "--help"): "Usage: sbx template save SANDBOX TAG",
     ("sbx", "template", "ls", "--help"): "Usage: sbx template ls --json",
     ("sbx", "template", "rm", "--help"): "Usage: sbx template rm TAG|ID",
+    ("sbx", "stop", "--help"): "Usage: sbx stop SANDBOX [SANDBOX...]",
 }
 PROBE_CALLS = [
     ("sbx", "version"),
@@ -70,6 +71,7 @@ PROBE_CALLS = [
     ("sbx", "template", "save", "--help"),
     ("sbx", "template", "ls", "--help"),
     ("sbx", "template", "rm", "--help"),
+    ("sbx", "stop", "--help"),
     ("sbx", "policy", "log", "--help"),
 ]
 HOST_HEAD = b"0123456789abcdef0123456789abcdef01234567\n"
@@ -1319,6 +1321,11 @@ def test_runtime_template_probe_requires_all_template_help_commands(
             "Usage: sbx template rm IMAGE",
             "template_rm_missing_capability:TAG|ID",
         ),
+        (
+            ("sbx", "stop", "--help"),
+            "Usage: sbx stop [NAME...]",
+            "stop_missing_capability:SANDBOX",
+        ),
     ],
 )
 def test_runtime_template_probe_rejects_incomplete_help_contract(
@@ -1346,7 +1353,7 @@ def test_runtime_template_lifecycle_uses_owned_tag_and_exact_image_id(
         spawner,
         deadline=time.monotonic() + 300.0,
     )
-    image_id = "sha256:" + "a" * 64
+    image_id = "a" * 12
     saved_tag: str | None = None
     template_saved = False
 
@@ -1354,10 +1361,21 @@ def test_runtime_template_lifecycle_uses_owned_tag_and_exact_image_id(
         nonlocal saved_tag, template_saved
         if command == ("sbx", "template", "ls", "--json"):
             if not template_saved:
-                return _Outcome(stdout=b"[]")
+                return _Outcome(stdout=b'{"images":[]}')
             assert saved_tag is not None
             payload = json.dumps(
-                [{"repository": "repotrial-runtime", "tag": saved_tag, "id": image_id}]
+                {
+                    "images": [
+                        {
+                            "id": image_id,
+                            "repository": "docker.io/library/repotrial-runtime",
+                            "tag": saved_tag.split(":", 1)[1],
+                            "flavor": "shell",
+                            "created_at": "2026-09-06T00:00:00Z",
+                            "size": 1,
+                        }
+                    ]
+                }
             ).encode()
             return _Outcome(stdout=payload)
         if command[:3] == ("sbx", "template", "save"):
@@ -1389,6 +1407,57 @@ def test_runtime_template_lifecycle_uses_owned_tag_and_exact_image_id(
     assert template_calls[5] == ("sbx", "template", "ls", "--json")
     assert saved_tag is not None and _RUNTIME_TEMPLATE_TAG.fullmatch(saved_tag)
     assert provider.expected_image_identity_sha256() is None
+    stop_index = spawner.calls.index(("sbx", "stop", sandbox_id))
+    save_index = spawner.calls.index(template_calls[1])
+    assert stop_index < save_index
+
+
+@pytest.mark.parametrize(
+    "stop_outcome", [_Outcome(returncode=1), asyncio.CancelledError()]
+)
+def test_runtime_template_stop_failure_prevents_save(
+    monkeypatch: pytest.MonkeyPatch, stop_outcome: _Outcome | BaseException
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch,
+        spawner,
+        deadline=time.monotonic() + 300.0,
+    )
+    spawner.overrides[("sbx", "stop", sandbox_id)] = stop_outcome
+
+    spawner.handler = lambda command: (
+        _Outcome(stdout=b'{"images":[]}')
+        if command == ("sbx", "template", "ls", "--json")
+        else _Outcome()
+    )
+    with pytest.raises((DockerSbxError, asyncio.CancelledError)):
+        asyncio.run(provider.activate_runtime_template(sandbox_id, "b" * 64))
+
+    assert not any(call[:3] == ("sbx", "template", "save") for call in spawner.calls)
+
+
+def test_runtime_template_stop_timeout_prevents_save(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch,
+        spawner,
+        deadline=time.monotonic() + 300.0,
+        command_timeout_s=0.01,
+    )
+    spawner.overrides[("sbx", "stop", sandbox_id)] = _Outcome(hang=True)
+    spawner.handler = lambda command: (
+        _Outcome(stdout=b'{"images":[]}')
+        if command == ("sbx", "template", "ls", "--json")
+        else _Outcome()
+    )
+
+    with pytest.raises(DockerSbxError, match="timeout"):
+        asyncio.run(provider.activate_runtime_template(sandbox_id, "b" * 64))
+
+    assert not any(call[:3] == ("sbx", "template", "save") for call in spawner.calls)
 
 
 def test_runtime_template_cleanup_after_save_uses_unbounded_deadline_and_confirms_absence(
@@ -1448,7 +1517,9 @@ def test_runtime_template_finalize_removes_by_owned_tag_and_preserves_shared_ima
         if removed_owned:
             return (docker_sbx._RuntimeTemplate("shell-docker", "latest", shared_id),)
         return (
-            docker_sbx._RuntimeTemplate("repotrial-runtime", "e" * 32, shared_id),
+            docker_sbx._RuntimeTemplate(
+                "docker.io/library/repotrial-runtime", "e" * 32, shared_id
+            ),
             docker_sbx._RuntimeTemplate("shell-docker", "latest", shared_id),
         )
 
@@ -1484,7 +1555,11 @@ def test_runtime_template_finalize_keeps_state_when_owned_tag_remains(
 
     async def listed(deadline: float | None = None) -> tuple[object, ...]:
         del deadline
-        return (docker_sbx._RuntimeTemplate("repotrial-runtime", "1" * 32, image_id),)
+        return (
+            docker_sbx._RuntimeTemplate(
+                "docker.io/library/repotrial-runtime", "1" * 32, image_id
+            ),
+        )
 
     monkeypatch.setattr(provider, "_list_runtime_templates", listed)
 
@@ -1526,7 +1601,9 @@ def test_runtime_template_finalize_propagates_remove_failure_and_uses_tag(
         del deadline
         return (
             docker_sbx._RuntimeTemplate(
-                "repotrial-runtime", "7" * 32, provider._runtime_template_image_id or ""
+                "docker.io/library/repotrial-runtime",
+                "7" * 32,
+                provider._runtime_template_image_id or "",
             ),
         )
 
@@ -1549,7 +1626,7 @@ def test_runtime_template_activation_is_single_use_even_after_finalize(
         spawner,
         deadline=time.monotonic() + 300.0,
     )
-    image_id = "sha256:" + "4" * 64
+    image_id = "4" * 12
     saved_tag: str | None = None
     template_saved = False
 
@@ -1557,17 +1634,22 @@ def test_runtime_template_activation_is_single_use_even_after_finalize(
         nonlocal saved_tag, template_saved
         if command == ("sbx", "template", "ls", "--json"):
             if not template_saved:
-                return _Outcome(stdout=b"[]")
+                return _Outcome(stdout=b'{"images":[]}')
             assert saved_tag is not None
             return _Outcome(
                 stdout=json.dumps(
-                    [
-                        {
-                            "repository": "repotrial-runtime",
-                            "tag": saved_tag,
-                            "id": image_id,
-                        }
-                    ]
+                    {
+                        "images": [
+                            {
+                                "id": image_id,
+                                "repository": "docker.io/library/repotrial-runtime",
+                                "tag": saved_tag.split(":", 1)[1],
+                                "flavor": "shell",
+                                "created_at": "2026-09-06T00:00:00Z",
+                                "size": 1,
+                            }
+                        ]
+                    }
                 ).encode()
             )
         if command[:3] == ("sbx", "template", "save"):
@@ -1623,13 +1705,18 @@ def test_runtime_template_rejects_preexisting_owned_tag(
         lambda: SimpleNamespace(hex="d" * 32),
     )
     existing = json.dumps(
-        [
-            {
-                "repository": "repotrial-runtime",
-                "tag": "d" * 32,
-                "id": "sha256:" + "a" * 64,
-            }
-        ]
+        {
+            "images": [
+                {
+                    "id": "a" * 12,
+                    "repository": "docker.io/library/repotrial-runtime",
+                    "tag": "d" * 32,
+                    "flavor": "shell",
+                    "created_at": "2026-09-06T00:00:00Z",
+                    "size": 1,
+                }
+            ]
+        }
     ).encode()
     spawner.handler = lambda command: (
         _Outcome(stdout=existing)
@@ -1647,12 +1734,13 @@ def test_runtime_template_rejects_preexisting_owned_tag(
     "output",
     [
         b"{",
-        b'[{"repository":"repotrial-runtime","tag":"x","id":"bad"}]',
         (
-            b'[{"repository":"repotrial-runtime","tag":"x","id":"'
-            b"sha256:"
-            b'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
-            b'"id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'
+            b'{"images":[{"id":"bad","repository":"docker.io/library/repotrial-runtime",'
+            b'"tag":"x","flavor":"shell","created_at":"now","size":1}]}'
+        ),
+        (
+            b'{"images":[{"id":"aaaaaaaaaaaa","repository":"docker.io/library/repotrial-runtime",'
+            b'"tag":"x","flavor":"shell","created_at":"now","size":1,"id":"bbbbbbbbbbbbbb"}]}'
         ),
     ],
 )
@@ -1661,6 +1749,33 @@ def test_runtime_template_listing_rejects_malformed_or_duplicate_records(
 ) -> None:
     with pytest.raises(DockerSbxError, match="template_list_invalid"):
         docker_sbx._parse_runtime_templates(output)
+
+
+def test_runtime_template_listing_accepts_real_schema_and_normalized_match() -> None:
+    tag = "repotrial-runtime:" + "a" * 32
+    output = json.dumps(
+        {
+            "images": [
+                {
+                    "id": "b" * 12,
+                    "repository": "docker.io/library/repotrial-runtime",
+                    "tag": "a" * 32,
+                    "flavor": "shell",
+                    "created_at": "2026-09-06T00:00:00Z",
+                    "size": 123,
+                }
+            ]
+        }
+    ).encode()
+
+    templates = docker_sbx._parse_runtime_templates(output)
+
+    assert len(templates) == 1
+    assert docker_sbx._runtime_template_matches(templates[0], tag)
+    assert not docker_sbx._runtime_template_matches(
+        docker_sbx._RuntimeTemplate("repotrial-runtime", "a" * 32, "b" * 12),
+        tag,
+    )
 
 
 def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
@@ -3652,21 +3767,35 @@ def test_create_deadline_starts_before_probes_and_limits_create_subprocess(
     assert timed_commands[1 : len(PROBE_CALLS) + 1] == list(
         zip(
             PROBE_CALLS,
-            (22.0, 21.0, 20.0, 19.0, 18.0, 17.0, 16.0, 15.0, 14.0, 13.0, 12.0, 11.0),
+            (
+                22.0,
+                21.0,
+                20.0,
+                19.0,
+                18.0,
+                17.0,
+                16.0,
+                15.0,
+                14.0,
+                13.0,
+                12.0,
+                11.0,
+                10.0,
+            ),
             strict=True,
         )
     )
     create_call = _actual_create_call(spawner)
     assert timed_commands[len(PROBE_CALLS) + 1][0][:2] == ("git", "-C")
-    assert timed_commands[len(PROBE_CALLS) + 1][1] == 10.0
+    assert timed_commands[len(PROBE_CALLS) + 1][1] == 9.0
     assert [timeout for _, timeout in timed_commands[-7:]] == [
-        9.0,
         8.0,
         7.0,
         6.0,
         5.0,
         4.0,
         3.0,
+        2.0,
     ]
     assert [command for command, _ in timed_commands[-7:]] == [
         create_call,
