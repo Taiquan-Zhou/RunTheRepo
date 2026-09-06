@@ -7,7 +7,8 @@ import re
 import stat
 import unicodedata
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -122,6 +123,17 @@ _MAX_IMAGE_TEMPLATE_EVIDENCE_BYTES = 64 * 1024
 _TEMPLATE_REASON_PATTERN = re.compile(r"[a-z0-9_]{1,64}\Z")
 
 
+@dataclass(slots=True)
+class _TemplateEvidenceHandle:
+    path: Path | None = None
+    owned: bool = False
+
+
+_TEMPLATE_EVIDENCE_HANDLE: ContextVar[_TemplateEvidenceHandle | None] = ContextVar(
+    "repotrial_template_evidence_handle", default=None
+)
+
+
 def build_run_graph(
     *,
     checkpointer: BaseCheckpointSaver[str] | None = None,
@@ -177,31 +189,44 @@ async def _invoke_graph_with_finalization(
 
     if not context.provider.supports_runtime_templates:
         return await invoke()
+    evidence_handle = _TemplateEvidenceHandle()
+    token = _TEMPLATE_EVIDENCE_HANDLE.set(evidence_handle)
     try:
-        async with managed_runtime_template(context.provider):
-            result = await invoke()
-    except RuntimeTemplateCleanupError as error:
+        try:
+            async with managed_runtime_template(context.provider):
+                result = await invoke()
+        except RuntimeTemplateCleanupError as error:
+            audit_failure = _append_template_finalization_evidence(
+                context.artifact_dir,
+                run_id,
+                evidence_path=evidence_handle.path if evidence_handle.owned else None,
+                body_failure=error.body_failure,
+                cleanup_failure=error.cleanup_failure,
+            )
+            if audit_failure is not None:
+                error.secondary_failures = (*error.secondary_failures, audit_failure)
+                _retain_template_secondary_failure(error, audit_failure)
+            raise
+        except BaseException as error:
+            audit_failure = _append_template_finalization_evidence(
+                context.artifact_dir,
+                run_id,
+                evidence_path=evidence_handle.path if evidence_handle.owned else None,
+                body_failure=error,
+            )
+            if audit_failure is not None:
+                _retain_template_secondary_failure(error, audit_failure)
+            raise
         audit_failure = _append_template_finalization_evidence(
             context.artifact_dir,
             run_id,
-            body_failure=error.body_failure,
-            cleanup_failure=error.cleanup_failure,
+            evidence_path=evidence_handle.path if evidence_handle.owned else None,
         )
         if audit_failure is not None:
-            error.secondary_failures = (*error.secondary_failures, audit_failure)
-            _retain_template_secondary_failure(error, audit_failure)
-        raise
-    except BaseException as error:
-        audit_failure = _append_template_finalization_evidence(
-            context.artifact_dir, run_id, body_failure=error
-        )
-        if audit_failure is not None:
-            _retain_template_secondary_failure(error, audit_failure)
-        raise
-    audit_failure = _append_template_finalization_evidence(context.artifact_dir, run_id)
-    if audit_failure is not None:
-        raise _TemplateEvidenceError((audit_failure,)) from audit_failure
-    return result
+            raise _TemplateEvidenceError((audit_failure,)) from audit_failure
+        return result
+    finally:
+        _TEMPLATE_EVIDENCE_HANDLE.reset(token)
 
 
 async def ainvoke_run(
@@ -1686,6 +1711,10 @@ async def _prepare_runtime_template(
     expected_compatibility_sha256: str,
 ) -> None:
     template_evidence = _ImageTemplateEvidence(attempt_dir / "image-template.jsonl")
+    evidence_handle = _TEMPLATE_EVIDENCE_HANDLE.get()
+    if evidence_handle is not None:
+        evidence_handle.path = template_evidence.path
+        evidence_handle.owned = True
     warmup_id: str | None = None
     primary_failure: BaseException | None = None
     try:
@@ -1963,24 +1992,22 @@ def _append_template_finalization_evidence(
     artifact_dir: Path,
     run_id: str,
     *,
+    evidence_path: Path | None = None,
     body_failure: BaseException | None = None,
     cleanup_failure: BaseException | None = None,
 ) -> BaseException | None:
+    if evidence_path is None:
+        return None
     try:
-        if not artifact_dir.is_dir():
-            return OSError("runtime template evidence directory is missing")
-        paths = sorted(
-            artifact_dir.glob(
-                f"baseline-{_run_token(run_id)}-*-attempt-*/image-template.jsonl"
-            )
-        )
-    except OSError as discovery_error:
-        return discovery_error
-    if not paths:
-        return OSError("runtime template evidence artifact is missing")
-    try:
-        path = paths[-1]
-        if path.is_symlink() or not path.is_file():
+        if not evidence_path.is_relative_to(artifact_dir):
+            return OSError("runtime template evidence artifact is outside run")
+        path = evidence_path
+        if (
+            path.name != "image-template.jsonl"
+            or not path.parent.name.startswith(f"baseline-{_run_token(run_id)}-")
+            or path.is_symlink()
+            or not path.is_file()
+        ):
             return OSError("runtime template evidence artifact is unsafe")
     except OSError as safety_error:
         return safety_error

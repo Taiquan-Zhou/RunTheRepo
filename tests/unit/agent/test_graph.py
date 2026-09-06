@@ -2666,6 +2666,26 @@ def test_runtime_template_warmup_reuses_startup_input_materialization(
     )
 
 
+def test_runtime_template_baseline_checkpoint_without_warmup_is_valid(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, host_port):
+        provider = RuntimeTemplateGraphProvider(host_port=host_port)
+        context, source = _context(tmp_path, provider, journeys=[])
+        graph = build_run_graph(interrupt_after=("baseline",))
+
+        result = asyncio.run(
+            ainvoke_run(
+                graph,
+                _state(source.parent, run_id="runtime-template-baseline-checkpoint"),
+                context=context,
+            )
+        )
+
+    assert result.stage_history == ["intake", "baseline"]
+    assert not list(context.artifact_dir.glob("baseline-*/image-template.jsonl"))
+
+
 def test_runtime_template_warmup_failure_stops_before_baseline(
     tmp_path: Path,
 ) -> None:
@@ -2742,11 +2762,13 @@ def test_runtime_template_finalization_evidence_is_run_scoped_and_classified(
     graph_module._append_template_finalization_evidence(
         artifact_dir,
         "run-a",
+        evidence_path=first,
         body_failure=ValueError("graph failed"),
     )
     graph_module._append_template_finalization_evidence(
         artifact_dir,
         "run-b",
+        evidence_path=second,
         cleanup_failure=RuntimeError("cleanup failed"),
     )
 
@@ -2824,7 +2846,7 @@ def test_template_finalization_evidence_failure_is_not_silent(
     monkeypatch.setattr(Path, "open", fail_append)
 
     failure = graph_module._append_template_finalization_evidence(
-        artifact_dir, "run-failure"
+        artifact_dir, "run-failure", evidence_path=path
     )
     assert isinstance(failure, OSError)
 
