@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from repotrial.sandbox.base import ExecResult
+from repotrial.sandbox.base import (
+    ExecResult,
+    SandboxFailureEvidence,
+    get_sandbox_failure_evidence,
+)
+from repotrial.sandbox.docker_sbx import DockerSbxError
 from repotrial.sandbox.fake import FakeSandboxProvider
 from repotrial.trial.image_template import (
     ImageTemplateError,
@@ -18,6 +23,25 @@ from repotrial.trial.image_template import (
 _IMAGE_A = "sha256:" + "a" * 64
 _IMAGE_B = "sha256:" + "b" * 64
 _DIGEST_A = "sha256:" + "1" * 64
+_IMAGE_LIST_FORMAT = (
+    '{"ID":{{json .ID}},"Repository":{{json .Repository}},'
+    '"Tag":{{json .Tag}},"Digest":{{json .Digest}}}'
+)
+_REAL_DOCKER_IMAGE_ROW = json.dumps(
+    {
+        "Containers": "N/A",
+        "CreatedAt": "2026-09-06 04:00:00 +0000 UTC",
+        "CreatedSince": "2 hours ago",
+        "Digest": _DIGEST_A,
+        "ID": _IMAGE_A,
+        "Repository": "alpine",
+        "SharedSize": "N/A",
+        "Size": "7.8MB",
+        "Tag": "latest",
+        "UniqueSize": "N/A",
+    },
+    separators=(",", ":"),
+)
 COMPOSE_PATH = "compose.yml"
 
 
@@ -110,12 +134,18 @@ class TemplateProvider(FakeSandboxProvider):
         fail_stage: str | None = None,
         inventory_output: str | bytes | None = None,
         success_stderr: str = "",
+        provider_error: DockerSbxError | None = None,
+        provider_error_stage: str | None = None,
+        activation_error: DockerSbxError | None = None,
     ) -> None:
         super().__init__()
         self.guest_root = guest_root
         self.fail_stage = fail_stage
         self.inventory_output = inventory_output or _line()
         self.success_stderr = success_stderr
+        self.provider_error = provider_error
+        self.provider_error_stage = provider_error_stage
+        self.activation_error = activation_error
         self.exec_calls: list[tuple[str, ...]] = []
         self.activated_identity: str | None = None
 
@@ -127,6 +157,8 @@ class TemplateProvider(FakeSandboxProvider):
         self, sandbox_id: str, image_identity_sha256: str
     ) -> None:
         self._require_active(sandbox_id)
+        if self.activation_error is not None:
+            raise self.activation_error
         self.activated_identity = image_identity_sha256
 
     async def exec(
@@ -136,16 +168,40 @@ class TemplateProvider(FakeSandboxProvider):
         call = tuple(argv)
         self.exec_calls.append(call)
         if call[-2:] == ("config", "--quiet"):
+            if (
+                self.provider_error_stage == "config"
+                and self.provider_error is not None
+            ):
+                raise self.provider_error
             return self._result("config")
         if call[-2:] == ("pull", "--ignore-buildable"):
+            if self.provider_error_stage == "pull" and self.provider_error is not None:
+                raise self.provider_error
             return self._result("pull")
         if call[-1:] == ("build",):
+            if self.provider_error_stage == "build" and self.provider_error is not None:
+                raise self.provider_error
             return self._result("build")
         if call[-8:-6] == ("docker", "image"):
+            if (
+                self.provider_error_stage == "inventory"
+                and self.provider_error is not None
+            ):
+                raise self.provider_error
+            if call[-1] == "{{json .}}":
+                return self._result("inventory", stdout=_REAL_DOCKER_IMAGE_ROW)
+            assert call[-1] == _IMAGE_LIST_FORMAT
             return self._result("inventory", stdout=self.inventory_output)
         if call[-1:] == ("pwd",):
+            if self.provider_error_stage == "pwd" and self.provider_error is not None:
+                raise self.provider_error
             return self._result("pwd", stdout=f"{self.guest_root}\n")
         if call[-5:] == ("rm", "--recursive", "--force", "--", self.guest_root):
+            if (
+                self.provider_error_stage == "remove"
+                and self.provider_error is not None
+            ):
+                raise self.provider_error
             return self._result("remove")
         raise AssertionError(f"unexpected provider command: {call!r}")
 
@@ -218,6 +274,30 @@ def test_prepare_compose_image_template_pulls_builds_removes_then_activates() ->
     ]
 
 
+def test_prepare_uses_explicit_four_field_docker_image_format() -> None:
+    provider = TemplateProvider()
+
+    inventory = _prepare(provider)
+
+    inventory_call = next(
+        call for call in provider.exec_calls if call[-8:-6] == ("docker", "image")
+    )
+    assert inventory_call == (
+        "docker",
+        "image",
+        "ls",
+        "--all",
+        "--no-trunc",
+        "--digests",
+        "--format",
+        _IMAGE_LIST_FORMAT,
+    )
+    assert "{{json .}}" not in inventory_call[-1]
+    assert inventory.records
+    with pytest.raises(ValueError):
+        parse_image_inventory(_REAL_DOCKER_IMAGE_ROW)
+
+
 def test_prepare_compose_image_template_can_derive_proven_guest_root() -> None:
     provider = TemplateProvider()
 
@@ -273,6 +353,75 @@ def test_prepare_compose_image_template_fails_closed_before_activation(
         }
         observed = [_stage(call) for call in provider.exec_calls]
         assert tuple(observed) == expected_stages[fail_stage]
+
+
+@pytest.mark.parametrize(
+    "reason", ["total_duration_exhausted", "process_cleanup_unconfirmed"]
+)
+def test_prepare_preserves_docker_sbx_error_from_exec(reason: str) -> None:
+    failure_evidence = SandboxFailureEvidence(
+        operation="exec",
+        reason=reason,
+        sandbox_id="sandbox-1",
+    )
+    provider_error = DockerSbxError(
+        "exec",
+        reason,
+        stderr="provider-detail",
+        failure_evidence=failure_evidence,
+    )
+    provider = TemplateProvider(
+        provider_error=provider_error,
+        provider_error_stage="pull",
+    )
+
+    with pytest.raises(DockerSbxError) as raised:
+        _prepare(provider)
+
+    assert raised.value is provider_error
+    assert raised.value.reason == reason
+    assert get_sandbox_failure_evidence(raised.value) is failure_evidence
+
+
+def test_prepare_preserves_docker_sbx_error_from_compose_preflight() -> None:
+    provider_error = DockerSbxError(
+        "exec", "total_duration_exhausted", stderr="provider-detail"
+    )
+    provider = TemplateProvider(
+        provider_error=provider_error,
+        provider_error_stage="config",
+    )
+
+    async def exercise() -> object:
+        sandbox_id = await provider.create(Path("missing-workspace"), "warmup")
+        return await prepare_compose_image_template(
+            provider,
+            sandbox_id,
+            COMPOSE_PATH,
+            {},
+            guest_workspace=provider.guest_root,
+            declared_secret_env_keys={"REQUIRED_SECRET"},
+        )
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(exercise())
+
+    assert raised.value is provider_error
+    assert raised.value.reason == "total_duration_exhausted"
+
+
+@pytest.mark.parametrize(
+    "reason", ["total_duration_exhausted", "process_cleanup_unconfirmed"]
+)
+def test_prepare_preserves_docker_sbx_error_from_activation(reason: str) -> None:
+    provider_error = DockerSbxError("template_save", reason, stderr="provider-detail")
+    provider = TemplateProvider(activation_error=provider_error)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _prepare(provider)
+
+    assert raised.value is provider_error
+    assert raised.value.reason == reason
 
 
 def test_prepare_compose_image_template_rejects_unproven_guest_root() -> None:

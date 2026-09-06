@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from repotrial.sandbox.base import ExecResult, SandboxProvider
+from repotrial.sandbox.docker_sbx import DockerSbxError
 
 _IMAGE_ID_PATTERN: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _DIGEST_PATTERN: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -28,7 +29,10 @@ _IMAGE_LIST_ARGV: Final = (
     "--no-trunc",
     "--digests",
     "--format",
-    "{{json .}}",
+    (
+        '{"ID":{{json .ID}},"Repository":{{json .Repository}},'
+        '"Tag":{{json .Tag}},"Digest":{{json .Digest}}}'
+    ),
 )
 _IMAGE_COMMAND_TIMEOUT_S: Final = 600
 _REASON_PATTERN: Final = re.compile(r"[a-z0-9_]{1,64}\Z")
@@ -316,6 +320,8 @@ async def prepare_compose_image_template(
             declared_secret_keys,
             unset_env_keys,
         )
+    except DockerSbxError:
+        raise
     except (KeyError, OSError, RuntimeError, TypeError, ValueError):
         raise ImageTemplateError("compose_preflight_failed") from None
     del recovered_env
@@ -333,7 +339,8 @@ async def prepare_compose_image_template(
             "compose_preflight_failed",
             timeout_s=30,
         )
-    _require_successful_command(config_result, "compose_preflight_failed")
+    if config_result is not None:
+        _validate_successful_result(config_result, "compose_preflight_failed")
 
     try:
         prefix = _validated_compose_env_prefix(
@@ -341,22 +348,20 @@ async def prepare_compose_image_template(
         )
     except (TypeError, ValueError):
         raise ImageTemplateError("compose_preflight_failed") from None
-    pull = await _exec(
+    await _exec(
         provider,
         sandbox_id,
         [*prefix, *docker_compose, "pull", "--ignore-buildable"],
         "image_pull_failed",
         timeout_s=_IMAGE_COMMAND_TIMEOUT_S,
     )
-    _require_successful_command(pull, "image_pull_failed")
-    build = await _exec(
+    await _exec(
         provider,
         sandbox_id,
         [*prefix, *docker_compose, "build"],
         "image_build_failed",
         timeout_s=_IMAGE_COMMAND_TIMEOUT_S,
     )
-    _require_successful_command(build, "image_build_failed")
     inventory_result = await _exec(
         provider,
         sandbox_id,
@@ -364,7 +369,6 @@ async def prepare_compose_image_template(
         "image_inventory_failed",
         timeout_s=60,
     )
-    _require_successful_command(inventory_result, "image_inventory_failed")
     try:
         inventory = parse_image_inventory(inventory_result.stdout)
     except ImageInventoryError as error:
@@ -377,21 +381,21 @@ async def prepare_compose_image_template(
         "guest_workspace_verification_failed",
         timeout_s=30,
     )
-    _require_successful_command(pwd_result, "guest_workspace_verification_failed")
     actual_guest_workspace = _parse_guest_workspace(pwd_result.stdout)
     if guest_workspace is not None and actual_guest_workspace != guest_workspace:
         raise ImageTemplateError("guest_workspace_verification_failed")
 
-    remove_result = await _exec(
+    await _exec(
         provider,
         sandbox_id,
         [*prefix, "rm", "--recursive", "--force", "--", actual_guest_workspace],
         "guest_workspace_removal_failed",
         timeout_s=30,
     )
-    _require_successful_command(remove_result, "guest_workspace_removal_failed")
     try:
         await provider.activate_runtime_template(sandbox_id, inventory.sha256)
+    except DockerSbxError:
+        raise
     except ImageTemplateError:
         raise
     except (KeyError, OSError, RuntimeError, TypeError, ValueError):
@@ -433,7 +437,6 @@ async def verify_compose_image_identity(
         "image_identity_verification_failed",
         timeout_s=60,
     )
-    _require_successful_command(result, "image_identity_verification_failed")
     try:
         actual = parse_image_inventory(result.stdout)
     except ImageInventoryError:
@@ -482,22 +485,14 @@ async def _exec(
 ) -> ExecResult:
     try:
         result = await provider.exec(sandbox_id, argv, timeout_s=timeout_s)
+    except DockerSbxError:
+        raise
     except (KeyError, OSError, RuntimeError, TypeError, ValueError):
         raise ImageTemplateError(reason) from None
-    if not isinstance(result, ExecResult):
-        raise ImageTemplateError(reason)
-    for output in (result.stdout, result.stderr):
-        if not isinstance(output, str):
-            raise ImageTemplateError(reason)
-        try:
-            if len(output.encode("utf-8", errors="strict")) > _MAX_COMMAND_OUTPUT_BYTES:
-                raise ImageTemplateError(reason)
-        except UnicodeEncodeError:
-            raise ImageTemplateError(reason) from None
-    return result
+    return _validate_successful_result(result, reason)
 
 
-def _require_successful_command(result: ExecResult, reason: str) -> None:
+def _validate_successful_result(result: object, reason: str) -> ExecResult:
     if not isinstance(result, ExecResult):
         raise ImageTemplateError(reason)
     for output in (result.stdout, result.stderr):
@@ -510,6 +505,7 @@ def _require_successful_command(result: ExecResult, reason: str) -> None:
             raise ImageTemplateError(reason) from None
     if type(result.exit_code) is not int or result.exit_code != 0:
         raise ImageTemplateError(reason)
+    return result
 
 
 def _validate_guest_workspace(path: object) -> None:
