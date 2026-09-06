@@ -2478,3 +2478,189 @@ def test_pinned_intake_derives_declared_environment_once_before_boot(
     assert result.run.commit_sha == "c" * 40
     assert up_commands[1][:2] == ("env", "PINNED_TOKEN=repotrial-synthetic-value")
     assert result.run.journeys == []
+
+
+_TEMPLATE_IMAGE_OUTPUT = (
+    '{"ID":"sha256:' + "a" * 64 + '","Repository":"example/web",'
+    '"Tag":"1","Digest":"<none>"}\n'
+)
+
+
+class RuntimeTemplateGraphProvider(GraphProvider):
+    def __init__(
+        self,
+        *,
+        host_port: int | None = None,
+        fail_prepare: bool = False,
+    ) -> None:
+        super().__init__(host_port=host_port)
+        self.events: list[str] = []
+        self.fail_prepare = fail_prepare
+        self._template_identity: str | None = None
+        self._warmup_prepared = False
+
+    @property
+    def supports_runtime_templates(self) -> bool:
+        return True
+
+    def expected_image_identity_sha256(self) -> str | None:
+        return self._template_identity
+
+    async def create(self, workspace: Path, name: str) -> str:
+        if name.startswith("repotrial-warmup-"):
+            self.events.append("warmup_create")
+        elif name.startswith("repotrial-baseline-"):
+            self.events.append("baseline_create")
+        elif name.startswith("repotrial-candidate-"):
+            self.events.append("candidate_create")
+        sandbox_id = await super().create(workspace, name)
+        if name.startswith("repotrial-warmup-"):
+            self._roles[sandbox_id] = "warmup"
+        return sandbox_id
+
+    async def exec(
+        self, sandbox_id: str, argv: list[str], timeout_s: int = 60
+    ) -> ExecResult:
+        snapshot = tuple(argv)
+        if "image" in snapshot and "ls" in snapshot:
+            self._require_active(sandbox_id)
+            self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+            return ExecResult(exit_code=0, stdout=_TEMPLATE_IMAGE_OUTPUT, stderr="")
+        if snapshot[-8:] == (
+            "up",
+            "-d",
+            "--wait",
+            "--wait-timeout",
+            "60",
+            "--pull",
+            "never",
+            "--no-build",
+        ):
+            self._require_active(sandbox_id)
+            self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+            return ExecResult(exit_code=0, stdout="", stderr="")
+        if self._roles.get(sandbox_id) == "warmup":
+            if "pull" in snapshot and "--ignore-buildable" in snapshot:
+                self._require_active(sandbox_id)
+                self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+                if self.fail_prepare:
+                    return ExecResult(exit_code=1, stdout="", stderr="")
+                self.events.append("prepare")
+                self._warmup_prepared = True
+                return ExecResult(exit_code=0, stdout="", stderr="")
+            if snapshot[-1:] == ("build",):
+                self._require_active(sandbox_id)
+                self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+                return ExecResult(exit_code=0, stdout="", stderr="")
+            if snapshot[-1:] == ("pwd",):
+                self._require_active(sandbox_id)
+                self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+                return ExecResult(exit_code=0, stdout="/workspace\n", stderr="")
+            if "rm" in snapshot:
+                self._require_active(sandbox_id)
+                self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+                return ExecResult(exit_code=0, stdout="", stderr="")
+        return await super().exec(sandbox_id, argv, timeout_s)
+
+    async def activate_runtime_template(
+        self, sandbox_id: str, image_identity_sha256: str
+    ) -> None:
+        self._require_active(sandbox_id)
+        assert self._warmup_prepared
+        self._template_identity = image_identity_sha256
+        self.events.append("activate")
+
+    async def destroy(self, sandbox_id: str) -> None:
+        if self._roles.get(sandbox_id) == "warmup":
+            self.events.append("warmup_destroy")
+        await super().destroy(sandbox_id)
+
+    async def finalize_runtime_template(self) -> None:
+        if self._template_identity is not None:
+            self.events.append("template_remove")
+            self._template_identity = None
+
+
+def test_runtime_template_warmup_precedes_baseline_and_finalizes_once(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, host_port):
+        provider = RuntimeTemplateGraphProvider(host_port=host_port)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+
+        result = _run(_state(source.parent, run_id="runtime-template-order"), context)
+
+    assert result.run.stop_reason == "no_remaining_mutations"
+    assert provider.events == [
+        "warmup_create",
+        "prepare",
+        "activate",
+        "warmup_destroy",
+        "baseline_create",
+        "candidate_create",
+        "template_remove",
+    ]
+    evidence = list(context.artifact_dir.glob("baseline-*/image-template.jsonl"))
+    assert len(evidence) == 1
+    rows = [json.loads(line) for line in evidence[0].read_text().splitlines()]
+    assert [(row["event"], row["outcome"]) for row in rows] == [
+        ("warmup_create", "started"),
+        ("warmup_create", "success"),
+        ("prepare", "started"),
+        ("prepare", "success"),
+        ("activate", "success"),
+        ("warmup_destroy", "success"),
+        ("template_remove", "success"),
+    ]
+
+
+def test_runtime_template_warmup_reuses_startup_input_materialization(
+    tmp_path: Path,
+) -> None:
+    provider = RuntimeTemplateGraphProvider()
+    context, source = _context(tmp_path, provider, journeys=[])
+    source.write_text(
+        _compose_text(()) + "    env_file:\n      - .env\n", encoding="utf-8"
+    )
+    (context.workspace / ".env.sample").write_text("APP_MODE=test\n", encoding="utf-8")
+
+    _run(_state(source.parent, run_id="runtime-template-startup"), context)
+
+    adapter_calls = [
+        index
+        for index, call in enumerate(provider.calls)
+        if call[0] == "exec" and "repotrial-startup-input" in call[2]
+    ]
+    pull_calls = [
+        index
+        for index, call in enumerate(provider.calls)
+        if call[0] == "exec" and "--ignore-buildable" in call[2]
+    ]
+    assert len(adapter_calls) == 2
+    assert len(pull_calls) == 1
+    assert adapter_calls[0] < pull_calls[0]
+    assert len(list(context.artifact_dir.glob("baseline-*/image-template.jsonl"))) == 1
+    assert (
+        len(
+            list(
+                context.artifact_dir.glob(
+                    "baseline-*/warmup-startup-input-attempt.jsonl"
+                )
+            )
+        )
+        == 1
+    )
+
+
+def test_runtime_template_warmup_failure_stops_before_baseline(
+    tmp_path: Path,
+) -> None:
+    provider = RuntimeTemplateGraphProvider(fail_prepare=True)
+    context, source = _context(tmp_path, provider, journeys=[])
+
+    result = _run(_state(source.parent, run_id="runtime-template-failure"), context)
+
+    assert result.boot_verdict is Verdict.UNSUPPORTED
+    assert result.run.stop_reason == "image_prepare_failed"
+    assert provider.events == ["warmup_create", "warmup_destroy"]
+    assert not any(event == "baseline_create" for event in provider.events)

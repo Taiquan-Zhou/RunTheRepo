@@ -19,7 +19,12 @@ from repotrial.sandbox.base import (
     serialize_sandbox_failure_evidence,
 )
 from repotrial.sandbox.docker_sbx import DockerSbxError
-from repotrial.sandbox.lifecycle import CleanupError, managed_sandbox
+from repotrial.sandbox.lifecycle import (
+    CleanupError,
+    RuntimeTemplateCleanupError,
+    managed_runtime_template,
+    managed_sandbox,
+)
 
 
 class _Provider(SandboxProvider):
@@ -2006,3 +2011,66 @@ def test_every_successful_event_write_is_immediately_flushed(
         for operation in [("write", event), ("flush", event)]
     ]
     assert artifact.operations == [*expected_operations, ("close", None)]
+
+
+class _TemplateProvider(_Provider):
+    def __init__(
+        self,
+        *,
+        cleanup_failure: BaseException | None = None,
+        started: asyncio.Event | None = None,
+        release: asyncio.Event | None = None,
+    ) -> None:
+        super().__init__()
+        self.cleanup_failure = cleanup_failure
+        self.started = started
+        self.release = release
+
+    async def finalize_runtime_template(self) -> None:
+        self.calls.append(("finalize_runtime_template",))
+        if self.started is not None:
+            self.started.set()
+        if self.release is not None:
+            await self.release.wait()
+        if self.cleanup_failure is not None:
+            raise self.cleanup_failure
+
+
+def test_runtime_template_cleanup_preserves_primary_and_cleanup_failure() -> None:
+    cleanup_failure = OSError("template removal failed")
+    provider = _TemplateProvider(cleanup_failure=cleanup_failure)
+
+    async def exercise() -> None:
+        async with managed_runtime_template(provider):
+            raise ValueError("graph failed")
+
+    with pytest.raises(RuntimeTemplateCleanupError) as caught:
+        asyncio.run(exercise())
+
+    failure = caught.value
+    assert failure.body_failure is not None
+    assert isinstance(failure.body_failure, ValueError)
+    assert failure.cleanup_failure is cleanup_failure
+    assert failure.__cause__ is cleanup_failure
+    assert provider.calls == [("finalize_runtime_template",)]
+
+
+def test_runtime_template_cleanup_waits_after_cancellation() -> None:
+    async def exercise() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        provider = _TemplateProvider(started=started, release=release)
+
+        async def invoke() -> None:
+            async with managed_runtime_template(provider):
+                return
+
+        task = asyncio.create_task(invoke())
+        await started.wait()
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert provider.calls == [("finalize_runtime_template",)]
+
+    asyncio.run(exercise())

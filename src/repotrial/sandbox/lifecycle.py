@@ -40,6 +40,22 @@ class CleanupError(RuntimeError):
         self.secondary_failures = secondary_failures
 
 
+class RuntimeTemplateCleanupError(RuntimeError):
+    """Report template cleanup failure without losing a graph failure."""
+
+    def __init__(
+        self,
+        cleanup_failure: BaseException,
+        body_failure: BaseException | None,
+        *,
+        secondary_failures: tuple[BaseException, ...] = (),
+    ) -> None:
+        super().__init__("runtime template cleanup failed")
+        self.cleanup_failure = cleanup_failure
+        self.body_failure = body_failure
+        self.secondary_failures = secondary_failures
+
+
 @dataclass
 class _Outcome:
     body_failure: BaseException | None = None
@@ -221,6 +237,54 @@ def _validate_artifact_destination(workspace: Path, artifact: Path) -> None:
     resolved_artifact = artifact.resolve(strict=False)
     if resolved_artifact.is_relative_to(resolved_workspace):
         raise ValueError("lifecycle artifact must resolve outside workspace")
+
+
+async def _finalize_runtime_template_call(
+    provider: SandboxProvider,
+) -> BaseException | None:
+    try:
+        await provider.finalize_runtime_template()
+    except _BOUNDARY_FAILURES as failure:
+        return failure
+    return None
+
+
+async def _finalize_runtime_template_boundary(
+    provider: SandboxProvider,
+) -> tuple[BaseException | None, list[asyncio.CancelledError]]:
+    cleanup_task = asyncio.create_task(_finalize_runtime_template_call(provider))
+    cancellations: list[asyncio.CancelledError] = []
+    while not cleanup_task.done():
+        try:
+            await asyncio.wait({cleanup_task})
+        except asyncio.CancelledError as cancellation:
+            cancellations.append(cancellation)
+    return cleanup_task.result(), cancellations
+
+
+@asynccontextmanager
+async def managed_runtime_template(provider: SandboxProvider) -> AsyncIterator[None]:
+    """Finalize a provider-owned image template despite caller cancellation."""
+
+    body_failure: BaseException | None = None
+    try:
+        yield
+    except _BOUNDARY_FAILURES as failure:
+        body_failure = failure
+
+    cleanup_failure, cancellations = await _finalize_runtime_template_boundary(provider)
+    if cleanup_failure is not None:
+        cleanup_error = RuntimeTemplateCleanupError(
+            cleanup_failure,
+            body_failure,
+            secondary_failures=tuple(cancellations),
+        )
+        raise cleanup_error from cleanup_failure
+    if body_failure is not None:
+        _raise_primary(body_failure, list(cancellations))
+    if cancellations:
+        primary = cancellations.pop(0)
+        _raise_primary(primary, list(cancellations))
 
 
 @asynccontextmanager

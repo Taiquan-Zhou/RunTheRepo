@@ -1,3 +1,4 @@
+import asyncio
 import errno
 import hashlib
 import json
@@ -54,13 +55,27 @@ from repotrial.intake.compose_discovery import discover_compose
 from repotrial.journey.http_runner import run_http_journey
 from repotrial.journey.playwright_runner import run_playwright_journey
 from repotrial.models.base import RecoveryAction
-from repotrial.sandbox.lifecycle import managed_sandbox
+from repotrial.sandbox.base import (
+    SandboxProvider,
+    find_sandbox_failure_evidence,
+    serialize_sandbox_failure_evidence,
+)
+from repotrial.sandbox.lifecycle import (
+    CleanupError,
+    RuntimeTemplateCleanupError,
+    managed_runtime_template,
+    managed_sandbox,
+)
 from repotrial.trial import boot as boot_module
 from repotrial.trial.boot import BootResult, _boot_compose_with_evidence, boot_compose
 from repotrial.trial.boot_evidence import record_recovery_evidence
 from repotrial.trial.compatibility import (
     materialize_guest_compatibility_overlay,
     verify_guest_compatibility_overlay,
+)
+from repotrial.trial.image_template import (
+    ImageTemplateError,
+    prepare_compose_image_template,
 )
 from repotrial.trial.journey_artifact import (
     verify_baseline_journeys,
@@ -80,6 +95,7 @@ from repotrial.trial.recovery_context import (
 )
 from repotrial.trial.startup_inputs import (
     _ADAPTER_SHA256,
+    StartupInputPlan,
     StartupInputUnsupported,
     materialize_startup_input,
     plan_startup_input,
@@ -102,6 +118,8 @@ _FULL_COMMIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
 _MAX_ATTEMPT_SLOTS = 4
 _COMPATIBILITY_OVERLAY_NAME = "compatibility.overlay.yaml"
 _MAX_COMPATIBILITY_ARTIFACT_BYTES = 1_048_576
+_MAX_IMAGE_TEMPLATE_EVIDENCE_BYTES = 64 * 1024
+_TEMPLATE_REASON_PATTERN = re.compile(r"[a-z0-9_]{1,64}\Z")
 
 
 def build_run_graph(
@@ -138,6 +156,37 @@ def build_run_graph(
     )
 
 
+async def _invoke_graph_with_finalization(
+    graph: RunGraph,
+    input_state: GraphState | None,
+    run_id: str,
+    *,
+    context: GraphContext,
+    config: RunnableConfig | None,
+) -> GraphState:
+    run_context = _snapshot_context(context)
+    prepared_config = _run_config(run_id, config)
+
+    async def invoke() -> GraphState:
+        result = await graph.ainvoke(
+            input_state,
+            cast(Any, prepared_config),
+            context=run_context,
+        )
+        return _validated_result(result, run_id)
+
+    if not context.provider.supports_runtime_templates:
+        return await invoke()
+    try:
+        async with managed_runtime_template(context.provider):
+            result = await invoke()
+    except BaseException as error:
+        _append_template_finalization_evidence(context.artifact_dir, error)
+        raise
+    _append_template_finalization_evidence(context.artifact_dir, None)
+    return result
+
+
 async def ainvoke_run(
     graph: RunGraph,
     state: RunState,
@@ -145,14 +194,13 @@ async def ainvoke_run(
     context: GraphContext,
     config: RunnableConfig | None = None,
 ) -> GraphState:
-    run_context = _snapshot_context(context)
-    prepared_config = _run_config(state.run_id, config)
-    result = await graph.ainvoke(
+    return await _invoke_graph_with_finalization(
+        graph,
         GraphState(run=state.model_copy(deep=True)),
-        cast(Any, prepared_config),
-        context=run_context,
+        state.run_id,
+        context=context,
+        config=config,
     )
-    return _validated_result(result, state.run_id)
 
 
 async def aresume_run(
@@ -164,10 +212,9 @@ async def aresume_run(
 ) -> GraphState:
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("run_id must be a non-empty string")
-    run_context = _snapshot_context(context)
-    prepared_config = _run_config(run_id, config)
-    result = await graph.ainvoke(None, cast(Any, prepared_config), context=run_context)
-    return _validated_result(result, run_id)
+    return await _invoke_graph_with_finalization(
+        graph, None, run_id, context=context, config=config
+    )
 
 
 async def _intake(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate:
@@ -291,6 +338,48 @@ async def _baseline(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUp
     }
 
 
+async def _materialize_boot_inputs(
+    provider: SandboxProvider,
+    sandbox_id: str,
+    *,
+    compose_path: str,
+    compose_env: Mapping[str, str],
+    startup_plan: StartupInputPlan | None,
+    compatibility_path: Path | None,
+    compatibility_relative: str | None,
+    expected_compatibility_sha256: str,
+    startup_input_evidence: Path,
+    compatibility_evidence: Path,
+) -> None:
+    if compatibility_relative is not None:
+        if compatibility_path is None:
+            raise CompatibilityError("identity_incomplete")
+        await materialize_guest_compatibility_overlay(
+            provider,
+            sandbox_id,
+            host_artifact_path=compatibility_path,
+            relative_path=compatibility_relative,
+            expected_sha256=expected_compatibility_sha256,
+            evidence_path=compatibility_evidence,
+        )
+        await verify_guest_compatibility_overlay(
+            provider,
+            sandbox_id,
+            relative_path=compatibility_relative,
+            expected_sha256=expected_compatibility_sha256,
+        )
+    if startup_plan is not None:
+        await materialize_startup_input(
+            provider,
+            sandbox_id,
+            startup_plan,
+            compose_path=compose_path,
+            compose_env=compose_env,
+            evidence_path=startup_input_evidence,
+            compatibility_overlay_path=compatibility_relative,
+        )
+
+
 async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate:
     attempt = state.boot_attempt + 1
     if attempt > 4:
@@ -395,6 +484,58 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
             "run": state.run.model_copy(update={"stop_reason": "boot_unsupported"}),
             "stage_history": _visit(state, "boot"),
         }
+    template_artifact_relative: str | None = None
+
+    def template_run(run: RunState, **updates: object) -> RunState:
+        copied = run.model_copy(update=updates)
+        if template_artifact_relative is not None:
+            _append_artifact(copied, template_artifact_relative)
+        return copied
+
+    if (
+        context.provider.supports_runtime_templates
+        and context.provider.expected_image_identity_sha256() is None
+    ):
+        template_evidence = attempt_dir / "image-template.jsonl"
+        artifact_root = _real_directory(context.artifact_dir, "artifact_dir")
+        template_artifact_relative = template_evidence.relative_to(
+            artifact_root
+        ).as_posix()
+        try:
+            await _prepare_runtime_template(
+                state.run,
+                context,
+                attempt=attempt,
+                attempt_slot=attempt_slot,
+                attempt_dir=attempt_dir,
+                env=env,
+                compose_path=compose_path,
+                compatibility_path=compatibility_path,
+                compatibility_relative=compatibility_relative,
+                startup_plan=startup_plan,
+                declared_secret_env_keys=declared_secret_env_keys,
+                expected_compatibility_sha256=(
+                    state.run.compatibility_overlay_sha256 or ""
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except (
+            AssertionError,
+            CleanupError,
+            ImageTemplateError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            return {
+                "boot_attempt": attempt,
+                "boot_verdict": Verdict.UNSUPPORTED,
+                "run": template_run(state.run, stop_reason=_warmup_stop_reason(error)),
+                "stage_history": _visit(state, "boot"),
+            }
+
     async with managed_sandbox(
         context.provider,
         context.workspace,
@@ -404,44 +545,98 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
         ),
         lifecycle_artifact=lifecycle_artifact,
     ) as sandbox_id:
+
+        async def run_boot_compose() -> BootResult:
+            if evidence_enabled:
+                if startup_plan is None:
+                    return await _boot_compose_with_evidence(
+                        context.provider,
+                        sandbox_id,
+                        compose_path,
+                        env,
+                        attempt,
+                        evidence_path=evidence_artifact,
+                        compatibility_overlay_path=compatibility_relative,
+                        declared_secret_env_keys=declared_secret_env_keys,
+                    )
+                return await _boot_compose_with_evidence(
+                    context.provider,
+                    sandbox_id,
+                    compose_path,
+                    env,
+                    attempt,
+                    evidence_path=evidence_artifact,
+                    compatibility_overlay_path=compatibility_relative,
+                    unset_env_keys=startup_plan.all_source_key_names,
+                    project_directory=".",
+                    declared_secret_env_keys=declared_secret_env_keys,
+                )
+            if startup_plan is None:
+                if compatibility_relative is None:
+                    return await boot_compose(
+                        context.provider,
+                        sandbox_id,
+                        compose_path,
+                        env,
+                        attempt,
+                        declared_secret_env_keys=declared_secret_env_keys,
+                    )
+                return await boot_compose(
+                    context.provider,
+                    sandbox_id,
+                    compose_path,
+                    env,
+                    attempt,
+                    compatibility_overlay_path=compatibility_relative,
+                    declared_secret_env_keys=declared_secret_env_keys,
+                )
+            if compatibility_relative is None:
+                return await boot_compose(
+                    context.provider,
+                    sandbox_id,
+                    compose_path,
+                    env,
+                    attempt,
+                    unset_env_keys=startup_plan.all_source_key_names,
+                    project_directory=".",
+                    declared_secret_env_keys=declared_secret_env_keys,
+                )
+            return await boot_compose(
+                context.provider,
+                sandbox_id,
+                compose_path,
+                env,
+                attempt,
+                compatibility_overlay_path=compatibility_relative,
+                unset_env_keys=startup_plan.all_source_key_names,
+                project_directory=".",
+                declared_secret_env_keys=declared_secret_env_keys,
+            )
+
         try:
-            if compatibility_relative is not None:
-                if compatibility_path is None:
-                    raise CompatibilityError("identity_incomplete")
-                await materialize_guest_compatibility_overlay(
-                    context.provider,
-                    sandbox_id,
-                    host_artifact_path=compatibility_path,
-                    relative_path=compatibility_relative,
-                    expected_sha256=state.run.compatibility_overlay_sha256 or "",
-                    evidence_path=compatibility_evidence,
-                )
-                await verify_guest_compatibility_overlay(
-                    context.provider,
-                    sandbox_id,
-                    relative_path=compatibility_relative,
-                    expected_sha256=state.run.compatibility_overlay_sha256 or "",
-                )
+            await _materialize_boot_inputs(
+                context.provider,
+                sandbox_id,
+                compose_path=compose_path,
+                compose_env=env,
+                startup_plan=startup_plan,
+                compatibility_path=compatibility_path,
+                compatibility_relative=compatibility_relative,
+                expected_compatibility_sha256=(
+                    state.run.compatibility_overlay_sha256 or ""
+                ),
+                startup_input_evidence=startup_input_evidence,
+                compatibility_evidence=compatibility_evidence,
+            )
         except CompatibilityError as error:
             return {
                 "boot_attempt": attempt,
                 "boot_verdict": Verdict.UNSUPPORTED,
-                "run": state.run.model_copy(
-                    update={"stop_reason": f"compatibility:{error.reason}"}
+                "run": template_run(
+                    state.run, stop_reason=f"compatibility:{error.reason}"
                 ),
                 "stage_history": _visit(state, "boot"),
             }
-        try:
-            if startup_plan is not None:
-                await materialize_startup_input(
-                    context.provider,
-                    sandbox_id,
-                    startup_plan,
-                    compose_path=compose_path,
-                    compose_env=env,
-                    evidence_path=startup_input_evidence,
-                    compatibility_overlay_path=compatibility_relative,
-                )
         except StartupInputUnsupported:
             result = BootResult(
                 verdict=Verdict.UNSUPPORTED,
@@ -450,76 +645,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
                 attempt=attempt,
             )
         else:
-            if evidence_enabled:
-                if startup_plan is None:
-                    result = await _boot_compose_with_evidence(
-                        context.provider,
-                        sandbox_id,
-                        compose_path,
-                        env,
-                        attempt,
-                        evidence_path=evidence_artifact,
-                        compatibility_overlay_path=compatibility_relative,
-                        declared_secret_env_keys=declared_secret_env_keys,
-                    )
-                else:
-                    result = await _boot_compose_with_evidence(
-                        context.provider,
-                        sandbox_id,
-                        compose_path,
-                        env,
-                        attempt,
-                        evidence_path=evidence_artifact,
-                        compatibility_overlay_path=compatibility_relative,
-                        unset_env_keys=startup_plan.all_source_key_names,
-                        project_directory=".",
-                        declared_secret_env_keys=declared_secret_env_keys,
-                    )
-            else:
-                if startup_plan is None:
-                    if compatibility_relative is None:
-                        result = await boot_compose(
-                            context.provider,
-                            sandbox_id,
-                            compose_path,
-                            env,
-                            attempt,
-                            declared_secret_env_keys=declared_secret_env_keys,
-                        )
-                    else:
-                        result = await boot_compose(
-                            context.provider,
-                            sandbox_id,
-                            compose_path,
-                            env,
-                            attempt,
-                            compatibility_overlay_path=compatibility_relative,
-                            declared_secret_env_keys=declared_secret_env_keys,
-                        )
-                else:
-                    if compatibility_relative is None:
-                        result = await boot_compose(
-                            context.provider,
-                            sandbox_id,
-                            compose_path,
-                            env,
-                            attempt,
-                            unset_env_keys=startup_plan.all_source_key_names,
-                            project_directory=".",
-                            declared_secret_env_keys=declared_secret_env_keys,
-                        )
-                    else:
-                        result = await boot_compose(
-                            context.provider,
-                            sandbox_id,
-                            compose_path,
-                            env,
-                            attempt,
-                            compatibility_overlay_path=compatibility_relative,
-                            unset_env_keys=startup_plan.all_source_key_names,
-                            project_directory=".",
-                            declared_secret_env_keys=declared_secret_env_keys,
-                        )
+            result = await run_boot_compose()
         effective_env = dict(env)
         effective_env.update(result.recovery_env)
         journey_results: list[JourneyResult] | None = None
@@ -562,13 +688,16 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
         recovery_env = dict(state.recovery_env)
         recovery_env.update(result.recovery_env)
         update["recovery_env"] = recovery_env
-        update["run"] = state.run.model_copy(
-            update={
-                "recovery_env_keys": sorted(
-                    {*state.run.recovery_env_keys, *recovery_env}
-                )
-            }
+        update["run"] = template_run(
+            state.run,
+            recovery_env_keys=sorted({*state.run.recovery_env_keys, *recovery_env}),
         )
+    if template_artifact_relative is not None:
+        update_run = update.get("run", state.run)
+        if not isinstance(update_run, RunState):
+            raise TypeError("boot update contains a malformed run state")
+        update["run"] = template_run(update_run)
+
     if result.verdict is Verdict.PASS:
         update["pending_journey_results"] = journey_results
         update["pending_observation"] = observation
@@ -577,7 +706,7 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
         run = update.get("run", state.run)
         if not isinstance(run, RunState):
             raise TypeError("boot update contains a malformed run state")
-        update["run"] = run.model_copy(update={"stop_reason": "boot_unsupported"})
+        update["run"] = template_run(run, stop_reason="boot_unsupported")
         return update
 
     recovery_evidence = project_recovery_evidence(result.logs)
@@ -1508,6 +1637,96 @@ def _run_config(run_id: str, config: RunnableConfig | None) -> RunnableConfig:
     return prepared
 
 
+async def _prepare_runtime_template(
+    run: RunState,
+    context: GraphContext,
+    *,
+    attempt: int,
+    attempt_slot: int,
+    attempt_dir: Path,
+    env: Mapping[str, str],
+    compose_path: str,
+    compatibility_path: Path | None,
+    compatibility_relative: str | None,
+    startup_plan: StartupInputPlan | None,
+    declared_secret_env_keys: frozenset[str],
+    expected_compatibility_sha256: str,
+) -> None:
+    template_evidence = _ImageTemplateEvidence(attempt_dir / "image-template.jsonl")
+    warmup_id: str | None = None
+    try:
+        template_evidence.record("warmup_create", "started")
+        async with managed_sandbox(
+            context.provider,
+            context.workspace,
+            (
+                f"repotrial-warmup-{_run_token(run.run_id)}-"
+                f"{attempt:02d}-{attempt_slot:02d}"
+            ),
+            lifecycle_artifact=attempt_dir / "warmup-lifecycle.jsonl",
+        ) as sandbox_id:
+            warmup_id = sandbox_id
+            template_evidence.record("warmup_create", "success", sandbox_id=sandbox_id)
+            await _materialize_boot_inputs(
+                context.provider,
+                sandbox_id,
+                compose_path=compose_path,
+                compose_env=env,
+                startup_plan=startup_plan,
+                compatibility_path=compatibility_path,
+                compatibility_relative=compatibility_relative,
+                expected_compatibility_sha256=expected_compatibility_sha256,
+                startup_input_evidence=attempt_dir
+                / "warmup-startup-input-attempt.jsonl",
+                compatibility_evidence=attempt_dir
+                / "warmup-compatibility-materialization.jsonl",
+            )
+            template_evidence.record("prepare", "started", sandbox_id=sandbox_id)
+            inventory = await prepare_compose_image_template(
+                context.provider,
+                sandbox_id,
+                compose_path,
+                env,
+                guest_workspace="/workspace",
+                compatibility_overlay_path=compatibility_relative,
+                unset_env_keys=(
+                    () if startup_plan is None else startup_plan.all_source_key_names
+                ),
+                project_directory=(None if startup_plan is None else "."),
+                declared_secret_env_keys=declared_secret_env_keys,
+            )
+            template_evidence.record(
+                "prepare",
+                "success",
+                sandbox_id=sandbox_id,
+                identity_sha256=inventory.sha256,
+            )
+            template_evidence.record(
+                "activate",
+                "success",
+                sandbox_id=sandbox_id,
+                identity_sha256=inventory.sha256,
+            )
+        template_evidence.record("warmup_destroy", "success", sandbox_id=warmup_id)
+    except BaseException as error:
+        template_evidence.record(
+            "warmup_destroy",
+            "failure",
+            sandbox_id=warmup_id,
+            error=error,
+        )
+        raise
+    finally:
+        template_evidence.close()
+
+
+def _warmup_stop_reason(error: BaseException) -> str:
+    if isinstance(error, ImageTemplateError):
+        return "image_prepare_failed"
+    reason = _template_failure_reason(error)
+    return "image_prepare_failed" if reason == "operation_failed" else reason
+
+
 def _validated_result(result: object, run_id: str) -> GraphState:
     if not isinstance(result, Mapping):
         raise TypeError("graph returned invalid state")
@@ -1515,3 +1734,147 @@ def _validated_result(result: object, run_id: str) -> GraphState:
     if parsed.run.run_id != run_id:
         raise ValueError("checkpoint run_id does not match thread_id")
     return parsed
+
+
+class _ImageTemplateEvidence:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._artifact = path.open("x", encoding="utf-8", newline="\n")
+        try:
+            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            self._artifact.close()
+            raise
+        self._size = 0
+
+    def record(
+        self,
+        event: str,
+        outcome: str,
+        *,
+        sandbox_id: str | None = None,
+        identity_sha256: str | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        record = _template_event_record(
+            event,
+            outcome,
+            sandbox_id=sandbox_id,
+            identity_sha256=identity_sha256,
+            error=error,
+        )
+        encoded = (
+            json.dumps(record, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+            + "\n"
+        ).encode("utf-8")
+        if self._size + len(encoded) > _MAX_IMAGE_TEMPLATE_EVIDENCE_BYTES:
+            return
+        self._artifact.write(encoded.decode("utf-8"))
+        self._artifact.flush()
+        self._size += len(encoded)
+
+    def close(self) -> None:
+        self._artifact.close()
+
+
+def _template_failure_reason(error: BaseException) -> str:
+    if isinstance(error, RuntimeTemplateCleanupError):
+        error = error.cleanup_failure
+    if isinstance(error, CleanupError):
+        for nested in (
+            error.body_failure,
+            error.destroy_failure,
+            error.create_failure,
+            error.initial_cleanup_failure,
+        ):
+            if nested is not None:
+                reason = _template_failure_reason(nested)
+                if reason != "operation_failed":
+                    return reason
+        return "sandbox_cleanup_failed"
+    error_reason: object = getattr(error, "reason", None)
+    if isinstance(error_reason, str) and _TEMPLATE_REASON_PATTERN.fullmatch(
+        error_reason
+    ):
+        return error_reason
+    failure_evidence = find_sandbox_failure_evidence(error)
+    if failure_evidence is not None and _TEMPLATE_REASON_PATTERN.fullmatch(
+        failure_evidence.reason
+    ):
+        return failure_evidence.reason
+    return "operation_failed"
+
+
+def _serialized_template_failure(error: BaseException) -> dict[str, object] | None:
+    failure_evidence = find_sandbox_failure_evidence(error)
+    if failure_evidence is None:
+        return None
+    try:
+        return serialize_sandbox_failure_evidence(failure_evidence)
+    except ValueError:
+        return None
+
+
+def _template_event_record(
+    event: str,
+    outcome: str,
+    *,
+    sandbox_id: str | None = None,
+    identity_sha256: str | None = None,
+    error: BaseException | None = None,
+) -> dict[str, object]:
+    record: dict[str, object] = {"event": event, "outcome": outcome}
+    if sandbox_id is not None:
+        record["sandbox_id"] = sandbox_id
+    if identity_sha256 is not None:
+        record["identity_sha256"] = identity_sha256
+    if error is None:
+        return record
+    record["exception_type"] = type(error).__name__
+    record["reason"] = _template_failure_reason(error)
+    failure_evidence = _serialized_template_failure(error)
+    if failure_evidence is not None:
+        record["failure"] = failure_evidence
+    if isinstance(error, RuntimeTemplateCleanupError):
+        record["exception_type"] = type(error).__name__
+        record["reason"] = "runtime_template_cleanup_failed"
+        cleanup_failure = error.cleanup_failure
+        record["cleanup_exception_type"] = type(cleanup_failure).__name__
+        record["cleanup_reason"] = _template_failure_reason(cleanup_failure)
+        cleanup_evidence = _serialized_template_failure(cleanup_failure)
+        if cleanup_evidence is not None:
+            record["cleanup_failure"] = cleanup_evidence
+        if error.body_failure is not None:
+            record["primary_exception_type"] = type(error.body_failure).__name__
+            record["primary_reason"] = _template_failure_reason(error.body_failure)
+            primary_evidence = _serialized_template_failure(error.body_failure)
+            if primary_evidence is not None:
+                record["primary_failure"] = primary_evidence
+        return record
+
+    return record
+
+
+def _append_template_finalization_evidence(
+    artifact_dir: Path, error: BaseException | None
+) -> None:
+    paths = sorted(artifact_dir.glob("baseline-*/image-template.jsonl"))
+    if not paths:
+        return
+    path = paths[-1]
+    record = _template_event_record(
+        "template_remove",
+        "failure" if error is not None else "success",
+        error=error,
+    )
+    encoded = (
+        json.dumps(record, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode("utf-8")
+    try:
+        if path.stat().st_size + len(encoded) > _MAX_IMAGE_TEMPLATE_EVIDENCE_BYTES:
+            return
+        with path.open("ab") as artifact:
+            artifact.write(encoded)
+    except OSError:
+        return
