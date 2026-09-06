@@ -33,7 +33,7 @@ from repotrial.domain.models import (
     RunState,
 )
 from repotrial.models.base import RecoveryAction
-from repotrial.sandbox.base import ExecResult, SandboxProvider
+from repotrial.sandbox.base import ExecResult, SandboxFailureEvidence, SandboxProvider
 from repotrial.sandbox.docker_sbx import DockerSbxError
 from repotrial.sandbox.fake import FakeSandboxProvider
 from repotrial.sandbox.lifecycle import CleanupError
@@ -2500,6 +2500,7 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         finalize_failure: BaseException | None = None,
         prepare_error: BaseException | None = None,
         fail_activate: bool = False,
+        wrong_guest_workspace: bool = False,
     ) -> None:
         super().__init__(host_port=host_port)
         self.events: list[str] = []
@@ -2509,6 +2510,7 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         self.finalize_failure = finalize_failure
         self.prepare_error = prepare_error
         self.fail_activate = fail_activate
+        self.wrong_guest_workspace = wrong_guest_workspace
         self._template_identity: str | None = None
         self._warmup_prepared = False
 
@@ -2572,7 +2574,11 @@ class RuntimeTemplateGraphProvider(GraphProvider):
             if snapshot[-1:] == ("pwd",):
                 self._require_active(sandbox_id)
                 self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
-                return ExecResult(exit_code=0, stdout="/workspace\n", stderr="")
+                return ExecResult(
+                    exit_code=0,
+                    stdout="/wrong\n" if self.wrong_guest_workspace else "/workspace\n",
+                    stderr="",
+                )
             if "rm" in snapshot:
                 self._require_active(sandbox_id)
                 self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
@@ -3070,9 +3076,15 @@ def test_warmup_evidence_failures_preserve_managed_cleanup_failure(
         for error in caught.value.__cause__.exceptions
         if isinstance(error, graph_module._TemplateEvidenceError)
     )
-    assert any(
-        "evidence write failed" == str(error) for error in audit_error.audit_failures
-    )
+    assert [str(error) for error in audit_error.audit_failures] == [
+        "evidence write failed",
+        "evidence flush failed",
+        "evidence flush failed",
+        "evidence flush failed",
+        "evidence flush failed",
+        "evidence close failed",
+    ]
+    assert caught.value.__cause__.exceptions[0] is caught.value.destroy_failure
     evidence = list(context.artifact_dir.glob("baseline-*/image-template.jsonl"))
     rows = [json.loads(line) for line in evidence[0].read_text().splitlines()]
     assert rows[-1]["event"] == "template_remove"
@@ -3110,27 +3122,64 @@ def test_graph_finalization_evidence_boundary_fails_closed(
 
 
 @pytest.mark.parametrize(
-    ("provider_kwargs", "expected_reason"),
+    ("provider_kwargs", "expected_reason", "expected_events", "failure_reason"),
     [
         (
-            {
-                "prepare_error": ImageTemplateError(
-                    "guest_workspace_verification_failed"
-                )
-            },
+            {"wrong_guest_workspace": True},
             "image_prepare_failed",
+            [
+                ("warmup_create", "started"),
+                ("warmup_create", "success"),
+                ("prepare", "started"),
+                ("warmup_destroy", "success"),
+                ("prepare", "failure"),
+                ("template_remove", "success"),
+            ],
+            "guest_workspace_verification_failed",
         ),
         (
-            {"prepare_error": DockerSbxError("prepare", "total_duration_exhausted")},
+            {
+                "prepare_error": DockerSbxError(
+                    "prepare",
+                    "total_duration_exhausted",
+                    failure_evidence=SandboxFailureEvidence(
+                        operation="prepare",
+                        reason="total_duration_exhausted",
+                    ),
+                )
+            },
+            "total_duration_exhausted",
+            [
+                ("warmup_create", "started"),
+                ("warmup_create", "success"),
+                ("prepare", "started"),
+                ("warmup_destroy", "success"),
+                ("prepare", "failure"),
+                ("template_remove", "success"),
+            ],
             "total_duration_exhausted",
         ),
-        ({"fail_activate": True}, "image_prepare_failed"),
+        (
+            {"fail_activate": True},
+            "image_prepare_failed",
+            [
+                ("warmup_create", "started"),
+                ("warmup_create", "success"),
+                ("prepare", "started"),
+                ("warmup_destroy", "success"),
+                ("prepare", "failure"),
+                ("template_remove", "success"),
+            ],
+            "template_activation_failed",
+        ),
     ],
 )
 def test_boot_projects_bounded_warmup_failure_reason_and_evidence(
     tmp_path: Path,
     provider_kwargs: dict[str, object],
     expected_reason: str,
+    expected_events: list[tuple[str, str]],
+    failure_reason: str,
 ) -> None:
     provider = RuntimeTemplateGraphProvider(**provider_kwargs)
     context, source = _context(tmp_path, provider, journeys=[])
@@ -3140,17 +3189,19 @@ def test_boot_projects_bounded_warmup_failure_reason_and_evidence(
     )
 
     assert result.run.stop_reason == expected_reason
-    assert provider.events == [
-        "warmup_create",
-        "warmup_destroy",
-    ] or provider.events == [
-        "warmup_create",
-        "prepare",
-        "warmup_destroy",
-    ]
     evidence = list(context.artifact_dir.glob("baseline-*/image-template.jsonl"))
     rows = [json.loads(line) for line in evidence[0].read_text().splitlines()]
-    assert ("prepare", "failure") in {(row["event"], row["outcome"]) for row in rows}
+    assert [(row["event"], row["outcome"]) for row in rows] == expected_events
+    failure_row = next(
+        row for row in rows if row["event"] == "prepare" and row["outcome"] == "failure"
+    )
+    assert failure_row["reason"] == failure_reason
+    assert "stderr" not in json.dumps(failure_row)
+    if expected_reason == "total_duration_exhausted":
+        assert failure_row["failure"] == {
+            "operation": "prepare",
+            "reason": "total_duration_exhausted",
+        }
 
 
 def test_boot_projects_cleanup_failure_with_real_warmup_lifecycle(
@@ -3169,6 +3220,15 @@ def test_boot_projects_cleanup_failure_with_real_warmup_lifecycle(
     assert isinstance(caught.value.destroy_failure, RuntimeError)
     evidence = list(context.artifact_dir.glob("baseline-*/image-template.jsonl"))
     rows = [json.loads(line) for line in evidence[0].read_text().splitlines()]
-    assert ("warmup_destroy", "failure") in {
-        (row["event"], row["outcome"]) for row in rows
-    }
+    assert [(row["event"], row["outcome"]) for row in rows] == [
+        ("warmup_create", "started"),
+        ("warmup_create", "success"),
+        ("prepare", "started"),
+        ("prepare", "failure"),
+        ("warmup_destroy", "failure"),
+        ("template_remove", "body_failure"),
+    ]
+    assert rows[3]["reason"] == "operation_failed"
+    assert rows[4]["reason"] == "operation_failed"
+    assert rows[5]["reason"] == "sandbox_cleanup_failed"
+    assert "warmup cancelled" not in json.dumps(rows)
