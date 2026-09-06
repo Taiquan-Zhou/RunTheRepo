@@ -2501,6 +2501,8 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         prepare_error: BaseException | None = None,
         fail_activate: bool = False,
         wrong_guest_workspace: bool = False,
+        prepare_cancellation: asyncio.CancelledError | None = None,
+        warmup_destroy_error: BaseException | None = None,
     ) -> None:
         super().__init__(host_port=host_port)
         self.events: list[str] = []
@@ -2511,6 +2513,8 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         self.prepare_error = prepare_error
         self.fail_activate = fail_activate
         self.wrong_guest_workspace = wrong_guest_workspace
+        self.prepare_cancellation = prepare_cancellation
+        self.warmup_destroy_error = warmup_destroy_error
         self._template_identity: str | None = None
         self._warmup_prepared = False
 
@@ -2559,7 +2563,9 @@ class RuntimeTemplateGraphProvider(GraphProvider):
                 self._require_active(sandbox_id)
                 self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
                 if self.cancel_prepare:
-                    raise asyncio.CancelledError("warmup cancelled")
+                    raise self.prepare_cancellation or asyncio.CancelledError(
+                        "warmup cancelled"
+                    )
                 if self.prepare_error is not None:
                     raise self.prepare_error
                 if self.fail_prepare:
@@ -2599,7 +2605,7 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         if self._roles.get(sandbox_id) == "warmup":
             self.events.append("warmup_destroy")
             if self.fail_warmup_destroy:
-                raise RuntimeError("warmup destroy failed")
+                raise self.warmup_destroy_error or RuntimeError("warmup destroy failed")
         await super().destroy(sandbox_id)
 
     async def finalize_runtime_template(self) -> None:
@@ -3056,20 +3062,24 @@ class _WriteFlushCloseFailingEvidence(graph_module._ImageTemplateEvidence):
 def test_warmup_evidence_failures_preserve_managed_cleanup_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    cancellation = asyncio.CancelledError("cancel-raw-secret-marker")
+    destroy_error = RuntimeError("destroy-raw-secret-marker")
     monkeypatch.setattr(
         graph_module, "_ImageTemplateEvidence", _WriteFlushCloseFailingEvidence
     )
     provider = RuntimeTemplateGraphProvider(
         fail_warmup_destroy=True,
         cancel_prepare=True,
+        prepare_cancellation=cancellation,
+        warmup_destroy_error=destroy_error,
     )
     context, source = _context(tmp_path, provider, journeys=[])
 
     with pytest.raises(CleanupError) as caught:
         _run(_state(source.parent, run_id="runtime-template-audit-cleanup"), context)
 
-    assert isinstance(caught.value.body_failure, asyncio.CancelledError)
-    assert isinstance(caught.value.destroy_failure, RuntimeError)
+    assert caught.value.body_failure is cancellation
+    assert caught.value.destroy_failure is destroy_error
     assert isinstance(caught.value.__cause__, BaseExceptionGroup)
     audit_error = next(
         error
@@ -3089,6 +3099,8 @@ def test_warmup_evidence_failures_preserve_managed_cleanup_failure(
     rows = [json.loads(line) for line in evidence[0].read_text().splitlines()]
     assert rows[-1]["event"] == "template_remove"
     assert all(len(json.dumps(row)) < 4096 for row in rows)
+    assert "cancel-raw-secret-marker" not in json.dumps(rows)
+    assert "destroy-raw-secret-marker" not in json.dumps(rows)
 
 
 @pytest.mark.parametrize("mode", ["discovery", "size"])
@@ -3142,6 +3154,7 @@ def test_graph_finalization_evidence_boundary_fails_closed(
                 "prepare_error": DockerSbxError(
                     "prepare",
                     "total_duration_exhausted",
+                    stderr="docker-raw-secret-marker",
                     failure_evidence=SandboxFailureEvidence(
                         operation="prepare",
                         reason="total_duration_exhausted",
@@ -3202,22 +3215,27 @@ def test_boot_projects_bounded_warmup_failure_reason_and_evidence(
             "operation": "prepare",
             "reason": "total_duration_exhausted",
         }
+        assert "docker-raw-secret-marker" not in json.dumps(rows)
 
 
 def test_boot_projects_cleanup_failure_with_real_warmup_lifecycle(
     tmp_path: Path,
 ) -> None:
+    cancellation = asyncio.CancelledError("cleanup-cancel-raw-secret-marker")
+    destroy_error = RuntimeError("cleanup-destroy-raw-secret-marker")
     provider = RuntimeTemplateGraphProvider(
         fail_warmup_destroy=True,
         cancel_prepare=True,
+        prepare_cancellation=cancellation,
+        warmup_destroy_error=destroy_error,
     )
     context, source = _context(tmp_path, provider, journeys=[])
 
     with pytest.raises(CleanupError) as caught:
         _run(_state(source.parent, run_id="runtime-template-cleanup-reason"), context)
 
-    assert isinstance(caught.value.body_failure, asyncio.CancelledError)
-    assert isinstance(caught.value.destroy_failure, RuntimeError)
+    assert caught.value.body_failure is cancellation
+    assert caught.value.destroy_failure is destroy_error
     evidence = list(context.artifact_dir.glob("baseline-*/image-template.jsonl"))
     rows = [json.loads(line) for line in evidence[0].read_text().splitlines()]
     assert [(row["event"], row["outcome"]) for row in rows] == [
@@ -3231,4 +3249,5 @@ def test_boot_projects_cleanup_failure_with_real_warmup_lifecycle(
     assert rows[3]["reason"] == "operation_failed"
     assert rows[4]["reason"] == "operation_failed"
     assert rows[5]["reason"] == "sandbox_cleanup_failed"
-    assert "warmup cancelled" not in json.dumps(rows)
+    assert "cleanup-cancel-raw-secret-marker" not in json.dumps(rows)
+    assert "cleanup-destroy-raw-secret-marker" not in json.dumps(rows)
