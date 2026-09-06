@@ -2889,6 +2889,79 @@ def test_runtime_template_final_audit_identity_mismatch_fails_closed(
     assert rows[-1]["removal_confirmed"] is False
 
 
+def test_runtime_template_audit_identity_without_activation_fails_without_evidence(
+    tmp_path: Path,
+) -> None:
+    identity = RuntimeTemplateIdentity(
+        repository="docker.io/library/repotrial-runtime",
+        tag="b" * 32,
+        image_id="b" * 12,
+        image_identity_sha256="c" * 64,
+    )
+
+    class FinalAuditIdentityProvider(IncompleteRuntimeTemplateProvider):
+        def runtime_template_audit(self) -> RuntimeTemplateAudit:
+            return RuntimeTemplateAudit(identity=identity, removal_confirmed=True)
+
+        async def finalize_runtime_template(self) -> None:
+            return
+
+    provider = FinalAuditIdentityProvider()
+    context, _ = _context(tmp_path, provider, journeys=[])
+    state = _state(
+        context.workspace, run_id="runtime-template-audit-without-activation"
+    )
+
+    class SuccessfulGraph:
+        async def ainvoke(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            return GraphState(run=state).model_dump(mode="json")
+
+    with pytest.raises(graph_module._TemplateEvidenceError) as caught:
+        asyncio.run(
+            graph_module._invoke_graph_with_finalization(
+                SuccessfulGraph(),
+                None,
+                state.run_id,
+                context=context,
+                config=None,
+            )
+        )
+
+    assert caught.value.reason == "runtime_template_evidence_failed"
+
+
+def test_runtime_template_audit_identity_without_activation_cannot_write_remove_success(
+    tmp_path: Path,
+) -> None:
+    identity = RuntimeTemplateIdentity(
+        repository="docker.io/library/repotrial-runtime",
+        tag="b" * 32,
+        image_id="b" * 12,
+        image_identity_sha256="c" * 64,
+    )
+    with _healthy_server() as (_, host_port):
+        provider = RuntimeTemplateGraphProvider(
+            host_port=host_port,
+            fail_activate=True,
+            finalize_audit_identity=identity,
+        )
+        context, source = _context(tmp_path, provider, journeys=[])
+
+        with pytest.raises(graph_module._TemplateEvidenceError) as caught:
+            _run(
+                _state(source.parent, run_id="runtime-template-audit-no-activate"),
+                context,
+            )
+
+    assert caught.value.reason == "runtime_template_evidence_failed"
+    evidence = list(context.artifact_dir.glob("baseline-*/image-template.jsonl"))
+    rows = [json.loads(line) for line in evidence[0].read_text().splitlines()]
+    assert rows[-1]["event"] == "template_remove"
+    assert rows[-1]["outcome"] == "cleanup_failure"
+    assert rows[-1]["removal_confirmed"] is False
+
+
 def test_runtime_template_resume_after_baseline_checkpoint_prepares_before_first_warmup(
     tmp_path: Path,
 ) -> None:

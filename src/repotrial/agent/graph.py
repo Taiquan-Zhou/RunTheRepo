@@ -1876,9 +1876,8 @@ def _runtime_template_audit_snapshot(
         audit = _read_runtime_template_audit(provider)
     except ImageTemplateError as error:
         return None, error
-    if activation_identity is not None and (
-        audit.identity != activation_identity
-        or any(use.identity != activation_identity for use in audit.uses)
+    if audit.identity != activation_identity or any(
+        use.identity != activation_identity for use in audit.uses
     ):
         return audit, ImageTemplateError("runtime_template_audit_invalid")
     return audit, None
