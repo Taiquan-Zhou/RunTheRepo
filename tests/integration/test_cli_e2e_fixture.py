@@ -104,6 +104,8 @@ class FixtureProvider(FakeSandboxProvider):
         self.workspaces: dict[str, Path] = {}
         self.materialized_experiments: set[str] = set()
         self.experiment_guest_files: dict[str, bytes] = {}
+        self.accepted_guest_files: dict[str, dict[str, bytes]] = {}
+        self.accepted_expected_sha256: dict[str, dict[str, str]] = {}
         self.active_compose_files: dict[str, tuple[str, ...]] = {}
         self.active_env: dict[str, dict[str, str]] = {}
         self.discovered_container_ids: dict[str, str] = {}
@@ -126,6 +128,8 @@ class FixtureProvider(FakeSandboxProvider):
         self.workspaces.pop(sandbox_id, None)
         self.materialized_experiments.discard(sandbox_id)
         self.experiment_guest_files.pop(sandbox_id, None)
+        self.accepted_guest_files.pop(sandbox_id, None)
+        self.accepted_expected_sha256.pop(sandbox_id, None)
         self.active_compose_files.pop(sandbox_id, None)
         self.active_env.pop(sandbox_id, None)
         self.discovered_container_ids.pop(sandbox_id, None)
@@ -139,9 +143,15 @@ class FixtureProvider(FakeSandboxProvider):
         materialization = self._experiment_materialization(sandbox_id, argv)
         if materialization is not None:
             return materialization
+        accepted_materialization = self._accepted_materialization(sandbox_id, argv)
+        if accepted_materialization is not None:
+            return accepted_materialization
         verification = self._experiment_verification(sandbox_id, argv)
         if verification is not None:
             return verification
+        accepted_verification = self._accepted_verification(sandbox_id, argv)
+        if accepted_verification is not None:
+            return accepted_verification
         route = self._route_compose_command(sandbox_id, argv)
         if route is not None:
             route_name, compose_files, active_env = route
@@ -257,7 +267,14 @@ class FixtureProvider(FakeSandboxProvider):
             set(compose_files)
         ):
             return None
-        if compose_files[0] != self.expected_compose_path:
+        base_path = compose_files[0]
+        accepted_match = _compatibility._ACCEPTED_COMPOSE_PATTERN.fullmatch(base_path)
+        if base_path != self.expected_compose_path and accepted_match is None:
+            return None
+        if (
+            accepted_match is not None
+            and base_path not in self.accepted_guest_files.get(sandbox_id, {})
+        ):
             return None
         if len(compose_files) == 2 and (
             compose_files[1] != _compatibility._EXPERIMENT_RELATIVE_PATH
@@ -306,6 +323,48 @@ class FixtureProvider(FakeSandboxProvider):
             stderr="",
         )
 
+    def _accepted_materialization(
+        self, sandbox_id: str, argv: list[str]
+    ) -> ExecResult | None:
+        if len(argv) < 5 or argv[4] != "repotrial-accepted-compose":
+            return None
+        parsed = parse_fixture_materialization(argv)
+        if parsed is None:
+            return None
+        if isinstance(parsed, int):
+            return self._materialization_failure(parsed)
+        _command_name, relative_path, expected_sha256, payload = parsed
+        guest_files = self.accepted_guest_files.setdefault(sandbox_id, {})
+        if relative_path in guest_files:
+            return self._materialization_failure(24)
+        guest_files[relative_path] = payload
+        self.accepted_expected_sha256.setdefault(sandbox_id, {})[relative_path] = (
+            expected_sha256
+        )
+        return self._materialization_success(relative_path, expected_sha256)
+
+    def _accepted_verification(
+        self, sandbox_id: str, argv: list[str]
+    ) -> ExecResult | None:
+        if len(argv) != 3 or argv[:2] != ["sha256sum", "--"]:
+            return None
+        relative_path = argv[2]
+        if _compatibility._ACCEPTED_COMPOSE_PATTERN.fullmatch(relative_path) is None:
+            return None
+        try:
+            payload = self.accepted_guest_files[sandbox_id][relative_path]
+            expected_sha256 = self.accepted_expected_sha256[sandbox_id][relative_path]
+        except KeyError:
+            return None
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest != expected_sha256:
+            return self._materialization_failure(31)
+        return ExecResult(
+            exit_code=0,
+            stdout=f"{digest}  {relative_path}\n",
+            stderr="",
+        )
+
     @staticmethod
     def _materialization_failure(exit_code: int) -> ExecResult:
         return ExecResult(exit_code=exit_code, stdout="", stderr="")
@@ -346,6 +405,19 @@ def _cli_experiment_argv(payload: bytes) -> list[str]:
         _compatibility._EXPERIMENT_ADAPTER_SCRIPT,
         "repotrial-experiment-overlay",
         _compatibility._EXPERIMENT_RELATIVE_PATH,
+        hashlib.sha256(payload).hexdigest(),
+        base64.b64encode(payload).decode("ascii"),
+    ]
+
+
+def _cli_accepted_compose_argv(payload: bytes, relative_path: str) -> list[str]:
+    return [
+        "sh",
+        "-eu",
+        "-c",
+        _compatibility._ACCEPTED_COMPOSE_ADAPTER_SCRIPT,
+        "repotrial-accepted-compose",
+        relative_path,
         hashlib.sha256(payload).hexdigest(),
         base64.b64encode(payload).decode("ascii"),
     ]
@@ -601,6 +673,76 @@ def test_cli_fixture_rejects_an_unmaterialized_experiment_identity(
             await provider.destroy(sandbox_id)
 
     asyncio.run(exercise())
+
+
+def test_cli_fixture_replays_an_accepted_compose_chain_per_sandbox(
+    tmp_path: Path,
+) -> None:
+    provider = FixtureProvider(
+        expected_compose_path="compose.yaml",
+        allowed_env_keys=frozenset(),
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    accepted_relative = (
+        ".repotrial-accepted/accepted-0001-0123456789abcdef.compose.yaml"
+    )
+    accepted_payload = b"services:\n  web:\n    image: example/web:1\n"
+    experiment_payload = b"services:\n  web:\n    read_only: true\n"
+
+    async def exercise() -> tuple[ExecResult, ExecResult, ExecResult, ExecResult]:
+        sandbox_id = await provider.create(workspace, "candidate-accepted-chain")
+        try:
+            accepted_materialization = await provider.exec(
+                sandbox_id,
+                _cli_accepted_compose_argv(accepted_payload, accepted_relative),
+            )
+            accepted_verify = await provider.exec(
+                sandbox_id, ["sha256sum", "--", accepted_relative]
+            )
+            experiment_materialization = await provider.exec(
+                sandbox_id, _cli_experiment_argv(experiment_payload)
+            )
+            compose_up = await provider.exec(
+                sandbox_id,
+                _cli_compose_argv(
+                    "up",
+                    "-d",
+                    "--wait",
+                    "--wait-timeout",
+                    "60",
+                    compose_files=(
+                        accepted_relative,
+                        _compatibility._EXPERIMENT_RELATIVE_PATH,
+                    ),
+                ),
+            )
+            return (
+                accepted_materialization,
+                accepted_verify,
+                experiment_materialization,
+                compose_up,
+            )
+        finally:
+            await provider.destroy(sandbox_id)
+
+    (
+        accepted_materialization,
+        accepted_verify,
+        experiment_materialization,
+        compose_up,
+    ) = asyncio.run(exercise())
+
+    assert accepted_materialization.exit_code == 0
+    assert accepted_verify.stdout == (
+        f"{hashlib.sha256(accepted_payload).hexdigest()}  {accepted_relative}\n"
+    )
+    assert experiment_materialization.exit_code == 0
+    assert compose_up.exit_code == 0
+    assert provider.accepted_guest_files == {}
+    assert provider.accepted_expected_sha256 == {}
+    assert provider.experiment_guest_files == {}
+    assert provider.materialized_experiments == set()
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
