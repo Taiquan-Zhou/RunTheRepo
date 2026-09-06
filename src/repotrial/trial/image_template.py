@@ -377,18 +377,28 @@ async def prepare_compose_image_template(
     pwd_result = await _exec(
         provider,
         sandbox_id,
-        [*prefix, "pwd"],
+        [*prefix, "pwd", "-P"],
         "guest_workspace_verification_failed",
         timeout_s=30,
     )
-    actual_guest_workspace = _parse_guest_workspace(pwd_result.stdout)
-    if guest_workspace is not None and actual_guest_workspace != guest_workspace:
+    pwd_guest_workspace = _parse_guest_workspace(pwd_result.stdout)
+    git_root_result = await _exec(
+        provider,
+        sandbox_id,
+        [*prefix, "git", "rev-parse", "--show-toplevel"],
+        "guest_workspace_verification_failed",
+        timeout_s=30,
+    )
+    git_guest_workspace = _parse_guest_workspace(git_root_result.stdout)
+    if pwd_guest_workspace != git_guest_workspace:
+        raise ImageTemplateError("guest_workspace_verification_failed")
+    if guest_workspace is not None and git_guest_workspace != guest_workspace:
         raise ImageTemplateError("guest_workspace_verification_failed")
 
     await _exec(
         provider,
         sandbox_id,
-        [*prefix, "rm", "--recursive", "--force", "--", actual_guest_workspace],
+        [*prefix, "rm", "--recursive", "--force", "--", git_guest_workspace],
         "guest_workspace_removal_failed",
         timeout_s=30,
     )

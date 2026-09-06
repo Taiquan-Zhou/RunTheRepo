@@ -131,6 +131,7 @@ class TemplateProvider(FakeSandboxProvider):
         self,
         *,
         guest_root: str = "/workspace/repo",
+        git_root: str | None = None,
         fail_stage: str | None = None,
         inventory_output: str | bytes | None = None,
         success_stderr: str = "",
@@ -140,6 +141,7 @@ class TemplateProvider(FakeSandboxProvider):
     ) -> None:
         super().__init__()
         self.guest_root = guest_root
+        self.git_root = guest_root if git_root is None else git_root
         self.fail_stage = fail_stage
         self.inventory_output = inventory_output or _line()
         self.success_stderr = success_stderr
@@ -192,10 +194,17 @@ class TemplateProvider(FakeSandboxProvider):
                 return self._result("inventory", stdout=_REAL_DOCKER_IMAGE_ROW)
             assert call[-1] == _IMAGE_LIST_FORMAT
             return self._result("inventory", stdout=self.inventory_output)
-        if call[-1:] == ("pwd",):
+        if call[-2:] == ("pwd", "-P"):
             if self.provider_error_stage == "pwd" and self.provider_error is not None:
                 raise self.provider_error
             return self._result("pwd", stdout=f"{self.guest_root}\n")
+        if call[-3:] == ("git", "rev-parse", "--show-toplevel"):
+            if (
+                self.provider_error_stage == "git-root"
+                and self.provider_error is not None
+            ):
+                raise self.provider_error
+            return self._result("git-root", stdout=f"{self.git_root}\n")
         if call[-5:] == ("rm", "--recursive", "--force", "--", self.guest_root):
             if (
                 self.provider_error_stage == "remove"
@@ -236,8 +245,10 @@ def _stage(call: tuple[str, ...]) -> str:
         return "build"
     if call[-8:-6] == ("docker", "image"):
         return "inventory"
-    if call[-1:] == ("pwd",):
+    if call[-2:] == ("pwd", "-P"):
         return "pwd"
+    if call[-3:] == ("git", "rev-parse", "--show-toplevel"):
+        return "git-root"
     return "remove"
 
 
@@ -270,6 +281,7 @@ def test_prepare_compose_image_template_pulls_builds_removes_then_activates() ->
         "build",
         "inventory",
         "pwd",
+        "git-root",
         "remove",
     ]
 
@@ -349,7 +361,15 @@ def test_prepare_compose_image_template_fails_closed_before_activation(
             "pull": ("config", "pull"),
             "build": ("config", "pull", "build"),
             "inventory": ("config", "pull", "build", "inventory"),
-            "remove": ("config", "pull", "build", "inventory", "pwd", "remove"),
+            "remove": (
+                "config",
+                "pull",
+                "build",
+                "inventory",
+                "pwd",
+                "git-root",
+                "remove",
+            ),
         }
         observed = [_stage(call) for call in provider.exec_calls]
         assert tuple(observed) == expected_stages[fail_stage]
@@ -442,6 +462,28 @@ def test_prepare_compose_image_template_rejects_unproven_guest_root() -> None:
         asyncio.run(exercise())
 
     assert not any(call[-1:] == ("rm",) for call in provider.exec_calls)
+    assert provider.activated_identity is None
+
+
+def test_prepare_compose_image_template_rejects_mismatched_git_root() -> None:
+    provider = TemplateProvider(
+        guest_root="/workspace/repo",
+        git_root="/workspace/other",
+    )
+
+    with pytest.raises(ImageTemplateError) as error:
+        _prepare(provider)
+
+    assert error.value.reason == "guest_workspace_verification_failed"
+    assert any(call[-2:] == ("pwd", "-P") for call in provider.exec_calls)
+    assert any(
+        call[-3:] == ("git", "rev-parse", "--show-toplevel")
+        for call in provider.exec_calls
+    )
+    assert not any(
+        call[-5:] == ("rm", "--recursive", "--force", "--", provider.guest_root)
+        for call in provider.exec_calls
+    )
     assert provider.activated_identity is None
 
 

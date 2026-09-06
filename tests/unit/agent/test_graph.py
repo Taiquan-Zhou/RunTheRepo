@@ -2725,6 +2725,8 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         self,
         *,
         host_port: int | None = None,
+        guest_root: str = "/workspace/repo",
+        git_root: str | None = None,
         fail_prepare: bool = False,
         fail_warmup_destroy: bool = False,
         cancel_prepare: bool = False,
@@ -2738,6 +2740,8 @@ class RuntimeTemplateGraphProvider(GraphProvider):
     ) -> None:
         super().__init__(host_port=host_port)
         self.events: list[str] = []
+        self.guest_root = guest_root
+        self.git_root = guest_root if git_root is None else git_root
         self.fail_prepare = fail_prepare
         self.fail_warmup_destroy = fail_warmup_destroy
         self.cancel_prepare = cancel_prepare
@@ -2841,15 +2845,33 @@ class RuntimeTemplateGraphProvider(GraphProvider):
                 self._require_active(sandbox_id)
                 self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
                 return ExecResult(exit_code=0, stdout="", stderr="")
-            if snapshot[-1:] == ("pwd",):
+            if snapshot[-2:] == ("pwd", "-P"):
                 self._require_active(sandbox_id)
                 self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
                 return ExecResult(
                     exit_code=0,
-                    stdout="/wrong\n" if self.wrong_guest_workspace else "/workspace\n",
+                    stdout=(
+                        "/wrong\n"
+                        if self.wrong_guest_workspace
+                        else f"{self.guest_root}\n"
+                    ),
                     stderr="",
                 )
-            if "rm" in snapshot:
+            if snapshot[-3:] == ("git", "rev-parse", "--show-toplevel"):
+                self._require_active(sandbox_id)
+                self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+                return ExecResult(
+                    exit_code=0,
+                    stdout=f"{self.git_root}\n",
+                    stderr="",
+                )
+            if snapshot[-5:] == (
+                "rm",
+                "--recursive",
+                "--force",
+                "--",
+                self.guest_root,
+            ):
                 self._require_active(sandbox_id)
                 self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
                 return ExecResult(exit_code=0, stdout="", stderr="")

@@ -1967,7 +1967,6 @@ async def _prepare_runtime_template(
                 sandbox_id,
                 compose_path,
                 env,
-                guest_workspace="/workspace",
                 compatibility_overlay_path=compatibility_relative,
                 unset_env_keys=(
                     () if startup_plan is None else startup_plan.all_source_key_names
