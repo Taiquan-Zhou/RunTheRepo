@@ -144,6 +144,7 @@ class TemplateProvider(FakeSandboxProvider):
         git_root: str | None = None,
         fail_stage: str | None = None,
         inventory_output: str | bytes | None = None,
+        proof_output: str | bytes = "",
         success_stderr: str = "",
         provider_error: DockerSbxError | None = None,
         provider_error_stage: str | None = None,
@@ -154,6 +155,7 @@ class TemplateProvider(FakeSandboxProvider):
         self.git_root = guest_root if git_root is None else git_root
         self.fail_stage = fail_stage
         self.inventory_output = inventory_output or _line()
+        self.proof_output = proof_output
         self.success_stderr = success_stderr
         self.provider_error = provider_error
         self.provider_error_stage = provider_error_stage
@@ -228,12 +230,37 @@ class TemplateProvider(FakeSandboxProvider):
             command = call[-5:]
             if not _is_allowed_template_command(call, command):
                 raise AssertionError(f"unexpected guest-root command: {call!r}")
+            return ExecResult(
+                exit_code=1,
+                stdout="",
+                stderr="clone root is an active mountpoint",
+            )
+        if call[-5:] in {
+            ("find", self.guest_root, "-mindepth", "1", "-delete"),
+            ("find", self.git_root, "-mindepth", "1", "-delete"),
+        }:
+            command = call[-5:]
+            if not _is_allowed_template_command(call, command):
+                raise AssertionError(f"unexpected guest-root command: {call!r}")
             if (
                 self.provider_error_stage == "remove"
                 and self.provider_error is not None
             ):
                 raise self.provider_error
             return self._result("remove")
+        if call[-6:] in {
+            ("find", self.guest_root, "-mindepth", "1", "-print", "-quit"),
+            ("find", self.git_root, "-mindepth", "1", "-print", "-quit"),
+        }:
+            command = call[-6:]
+            if not _is_allowed_template_command(call, command):
+                raise AssertionError(f"unexpected guest-root command: {call!r}")
+            if (
+                self.provider_error_stage == "remove-proof"
+                and self.provider_error is not None
+            ):
+                raise self.provider_error
+            return self._result("remove-proof", stdout=self.proof_output)
         raise AssertionError(f"unexpected provider command: {call!r}")
 
     def _result(self, stage: str, *, stdout: str | bytes = "") -> ExecResult:
@@ -271,10 +298,21 @@ def _stage(call: tuple[str, ...]) -> str:
         return "pwd"
     if call[-3:] == ("git", "rev-parse", "--show-toplevel"):
         return "git-root"
+    if call[-5:] == ("find", call[-4], "-mindepth", "1", "-delete"):
+        return "remove"
+    if call[-6:] == (
+        "find",
+        call[-5],
+        "-mindepth",
+        "1",
+        "-print",
+        "-quit",
+    ):
+        return "remove-proof"
     return "remove"
 
 
-def test_prepare_compose_image_template_pulls_builds_removes_then_activates() -> None:
+def test_prepare_compose_image_template_clears_root_then_activates() -> None:
     provider = TemplateProvider()
 
     inventory = _prepare(provider)
@@ -288,14 +326,38 @@ def test_prepare_compose_image_template_pulls_builds_removes_then_activates() ->
         if call[-2:] == ("pull", "--ignore-buildable")
     )
     build = next(call for call in provider.exec_calls if call[-1:] == ("build",))
-    remove = next(
+    clear = next(
         call
         for call in provider.exec_calls
-        if call[-4:] == ("--recursive", "--force", "--", provider.guest_root)
+        if call[-5:] == ("find", provider.guest_root, "-mindepth", "1", "-delete")
+    )
+    proof = next(
+        call
+        for call in provider.exec_calls
+        if call[-6:]
+        == ("find", provider.guest_root, "-mindepth", "1", "-print", "-quit")
     )
     assert pull[-2:] == ("pull", "--ignore-buildable")
     assert build[-1] == "build"
-    assert remove[-4:] == ("--recursive", "--force", "--", provider.guest_root)
+    assert clear[-5:] == (
+        "find",
+        provider.guest_root,
+        "-mindepth",
+        "1",
+        "-delete",
+    )
+    assert proof[-6:] == (
+        "find",
+        provider.guest_root,
+        "-mindepth",
+        "1",
+        "-print",
+        "-quit",
+    )
+    assert not any(
+        call[-5:] == ("rm", "--recursive", "--force", "--", provider.guest_root)
+        for call in provider.exec_calls
+    )
     assert all("up" not in call for call in provider.exec_calls)
     assert [_stage(call) for call in provider.exec_calls] == [
         "config",
@@ -305,6 +367,27 @@ def test_prepare_compose_image_template_pulls_builds_removes_then_activates() ->
         "pwd",
         "git-root",
         "remove",
+        "remove-proof",
+    ]
+
+
+def test_prepare_rejects_nonempty_clear_proof_before_activation() -> None:
+    provider = TemplateProvider(proof_output="/workspace/repo/leftover\n")
+
+    with pytest.raises(ImageTemplateError) as error:
+        _prepare(provider)
+
+    assert error.value.reason == "guest_workspace_removal_failed"
+    assert provider.activated_identity is None
+    assert [_stage(call) for call in provider.exec_calls] == [
+        "config",
+        "pull",
+        "build",
+        "inventory",
+        "pwd",
+        "git-root",
+        "remove",
+        "remove-proof",
     ]
 
 
@@ -347,12 +430,32 @@ def test_prepare_compose_image_template_can_derive_proven_guest_root() -> None:
     inventory = asyncio.run(exercise())
 
     assert provider.activated_identity == inventory.sha256
-    remove = next(
+    clear = next(
         call
         for call in provider.exec_calls
-        if call[-4:] == ("--recursive", "--force", "--", provider.guest_root)
+        if call[-5:] == ("find", provider.guest_root, "-mindepth", "1", "-delete")
     )
-    assert remove[-4:] == ("--recursive", "--force", "--", provider.guest_root)
+    proof = next(
+        call
+        for call in provider.exec_calls
+        if call[-6:]
+        == ("find", provider.guest_root, "-mindepth", "1", "-print", "-quit")
+    )
+    assert clear[-5:] == (
+        "find",
+        provider.guest_root,
+        "-mindepth",
+        "1",
+        "-delete",
+    )
+    assert proof[-6:] == (
+        "find",
+        provider.guest_root,
+        "-mindepth",
+        "1",
+        "-print",
+        "-quit",
+    )
 
 
 def test_prepare_compose_image_template_allows_bounded_success_stderr() -> None:
@@ -364,7 +467,7 @@ def test_prepare_compose_image_template_allows_bounded_success_stderr() -> None:
 
 
 @pytest.mark.parametrize(
-    "fail_stage", ["config", "pull", "build", "inventory", "remove"]
+    "fail_stage", ["config", "pull", "build", "inventory", "remove", "remove-proof"]
 )
 def test_prepare_compose_image_template_fails_closed_before_activation(
     fail_stage: str,
@@ -391,6 +494,16 @@ def test_prepare_compose_image_template_fails_closed_before_activation(
                 "pwd",
                 "git-root",
                 "remove",
+            ),
+            "remove-proof": (
+                "config",
+                "pull",
+                "build",
+                "inventory",
+                "pwd",
+                "git-root",
+                "remove",
+                "remove-proof",
             ),
         }
         observed = [_stage(call) for call in provider.exec_calls]
@@ -484,7 +597,12 @@ def test_prepare_compose_image_template_rejects_unproven_guest_root() -> None:
         asyncio.run(exercise())
 
     assert not any(
-        call == ("rm", "--recursive", "--force", "--", provider.guest_root)
+        call[-5:]
+        in {
+            ("find", provider.guest_root, "-mindepth", "1", "-delete"),
+        }
+        or call[-6:]
+        == ("find", provider.guest_root, "-mindepth", "1", "-print", "-quit")
         for call in provider.exec_calls
     )
     assert provider.activated_identity is None
@@ -516,7 +634,16 @@ def test_prepare_compose_image_template_rejects_mismatched_git_root() -> None:
         for call in provider.exec_calls
     )
     assert not any(
-        call == ("rm", "--recursive", "--force", "--", provider.git_root)
+        call[-5:]
+        in {
+            ("find", provider.guest_root, "-mindepth", "1", "-delete"),
+            ("find", provider.git_root, "-mindepth", "1", "-delete"),
+        }
+        or call[-6:]
+        in {
+            ("find", provider.guest_root, "-mindepth", "1", "-print", "-quit"),
+            ("find", provider.git_root, "-mindepth", "1", "-print", "-quit"),
+        }
         for call in provider.exec_calls
     )
     assert provider.activated_identity is None
@@ -530,7 +657,8 @@ def test_prepare_compose_image_template_rejects_guest_root_control_characters() 
         _prepare(provider)
 
     assert not any(
-        call[-5:] == ("rm", "--recursive", "--force", "--", guest_root)
+        call[-5:] == ("find", guest_root, "-mindepth", "1", "-delete")
+        or call[-6:] == ("find", guest_root, "-mindepth", "1", "-print", "-quit")
         for call in provider.exec_calls
     )
     assert provider.activated_identity is None

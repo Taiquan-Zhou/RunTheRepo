@@ -398,10 +398,27 @@ async def prepare_compose_image_template(
     await _exec(
         provider,
         sandbox_id,
-        [*prefix, "rm", "--recursive", "--force", "--", git_guest_workspace],
+        [*prefix, "find", git_guest_workspace, "-mindepth", "1", "-delete"],
         "guest_workspace_removal_failed",
         timeout_s=30,
     )
+    proof_result = await _exec(
+        provider,
+        sandbox_id,
+        [
+            *prefix,
+            "find",
+            git_guest_workspace,
+            "-mindepth",
+            "1",
+            "-print",
+            "-quit",
+        ],
+        "guest_workspace_removal_failed",
+        timeout_s=30,
+    )
+    if proof_result.stdout != "":
+        raise ImageTemplateError("guest_workspace_removal_failed")
     try:
         await provider.activate_runtime_template(sandbox_id, inventory.sha256)
     except DockerSbxError:

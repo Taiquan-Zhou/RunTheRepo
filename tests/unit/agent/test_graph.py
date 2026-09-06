@@ -2895,6 +2895,30 @@ class RuntimeTemplateGraphProvider(GraphProvider):
                     raise AssertionError(f"unexpected guest-root command: {snapshot!r}")
                 self._require_active(sandbox_id)
                 self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+                return ExecResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr="clone root is an active mountpoint",
+                )
+            if snapshot[-5:] in {
+                ("find", self.guest_root, "-mindepth", "1", "-delete"),
+                ("find", self.git_root, "-mindepth", "1", "-delete"),
+            }:
+                command = snapshot[-5:]
+                if not _is_allowed_runtime_template_command(snapshot, command):
+                    raise AssertionError(f"unexpected guest-root command: {snapshot!r}")
+                self._require_active(sandbox_id)
+                self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+                return ExecResult(exit_code=0, stdout="", stderr="")
+            if snapshot[-6:] in {
+                ("find", self.guest_root, "-mindepth", "1", "-print", "-quit"),
+                ("find", self.git_root, "-mindepth", "1", "-print", "-quit"),
+            }:
+                command = snapshot[-6:]
+                if not _is_allowed_runtime_template_command(snapshot, command):
+                    raise AssertionError(f"unexpected guest-root command: {snapshot!r}")
+                self._require_active(sandbox_id)
+                self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
                 return ExecResult(exit_code=0, stdout="", stderr="")
         return await super().exec(sandbox_id, argv, timeout_s)
 
