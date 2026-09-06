@@ -54,9 +54,9 @@ HELP_OUTPUTS = {
     ("sbx", "policy", "log", "--help"): (
         "Usage: sbx policy log SANDBOX --type network --json"
     ),
-    ("sbx", "template", "save", "--help"): "Usage: sbx template save IMAGE",
+    ("sbx", "template", "save", "--help"): "Usage: sbx template save SANDBOX TAG",
     ("sbx", "template", "ls", "--help"): "Usage: sbx template ls --json",
-    ("sbx", "template", "rm", "--help"): "Usage: sbx template rm IMAGE",
+    ("sbx", "template", "rm", "--help"): "Usage: sbx template rm TAG|ID",
 }
 PROBE_CALLS = [
     ("sbx", "version"),
@@ -1306,6 +1306,37 @@ def test_runtime_template_probe_requires_all_template_help_commands(
     assert ("sbx", "template", "rm", "--help") in spawner.calls
 
 
+@pytest.mark.parametrize(
+    ("command", "output", "expected_reason"),
+    [
+        (
+            ("sbx", "template", "save", "--help"),
+            "Usage: sbx template save SANDBOX",
+            "template_save_missing_capability:TAG",
+        ),
+        (
+            ("sbx", "template", "rm", "--help"),
+            "Usage: sbx template rm IMAGE",
+            "template_rm_missing_capability:TAG|ID",
+        ),
+    ],
+)
+def test_runtime_template_probe_rejects_incomplete_help_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    command: tuple[str, ...],
+    output: str,
+    expected_reason: str,
+) -> None:
+    spawner = _SbxSpawner()
+    spawner.overrides[command] = _Outcome(stdout=output.encode())
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxUnsupportedError) as raised:
+        asyncio.run(provider._probe(time.monotonic() + 300.0))
+
+    assert raised.value.reason == expected_reason
+
+
 def test_runtime_template_lifecycle_uses_owned_tag_and_exact_image_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1334,7 +1365,7 @@ def test_runtime_template_lifecycle_uses_owned_tag_and_exact_image_id(
             template_saved = True
             return _Outcome()
         if command[:3] == ("sbx", "template", "rm"):
-            assert command[-1] == image_id or command[-1] == saved_tag
+            assert command[-1] == saved_tag
             template_saved = False
             return _Outcome()
         return _Outcome()
@@ -1353,10 +1384,208 @@ def test_runtime_template_lifecycle_uses_owned_tag_and_exact_image_id(
     assert template_calls[1][:3] == ("sbx", "template", "save")
     assert template_calls[1][-1] == saved_tag
     assert template_calls[2] == ("sbx", "template", "ls", "--json")
-    assert template_calls[3] == ("sbx", "template", "rm", image_id)
-    assert template_calls[4] == ("sbx", "template", "ls", "--json")
+    assert template_calls[3] == ("sbx", "template", "ls", "--json")
+    assert template_calls[4] == ("sbx", "template", "rm", saved_tag)
+    assert template_calls[5] == ("sbx", "template", "ls", "--json")
     assert saved_tag is not None and _RUNTIME_TEMPLATE_TAG.fullmatch(saved_tag)
     assert provider.expected_image_identity_sha256() is None
+
+
+def test_runtime_template_cleanup_after_save_uses_unbounded_deadline_and_confirms_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch,
+        spawner,
+        deadline=time.monotonic() + 300.0,
+    )
+    list_count = 0
+    cleanup_deadlines: list[float | None] = []
+
+    async def listed(deadline: float | None = None) -> tuple[object, ...]:
+        del deadline
+        nonlocal list_count
+        list_count += 1
+        if list_count == 1:
+            return ()
+        if list_count == 2:
+            raise DockerSbxError("template_ls", "timeout")
+        return ()
+
+    async def remove(_: str, *, deadline: float | None) -> None:
+        cleanup_deadlines.append(deadline)
+
+    monkeypatch.setattr(provider, "_list_runtime_templates", listed)
+    monkeypatch.setattr(provider, "_remove_runtime_template", remove)
+
+    with pytest.raises(DockerSbxError, match="timeout"):
+        asyncio.run(provider.activate_runtime_template(sandbox_id, "b" * 64))
+
+    assert cleanup_deadlines == [None]
+    assert list_count == 3
+
+
+def test_runtime_template_finalize_removes_by_owned_tag_and_preserves_shared_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, _ = _active_provider(
+        monkeypatch,
+        spawner,
+        deadline=time.monotonic() + 300.0,
+    )
+    owned_tag = "repotrial-runtime:" + "e" * 32
+    shared_id = "sha256:" + "f" * 64
+    provider._runtime_template_tag = owned_tag
+    provider._runtime_template_image_id = shared_id
+    provider._runtime_template_expected_identity = "a" * 64
+    removed: list[str] = []
+    removed_owned = False
+
+    async def listed(deadline: float | None = None) -> tuple[object, ...]:
+        del deadline
+        if removed_owned:
+            return (docker_sbx._RuntimeTemplate("shell-docker", "latest", shared_id),)
+        return (
+            docker_sbx._RuntimeTemplate("repotrial-runtime", "e" * 32, shared_id),
+            docker_sbx._RuntimeTemplate("shell-docker", "latest", shared_id),
+        )
+
+    async def remove(reference: str, *, deadline: float | None) -> None:
+        nonlocal removed_owned
+        del deadline
+        removed.append(reference)
+        removed_owned = True
+
+    monkeypatch.setattr(provider, "_list_runtime_templates", listed)
+    monkeypatch.setattr(provider, "_remove_runtime_template", remove)
+
+    asyncio.run(provider.finalize_runtime_template())
+
+    assert removed == [owned_tag]
+    assert provider.expected_image_identity_sha256() is None
+
+
+def test_runtime_template_finalize_keeps_state_when_owned_tag_remains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, _ = _active_provider(
+        monkeypatch,
+        spawner,
+        deadline=time.monotonic() + 300.0,
+    )
+    owned_tag = "repotrial-runtime:" + "1" * 32
+    image_id = "sha256:" + "2" * 64
+    provider._runtime_template_tag = owned_tag
+    provider._runtime_template_image_id = image_id
+    provider._runtime_template_expected_identity = "3" * 64
+
+    async def listed(deadline: float | None = None) -> tuple[object, ...]:
+        del deadline
+        return (docker_sbx._RuntimeTemplate("repotrial-runtime", "1" * 32, image_id),)
+
+    monkeypatch.setattr(provider, "_list_runtime_templates", listed)
+
+    async def remove(reference: str, *, deadline: float | None) -> None:
+        del reference, deadline
+
+    monkeypatch.setattr(provider, "_remove_runtime_template", remove)
+
+    with pytest.raises(DockerSbxError, match="template_still_present"):
+        asyncio.run(provider.finalize_runtime_template())
+
+    assert provider._runtime_template_tag == owned_tag
+
+
+@pytest.mark.parametrize(
+    "failure", [DockerSbxError("template_rm", "nonzero_exit"), asyncio.CancelledError()]
+)
+def test_runtime_template_finalize_propagates_remove_failure_and_uses_tag(
+    monkeypatch: pytest.MonkeyPatch, failure: BaseException
+) -> None:
+    spawner = _SbxSpawner()
+    provider, _ = _active_provider(
+        monkeypatch,
+        spawner,
+        deadline=time.monotonic() + 300.0,
+    )
+    owned_tag = "repotrial-runtime:" + "7" * 32
+    provider._runtime_template_tag = owned_tag
+    provider._runtime_template_image_id = "sha256:" + "8" * 64
+    provider._runtime_template_expected_identity = "9" * 64
+    references: list[str] = []
+
+    async def remove(reference: str, *, deadline: float | None) -> None:
+        del deadline
+        references.append(reference)
+        raise failure
+
+    async def listed(deadline: float | None = None) -> tuple[object, ...]:
+        del deadline
+        return (
+            docker_sbx._RuntimeTemplate(
+                "repotrial-runtime", "7" * 32, provider._runtime_template_image_id or ""
+            ),
+        )
+
+    monkeypatch.setattr(provider, "_list_runtime_templates", listed)
+    monkeypatch.setattr(provider, "_remove_runtime_template", remove)
+
+    with pytest.raises(type(failure)):
+        asyncio.run(provider.finalize_runtime_template())
+
+    assert references == [owned_tag]
+    assert provider._runtime_template_tag == owned_tag
+
+
+def test_runtime_template_activation_is_single_use_even_after_finalize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch,
+        spawner,
+        deadline=time.monotonic() + 300.0,
+    )
+    image_id = "sha256:" + "4" * 64
+    saved_tag: str | None = None
+    template_saved = False
+
+    def handler(command: tuple[str, ...]) -> _Outcome:
+        nonlocal saved_tag, template_saved
+        if command == ("sbx", "template", "ls", "--json"):
+            if not template_saved:
+                return _Outcome(stdout=b"[]")
+            assert saved_tag is not None
+            return _Outcome(
+                stdout=json.dumps(
+                    [
+                        {
+                            "repository": "repotrial-runtime",
+                            "tag": saved_tag,
+                            "id": image_id,
+                        }
+                    ]
+                ).encode()
+            )
+        if command[:3] == ("sbx", "template", "save"):
+            saved_tag = command[-1]
+            template_saved = True
+        if command[:3] == ("sbx", "template", "rm"):
+            template_saved = False
+        return _Outcome()
+
+    spawner.handler = handler
+
+    async def exercise() -> None:
+        await provider.activate_runtime_template(sandbox_id, "5" * 64)
+        await provider.finalize_runtime_template()
+        with pytest.raises(RuntimeError, match="already invoked"):
+            await provider.activate_runtime_template(sandbox_id, "6" * 64)
+
+    asyncio.run(exercise())
 
 
 def test_create_uses_active_runtime_template_with_clone_and_policy_flags(

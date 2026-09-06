@@ -336,6 +336,8 @@ class DockerSbxProvider(SandboxProvider):
         self._runtime_template_tag: str | None = None
         self._runtime_template_image_id: str | None = None
         self._runtime_template_expected_identity: str | None = None
+        self._runtime_template_pending_tag: str | None = None
+        self._runtime_template_activation_used = False
 
     @property
     def supports_runtime_templates(self) -> bool:
@@ -347,6 +349,9 @@ class DockerSbxProvider(SandboxProvider):
     async def activate_runtime_template(
         self, sandbox_id: str, image_identity_sha256: str
     ) -> None:
+        if self._runtime_template_activation_used:
+            raise RuntimeError("runtime template activation already invoked")
+        self._runtime_template_activation_used = True
         self._require_active(sandbox_id)
         if (
             not isinstance(image_identity_sha256, str)
@@ -361,6 +366,7 @@ class DockerSbxProvider(SandboxProvider):
         if any(_runtime_template_matches(item, tag) for item in before):
             raise DockerSbxError("template_save", "template_tag_collision")
 
+        self._runtime_template_pending_tag = tag
         save_attempted = False
         try:
             save_attempted = True
@@ -381,24 +387,43 @@ class DockerSbxProvider(SandboxProvider):
         except (DockerSbxError, asyncio.CancelledError) as primary_error:
             if save_attempted:
                 try:
-                    await self._remove_runtime_template(tag, deadline=deadline)
+                    await self._cleanup_runtime_template(tag)
                 except (DockerSbxError, asyncio.CancelledError) as cleanup_error:
                     primary_error.add_note("runtime template cleanup unconfirmed")
                     primary_error.__context__ = cleanup_error
             raise
 
     async def finalize_runtime_template(self) -> None:
-        tag = self._runtime_template_tag
-        image_id = self._runtime_template_image_id
-        if tag is None or image_id is None:
+        tag = self._runtime_template_tag or self._runtime_template_pending_tag
+        if tag is None:
             return
-        await self._remove_runtime_template(image_id, deadline=None)
         remaining = await self._list_runtime_templates(deadline=None)
-        if any(item.image_id == image_id for item in remaining):
-            raise DockerSbxError("template_finalize", "template_still_present")
+        matches = [item for item in remaining if _runtime_template_matches(item, tag)]
+        if len(matches) > 1:
+            raise DockerSbxError("template_finalize", "template_identity_invalid")
+        if matches:
+            expected_image_id = self._runtime_template_image_id
+            if (
+                expected_image_id is not None
+                and matches[0].image_id != expected_image_id
+            ):
+                raise DockerSbxError("template_finalize", "template_identity_changed")
+            await self._remove_runtime_template(tag, deadline=None)
+            remaining = await self._list_runtime_templates(deadline=None)
+            if any(_runtime_template_matches(item, tag) for item in remaining):
+                raise DockerSbxError("template_finalize", "template_still_present")
         self._runtime_template_tag = None
         self._runtime_template_image_id = None
         self._runtime_template_expected_identity = None
+        self._runtime_template_pending_tag = None
+
+    async def _cleanup_runtime_template(self, tag: str) -> None:
+        await self._remove_runtime_template(tag, deadline=None)
+        remaining = await self._list_runtime_templates(deadline=None)
+        if any(_runtime_template_matches(item, tag) for item in remaining):
+            raise DockerSbxError("template_cleanup", "template_still_present")
+        if self._runtime_template_pending_tag == tag:
+            self._runtime_template_pending_tag = None
 
     async def _remove_runtime_template(
         self, reference: str, *, deadline: float | None
@@ -1127,9 +1152,13 @@ class DockerSbxProvider(SandboxProvider):
                 ["policy", "allow", "network", "--help"],
                 ("--sandbox", '"**"'),
             ),
-            ("template_save", ["template", "save", "--help"], ()),
+            (
+                "template_save",
+                ["template", "save", "--help"],
+                ("SANDBOX", "TAG"),
+            ),
             ("template_ls", ["template", "ls", "--help"], ("--json",)),
-            ("template_rm", ["template", "rm", "--help"], ()),
+            ("template_rm", ["template", "rm", "--help"], ("TAG|ID",)),
         )
         for capability, arguments, tokens in required_help:
             result = await self._probe_call(capability, arguments, deadline)
