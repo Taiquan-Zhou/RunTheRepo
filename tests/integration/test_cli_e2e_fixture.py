@@ -1,4 +1,7 @@
 import asyncio
+import base64
+import binascii
+import hashlib
 import json
 import subprocess
 import threading
@@ -30,6 +33,7 @@ from repotrial.models.base import RecoveryAction
 from repotrial.sandbox.base import ExecResult
 from repotrial.sandbox.docker_sbx import DockerSbxUnsupportedError
 from repotrial.sandbox.fake import FakeSandboxProvider
+from repotrial.trial import compatibility as _compatibility
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 FIXED_RUN_ID = "11111111-1111-4111-8111-111111111111"
@@ -61,6 +65,8 @@ class FixtureProvider(FakeSandboxProvider):
         self.candidate_boot_unavailable = candidate_boot_unavailable
         self.create_error = create_error
         self.roles: dict[str, str] = {}
+        self.workspaces: dict[str, Path] = {}
+        self.materialized_experiments: set[str] = set()
         self.active_sandboxes: set[str] = set()
 
     async def create(self, workspace: Path, name: str) -> str:
@@ -70,12 +76,15 @@ class FixtureProvider(FakeSandboxProvider):
         self.roles[sandbox_id] = (
             "baseline" if name.startswith("repotrial-baseline-") else "candidate"
         )
+        self.workspaces[sandbox_id] = workspace
         self.active_sandboxes.add(sandbox_id)
         return sandbox_id
 
     async def destroy(self, sandbox_id: str) -> None:
         await super().destroy(sandbox_id)
         self.active_sandboxes.discard(sandbox_id)
+        self.workspaces.pop(sandbox_id, None)
+        self.materialized_experiments.discard(sandbox_id)
 
     async def exec(
         self, sandbox_id: str, argv: list[str], timeout_s: int = 60
@@ -83,6 +92,12 @@ class FixtureProvider(FakeSandboxProvider):
         self._require_active(sandbox_id)
         command = tuple(argv)
         self.calls.append(("exec", sandbox_id, command, timeout_s))
+        materialization = self._experiment_materialization(sandbox_id, argv)
+        if materialization is not None:
+            return materialization
+        verification = self._experiment_verification(sandbox_id, argv)
+        if verification is not None:
+            return verification
         if (
             self.roles[sandbox_id] == "candidate"
             and self.candidate_boot_unavailable
@@ -135,6 +150,102 @@ class FixtureProvider(FakeSandboxProvider):
                 stderr="",
             )
         raise AssertionError(f"unexpected provider command: {command!r}")
+
+    def _experiment_materialization(
+        self, sandbox_id: str, argv: list[str]
+    ) -> ExecResult | None:
+        if len(argv) != 8 or any(not isinstance(item, str) for item in argv):
+            return None
+        if argv[:5] != [
+            "sh",
+            "-eu",
+            "-c",
+            _compatibility._EXPERIMENT_ADAPTER_SCRIPT,
+            "repotrial-experiment-overlay",
+        ]:
+            return None
+        relative_path, expected_sha256, encoded_payload = argv[5:]
+        if relative_path != _compatibility._EXPERIMENT_RELATIVE_PATH:
+            return self._materialization_failure(22)
+        if len(encoded_payload) > _compatibility._MAX_COMPATIBILITY_PAYLOAD_BYTES:
+            return self._materialization_failure(25)
+        try:
+            payload = base64.b64decode(encoded_payload, validate=True)
+        except (UnicodeEncodeError, binascii.Error, ValueError):
+            return self._materialization_failure(26)
+        if (
+            _compatibility._SHA256_PATTERN.fullmatch(expected_sha256) is None
+            or hashlib.sha256(payload).hexdigest() != expected_sha256
+        ):
+            return self._materialization_failure(31)
+
+        workspace = self.workspaces[sandbox_id]
+        if not workspace.is_dir() or workspace.is_symlink():
+            return self._materialization_failure(21)
+        target = workspace / Path(_compatibility._EXPERIMENT_RELATIVE_PATH)
+        try:
+            target.parent.mkdir(exist_ok=True)
+        except OSError:
+            return self._materialization_failure(23)
+        if not target.parent.is_dir() or target.parent.is_symlink():
+            return self._materialization_failure(23)
+        if target.exists() or target.is_symlink():
+            return self._materialization_failure(24)
+        try:
+            with target.open("xb") as output:
+                output.write(payload)
+                output.flush()
+            target.chmod(0o600)
+        except FileExistsError:
+            return self._materialization_failure(24)
+        except OSError:
+            return self._materialization_failure(23)
+        self.materialized_experiments.add(sandbox_id)
+        return self._materialization_success(
+            _compatibility._EXPERIMENT_RELATIVE_PATH, expected_sha256
+        )
+
+    def _experiment_verification(
+        self, sandbox_id: str, argv: list[str]
+    ) -> ExecResult | None:
+        if len(argv) != 3 or argv[:2] != ["sha256sum", "--"]:
+            return None
+        relative_path = argv[2]
+        if relative_path != _compatibility._EXPERIMENT_RELATIVE_PATH:
+            return None
+        if sandbox_id not in self.materialized_experiments:
+            return None
+        target = self.workspaces[sandbox_id] / Path(relative_path)
+        try:
+            if target.is_symlink() or not target.is_file():
+                return self._materialization_failure(1)
+            payload = target.read_bytes()
+        except OSError:
+            return self._materialization_failure(1)
+        return ExecResult(
+            exit_code=0,
+            stdout=f"{hashlib.sha256(payload).hexdigest()}  {relative_path}\n",
+            stderr="",
+        )
+
+    @staticmethod
+    def _materialization_failure(exit_code: int) -> ExecResult:
+        return ExecResult(exit_code=exit_code, stdout="", stderr="")
+
+    @staticmethod
+    def _materialization_success(
+        relative_path: str, expected_sha256: str
+    ) -> ExecResult:
+        return ExecResult(
+            exit_code=0,
+            stdout=(
+                "root=/workspace\n"
+                f"path={relative_path}\n"
+                "mode=600\n"
+                f"sha256={expected_sha256}\n"
+            ),
+            stderr="",
+        )
 
 
 class _HealthHandler(BaseHTTPRequestHandler):

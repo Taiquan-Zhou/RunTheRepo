@@ -5,6 +5,7 @@ import json
 import socket
 import stat
 import subprocess
+from collections.abc import Collection, Sequence
 from importlib import import_module
 from pathlib import Path
 from types import ModuleType
@@ -15,6 +16,7 @@ from typer.testing import CliRunner
 
 from repotrial.domain.enums import ExperimentVerdict, MutationType, Verdict
 from repotrial.domain.models import JourneyResult
+from repotrial.sandbox.base import SandboxProvider
 from repotrial.trial.boot import BootResult
 
 ROOT = Path(__file__).parents[3]
@@ -478,8 +480,31 @@ def test_real_graph_unsupported_boot_projects_unavailable_metrics(
     graph = import_module("repotrial.agent.graph")
     manifest_dir = _isolated_fixture_project(tmp_path, recoverable_env="APP_MODE")
 
-    async def unsupported_boot(*args: object) -> BootResult:
-        return _unsupported_boot_result(cast(int, args[-1]))
+    async def unsupported_boot(
+        provider: SandboxProvider,
+        sandbox_id: str,
+        compose_path: str,
+        env: dict[str, str],
+        attempt: int,
+        *,
+        overlay_path: str | None = None,
+        compatibility_overlay_path: str | None = None,
+        unset_env_keys: Sequence[str] = (),
+        project_directory: str | None = None,
+        declared_secret_env_keys: Collection[str] = (),
+    ) -> BootResult:
+        del (
+            provider,
+            sandbox_id,
+            compose_path,
+            env,
+            overlay_path,
+            compatibility_overlay_path,
+            unset_env_keys,
+            project_directory,
+        )
+        assert declared_secret_env_keys == frozenset()
+        return _unsupported_boot_result(attempt)
 
     monkeypatch.setattr(graph, "boot_compose", unsupported_boot)
 
@@ -585,12 +610,35 @@ def test_functional_boot_failure_remains_a_numeric_metric_failure(
     graph = import_module("repotrial.agent.graph")
     manifest_dir = _isolated_fixture_project(tmp_path, recoverable_env="APP_MODE")
 
-    async def failed_boot(*args: object) -> BootResult:
+    async def failed_boot(
+        provider: SandboxProvider,
+        sandbox_id: str,
+        compose_path: str,
+        env: dict[str, str],
+        attempt: int,
+        *,
+        overlay_path: str | None = None,
+        compatibility_overlay_path: str | None = None,
+        unset_env_keys: Sequence[str] = (),
+        project_directory: str | None = None,
+        declared_secret_env_keys: Collection[str] = (),
+    ) -> BootResult:
+        del (
+            provider,
+            sandbox_id,
+            compose_path,
+            env,
+            overlay_path,
+            compatibility_overlay_path,
+            unset_env_keys,
+            project_directory,
+        )
+        assert declared_secret_env_keys == frozenset()
         return BootResult(
             verdict=Verdict.FAIL,
             service_states={},
             logs={"up": "functional failure"},
-            attempt=cast(int, args[-1]),
+            attempt=attempt,
         )
 
     monkeypatch.setattr(graph, "boot_compose", failed_boot)
