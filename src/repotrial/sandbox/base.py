@@ -270,5 +270,9 @@ class SandboxProvider(ABC):
     def expected_image_identity_sha256(self) -> str | None:
         return None
 
+    async def begin_invocation(self) -> None:
+        """Mark the start of one graph invocation for provider-owned state."""
+        return
+
     async def finalize_runtime_template(self) -> None:
         return None

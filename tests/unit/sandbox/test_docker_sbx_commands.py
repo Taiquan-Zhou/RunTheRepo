@@ -1705,6 +1705,68 @@ def test_runtime_template_activation_is_single_use_even_after_finalize(
     asyncio.run(exercise())
 
 
+def test_runtime_template_invocation_begin_resets_activation_guard_and_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    _install_deterministic_clock(monkeypatch, clock)
+    provider = _provider(monkeypatch, _SbxSpawner(), total_duration_s=10)
+    first_id = _create(provider, tmp_path)
+    asyncio.run(provider.destroy(first_id))
+    provider._runtime_template_activation_used = True
+
+    asyncio.run(provider.begin_invocation())
+
+    assert provider._runtime_template_activation_used is False
+    assert provider._trial_deadline is None
+    clock.value = 20
+    second_id = _create(provider, tmp_path)
+    assert provider._sandbox_deadlines[second_id] == 30.0
+    asyncio.run(provider.destroy(second_id))
+
+
+def test_runtime_template_invocation_begin_requires_previous_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(monkeypatch, _SbxSpawner())
+
+    asyncio.run(provider.begin_invocation())
+    with pytest.raises(RuntimeError, match="finalization"):
+        asyncio.run(provider.begin_invocation())
+
+    asyncio.run(provider.finalize_runtime_template())
+    asyncio.run(provider.begin_invocation())
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("_runtime_template_tag", "_runtime_template_pending_tag"),
+)
+def test_runtime_template_invocation_begin_rejects_template_state(
+    monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    provider = _provider(monkeypatch, _SbxSpawner())
+    setattr(provider, field, "repotrial-runtime:" + "a" * 32)
+
+    with pytest.raises(RuntimeError, match="template"):
+        asyncio.run(provider.begin_invocation())
+
+
+def test_runtime_template_invocation_begin_rejects_uncleaned_sandbox_or_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(monkeypatch, _SbxSpawner())
+    provider._sandbox_states["sandbox-17"] = docker_sbx._SandboxState.ACTIVE
+
+    with pytest.raises(RuntimeError, match="sandbox"):
+        asyncio.run(provider.begin_invocation())
+
+    provider._sandbox_states["sandbox-17"] = docker_sbx._SandboxState.CLEANED
+    provider._sandbox_deadlines["sandbox-17"] = 10.0
+    with pytest.raises(RuntimeError, match="deadline"):
+        asyncio.run(provider.begin_invocation())
+
+
 def test_create_uses_active_runtime_template_with_clone_and_policy_flags(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

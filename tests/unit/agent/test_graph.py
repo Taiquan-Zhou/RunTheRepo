@@ -2518,6 +2518,9 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         self._template_identity: str | None = None
         self._warmup_prepared = False
         self.candidate_template_identities: list[str | None] = []
+        self._runtime_template_activation_used = False
+        self._runtime_template_finalization_confirmed = True
+        self._trial_deadline: int | None = None
 
     @property
     def supports_runtime_templates(self) -> bool:
@@ -2526,7 +2529,20 @@ class RuntimeTemplateGraphProvider(GraphProvider):
     def expected_image_identity_sha256(self) -> str | None:
         return self._template_identity
 
+    async def begin_invocation(self) -> None:
+        if not self._runtime_template_finalization_confirmed:
+            raise RuntimeError("runtime template finalization is not confirmed")
+        if self._template_identity is not None:
+            raise RuntimeError("runtime template cleanup is not confirmed")
+        if self._active_sandboxes:
+            raise RuntimeError("sandbox cleanup is not confirmed")
+        self._runtime_template_activation_used = False
+        self._trial_deadline = None
+        self._runtime_template_finalization_confirmed = False
+
     async def create(self, workspace: Path, name: str) -> str:
+        if self._trial_deadline is None:
+            self._trial_deadline = 1
         if name.startswith("repotrial-warmup-"):
             self.events.append("warmup_create")
         elif name.startswith("repotrial-baseline-"):
@@ -2598,6 +2614,9 @@ class RuntimeTemplateGraphProvider(GraphProvider):
     async def activate_runtime_template(
         self, sandbox_id: str, image_identity_sha256: str
     ) -> None:
+        if self._runtime_template_activation_used:
+            raise RuntimeError("runtime template activation already invoked")
+        self._runtime_template_activation_used = True
         self._require_active(sandbox_id)
         assert self._warmup_prepared
         if self.fail_activate:
@@ -2618,6 +2637,7 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         if self._template_identity is not None:
             self.events.append("template_remove")
             self._template_identity = None
+        self._runtime_template_finalization_confirmed = True
 
 
 def test_runtime_template_warmup_precedes_baseline_and_finalizes_once(
@@ -2856,6 +2876,68 @@ def test_runtime_template_candidate_checkpoint_rebuilds_before_next_candidate(
     ]
 
 
+def test_runtime_template_resume_tampered_accepted_compose_stops_before_rewarmup(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, host_port):
+        provider = RuntimeTemplateGraphProvider(host_port=host_port)
+        context, source = _context(tmp_path, provider, risks=("root_user", "cap_add"))
+        graph = build_run_graph(interrupt_after=("decide",))
+        state = _state(source.parent, run_id="runtime-template-accepted-tamper")
+
+        checkpoint = asyncio.run(ainvoke_run(graph, state, context=context))
+        assert len(checkpoint.run.experiments) == 1
+        assert len(provider.candidate_template_identities) == 1
+        assert checkpoint.run.compose_path is not None
+        accepted = context.workspace / checkpoint.run.compose_path
+        accepted.write_text(
+            accepted.read_text(encoding="utf-8").replace(
+                "image: example/web:1", "image: example/web:2"
+            ),
+            encoding="utf-8",
+        )
+
+        resumed = asyncio.run(aresume_run(graph, state.run_id, context=context))
+
+    assert resumed.run.stop_reason == "experiment:parent_hash_mismatch"
+    assert provider.events.count("warmup_create") == 1
+    assert len(provider.candidate_template_identities) == 1
+
+
+def test_runtime_template_resume_startup_input_drift_stops_before_rewarmup(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, host_port):
+        provider = RuntimeTemplateGraphProvider(host_port=host_port)
+        context, source = _context(tmp_path, provider, risks=("root_user", "cap_add"))
+        source.write_text(
+            _compose_text(("root_user", "cap_add")) + "    env_file:\n      - .env\n",
+            encoding="utf-8",
+        )
+        (context.workspace / ".env.sample").write_text(
+            "APP_MODE=test\n", encoding="utf-8"
+        )
+        graph = build_run_graph(interrupt_after=("decide",))
+        state = _state(source.parent, run_id="runtime-template-startup-drift")
+
+        checkpoint = asyncio.run(ainvoke_run(graph, state, context=context))
+        assert len(checkpoint.run.experiments) == 1
+        assert len(provider.candidate_template_identities) == 1
+        identity = graph_module._run_evidence_directory(checkpoint.run, context) / (
+            "startup-input-identity.json"
+        )
+        assert identity.is_file()
+        (context.workspace / ".env.sample").write_text(
+            "APP_MODE=changed\n", encoding="utf-8"
+        )
+
+        resumed = asyncio.run(aresume_run(graph, state.run_id, context=context))
+
+    assert resumed.run.stop_reason == "experiment:startup_input_unsupported"
+    assert provider.events.count("warmup_create") == 1
+    assert len(provider.candidate_template_identities) == 1
+
+
 def test_runtime_template_resume_without_followup_sandbox_does_not_rewarmup(
     tmp_path: Path,
 ) -> None:
@@ -3045,12 +3127,12 @@ def test_graph_failure_and_template_cleanup_failure_preserve_both_objects(
 ) -> None:
     cleanup_failure = OSError("template cleanup failed")
     provider = RuntimeTemplateGraphProvider(finalize_failure=cleanup_failure)
-    provider._template_identity = "a" * 64
     context, _ = _context(tmp_path, provider, journeys=[])
 
     class FailingGraph:
         async def ainvoke(self, *args: object, **kwargs: object) -> object:
             del args, kwargs
+            provider._template_identity = "a" * 64
             raise ValueError("graph body failed")
 
     with pytest.raises(graph_module.RuntimeTemplateCleanupError) as caught:
@@ -3076,12 +3158,12 @@ def test_graph_failure_still_finalizes_active_template(
     tmp_path: Path, failure: BaseException
 ) -> None:
     provider = RuntimeTemplateGraphProvider()
-    provider._template_identity = "a" * 64
     context, _ = _context(tmp_path, provider, journeys=[])
 
     class FailingGraph:
         async def ainvoke(self, *args: object, **kwargs: object) -> object:
             del args, kwargs
+            provider._template_identity = "a" * 64
             raise failure
 
     with pytest.raises(type(failure)):
@@ -3103,13 +3185,13 @@ def test_successful_graph_preserves_template_cleanup_failure(
 ) -> None:
     cleanup_failure = OSError("template removal failed")
     provider = RuntimeTemplateGraphProvider(finalize_failure=cleanup_failure)
-    provider._template_identity = "a" * 64
     context, _ = _context(tmp_path, provider, journeys=[])
     state = _state(context.workspace, run_id="runtime-template-success-cleanup")
 
     class SuccessfulGraph:
         async def ainvoke(self, *args: object, **kwargs: object) -> object:
             del args, kwargs
+            provider._template_identity = "a" * 64
             return GraphState(run=state).model_dump(mode="json")
 
     with pytest.raises(graph_module.RuntimeTemplateCleanupError) as caught:
@@ -3169,7 +3251,6 @@ def test_graph_and_cleanup_failure_retain_audit_failure_as_secondary(
     cleanup_failure = OSError("template removal failed")
     audit_failure = OSError("evidence append failed")
     provider = RuntimeTemplateGraphProvider(finalize_failure=cleanup_failure)
-    provider._template_identity = "a" * 64
     context, _ = _context(tmp_path, provider, journeys=[])
 
     def fail_evidence(*args: object, **kwargs: object) -> BaseException:
@@ -3183,6 +3264,7 @@ def test_graph_and_cleanup_failure_retain_audit_failure_as_secondary(
     class FailingGraph:
         async def ainvoke(self, *args: object, **kwargs: object) -> object:
             del args, kwargs
+            provider._template_identity = "a" * 64
             raise ValueError("graph body failed")
 
     with pytest.raises(graph_module.RuntimeTemplateCleanupError) as caught:

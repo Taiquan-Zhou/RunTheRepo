@@ -340,6 +340,7 @@ class DockerSbxProvider(SandboxProvider):
         self._runtime_template_expected_identity: str | None = None
         self._runtime_template_pending_tag: str | None = None
         self._runtime_template_activation_used = False
+        self._runtime_template_finalization_confirmed = True
 
     @property
     def supports_runtime_templates(self) -> bool:
@@ -347,6 +348,32 @@ class DockerSbxProvider(SandboxProvider):
 
     def expected_image_identity_sha256(self) -> str | None:
         return self._runtime_template_expected_identity
+
+    async def begin_invocation(self) -> None:
+        if not self._runtime_template_finalization_confirmed:
+            raise RuntimeError("runtime template finalization is not confirmed")
+        if any(
+            value is not None
+            for value in (
+                self._runtime_template_tag,
+                self._runtime_template_image_id,
+                self._runtime_template_expected_identity,
+                self._runtime_template_pending_tag,
+            )
+        ):
+            raise RuntimeError("runtime template cleanup is not confirmed")
+        if any(
+            state is not _SandboxState.CLEANED
+            for state in self._sandbox_states.values()
+        ):
+            raise RuntimeError("sandbox cleanup is not confirmed")
+        if self._sandbox_deadlines:
+            raise RuntimeError("sandbox deadline cleanup is not confirmed")
+        if self._network_log_sandboxes or self._stopped_sandboxes:
+            raise RuntimeError("sandbox cleanup is not confirmed")
+        self._runtime_template_activation_used = False
+        self._trial_deadline = None
+        self._runtime_template_finalization_confirmed = False
 
     async def activate_runtime_template(
         self, sandbox_id: str, image_identity_sha256: str
@@ -399,6 +426,7 @@ class DockerSbxProvider(SandboxProvider):
     async def finalize_runtime_template(self) -> None:
         tag = self._runtime_template_tag or self._runtime_template_pending_tag
         if tag is None:
+            self._runtime_template_finalization_confirmed = True
             return
         remaining = await self._list_runtime_templates(deadline=None)
         matches = [item for item in remaining if _runtime_template_matches(item, tag)]
@@ -419,6 +447,7 @@ class DockerSbxProvider(SandboxProvider):
         self._runtime_template_image_id = None
         self._runtime_template_expected_identity = None
         self._runtime_template_pending_tag = None
+        self._runtime_template_finalization_confirmed = True
 
     async def _cleanup_runtime_template(self, tag: str) -> None:
         await self._remove_runtime_template(tag, deadline=None)

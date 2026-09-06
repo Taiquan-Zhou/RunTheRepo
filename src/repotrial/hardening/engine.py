@@ -2,7 +2,7 @@ import hashlib
 import os
 import stat
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -85,6 +85,23 @@ def _stage_failure_reason(error: DockerSbxError, fallback: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class RuntimeTemplatePreparation:
+    """Validated, non-sensitive inputs for one runtime-template warmup."""
+
+    compose_path: str
+    compatibility_overlay_path: Path | None
+    compatibility_overlay_relative: str | None
+    compatibility_overlay_sha256: str | None
+    startup_input_plan: StartupInputPlan | None
+    accepted_compose_path: Path | None
+    accepted_compose_relative: str | None
+    accepted_compose_sha256: str | None
+
+
+type RuntimeTemplatePreparer = Callable[[RuntimeTemplatePreparation], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
 class ExperimentContext:
     workspace: Path
     overlay_path: Path
@@ -96,6 +113,7 @@ class ExperimentContext:
     compatibility_overlay_path: Path | None = None
     compatibility_overlay_sha256: str | None = None
     compatibility_overlay_evidence_path: Path | None = None
+    runtime_template_preparer: RuntimeTemplatePreparer | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +203,27 @@ async def run_experiment(
         )
 
     _validate_artifact_targets(prepared)
+    if context.runtime_template_preparer is not None:
+        await context.runtime_template_preparer(
+            RuntimeTemplatePreparation(
+                compose_path=prepared.compose_path,
+                compatibility_overlay_path=prepared.compatibility_overlay_path,
+                compatibility_overlay_relative=prepared.compatibility_overlay_relative,
+                compatibility_overlay_sha256=context.compatibility_overlay_sha256,
+                startup_input_plan=prepared.startup_input_plan,
+                accepted_compose_path=(
+                    prepared.compose_file
+                    if prepared.accepted_compose_evidence_path is not None
+                    else None
+                ),
+                accepted_compose_relative=(
+                    prepared.compose_path
+                    if prepared.accepted_compose_evidence_path is not None
+                    else None
+                ),
+                accepted_compose_sha256=prepared.accepted_compose_sha256,
+            )
+        )
     try:
         write_overlay(prepared.base, prepared.candidate, prepared.overlay_path)
     except MutationError:

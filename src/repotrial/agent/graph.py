@@ -50,7 +50,12 @@ from repotrial.domain.models import (
     PinnedRepo,
     RunState,
 )
-from repotrial.hardening.engine import ExperimentContext, run_experiment
+from repotrial.hardening.engine import (
+    ExperimentContext,
+    RuntimeTemplatePreparation,
+    RuntimeTemplatePreparer,
+    run_experiment,
+)
 from repotrial.hardening.policy import propose_mutation
 from repotrial.intake.compose_discovery import discover_compose
 from repotrial.journey.http_runner import run_http_journey
@@ -71,7 +76,6 @@ from repotrial.trial import boot as boot_module
 from repotrial.trial.boot import BootResult, _boot_compose_with_evidence, boot_compose
 from repotrial.trial.boot_evidence import record_recovery_evidence
 from repotrial.trial.compatibility import (
-    fingerprint_host_artifact,
     materialize_guest_accepted_compose,
     materialize_guest_compatibility_overlay,
     verify_guest_accepted_compose,
@@ -192,6 +196,7 @@ async def _invoke_graph_with_finalization(
 
     if not context.provider.supports_runtime_templates:
         return await invoke()
+    await context.provider.begin_invocation()
     evidence_handle = _TemplateEvidenceHandle()
     token = _TEMPLATE_EVIDENCE_HANDLE.set(evidence_handle)
     try:
@@ -1243,7 +1248,6 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
         / f"{token}-{index:04d}-attempt-{attempt_slot:02d}.overlay.yaml"
     )
     workspace = _real_directory(context.workspace, "workspace")
-    compose_path = _required_compose_path(state.run)
     env = dict(context.env)
     env.update(state.recovery_env)
     overlay_dir = _real_directory_inside(context.overlay_dir, workspace, "overlay_dir")
@@ -1252,31 +1256,28 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
         raise ValueError("overlay must be a direct child of overlay_dir")
     if overlay_path.exists() or overlay_path.is_symlink():
         raise ValueError("overlay attempt target is already in use")
+    runtime_template_preparer: RuntimeTemplatePreparer | None = None
     if (
         context.provider.supports_runtime_templates
         and context.provider.expected_image_identity_sha256() is None
     ):
-        try:
+
+        async def prepare_runtime_template(
+            preparation: RuntimeTemplatePreparation,
+        ) -> None:
+            nonlocal template_artifact_owned
             recovery_context = (
                 None
                 if context.allowed_env_keys
-                else derive_recovery_context(context.workspace, compose_path)
+                else derive_recovery_context(
+                    context.workspace, preparation.compose_path
+                )
             )
             declared_secret_env_keys = (
                 frozenset()
                 if recovery_context is None
                 else recovery_context.declared_secret_env_keys
             )
-            startup_plan = plan_startup_input(context.workspace, compose_path)
-            accepted_compose_path: Path | None = None
-            accepted_compose_relative: str | None = None
-            accepted_compose_sha256: str | None = None
-            if compose_path.startswith(".repotrial-accepted/"):
-                accepted_compose_path = _compose_source(workspace, compose_path)
-                accepted_compose_relative = compose_path
-                accepted_compose_sha256 = fingerprint_host_artifact(
-                    accepted_compose_path
-                )
             await _prepare_runtime_template(
                 state.run,
                 context,
@@ -1284,64 +1285,21 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
                 attempt_slot=attempt_slot,
                 attempt_dir=attempt_dir,
                 env=env,
-                compose_path=compose_path,
-                compatibility_path=compatibility_path,
-                compatibility_relative=(
-                    None
-                    if compatibility_path is None
-                    else compatibility_path.relative_to(workspace).as_posix()
-                ),
-                startup_plan=startup_plan,
+                compose_path=preparation.compose_path,
+                compatibility_path=preparation.compatibility_overlay_path,
+                compatibility_relative=preparation.compatibility_overlay_relative,
+                startup_plan=preparation.startup_input_plan,
                 declared_secret_env_keys=declared_secret_env_keys,
                 expected_compatibility_sha256=(
-                    state.run.compatibility_overlay_sha256 or ""
+                    preparation.compatibility_overlay_sha256 or ""
                 ),
-                accepted_compose_path=accepted_compose_path,
-                accepted_compose_relative=accepted_compose_relative,
-                accepted_compose_sha256=accepted_compose_sha256,
+                accepted_compose_path=preparation.accepted_compose_path,
+                accepted_compose_relative=preparation.accepted_compose_relative,
+                accepted_compose_sha256=preparation.accepted_compose_sha256,
             )
             template_artifact_owned = True
-        except asyncio.CancelledError:
-            raise
-        except CleanupError:
-            raise
-        except StartupInputUnsupported:
-            if (
-                not template_evidence_preexisting
-                and template_evidence.is_file()
-                and not template_evidence.is_symlink()
-            ):
-                template_artifact_owned = True
-            return {
-                "run": template_run(state.run, stop_reason="startup_input_unsupported"),
-                "pending_mutation": None,
-                "pending_experiment": None,
-                "pending_overlay_path": None,
-                "pending_overlay_materialized": None,
-                "stage_history": _visit(state, "experiment"),
-            }
-        except (
-            AssertionError,
-            ImageTemplateError,
-            OSError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-        ) as error:
-            if (
-                not template_evidence_preexisting
-                and template_evidence.is_file()
-                and not template_evidence.is_symlink()
-            ):
-                template_artifact_owned = True
-            return {
-                "run": template_run(state.run, stop_reason=_warmup_stop_reason(error)),
-                "pending_mutation": None,
-                "pending_experiment": None,
-                "pending_overlay_path": None,
-                "pending_overlay_materialized": None,
-                "stage_history": _visit(state, "experiment"),
-            }
+
+        runtime_template_preparer = prepare_runtime_template
     experiment_context = ExperimentContext(
         workspace=context.workspace,
         overlay_path=overlay_path,
@@ -1359,6 +1317,7 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
         startup_input_identity_path=(
             _run_evidence_directory(state.run, context) / "startup-input-identity.json"
         ),
+        runtime_template_preparer=runtime_template_preparer,
     )
     verify_baseline_journeys(
         _baseline_journey_artifact(state.run, context), state.run.journeys
@@ -1370,9 +1329,48 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
             context.provider,
             context=experiment_context,
         )
+    except CleanupError:
+        raise
     except CompatibilityError as error:
         return {
             "run": template_run(state.run, stop_reason=f"compatibility:{error.reason}"),
+            "pending_mutation": None,
+            "pending_experiment": None,
+            "pending_overlay_path": None,
+            "pending_overlay_materialized": None,
+            "stage_history": _visit(state, "experiment"),
+        }
+    except StartupInputUnsupported:
+        if (
+            not template_evidence_preexisting
+            and template_evidence.is_file()
+            and not template_evidence.is_symlink()
+        ):
+            template_artifact_owned = True
+        return {
+            "run": template_run(state.run, stop_reason="startup_input_unsupported"),
+            "pending_mutation": None,
+            "pending_experiment": None,
+            "pending_overlay_path": None,
+            "pending_overlay_materialized": None,
+            "stage_history": _visit(state, "experiment"),
+        }
+    except (
+        AssertionError,
+        ImageTemplateError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        if (
+            not template_evidence_preexisting
+            and template_evidence.is_file()
+            and not template_evidence.is_symlink()
+        ):
+            template_artifact_owned = True
+        return {
+            "run": template_run(state.run, stop_reason=_warmup_stop_reason(error)),
             "pending_mutation": None,
             "pending_experiment": None,
             "pending_overlay_path": None,
