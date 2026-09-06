@@ -137,6 +137,7 @@ _TEMPLATE_REASON_PATTERN = re.compile(r"[a-z0-9_]{1,64}\Z")
 class _TemplateEvidenceHandle:
     path: Path | None = None
     owned: bool = False
+    activation_identity: RuntimeTemplateIdentity | None = None
 
 
 _TEMPLATE_EVIDENCE_HANDLE: ContextVar[_TemplateEvidenceHandle | None] = ContextVar(
@@ -208,7 +209,8 @@ async def _invoke_graph_with_finalization(
                 result = await invoke()
         except RuntimeTemplateCleanupError as error:
             template_audit, audit_read_failure = _runtime_template_audit_snapshot(
-                context.provider
+                context.provider,
+                activation_identity=evidence_handle.activation_identity,
             )
             audit_failure = _append_template_finalization_evidence(
                 context.artifact_dir,
@@ -225,7 +227,8 @@ async def _invoke_graph_with_finalization(
             raise
         except BaseException as error:
             template_audit, audit_read_failure = _runtime_template_audit_snapshot(
-                context.provider
+                context.provider,
+                activation_identity=evidence_handle.activation_identity,
             )
             audit_failure = _append_template_finalization_evidence(
                 context.artifact_dir,
@@ -239,7 +242,8 @@ async def _invoke_graph_with_finalization(
                 _retain_template_secondary_failure(error, audit_failure)
             raise
         template_audit, audit_read_failure = _runtime_template_audit_snapshot(
-            context.provider
+            context.provider,
+            activation_identity=evidence_handle.activation_identity,
         )
         audit_failure = _append_template_finalization_evidence(
             context.artifact_dir,
@@ -1865,11 +1869,19 @@ def _read_runtime_template_audit(provider: SandboxProvider) -> RuntimeTemplateAu
 
 def _runtime_template_audit_snapshot(
     provider: SandboxProvider,
+    *,
+    activation_identity: RuntimeTemplateIdentity | None = None,
 ) -> tuple[RuntimeTemplateAudit | None, BaseException | None]:
     try:
-        return _read_runtime_template_audit(provider), None
+        audit = _read_runtime_template_audit(provider)
     except ImageTemplateError as error:
         return None, error
+    if activation_identity is not None and (
+        audit.identity != activation_identity
+        or any(use.identity != activation_identity for use in audit.uses)
+    ):
+        return audit, ImageTemplateError("runtime_template_audit_invalid")
+    return audit, None
 
 
 async def _prepare_runtime_template(
@@ -1982,6 +1994,14 @@ async def _prepare_runtime_template(
                 or identity.image_identity_sha256 != inventory.sha256
             ):
                 raise ImageTemplateError("runtime_template_identity_invalid")
+            if (
+                evidence_handle is not None
+                and evidence_handle.activation_identity is not None
+                and evidence_handle.activation_identity != identity
+            ):
+                raise ImageTemplateError("runtime_template_identity_invalid")
+            if evidence_handle is not None:
+                evidence_handle.activation_identity = identity
             template_evidence.record(
                 "activate",
                 "success",

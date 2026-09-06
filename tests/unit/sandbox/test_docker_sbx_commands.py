@@ -1532,6 +1532,70 @@ def test_runtime_template_cleanup_after_save_uses_unbounded_deadline_and_confirm
     assert list_count == 3
 
 
+def test_runtime_template_finalize_retries_pending_tag_without_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch,
+        spawner,
+        deadline=time.monotonic() + 300.0,
+    )
+    list_count = 0
+    remove_count = 0
+    saved_tag: str | None = None
+    removed = False
+
+    async def listed(deadline: float | None = None) -> tuple[object, ...]:
+        del deadline
+        nonlocal list_count
+        list_count += 1
+        if list_count == 1:
+            return ()
+        if list_count == 2:
+            raise DockerSbxError("template_ls", "template_list_invalid")
+        if removed:
+            return ()
+        assert saved_tag is not None
+        return (
+            docker_sbx._RuntimeTemplate(
+                "docker.io/library/repotrial-runtime",
+                saved_tag.split(":", 1)[1],
+                "a" * 12,
+            ),
+        )
+
+    async def remove(reference: str, *, deadline: float | None) -> None:
+        del deadline
+        nonlocal remove_count, removed
+        pending_tag = provider._runtime_template_pending_tag
+        assert pending_tag is not None
+        assert reference == pending_tag
+        remove_count += 1
+        if remove_count == 1:
+            raise DockerSbxError("template_rm", "io_error")
+        removed = True
+
+    monkeypatch.setattr(provider, "_list_runtime_templates", listed)
+    monkeypatch.setattr(provider, "_remove_runtime_template", remove)
+
+    with pytest.raises(DockerSbxError, match="template_list_invalid"):
+        asyncio.run(provider.activate_runtime_template(sandbox_id, "b" * 64))
+
+    saved_tag = provider._runtime_template_pending_tag
+    assert saved_tag is not None
+    assert provider._runtime_template_identity is None
+    assert provider.runtime_template_audit().identity is None
+
+    asyncio.run(provider.finalize_runtime_template())
+
+    assert list_count == 4
+    assert remove_count == 2
+    assert provider._runtime_template_pending_tag is None
+    assert provider.runtime_template_audit().identity is None
+    assert provider.runtime_template_audit().removal_confirmed is True
+
+
 def test_runtime_template_finalize_removes_by_owned_tag_and_preserves_shared_image(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -472,6 +472,17 @@ class DockerSbxProvider(SandboxProvider):
             )
             self._runtime_template_finalization_confirmed = True
             return
+        if (
+            active_identity is None
+            and audit_identity is None
+            and self._runtime_template_tag is None
+            and self._runtime_template_image_id is None
+            and self._runtime_template_expected_identity is None
+            and not self._runtime_template_audit.uses
+            and _RUNTIME_TEMPLATE_TAG.fullmatch(tag) is not None
+        ):
+            await self._finalize_pending_runtime_template(tag)
+            return
         if active_identity is None or audit_identity != active_identity:
             raise DockerSbxError("template_finalize", "template_identity_invalid")
         if self._runtime_template_audit.removal_confirmed:
@@ -518,6 +529,20 @@ class DockerSbxProvider(SandboxProvider):
         self._runtime_template_expected_identity = None
         self._runtime_template_pending_tag = None
         self._runtime_template_identity = None
+        self._runtime_template_finalization_confirmed = True
+
+    async def _finalize_pending_runtime_template(self, tag: str) -> None:
+        remaining = await self._list_runtime_templates(deadline=None)
+        matches = [item for item in remaining if _runtime_template_matches(item, tag)]
+        if len(matches) > 1:
+            raise DockerSbxError("template_finalize", "template_identity_invalid")
+        if matches:
+            await self._remove_runtime_template(tag, deadline=None)
+        remaining = await self._list_runtime_templates(deadline=None)
+        if any(_runtime_template_matches(item, tag) for item in remaining):
+            raise DockerSbxError("template_finalize", "template_still_present")
+        self._runtime_template_pending_tag = None
+        self._runtime_template_audit = RuntimeTemplateAudit(removal_confirmed=True)
         self._runtime_template_finalization_confirmed = True
 
     async def _cleanup_runtime_template(self, tag: str) -> None:

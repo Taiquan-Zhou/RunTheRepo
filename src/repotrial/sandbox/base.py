@@ -451,11 +451,15 @@ class SandboxProvider(ABC):
     def runtime_template_audit(self) -> RuntimeTemplateAudit:
         """Return the immutable audit snapshot for this invocation."""
 
+        if self.supports_runtime_templates:
+            raise RuntimeError("runtime template audit is unsupported")
         return RuntimeTemplateAudit(removal_confirmed=True)
 
     async def begin_invocation(self) -> None:
         """Mark the start of one graph invocation for provider-owned state."""
-        return
+        if self.supports_runtime_templates:
+            raise RuntimeError("runtime template invocation is unsupported")
 
     async def finalize_runtime_template(self) -> None:
-        return None
+        if self.supports_runtime_templates:
+            raise RuntimeError("runtime template finalization is unsupported")

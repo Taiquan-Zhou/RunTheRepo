@@ -2509,6 +2509,7 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         wrong_guest_workspace: bool = False,
         prepare_cancellation: asyncio.CancelledError | None = None,
         warmup_destroy_error: BaseException | None = None,
+        finalize_audit_identity: RuntimeTemplateIdentity | None = None,
     ) -> None:
         super().__init__(host_port=host_port)
         self.events: list[str] = []
@@ -2521,6 +2522,7 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         self.wrong_guest_workspace = wrong_guest_workspace
         self.prepare_cancellation = prepare_cancellation
         self.warmup_destroy_error = warmup_destroy_error
+        self.finalize_audit_identity = finalize_audit_identity
         self._template_identity: str | None = None
         self._template_runtime_identity: RuntimeTemplateIdentity | None = None
         self._template_audit = RuntimeTemplateAudit(removal_confirmed=True)
@@ -2676,7 +2678,26 @@ class RuntimeTemplateGraphProvider(GraphProvider):
             uses=self._template_audit.uses,
             removal_confirmed=True,
         )
+        if self.finalize_audit_identity is not None:
+            self._template_audit = RuntimeTemplateAudit(
+                identity=self.finalize_audit_identity,
+                removal_confirmed=True,
+            )
         self._runtime_template_finalization_confirmed = True
+
+
+class IncompleteRuntimeTemplateProvider(FakeSandboxProvider):
+    @property
+    def supports_runtime_templates(self) -> bool:
+        return True
+
+    async def begin_invocation(self) -> None:
+        return
+
+    async def activate_runtime_template(
+        self, sandbox_id: str, image_identity_sha256: str
+    ) -> None:
+        del sandbox_id, image_identity_sha256
 
 
 def test_runtime_template_warmup_precedes_baseline_and_finalizes_once(
@@ -2811,6 +2832,61 @@ def test_ordinary_run_experiment_error_is_not_image_prepare_failure(
         )
 
     assert result.run.stop_reason == "operation_failed"
+
+
+def test_capable_provider_without_audit_contract_fails_closed(
+    tmp_path: Path,
+) -> None:
+    provider = IncompleteRuntimeTemplateProvider()
+    context, _ = _context(tmp_path, provider, journeys=[])
+    state = _state(context.workspace, run_id="runtime-template-missing-audit")
+
+    class ActivatingGraph:
+        async def ainvoke(self, *args: object, **kwargs: object) -> object:
+            del args
+            await provider.activate_runtime_template("sandbox", "a" * 64)
+            return GraphState(run=state).model_dump(mode="json")
+
+    with pytest.raises(RuntimeError, match="runtime template"):
+        asyncio.run(
+            graph_module._invoke_graph_with_finalization(
+                ActivatingGraph(),
+                None,
+                state.run_id,
+                context=context,
+                config=None,
+            )
+        )
+
+
+def test_runtime_template_final_audit_identity_mismatch_fails_closed(
+    tmp_path: Path,
+) -> None:
+    mismatched_identity = RuntimeTemplateIdentity(
+        repository="docker.io/library/repotrial-runtime",
+        tag="b" * 32,
+        image_id="b" * 12,
+        image_identity_sha256="c" * 64,
+    )
+    with _healthy_server() as (_, host_port):
+        provider = RuntimeTemplateGraphProvider(
+            host_port=host_port,
+            finalize_audit_identity=mismatched_identity,
+        )
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+
+        with pytest.raises(graph_module._TemplateEvidenceError) as caught:
+            _run(
+                _state(source.parent, run_id="runtime-template-audit-mismatch"),
+                context,
+            )
+
+    assert caught.value.reason == "runtime_template_evidence_failed"
+    evidence = list(context.artifact_dir.glob("baseline-*/image-template.jsonl"))
+    rows = [json.loads(line) for line in evidence[0].read_text().splitlines()]
+    assert rows[-1]["event"] == "template_remove"
+    assert rows[-1]["outcome"] == "cleanup_failure"
+    assert rows[-1]["removal_confirmed"] is False
 
 
 def test_runtime_template_resume_after_baseline_checkpoint_prepares_before_first_warmup(
