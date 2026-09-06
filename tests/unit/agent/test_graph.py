@@ -2517,6 +2517,7 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         self.warmup_destroy_error = warmup_destroy_error
         self._template_identity: str | None = None
         self._warmup_prepared = False
+        self.candidate_template_identities: list[str | None] = []
 
     @property
     def supports_runtime_templates(self) -> bool:
@@ -2531,6 +2532,9 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         elif name.startswith("repotrial-baseline-"):
             self.events.append("baseline_create")
         elif name.startswith("repotrial-candidate-"):
+            if self._template_identity is None:
+                raise AssertionError("candidate create requires active template")
+            self.candidate_template_identities.append(self._template_identity)
             self.events.append("candidate_create")
         sandbox_id = await super().create(workspace, name)
         if name.startswith("repotrial-warmup-"):
@@ -2727,20 +2731,184 @@ def test_runtime_template_warmup_failure_stops_before_baseline(
     }
 
 
-def test_runtime_template_resume_without_active_identity_fails_closed(
+def test_runtime_template_resume_after_baseline_checkpoint_prepares_before_first_warmup(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, host_port):
+        provider = RuntimeTemplateGraphProvider(host_port=host_port)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+        graph = build_run_graph(interrupt_after=("baseline",))
+        state = _state(source.parent, run_id="runtime-template-baseline-resume")
+
+        interrupted = asyncio.run(ainvoke_run(graph, state, context=context))
+        assert interrupted.stage_history == ["intake", "baseline"]
+        assert provider.events == []
+
+        resumed = asyncio.run(aresume_run(graph, state.run_id, context=context))
+
+    assert resumed.run.stop_reason == "no_remaining_mutations"
+    assert provider.events[:4] == [
+        "warmup_create",
+        "prepare",
+        "activate",
+        "warmup_destroy",
+    ]
+    assert provider.events[-1] == "template_remove"
+    assert len(provider.candidate_template_identities) == 1
+    assert len(provider.candidate_template_identities[0] or "") == 64
+
+
+def test_runtime_template_resume_after_boot_rebuilds_before_candidate_with_immutable_startup(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, host_port):
+        provider = RuntimeTemplateGraphProvider(host_port=host_port)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+        graph = build_run_graph(interrupt_after=("boot",))
+        state = _state(source.parent, run_id="runtime-template-boot-resume")
+
+        interrupted = asyncio.run(ainvoke_run(graph, state, context=context))
+        assert interrupted.stage_history == ["intake", "baseline", "boot"]
+        assert provider.expected_image_identity_sha256() is None
+        assert provider.events == [
+            "warmup_create",
+            "prepare",
+            "activate",
+            "warmup_destroy",
+            "baseline_create",
+            "template_remove",
+        ]
+
+        resumed = asyncio.run(aresume_run(graph, state.run_id, context=context))
+
+    assert resumed.run.stop_reason == "no_remaining_mutations"
+    assert provider.events[6:] == [
+        "warmup_create",
+        "prepare",
+        "activate",
+        "warmup_destroy",
+        "candidate_create",
+        "template_remove",
+    ]
+    assert len(provider.candidate_template_identities) == 1
+    assert len(provider.candidate_template_identities[0] or "") == 64
+    candidate_ids = {
+        sandbox_id
+        for sandbox_id, role in provider._roles.items()
+        if role == "candidate"
+    }
+    candidate_up = [
+        call[2]
+        for call in provider.calls
+        if call[0] == "exec"
+        and call[1] in candidate_ids
+        and call[2][-8:]
+        == (
+            "up",
+            "-d",
+            "--wait",
+            "--wait-timeout",
+            "60",
+            "--pull",
+            "never",
+            "--no-build",
+        )
+    ]
+    assert len(candidate_up) == 1
+
+
+def test_runtime_template_candidate_checkpoint_rebuilds_before_next_candidate(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, host_port):
+        provider = RuntimeTemplateGraphProvider(host_port=host_port)
+        context, source = _context(tmp_path, provider, risks=("root_user", "cap_add"))
+        graph = build_run_graph(interrupt_after=("experiment",))
+        state = _state(source.parent, run_id="runtime-template-candidate-resume")
+
+        first = asyncio.run(ainvoke_run(graph, state, context=context))
+        assert first.pending_experiment is not None
+        assert provider.expected_image_identity_sha256() is None
+        first_resume = asyncio.run(aresume_run(graph, state.run_id, context=context))
+        assert first_resume.pending_experiment is not None
+        assert provider.expected_image_identity_sha256() is None
+        second_resume = asyncio.run(aresume_run(graph, state.run_id, context=context))
+
+    assert second_resume.run.stop_reason == "no_remaining_mutations"
+    assert len(provider.candidate_template_identities) == 2
+    assert all(
+        len(identity or "") == 64 for identity in provider.candidate_template_identities
+    )
+    assert provider.events == [
+        "warmup_create",
+        "prepare",
+        "activate",
+        "warmup_destroy",
+        "baseline_create",
+        "candidate_create",
+        "template_remove",
+        "warmup_create",
+        "prepare",
+        "activate",
+        "warmup_destroy",
+        "candidate_create",
+        "template_remove",
+    ]
+
+
+def test_runtime_template_resume_without_followup_sandbox_does_not_rewarmup(
     tmp_path: Path,
 ) -> None:
     provider = RuntimeTemplateGraphProvider()
     context, source = _context(tmp_path, provider, journeys=[])
     graph = build_run_graph(interrupt_after=("boot",))
-    state = _state(source.parent, run_id="runtime-template-resume")
+    state = _state(source.parent, run_id="runtime-template-no-candidate")
 
     interrupted = asyncio.run(ainvoke_run(graph, state, context=context))
-    assert interrupted.run.run_id == state.run_id
+    assert interrupted.stage_history == ["intake", "baseline", "boot"]
+    assert provider.expected_image_identity_sha256() is None
+    resumed = asyncio.run(aresume_run(graph, state.run_id, context=context))
 
-    with pytest.raises(ImageTemplateError, match="runtime_template_resume_unsupported"):
-        asyncio.run(aresume_run(graph, state.run_id, context=context))
-    assert provider.events[-1] == "template_remove"
+    assert resumed.run.stop_reason == "insufficient_coverage"
+    assert provider.events.count("warmup_create") == 1
+    assert "candidate_create" not in provider.events
+
+
+def test_runtime_template_resume_rebuild_failure_is_bounded_and_fail_closed(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, host_port):
+        provider = RuntimeTemplateGraphProvider(host_port=host_port)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+        graph = build_run_graph(interrupt_after=("boot",))
+        state = _state(source.parent, run_id="runtime-template-rebuild-failure")
+
+        interrupted = asyncio.run(ainvoke_run(graph, state, context=context))
+        assert interrupted.stage_history == ["intake", "baseline", "boot"]
+        provider.fail_prepare = True
+
+        resumed = asyncio.run(aresume_run(graph, state.run_id, context=context))
+
+    assert resumed.run.stop_reason == "image_prepare_failed"
+    assert provider.events == [
+        "warmup_create",
+        "prepare",
+        "activate",
+        "warmup_destroy",
+        "baseline_create",
+        "template_remove",
+        "warmup_create",
+        "warmup_destroy",
+    ]
+    assert provider.candidate_template_identities == []
+    assert provider.expected_image_identity_sha256() is None
+    evidence = list(context.artifact_dir.glob("experiment-*/image-template.jsonl"))
+    assert len(evidence) == 1
+    assert (
+        evidence[0].relative_to(context.artifact_dir).as_posix()
+        in resumed.run.artifacts
+    )
+    assert any(item.startswith("baseline-") for item in resumed.run.artifacts)
 
 
 def test_runtime_template_destroy_failure_preserves_cleanup_error(
