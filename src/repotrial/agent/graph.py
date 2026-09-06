@@ -516,6 +516,9 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
         template_evidence_relative = template_evidence.relative_to(
             artifact_root
         ).as_posix()
+        template_evidence_preexisting = (
+            template_evidence.exists() or template_evidence.is_symlink()
+        )
         try:
             await _prepare_runtime_template(
                 state.run,
@@ -546,7 +549,11 @@ async def _boot(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate
             TypeError,
             ValueError,
         ) as error:
-            if template_evidence.is_file() and not template_evidence.is_symlink():
+            if (
+                not template_evidence_preexisting
+                and template_evidence.is_file()
+                and not template_evidence.is_symlink()
+            ):
                 template_artifact_relative = template_evidence_relative
             return {
                 "boot_attempt": attempt,
