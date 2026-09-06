@@ -34,6 +34,7 @@ from repotrial.domain.models import (
 )
 from repotrial.models.base import RecoveryAction
 from repotrial.sandbox.base import ExecResult, SandboxProvider
+from repotrial.sandbox.docker_sbx import DockerSbxError
 from repotrial.sandbox.fake import FakeSandboxProvider
 from repotrial.sandbox.lifecycle import CleanupError
 from repotrial.trial.image_template import ImageTemplateError
@@ -2907,3 +2908,179 @@ def test_graph_failure_still_finalizes_active_template(
         )
 
     assert provider.events == ["template_remove"]
+
+
+def test_successful_graph_preserves_template_cleanup_failure(
+    tmp_path: Path,
+) -> None:
+    cleanup_failure = OSError("template removal failed")
+    provider = RuntimeTemplateGraphProvider(finalize_failure=cleanup_failure)
+    provider._template_identity = "a" * 64
+    context, _ = _context(tmp_path, provider, journeys=[])
+    state = _state(context.workspace, run_id="runtime-template-success-cleanup")
+
+    class SuccessfulGraph:
+        async def ainvoke(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            return GraphState(run=state).model_dump(mode="json")
+
+    with pytest.raises(graph_module.RuntimeTemplateCleanupError) as caught:
+        asyncio.run(
+            graph_module._invoke_graph_with_finalization(
+                SuccessfulGraph(),
+                None,
+                state.run_id,
+                context=context,
+                config=None,
+            )
+        )
+
+    assert caught.value.body_failure is None
+    assert caught.value.cleanup_failure is cleanup_failure
+
+
+def test_runtime_template_warmup_reuses_compatibility_materialization(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, host_port):
+        provider = RuntimeTemplateGraphProvider(host_port=host_port)
+        context, source = _context(tmp_path, provider, journeys=[])
+        source.write_text(
+            _compose_text(()).replace(
+                "    image: example/web:1\n",
+                "    image: example/web:1\n"
+                f"    ports:\n      - '127.0.0.1:{host_port}:8080'\n",
+            ),
+            encoding="utf-8",
+        )
+
+        _run(_state(source.parent, run_id="runtime-template-compatibility"), context)
+
+    warmup_id = next(
+        sandbox_id for sandbox_id, role in provider._roles.items() if role == "warmup"
+    )
+    warmup_calls = [
+        call for call in provider.calls if call[0] == "exec" and call[1] == warmup_id
+    ]
+    compatibility_index = next(
+        index
+        for index, call in enumerate(warmup_calls)
+        if "repotrial-compatibility-overlay" in call[2]
+    )
+    prepare_index = next(
+        index
+        for index, call in enumerate(warmup_calls)
+        if "--ignore-buildable" in call[2]
+    )
+    assert compatibility_index < prepare_index
+
+
+class _FlushBrokenTemplateArtifact:
+    def write(self, _: str) -> None:
+        return
+
+    def flush(self) -> None:
+        raise OSError("evidence flush failed")
+
+    def close(self) -> None:
+        return
+
+
+def test_image_template_evidence_retains_flush_failure() -> None:
+    evidence = graph_module._ImageTemplateEvidence.__new__(
+        graph_module._ImageTemplateEvidence
+    )
+    evidence._artifact = _FlushBrokenTemplateArtifact()
+    evidence._size = 0
+    evidence.audit_failures = []
+
+    evidence.record("prepare", "started")
+    evidence.close()
+
+    assert [str(error) for error in evidence.audit_failures] == [
+        "evidence flush failed"
+    ]
+
+
+def test_graph_and_cleanup_failure_retain_audit_failure_as_secondary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cleanup_failure = OSError("template removal failed")
+    audit_failure = OSError("evidence append failed")
+    provider = RuntimeTemplateGraphProvider(finalize_failure=cleanup_failure)
+    provider._template_identity = "a" * 64
+    context, _ = _context(tmp_path, provider, journeys=[])
+
+    def fail_evidence(*args: object, **kwargs: object) -> BaseException:
+        del args, kwargs
+        return audit_failure
+
+    monkeypatch.setattr(
+        graph_module, "_append_template_finalization_evidence", fail_evidence
+    )
+
+    class FailingGraph:
+        async def ainvoke(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise ValueError("graph body failed")
+
+    with pytest.raises(graph_module.RuntimeTemplateCleanupError) as caught:
+        asyncio.run(
+            graph_module._invoke_graph_with_finalization(
+                FailingGraph(),
+                None,
+                "runtime-template-audit-secondary",
+                context=context,
+                config=None,
+            )
+        )
+
+    assert caught.value.cleanup_failure is cleanup_failure
+    assert isinstance(caught.value.body_failure, ValueError)
+    assert caught.value.secondary_failures == (audit_failure,)
+    assert isinstance(caught.value.__cause__, BaseExceptionGroup)
+    assert audit_failure in caught.value.__cause__.exceptions
+
+
+def test_template_finalization_discovery_and_size_fail_closed(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    run_id = "runtime-template-artifact-boundary"
+    path = (
+        artifact_dir
+        / f"baseline-{graph_module._run_token(run_id)}-0000-attempt-01"
+        / "image-template.jsonl"
+    )
+    path.parent.mkdir()
+
+    discovery_failure = graph_module._append_template_finalization_evidence(
+        artifact_dir, run_id, evidence_path=path
+    )
+    assert isinstance(discovery_failure, OSError)
+
+    path.write_bytes(b"x" * graph_module._MAX_IMAGE_TEMPLATE_EVIDENCE_BYTES)
+    size_failure = graph_module._append_template_finalization_evidence(
+        artifact_dir, run_id, evidence_path=path
+    )
+    assert isinstance(size_failure, OSError)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (
+            ImageTemplateError("guest_workspace_verification_failed"),
+            "image_prepare_failed",
+        ),
+        (
+            DockerSbxError("prepare", "total_duration_exhausted"),
+            "total_duration_exhausted",
+        ),
+        (ImageTemplateError("template_activation_failed"), "image_prepare_failed"),
+        (RuntimeError("warmup cleanup failed"), "image_prepare_failed"),
+    ],
+)
+def test_warmup_failure_reasons_are_bounded(
+    failure: BaseException, expected: str
+) -> None:
+    assert graph_module._warmup_stop_reason(failure) == expected
