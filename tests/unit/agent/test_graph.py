@@ -2496,12 +2496,14 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         fail_prepare: bool = False,
         fail_warmup_destroy: bool = False,
         cancel_prepare: bool = False,
+        finalize_failure: BaseException | None = None,
     ) -> None:
         super().__init__(host_port=host_port)
         self.events: list[str] = []
         self.fail_prepare = fail_prepare
         self.fail_warmup_destroy = fail_warmup_destroy
         self.cancel_prepare = cancel_prepare
+        self.finalize_failure = finalize_failure
         self._template_identity: str | None = None
         self._warmup_prepared = False
 
@@ -2586,6 +2588,8 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         await super().destroy(sandbox_id)
 
     async def finalize_runtime_template(self) -> None:
+        if self.finalize_failure is not None:
+            raise self.finalize_failure
         if self._template_identity is not None:
             self.events.append("template_remove")
             self._template_identity = None
@@ -2767,3 +2771,117 @@ def test_image_template_evidence_is_atomic_no_clobber_and_mode_bounded(
     evidence.record("prepare", "started")
     evidence.close()
     assert json.loads(path.read_text(encoding="utf-8"))["event"] == "prepare"
+
+
+class _BrokenTemplateArtifact:
+    def write(self, _: str) -> None:
+        raise OSError("evidence write failed")
+
+    def flush(self) -> None:
+        raise OSError("evidence flush failed")
+
+    def close(self) -> None:
+        raise OSError("evidence close failed")
+
+
+def test_image_template_evidence_retains_audit_failures() -> None:
+    evidence = graph_module._ImageTemplateEvidence.__new__(
+        graph_module._ImageTemplateEvidence
+    )
+    evidence._artifact = _BrokenTemplateArtifact()
+    evidence._size = 0
+    evidence.audit_failures = []
+
+    evidence.record("prepare", "started")
+    evidence.close()
+
+    assert [str(error) for error in evidence.audit_failures] == [
+        "evidence write failed",
+        "evidence close failed",
+    ]
+
+
+def test_template_finalization_evidence_failure_is_not_silent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    path = (
+        artifact_dir
+        / f"baseline-{graph_module._run_token('run-failure')}-0000-attempt-01"
+        / "image-template.jsonl"
+    )
+    path.parent.mkdir()
+    path.write_text('{"event":"prepare"}\n', encoding="utf-8")
+    original_open = Path.open
+
+    def fail_append(self: Path, *args: object, **kwargs: object):
+        if args and args[0] == "ab":
+            raise OSError("finalization evidence write failed")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_append)
+
+    failure = graph_module._append_template_finalization_evidence(
+        artifact_dir, "run-failure"
+    )
+    assert isinstance(failure, OSError)
+
+
+def test_graph_failure_and_template_cleanup_failure_preserve_both_objects(
+    tmp_path: Path,
+) -> None:
+    cleanup_failure = OSError("template cleanup failed")
+    provider = RuntimeTemplateGraphProvider(finalize_failure=cleanup_failure)
+    provider._template_identity = "a" * 64
+    context, _ = _context(tmp_path, provider, journeys=[])
+
+    class FailingGraph:
+        async def ainvoke(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise ValueError("graph body failed")
+
+    with pytest.raises(graph_module.RuntimeTemplateCleanupError) as caught:
+        asyncio.run(
+            graph_module._invoke_graph_with_finalization(
+                FailingGraph(),
+                None,
+                "runtime-template-dual-failure",
+                context=context,
+                config=None,
+            )
+        )
+
+    assert isinstance(caught.value.body_failure, ValueError)
+    assert caught.value.body_failure.args == ("graph body failed",)
+    assert caught.value.cleanup_failure is cleanup_failure
+
+
+@pytest.mark.parametrize(
+    "failure", [ValueError("graph failed"), asyncio.CancelledError()]
+)
+def test_graph_failure_still_finalizes_active_template(
+    tmp_path: Path, failure: BaseException
+) -> None:
+    provider = RuntimeTemplateGraphProvider()
+    provider._template_identity = "a" * 64
+    context, _ = _context(tmp_path, provider, journeys=[])
+
+    class FailingGraph:
+        async def ainvoke(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise failure
+
+    with pytest.raises(type(failure)):
+        asyncio.run(
+            graph_module._invoke_graph_with_finalization(
+                FailingGraph(),
+                None,
+                "runtime-template-finalize-failure",
+                context=context,
+                config=None,
+            )
+        )
+
+    assert provider.events == ["template_remove"]

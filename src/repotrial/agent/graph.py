@@ -181,19 +181,26 @@ async def _invoke_graph_with_finalization(
         async with managed_runtime_template(context.provider):
             result = await invoke()
     except RuntimeTemplateCleanupError as error:
-        _append_template_finalization_evidence(
+        audit_failure = _append_template_finalization_evidence(
             context.artifact_dir,
             run_id,
             body_failure=error.body_failure,
             cleanup_failure=error.cleanup_failure,
         )
+        if audit_failure is not None:
+            error.secondary_failures = (*error.secondary_failures, audit_failure)
+            _retain_template_secondary_failure(error, audit_failure)
         raise
     except BaseException as error:
-        _append_template_finalization_evidence(
+        audit_failure = _append_template_finalization_evidence(
             context.artifact_dir, run_id, body_failure=error
         )
+        if audit_failure is not None:
+            _retain_template_secondary_failure(error, audit_failure)
         raise
-    _append_template_finalization_evidence(context.artifact_dir, run_id)
+    audit_failure = _append_template_finalization_evidence(context.artifact_dir, run_id)
+    if audit_failure is not None:
+        raise _TemplateEvidenceError((audit_failure,)) from audit_failure
     return result
 
 
@@ -1680,6 +1687,7 @@ async def _prepare_runtime_template(
 ) -> None:
     template_evidence = _ImageTemplateEvidence(attempt_dir / "image-template.jsonl")
     warmup_id: str | None = None
+    primary_failure: BaseException | None = None
     try:
         template_evidence.record("warmup_create", "started")
         async with managed_sandbox(
@@ -1745,23 +1753,58 @@ async def _prepare_runtime_template(
             sandbox_id=warmup_id,
             error=error.destroy_failure,
         )
-        raise
-    except BaseException as error:
+        primary_failure = error
+    except asyncio.CancelledError as error:
         if warmup_id is not None:
             template_evidence.record("warmup_destroy", "success", sandbox_id=warmup_id)
         template_evidence.record(
             "prepare", "failure", sandbox_id=warmup_id, error=error
         )
-        raise
+        primary_failure = error
+    except (AssertionError, OSError, RuntimeError, TypeError, ValueError) as error:
+        if warmup_id is not None:
+            template_evidence.record("warmup_destroy", "success", sandbox_id=warmup_id)
+        template_evidence.record(
+            "prepare", "failure", sandbox_id=warmup_id, error=error
+        )
+        primary_failure = error
     finally:
         template_evidence.close()
+    if template_evidence.audit_failures:
+        audit_error = _TemplateEvidenceError(tuple(template_evidence.audit_failures))
+        if primary_failure is not None:
+            _retain_template_secondary_failure(primary_failure, audit_error)
+            raise primary_failure
+        raise audit_error from audit_error.audit_failures[0]
+    if primary_failure is not None:
+        raise primary_failure
 
 
 def _warmup_stop_reason(error: BaseException) -> str:
-    if isinstance(error, ImageTemplateError):
+    if isinstance(error, ImageTemplateError) and error.reason != (
+        "runtime_template_evidence_failed"
+    ):
         return "image_prepare_failed"
     reason = _template_failure_reason(error)
     return "image_prepare_failed" if reason == "operation_failed" else reason
+
+
+class _TemplateEvidenceError(ImageTemplateError):
+    def __init__(self, audit_failures: tuple[BaseException, ...]) -> None:
+        super().__init__("runtime_template_evidence_failed")
+        self.audit_failures = audit_failures
+
+
+def _retain_template_secondary_failure(
+    primary: BaseException, secondary: BaseException
+) -> None:
+    prior = primary.__cause__
+    if prior is None:
+        primary.__cause__ = secondary
+    else:
+        primary.__cause__ = BaseExceptionGroup(
+            "runtime template secondary failures", [prior, secondary]
+        )
 
 
 def _validated_result(result: object, run_id: str) -> GraphState:
@@ -1797,6 +1840,7 @@ class _ImageTemplateEvidence:
                     pass
             raise
         self._size = 0
+        self.audit_failures: list[BaseException] = []
 
     def record(
         self,
@@ -1820,18 +1864,21 @@ class _ImageTemplateEvidence:
         ).encode("utf-8")
         try:
             if self._size + len(encoded) > _MAX_IMAGE_TEMPLATE_EVIDENCE_BYTES:
+                self.audit_failures.append(
+                    OSError("runtime template evidence size limit exceeded")
+                )
                 return
             self._artifact.write(encoded.decode("utf-8"))
             self._artifact.flush()
             self._size += len(encoded)
-        except (OSError, UnicodeError):
-            return
+        except (OSError, UnicodeError) as failure:
+            self.audit_failures.append(failure)
 
     def close(self) -> None:
         try:
             self._artifact.close()
-        except OSError:
-            return
+        except OSError as error:
+            self.audit_failures.append(error)
 
 
 def _template_failure_reason(error: BaseException) -> str:
@@ -1918,19 +1965,25 @@ def _append_template_finalization_evidence(
     *,
     body_failure: BaseException | None = None,
     cleanup_failure: BaseException | None = None,
-) -> None:
-    if not artifact_dir.is_dir():
-        return
-    paths = sorted(
-        artifact_dir.glob(
-            f"baseline-{_run_token(run_id)}-*-attempt-*/image-template.jsonl"
+) -> BaseException | None:
+    try:
+        if not artifact_dir.is_dir():
+            return OSError("runtime template evidence directory is missing")
+        paths = sorted(
+            artifact_dir.glob(
+                f"baseline-{_run_token(run_id)}-*-attempt-*/image-template.jsonl"
+            )
         )
-    )
+    except OSError as discovery_error:
+        return discovery_error
     if not paths:
-        return
-    path = paths[-1]
-    if path.is_symlink() or not path.is_file():
-        return
+        return OSError("runtime template evidence artifact is missing")
+    try:
+        path = paths[-1]
+        if path.is_symlink() or not path.is_file():
+            return OSError("runtime template evidence artifact is unsafe")
+    except OSError as safety_error:
+        return safety_error
     error: BaseException | None
     if cleanup_failure is not None:
         error = (
@@ -1956,8 +2009,9 @@ def _append_template_finalization_evidence(
     ).encode("utf-8")
     try:
         if path.stat().st_size + len(encoded) > _MAX_IMAGE_TEMPLATE_EVIDENCE_BYTES:
-            return
+            return OSError("runtime template evidence size limit exceeded")
         with path.open("ab") as artifact:
             artifact.write(encoded)
-    except OSError:
-        return
+    except OSError as append_error:
+        return append_error
+    return None
