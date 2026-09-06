@@ -43,6 +43,16 @@ _REAL_DOCKER_IMAGE_ROW = json.dumps(
     separators=(",", ":"),
 )
 COMPOSE_PATH = "compose.yml"
+_ALLOWED_TEMPLATE_ENV_PREFIXES = (
+    (),
+    ("env", "REQUIRED_SECRET=repotrial-synthetic-value"),
+)
+
+
+def _is_allowed_template_command(
+    call: tuple[str, ...], command: tuple[str, ...]
+) -> bool:
+    return any(call == (*prefix, *command) for prefix in _ALLOWED_TEMPLATE_ENV_PREFIXES)
 
 
 def _line(
@@ -195,17 +205,29 @@ class TemplateProvider(FakeSandboxProvider):
             assert call[-1] == _IMAGE_LIST_FORMAT
             return self._result("inventory", stdout=self.inventory_output)
         if call[-2:] == ("pwd", "-P"):
+            command = call[-2:]
+            if not _is_allowed_template_command(call, command):
+                raise AssertionError(f"unexpected guest-root command: {call!r}")
             if self.provider_error_stage == "pwd" and self.provider_error is not None:
                 raise self.provider_error
             return self._result("pwd", stdout=f"{self.guest_root}\n")
         if call[-3:] == ("git", "rev-parse", "--show-toplevel"):
+            command = call[-3:]
+            if not _is_allowed_template_command(call, command):
+                raise AssertionError(f"unexpected guest-root command: {call!r}")
             if (
                 self.provider_error_stage == "git-root"
                 and self.provider_error is not None
             ):
                 raise self.provider_error
             return self._result("git-root", stdout=f"{self.git_root}\n")
-        if call[-5:] == ("rm", "--recursive", "--force", "--", self.guest_root):
+        if call[-5:] in {
+            ("rm", "--recursive", "--force", "--", self.guest_root),
+            ("rm", "--recursive", "--force", "--", self.git_root),
+        }:
+            command = call[-5:]
+            if not _is_allowed_template_command(call, command):
+                raise AssertionError(f"unexpected guest-root command: {call!r}")
             if (
                 self.provider_error_stage == "remove"
                 and self.provider_error is not None
@@ -461,7 +483,10 @@ def test_prepare_compose_image_template_rejects_unproven_guest_root() -> None:
 
         asyncio.run(exercise())
 
-    assert not any(call[-1:] == ("rm",) for call in provider.exec_calls)
+    assert not any(
+        call == ("rm", "--recursive", "--force", "--", provider.guest_root)
+        for call in provider.exec_calls
+    )
     assert provider.activated_identity is None
 
 
@@ -472,7 +497,17 @@ def test_prepare_compose_image_template_rejects_mismatched_git_root() -> None:
     )
 
     with pytest.raises(ImageTemplateError) as error:
-        _prepare(provider)
+
+        async def exercise() -> object:
+            sandbox_id = await provider.create(Path("missing-workspace"), "warmup")
+            return await prepare_compose_image_template(
+                provider,
+                sandbox_id,
+                COMPOSE_PATH,
+                {},
+            )
+
+        asyncio.run(exercise())
 
     assert error.value.reason == "guest_workspace_verification_failed"
     assert any(call[-2:] == ("pwd", "-P") for call in provider.exec_calls)
@@ -481,7 +516,7 @@ def test_prepare_compose_image_template_rejects_mismatched_git_root() -> None:
         for call in provider.exec_calls
     )
     assert not any(
-        call[-5:] == ("rm", "--recursive", "--force", "--", provider.guest_root)
+        call == ("rm", "--recursive", "--force", "--", provider.git_root)
         for call in provider.exec_calls
     )
     assert provider.activated_identity is None

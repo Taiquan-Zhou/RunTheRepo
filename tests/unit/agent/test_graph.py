@@ -64,6 +64,21 @@ _GRAPH_ALLOWED_ENV_KEYS = frozenset(
         "WAKAPI_DB_PASSWORD",
     }
 )
+_RUNTIME_TEMPLATE_ALLOWED_ENV_PREFIXES: tuple[tuple[str, ...], ...] = (
+    (),
+    ("env", "-u", "APP_MODE"),
+)
+
+
+def _is_allowed_runtime_template_command(
+    snapshot: tuple[str, ...], command: tuple[str, ...]
+) -> bool:
+    return any(
+        snapshot == (*prefix, *command)
+        for prefix in _RUNTIME_TEMPLATE_ALLOWED_ENV_PREFIXES
+    )
+
+
 _GRAPH_COMPOSE_ROUTES = {
     ("config", "--format", "json"): "config_format",
     ("config", "--quiet"): "config_quiet",
@@ -2846,6 +2861,9 @@ class RuntimeTemplateGraphProvider(GraphProvider):
                 self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
                 return ExecResult(exit_code=0, stdout="", stderr="")
             if snapshot[-2:] == ("pwd", "-P"):
+                command = snapshot[-2:]
+                if not _is_allowed_runtime_template_command(snapshot, command):
+                    raise AssertionError(f"unexpected guest-root command: {snapshot!r}")
                 self._require_active(sandbox_id)
                 self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
                 return ExecResult(
@@ -2858,6 +2876,9 @@ class RuntimeTemplateGraphProvider(GraphProvider):
                     stderr="",
                 )
             if snapshot[-3:] == ("git", "rev-parse", "--show-toplevel"):
+                command = snapshot[-3:]
+                if not _is_allowed_runtime_template_command(snapshot, command):
+                    raise AssertionError(f"unexpected guest-root command: {snapshot!r}")
                 self._require_active(sandbox_id)
                 self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
                 return ExecResult(
@@ -2865,13 +2886,13 @@ class RuntimeTemplateGraphProvider(GraphProvider):
                     stdout=f"{self.git_root}\n",
                     stderr="",
                 )
-            if snapshot[-5:] == (
-                "rm",
-                "--recursive",
-                "--force",
-                "--",
-                self.guest_root,
-            ):
+            if snapshot[-5:] in {
+                ("rm", "--recursive", "--force", "--", self.guest_root),
+                ("rm", "--recursive", "--force", "--", self.git_root),
+            }:
+                command = snapshot[-5:]
+                if not _is_allowed_runtime_template_command(snapshot, command):
+                    raise AssertionError(f"unexpected guest-root command: {snapshot!r}")
                 self._require_active(sandbox_id)
                 self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
                 return ExecResult(exit_code=0, stdout="", stderr="")
