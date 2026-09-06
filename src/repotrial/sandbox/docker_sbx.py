@@ -20,8 +20,11 @@ from .base import (
     FailureEvidenceRecord,
     FailureEvidenceValue,
     NetworkLogResult,
+    RuntimeTemplateAudit,
+    RuntimeTemplateIdentity,
     SandboxFailureEvidence,
     SandboxProvider,
+    _normalize_runtime_template_repository,
     attach_partial_create_cleanup_context,
     attach_sandbox_failure_evidence,
     get_sandbox_failure_evidence,
@@ -341,6 +344,8 @@ class DockerSbxProvider(SandboxProvider):
         self._runtime_template_pending_tag: str | None = None
         self._runtime_template_activation_used = False
         self._runtime_template_finalization_confirmed = True
+        self._runtime_template_identity: RuntimeTemplateIdentity | None = None
+        self._runtime_template_audit = RuntimeTemplateAudit(removal_confirmed=True)
 
     @property
     def supports_runtime_templates(self) -> bool:
@@ -348,6 +353,9 @@ class DockerSbxProvider(SandboxProvider):
 
     def expected_image_identity_sha256(self) -> str | None:
         return self._runtime_template_expected_identity
+
+    def runtime_template_audit(self) -> RuntimeTemplateAudit:
+        return self._runtime_template_audit
 
     async def begin_invocation(self) -> None:
         if not self._runtime_template_finalization_confirmed:
@@ -359,7 +367,13 @@ class DockerSbxProvider(SandboxProvider):
                 self._runtime_template_image_id,
                 self._runtime_template_expected_identity,
                 self._runtime_template_pending_tag,
+                self._runtime_template_identity,
             )
+        ):
+            raise RuntimeError("runtime template cleanup is not confirmed")
+        if (
+            self._runtime_template_audit.identity is not None
+            and not self._runtime_template_audit.removal_confirmed
         ):
             raise RuntimeError("runtime template cleanup is not confirmed")
         if any(
@@ -374,6 +388,8 @@ class DockerSbxProvider(SandboxProvider):
         self._runtime_template_activation_used = False
         self._trial_deadline = None
         self._runtime_template_finalization_confirmed = False
+        self._runtime_template_identity = None
+        self._runtime_template_audit = RuntimeTemplateAudit()
 
     async def activate_runtime_template(
         self, sandbox_id: str, image_identity_sha256: str
@@ -411,9 +427,22 @@ class DockerSbxProvider(SandboxProvider):
             matches = [item for item in after if _runtime_template_matches(item, tag)]
             if len(matches) != 1:
                 raise DockerSbxError("template_save", "template_identity_invalid")
+            try:
+                identity = RuntimeTemplateIdentity(
+                    repository=matches[0].repository,
+                    tag=matches[0].tag,
+                    image_id=matches[0].image_id,
+                    image_identity_sha256=image_identity_sha256,
+                )
+            except (TypeError, ValueError):
+                raise DockerSbxError(
+                    "template_save", "template_identity_invalid"
+                ) from None
             self._runtime_template_tag = tag
-            self._runtime_template_image_id = matches[0].image_id
+            self._runtime_template_image_id = identity.image_id
             self._runtime_template_expected_identity = image_identity_sha256
+            self._runtime_template_identity = identity
+            self._runtime_template_audit = RuntimeTemplateAudit(identity=identity)
         except (DockerSbxError, asyncio.CancelledError) as primary_error:
             if save_attempted:
                 try:
@@ -424,15 +453,50 @@ class DockerSbxProvider(SandboxProvider):
             raise
 
     async def finalize_runtime_template(self) -> None:
+        active_identity = self._runtime_template_identity
+        audit_identity = self._runtime_template_audit.identity
+        if active_identity is not None and audit_identity != active_identity:
+            raise DockerSbxError("template_finalize", "template_identity_invalid")
+        identity = active_identity or audit_identity
         tag = self._runtime_template_tag or self._runtime_template_pending_tag
         if tag is None:
+            if active_identity is not None or (
+                audit_identity is not None
+                and not self._runtime_template_audit.removal_confirmed
+            ):
+                raise DockerSbxError("template_finalize", "template_identity_invalid")
+            self._runtime_template_audit = RuntimeTemplateAudit(
+                identity=identity,
+                uses=self._runtime_template_audit.uses,
+                removal_confirmed=True,
+            )
             self._runtime_template_finalization_confirmed = True
             return
+        if active_identity is None or audit_identity != active_identity:
+            raise DockerSbxError("template_finalize", "template_identity_invalid")
+        if self._runtime_template_audit.removal_confirmed:
+            raise DockerSbxError("template_finalize", "template_identity_invalid")
+        if identity is None or not _runtime_template_identity_matches_tag(
+            identity, tag
+        ):
+            raise DockerSbxError("template_finalize", "template_identity_invalid")
+        if (
+            self._runtime_template_image_id != identity.image_id
+            or self._runtime_template_expected_identity
+            != identity.image_identity_sha256
+        ):
+            raise DockerSbxError("template_finalize", "template_identity_invalid")
         remaining = await self._list_runtime_templates(deadline=None)
         matches = [item for item in remaining if _runtime_template_matches(item, tag)]
         if len(matches) > 1:
             raise DockerSbxError("template_finalize", "template_identity_invalid")
         if matches:
+            if (
+                matches[0].repository.strip().lower() != identity.repository
+                or matches[0].tag != identity.tag
+                or matches[0].image_id != identity.image_id
+            ):
+                raise DockerSbxError("template_finalize", "template_identity_changed")
             expected_image_id = self._runtime_template_image_id
             if (
                 expected_image_id is not None
@@ -443,10 +507,17 @@ class DockerSbxProvider(SandboxProvider):
             remaining = await self._list_runtime_templates(deadline=None)
             if any(_runtime_template_matches(item, tag) for item in remaining):
                 raise DockerSbxError("template_finalize", "template_still_present")
+        if identity is not None:
+            self._runtime_template_audit = RuntimeTemplateAudit(
+                identity=identity,
+                uses=self._runtime_template_audit.uses,
+                removal_confirmed=True,
+            )
         self._runtime_template_tag = None
         self._runtime_template_image_id = None
         self._runtime_template_expected_identity = None
         self._runtime_template_pending_tag = None
+        self._runtime_template_identity = None
         self._runtime_template_finalization_confirmed = True
 
     async def _cleanup_runtime_template(self, tag: str) -> None:
@@ -493,6 +564,37 @@ class DockerSbxProvider(SandboxProvider):
         _require_success("stop", result)
 
     async def create(self, workspace: Path, name: str) -> str:
+        template_tag = self._runtime_template_tag
+        template_identity = self._runtime_template_identity
+        audit_identity = self._runtime_template_audit.identity
+        if (
+            any(
+                value is not None
+                for value in (
+                    template_tag,
+                    self._runtime_template_image_id,
+                    self._runtime_template_expected_identity,
+                    self._runtime_template_pending_tag,
+                    template_identity,
+                )
+            )
+            or (
+                audit_identity is not None
+                and not self._runtime_template_audit.removal_confirmed
+            )
+        ) and (
+            template_identity is None
+            or template_tag is None
+            or not _runtime_template_identity_matches_tag(
+                template_identity, template_tag
+            )
+            or self._runtime_template_expected_identity
+            != template_identity.image_identity_sha256
+            or self._runtime_template_audit.identity != template_identity
+            or self._runtime_template_audit.removal_confirmed
+            or len(self._runtime_template_audit.uses) >= 128
+        ):
+            raise DockerSbxError("create", "template_identity_invalid")
         deadline = self._trial_deadline
         first_successful_create = deadline is None
         if deadline is None:
@@ -537,8 +639,8 @@ class DockerSbxProvider(SandboxProvider):
         ]
         for resource in sorted(self._policy.deny_network):
             arguments.extend(("--deny-network", resource))
-        if self._runtime_template_tag is not None:
-            arguments.extend(("--template", self._runtime_template_tag))
+        if template_tag is not None:
+            arguments.extend(("--template", template_tag))
         arguments.extend(("shell", str(resolved_workspace)))
         try:
             create_error: DockerSbxError | asyncio.CancelledError | None = None
@@ -620,6 +722,10 @@ class DockerSbxProvider(SandboxProvider):
         self._sandbox_deadlines[sandbox_id] = deadline
         if network_log_supported:
             self._network_log_sandboxes.add(sandbox_id)
+        if template_identity is not None:
+            self._runtime_template_audit = self._runtime_template_audit.with_use(
+                sandbox_id
+            )
         return sandbox_id
 
     async def _host_head(self, workspace: Path, deadline: float) -> str:
@@ -2024,15 +2130,24 @@ def _parse_runtime_templates(output: bytes) -> tuple[_RuntimeTemplate, ...]:
         flavor = item["flavor"]
         created_at = item["created_at"]
         size = item["size"]
+        try:
+            normalized_repository = _normalize_runtime_template_repository(repository)
+            normalized_tag = tag.strip() if isinstance(tag, str) else tag
+        except (TypeError, ValueError):
+            raise DockerSbxError("template_ls", "template_list_invalid") from None
         if (
             not isinstance(image_id, str)
             or _IMAGE_ID.fullmatch(image_id) is None
-            or not isinstance(repository, str)
-            or repository == ""
-            or len(repository.encode("utf-8")) > 512
             or not isinstance(tag, str)
-            or tag == ""
-            or len(tag.encode("utf-8")) > 128
+            or not isinstance(normalized_tag, str)
+            or not normalized_tag
+            or any(
+                ord(character) < 32 or ord(character) == 127 or character.isspace()
+                for character in normalized_tag
+            )
+            or re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z", normalized_tag)
+            is None
+            or len(normalized_tag.encode("utf-8")) > 128
             or not isinstance(flavor, str)
             or len(flavor.encode("utf-8")) > 128
             or not isinstance(created_at, str)
@@ -2045,8 +2160,8 @@ def _parse_runtime_templates(output: bytes) -> tuple[_RuntimeTemplate, ...]:
             raise DockerSbxError("template_ls", "template_list_invalid")
         templates.append(
             _RuntimeTemplate(
-                repository=repository,
-                tag=tag,
+                repository=normalized_repository,
+                tag=normalized_tag,
                 image_id=image_id,
             )
         )
@@ -2059,6 +2174,17 @@ def _runtime_template_matches(template: _RuntimeTemplate, tag: str) -> bool:
     return (
         template.repository == _RUNTIME_TEMPLATE_REPOSITORY
         and template.tag == tag.split(":", 1)[1]
+    )
+
+
+def _runtime_template_identity_matches_tag(
+    identity: RuntimeTemplateIdentity, tag: str
+) -> bool:
+    if _RUNTIME_TEMPLATE_TAG.fullmatch(tag) is None:
+        return False
+    return (
+        identity.repository == _RUNTIME_TEMPLATE_REPOSITORY
+        and identity.tag == tag.split(":", 1)[1]
     )
 
 

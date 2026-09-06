@@ -33,7 +33,13 @@ from repotrial.domain.models import (
     RunState,
 )
 from repotrial.models.base import RecoveryAction
-from repotrial.sandbox.base import ExecResult, SandboxFailureEvidence, SandboxProvider
+from repotrial.sandbox.base import (
+    ExecResult,
+    RuntimeTemplateAudit,
+    RuntimeTemplateIdentity,
+    SandboxFailureEvidence,
+    SandboxProvider,
+)
 from repotrial.sandbox.docker_sbx import DockerSbxError
 from repotrial.sandbox.fake import FakeSandboxProvider
 from repotrial.sandbox.lifecycle import CleanupError
@@ -2516,6 +2522,8 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         self.prepare_cancellation = prepare_cancellation
         self.warmup_destroy_error = warmup_destroy_error
         self._template_identity: str | None = None
+        self._template_runtime_identity: RuntimeTemplateIdentity | None = None
+        self._template_audit = RuntimeTemplateAudit(removal_confirmed=True)
         self._warmup_prepared = False
         self.candidate_template_identities: list[str | None] = []
         self._runtime_template_activation_used = False
@@ -2529,6 +2537,9 @@ class RuntimeTemplateGraphProvider(GraphProvider):
     def expected_image_identity_sha256(self) -> str | None:
         return self._template_identity
 
+    def runtime_template_audit(self) -> RuntimeTemplateAudit:
+        return self._template_audit
+
     async def begin_invocation(self) -> None:
         if not self._runtime_template_finalization_confirmed:
             raise RuntimeError("runtime template finalization is not confirmed")
@@ -2537,6 +2548,8 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         if self._active_sandboxes:
             raise RuntimeError("sandbox cleanup is not confirmed")
         self._runtime_template_activation_used = False
+        self._template_runtime_identity = None
+        self._template_audit = RuntimeTemplateAudit()
         self._trial_deadline = None
         self._runtime_template_finalization_confirmed = False
 
@@ -2553,6 +2566,10 @@ class RuntimeTemplateGraphProvider(GraphProvider):
             self.candidate_template_identities.append(self._template_identity)
             self.events.append("candidate_create")
         sandbox_id = await super().create(workspace, name)
+        if self._template_runtime_identity is not None and not name.startswith(
+            "repotrial-warmup-"
+        ):
+            self._template_audit = self._template_audit.with_use(sandbox_id)
         if name.startswith("repotrial-warmup-"):
             self._roles[sandbox_id] = "warmup"
         return sandbox_id
@@ -2622,6 +2639,15 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         if self.fail_activate:
             raise ImageTemplateError("template_activation_failed")
         self._template_identity = image_identity_sha256
+        self._template_runtime_identity = RuntimeTemplateIdentity(
+            repository="docker.io/library/repotrial-runtime",
+            tag="a" * 32,
+            image_id="a" * 12,
+            image_identity_sha256=image_identity_sha256,
+        )
+        self._template_audit = RuntimeTemplateAudit(
+            identity=self._template_runtime_identity
+        )
         self.events.append("activate")
 
     async def destroy(self, sandbox_id: str) -> None:
@@ -2637,6 +2663,19 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         if self._template_identity is not None:
             self.events.append("template_remove")
             self._template_identity = None
+            identity = self._template_runtime_identity
+            if identity is not None:
+                self._template_audit = RuntimeTemplateAudit(
+                    identity=identity,
+                    uses=self._template_audit.uses,
+                    removal_confirmed=True,
+                )
+                self._template_runtime_identity = None
+        self._template_audit = RuntimeTemplateAudit(
+            identity=self._template_audit.identity,
+            uses=self._template_audit.uses,
+            removal_confirmed=True,
+        )
         self._runtime_template_finalization_confirmed = True
 
 
@@ -2669,6 +2708,8 @@ def test_runtime_template_warmup_precedes_baseline_and_finalizes_once(
         ("prepare", "success"),
         ("activate", "success"),
         ("warmup_destroy", "success"),
+        ("template_use", "success"),
+        ("template_use", "success"),
         ("template_remove", "success"),
     ]
 
@@ -2749,6 +2790,27 @@ def test_runtime_template_warmup_failure_stops_before_baseline(
     assert ("warmup_destroy", "failure") not in {
         (row["event"], row["outcome"]) for row in rows
     }
+
+
+def test_ordinary_run_experiment_error_is_not_image_prepare_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _healthy_server() as (_, host_port):
+        provider = RuntimeTemplateGraphProvider(host_port=host_port)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+
+        async def fail_experiment(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise ValueError("ordinary experiment failure")
+
+        monkeypatch.setattr(graph_module, "run_experiment", fail_experiment)
+
+        result = _run(
+            _state(source.parent, run_id="runtime-template-ordinary-experiment"),
+            context,
+        )
+
+    assert result.run.stop_reason == "operation_failed"
 
 
 def test_runtime_template_resume_after_baseline_checkpoint_prepares_before_first_warmup(
@@ -3494,10 +3556,52 @@ def test_boot_projects_cleanup_failure_with_real_warmup_lifecycle(
         ("prepare", "started"),
         ("prepare", "failure"),
         ("warmup_destroy", "failure"),
-        ("template_remove", "body_failure"),
+        ("template_body_failure", "body_failure"),
+        ("template_remove", "success"),
     ]
     assert rows[3]["reason"] == "operation_failed"
     assert rows[4]["reason"] == "operation_failed"
     assert rows[5]["reason"] == "sandbox_cleanup_failed"
     assert "cleanup-cancel-raw-secret-marker" not in json.dumps(rows)
     assert "cleanup-destroy-raw-secret-marker" not in json.dumps(rows)
+
+
+def test_runtime_template_evidence_persists_inventory_and_use_identity(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, host_port):
+        provider = RuntimeTemplateGraphProvider(host_port=host_port)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+
+        result = _run(
+            _state(source.parent, run_id="runtime-template-audit-identity"), context
+        )
+
+    assert result.run.stop_reason == "no_remaining_mutations"
+    evidence = list(context.artifact_dir.glob("baseline-*/image-template.jsonl"))
+    assert len(evidence) == 1
+    rows = [json.loads(line) for line in evidence[0].read_text().splitlines()]
+    prepare = next(
+        row for row in rows if row["event"] == "prepare" and row["outcome"] == "success"
+    )
+    activate = next(
+        row
+        for row in rows
+        if row["event"] == "activate" and row["outcome"] == "success"
+    )
+    assert prepare["inventory_record_count"] == 1
+    assert prepare["inventory_image_ids"] == ["sha256:" + "a" * 64]
+    assert prepare["inventory_sha256"] == prepare["identity_sha256"]
+    assert activate["inventory_record_count"] == prepare["inventory_record_count"]
+    assert activate["inventory_image_ids"] == prepare["inventory_image_ids"]
+    assert activate["inventory_sha256"] == prepare["inventory_sha256"]
+    identity = activate["template_identity"]
+    assert identity["repository"] == "docker.io/library/repotrial-runtime"
+    assert len(identity["tag"]) == 32
+    assert len(identity["image_id"]) == 12
+    assert identity["image_identity_sha256"] == prepare["inventory_sha256"]
+    uses = [row for row in rows if row["event"] == "template_use"]
+    assert len(uses) == 2
+    assert all(row["template_identity"] == identity for row in uses)
+    assert rows[-1]["event"] == "template_remove"
+    assert rows[-1]["outcome"] == "success"

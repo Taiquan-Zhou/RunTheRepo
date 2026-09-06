@@ -53,6 +53,7 @@ from repotrial.domain.models import (
 from repotrial.hardening.engine import (
     ExperimentContext,
     RuntimeTemplatePreparation,
+    RuntimeTemplatePreparationError,
     RuntimeTemplatePreparer,
     run_experiment,
 )
@@ -62,6 +63,8 @@ from repotrial.journey.http_runner import run_http_journey
 from repotrial.journey.playwright_runner import run_playwright_journey
 from repotrial.models.base import RecoveryAction
 from repotrial.sandbox.base import (
+    RuntimeTemplateAudit,
+    RuntimeTemplateIdentity,
     SandboxProvider,
     find_sandbox_failure_evidence,
     serialize_sandbox_failure_evidence,
@@ -204,31 +207,46 @@ async def _invoke_graph_with_finalization(
             async with managed_runtime_template(context.provider):
                 result = await invoke()
         except RuntimeTemplateCleanupError as error:
+            template_audit, audit_read_failure = _runtime_template_audit_snapshot(
+                context.provider
+            )
             audit_failure = _append_template_finalization_evidence(
                 context.artifact_dir,
                 run_id,
                 evidence_path=evidence_handle.path if evidence_handle.owned else None,
                 body_failure=error.body_failure,
                 cleanup_failure=error.cleanup_failure,
+                template_audit=template_audit,
+                audit_failure=audit_read_failure,
             )
             if audit_failure is not None:
                 error.secondary_failures = (*error.secondary_failures, audit_failure)
                 _retain_template_secondary_failure(error, audit_failure)
             raise
         except BaseException as error:
+            template_audit, audit_read_failure = _runtime_template_audit_snapshot(
+                context.provider
+            )
             audit_failure = _append_template_finalization_evidence(
                 context.artifact_dir,
                 run_id,
                 evidence_path=evidence_handle.path if evidence_handle.owned else None,
                 body_failure=error,
+                template_audit=template_audit,
+                audit_failure=audit_read_failure,
             )
             if audit_failure is not None:
                 _retain_template_secondary_failure(error, audit_failure)
             raise
+        template_audit, audit_read_failure = _runtime_template_audit_snapshot(
+            context.provider
+        )
         audit_failure = _append_template_finalization_evidence(
             context.artifact_dir,
             run_id,
             evidence_path=evidence_handle.path if evidence_handle.owned else None,
+            template_audit=template_audit,
+            audit_failure=audit_read_failure,
         )
         if audit_failure is not None:
             raise _TemplateEvidenceError((audit_failure,)) from audit_failure
@@ -1278,25 +1296,39 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
                 if recovery_context is None
                 else recovery_context.declared_secret_env_keys
             )
-            await _prepare_runtime_template(
-                state.run,
-                context,
-                attempt=index + 1,
-                attempt_slot=attempt_slot,
-                attempt_dir=attempt_dir,
-                env=env,
-                compose_path=preparation.compose_path,
-                compatibility_path=preparation.compatibility_overlay_path,
-                compatibility_relative=preparation.compatibility_overlay_relative,
-                startup_plan=preparation.startup_input_plan,
-                declared_secret_env_keys=declared_secret_env_keys,
-                expected_compatibility_sha256=(
-                    preparation.compatibility_overlay_sha256 or ""
-                ),
-                accepted_compose_path=preparation.accepted_compose_path,
-                accepted_compose_relative=preparation.accepted_compose_relative,
-                accepted_compose_sha256=preparation.accepted_compose_sha256,
-            )
+            try:
+                await _prepare_runtime_template(
+                    state.run,
+                    context,
+                    attempt=index + 1,
+                    attempt_slot=attempt_slot,
+                    attempt_dir=attempt_dir,
+                    env=env,
+                    compose_path=preparation.compose_path,
+                    compatibility_path=preparation.compatibility_overlay_path,
+                    compatibility_relative=preparation.compatibility_overlay_relative,
+                    startup_plan=preparation.startup_input_plan,
+                    declared_secret_env_keys=declared_secret_env_keys,
+                    expected_compatibility_sha256=(
+                        preparation.compatibility_overlay_sha256 or ""
+                    ),
+                    accepted_compose_path=preparation.accepted_compose_path,
+                    accepted_compose_relative=preparation.accepted_compose_relative,
+                    accepted_compose_sha256=preparation.accepted_compose_sha256,
+                )
+            except (asyncio.CancelledError, CleanupError):
+                raise
+            except RuntimeTemplatePreparationError:
+                raise
+            except (
+                AssertionError,
+                ImageTemplateError,
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as error:
+                raise RuntimeTemplatePreparationError(error) from error
             template_artifact_owned = True
 
         runtime_template_preparer = prepare_runtime_template
@@ -1331,6 +1363,23 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
         )
     except CleanupError:
         raise
+    except RuntimeTemplatePreparationError as error:
+        if (
+            not template_evidence_preexisting
+            and template_evidence.is_file()
+            and not template_evidence.is_symlink()
+        ):
+            template_artifact_owned = True
+        return {
+            "run": template_run(
+                state.run, stop_reason=_warmup_stop_reason(error.failure)
+            ),
+            "pending_mutation": None,
+            "pending_experiment": None,
+            "pending_overlay_path": None,
+            "pending_overlay_materialized": None,
+            "stage_history": _visit(state, "experiment"),
+        }
     except CompatibilityError as error:
         return {
             "run": template_run(state.run, stop_reason=f"compatibility:{error.reason}"),
@@ -1370,7 +1419,7 @@ async def _experiment(state: GraphState, runtime: Runtime[GraphContext]) -> Node
         ):
             template_artifact_owned = True
         return {
-            "run": template_run(state.run, stop_reason=_warmup_stop_reason(error)),
+            "run": template_run(state.run, stop_reason=_template_failure_reason(error)),
             "pending_mutation": None,
             "pending_experiment": None,
             "pending_overlay_path": None,
@@ -1797,6 +1846,32 @@ def _run_config(run_id: str, config: RunnableConfig | None) -> RunnableConfig:
     return prepared
 
 
+def _read_runtime_template_audit(provider: SandboxProvider) -> RuntimeTemplateAudit:
+    try:
+        audit = provider.runtime_template_audit()
+    except (
+        AttributeError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        raise ImageTemplateError("runtime_template_audit_invalid") from None
+    if not isinstance(audit, RuntimeTemplateAudit):
+        raise ImageTemplateError("runtime_template_audit_invalid")
+    return audit
+
+
+def _runtime_template_audit_snapshot(
+    provider: SandboxProvider,
+) -> tuple[RuntimeTemplateAudit | None, BaseException | None]:
+    try:
+        return _read_runtime_template_audit(provider), None
+    except ImageTemplateError as error:
+        return None, error
+
+
 async def _prepare_runtime_template(
     run: RunState,
     context: GraphContext,
@@ -1894,12 +1969,28 @@ async def _prepare_runtime_template(
                 "success",
                 sandbox_id=sandbox_id,
                 identity_sha256=inventory.sha256,
+                inventory_record_count=len(inventory.records),
+                inventory_image_ids=[record.image_id for record in inventory.records],
+                inventory_sha256=inventory.sha256,
             )
+            audit = _read_runtime_template_audit(context.provider)
+            identity = audit.identity
+            if (
+                identity is None
+                or audit.removal_confirmed
+                or audit.uses
+                or identity.image_identity_sha256 != inventory.sha256
+            ):
+                raise ImageTemplateError("runtime_template_identity_invalid")
             template_evidence.record(
                 "activate",
                 "success",
                 sandbox_id=sandbox_id,
                 identity_sha256=inventory.sha256,
+                inventory_record_count=len(inventory.records),
+                inventory_image_ids=[record.image_id for record in inventory.records],
+                inventory_sha256=inventory.sha256,
+                template_identity=identity,
             )
         template_evidence.record("warmup_destroy", "success", sandbox_id=warmup_id)
     except CleanupError as error:
@@ -2009,6 +2100,11 @@ class _ImageTemplateEvidence:
         *,
         sandbox_id: str | None = None,
         identity_sha256: str | None = None,
+        inventory_record_count: int | None = None,
+        inventory_image_ids: Sequence[str] | None = None,
+        inventory_sha256: str | None = None,
+        template_identity: RuntimeTemplateIdentity | None = None,
+        removal_confirmed: bool | None = None,
         error: BaseException | None = None,
     ) -> None:
         record = _template_event_record(
@@ -2016,6 +2112,11 @@ class _ImageTemplateEvidence:
             outcome,
             sandbox_id=sandbox_id,
             identity_sha256=identity_sha256,
+            inventory_record_count=inventory_record_count,
+            inventory_image_ids=inventory_image_ids,
+            inventory_sha256=inventory_sha256,
+            template_identity=template_identity,
+            removal_confirmed=removal_confirmed,
             error=error,
         )
         encoded = (
@@ -2085,13 +2186,73 @@ def _template_event_record(
     *,
     sandbox_id: str | None = None,
     identity_sha256: str | None = None,
+    inventory_record_count: int | None = None,
+    inventory_image_ids: Sequence[str] | None = None,
+    inventory_sha256: str | None = None,
+    template_identity: RuntimeTemplateIdentity | None = None,
+    removal_confirmed: bool | None = None,
     error: BaseException | None = None,
 ) -> dict[str, object]:
     record: dict[str, object] = {"event": event, "outcome": outcome}
     if sandbox_id is not None:
         record["sandbox_id"] = sandbox_id
     if identity_sha256 is not None:
+        if (
+            not isinstance(identity_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}\Z", identity_sha256) is None
+        ):
+            raise ValueError("runtime template identity hash is invalid")
         record["identity_sha256"] = identity_sha256
+    if inventory_record_count is not None:
+        if (
+            type(inventory_record_count) is not int
+            or not 0 <= inventory_record_count <= 256
+        ):
+            raise ValueError("runtime template inventory count is invalid")
+        record["inventory_record_count"] = inventory_record_count
+    image_ids: list[str] | None = None
+    if inventory_image_ids is not None:
+        if isinstance(inventory_image_ids, (str, bytes)):
+            raise TypeError("runtime template inventory image IDs are invalid")
+        image_ids = list(inventory_image_ids)
+        if len(image_ids) > 256 or any(
+            not isinstance(image_id, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}\Z", image_id) is None
+            for image_id in image_ids
+        ):
+            raise ValueError("runtime template inventory image IDs are invalid")
+        record["inventory_image_ids"] = image_ids
+    if (
+        inventory_record_count is not None
+        and image_ids is not None
+        and inventory_record_count != len(image_ids)
+    ):
+        raise ValueError("runtime template inventory count does not match IDs")
+    if inventory_sha256 is not None:
+        if (
+            not isinstance(inventory_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}\Z", inventory_sha256) is None
+        ):
+            raise ValueError("runtime template inventory hash is invalid")
+        if identity_sha256 is not None and identity_sha256 != inventory_sha256:
+            raise ValueError("runtime template inventory hash does not match")
+        record["inventory_sha256"] = inventory_sha256
+    if template_identity is not None:
+        if not isinstance(template_identity, RuntimeTemplateIdentity):
+            raise TypeError("runtime template identity is invalid")
+        if (
+            identity_sha256 is not None
+            and identity_sha256 != template_identity.image_identity_sha256
+        ) or (
+            inventory_sha256 is not None
+            and inventory_sha256 != template_identity.image_identity_sha256
+        ):
+            raise ValueError("runtime template identity hash does not match")
+        record["template_identity"] = template_identity.as_public_record()
+    if removal_confirmed is not None:
+        if type(removal_confirmed) is not bool:
+            raise TypeError("runtime template removal confirmation is invalid")
+        record["removal_confirmed"] = removal_confirmed
     if error is None:
         return record
     record["exception_type"] = type(error).__name__
@@ -2126,8 +2287,14 @@ def _append_template_finalization_evidence(
     evidence_path: Path | None = None,
     body_failure: BaseException | None = None,
     cleanup_failure: BaseException | None = None,
+    template_audit: RuntimeTemplateAudit | None = None,
+    audit_failure: BaseException | None = None,
 ) -> BaseException | None:
     if evidence_path is None:
+        if audit_failure is not None:
+            return audit_failure
+        if template_audit is not None and not template_audit.removal_confirmed:
+            return ValueError("runtime template removal is not confirmed")
         return None
     try:
         if not evidence_path.is_relative_to(artifact_dir):
@@ -2145,34 +2312,89 @@ def _append_template_finalization_evidence(
             return OSError("runtime template evidence artifact is unsafe")
     except OSError as safety_error:
         return safety_error
-    error: BaseException | None
-    if cleanup_failure is not None:
-        error = (
-            RuntimeTemplateCleanupError(cleanup_failure, body_failure)
-            if body_failure is not None
-            else cleanup_failure
-        )
-        outcome = "cleanup_failure"
-    elif body_failure is not None:
-        error = body_failure
-        outcome = "body_failure"
+
+    records: list[dict[str, object]] = []
+    if template_audit is None:
+        effective_cleanup_failure = cleanup_failure or audit_failure
+        if effective_cleanup_failure is not None:
+            error: BaseException | None = (
+                RuntimeTemplateCleanupError(effective_cleanup_failure, body_failure)
+                if body_failure is not None
+                else effective_cleanup_failure
+            )
+            outcome = "cleanup_failure"
+        elif body_failure is not None:
+            error = body_failure
+            outcome = "body_failure"
+        else:
+            error = None
+            outcome = "success"
+        records.append(_template_event_record("template_remove", outcome, error=error))
     else:
-        error = None
-        outcome = "success"
-    record = _template_event_record(
-        "template_remove",
-        outcome,
-        error=error,
-    )
-    encoded = (
-        json.dumps(record, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
-        + "\n"
-    ).encode("utf-8")
+        identity = template_audit.identity
+        if not template_audit.removal_confirmed:
+            audit_failure = audit_failure or ValueError(
+                "runtime template removal is not confirmed"
+            )
+        if body_failure is not None:
+            records.append(
+                _template_event_record(
+                    "template_body_failure",
+                    "body_failure",
+                    error=body_failure,
+                )
+            )
+        if identity is not None:
+            records.extend(
+                _template_event_record(
+                    "template_use",
+                    "success",
+                    sandbox_id=use.sandbox_id,
+                    identity_sha256=use.identity.image_identity_sha256,
+                    template_identity=use.identity,
+                )
+                for use in template_audit.uses
+            )
+
+        effective_cleanup_failure = cleanup_failure or audit_failure
+        if effective_cleanup_failure is not None:
+            error = (
+                RuntimeTemplateCleanupError(effective_cleanup_failure, body_failure)
+                if body_failure is not None
+                else effective_cleanup_failure
+            )
+            records.append(
+                _template_event_record(
+                    "template_remove",
+                    "cleanup_failure",
+                    error=error,
+                    template_identity=identity,
+                    removal_confirmed=False,
+                )
+            )
+        else:
+            records.append(
+                _template_event_record(
+                    "template_remove",
+                    "success",
+                    error=None,
+                    template_identity=identity,
+                    removal_confirmed=True,
+                )
+            )
+
     try:
-        if path.stat().st_size + len(encoded) > _MAX_IMAGE_TEMPLATE_EVIDENCE_BYTES:
-            return OSError("runtime template evidence size limit exceeded")
-        with path.open("ab") as artifact:
-            artifact.write(encoded)
-    except OSError as append_error:
+        for record in records:
+            encoded = (
+                json.dumps(
+                    record, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+                )
+                + "\n"
+            ).encode("utf-8")
+            if path.stat().st_size + len(encoded) > _MAX_IMAGE_TEMPLATE_EVIDENCE_BYTES:
+                return OSError("runtime template evidence size limit exceeded")
+            with path.open("ab") as artifact:
+                artifact.write(encoded)
+    except (OSError, TypeError, UnicodeError, ValueError) as append_error:
         return append_error
-    return None
+    return audit_failure

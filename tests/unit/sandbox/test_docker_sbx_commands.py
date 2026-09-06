@@ -14,6 +14,8 @@ from repotrial.sandbox import docker_sbx
 from repotrial.sandbox.base import (
     ExecResult,
     NetworkLogResult,
+    RuntimeTemplateAudit,
+    RuntimeTemplateIdentity,
     get_sandbox_failure_evidence,
     serialize_sandbox_failure_evidence,
 )
@@ -1540,10 +1542,18 @@ def test_runtime_template_finalize_removes_by_owned_tag_and_preserves_shared_ima
         deadline=time.monotonic() + 300.0,
     )
     owned_tag = "repotrial-runtime:" + "e" * 32
-    shared_id = "sha256:" + "f" * 64
+    shared_id = "f" * 12
     provider._runtime_template_tag = owned_tag
     provider._runtime_template_image_id = shared_id
     provider._runtime_template_expected_identity = "a" * 64
+    identity = RuntimeTemplateIdentity(
+        repository="docker.io/library/repotrial-runtime",
+        tag="e" * 32,
+        image_id=shared_id,
+        image_identity_sha256="a" * 64,
+    )
+    provider._runtime_template_identity = identity
+    provider._runtime_template_audit = RuntimeTemplateAudit(identity=identity)
     removed: list[str] = []
     removed_owned = False
 
@@ -1583,10 +1593,18 @@ def test_runtime_template_finalize_keeps_state_when_owned_tag_remains(
         deadline=time.monotonic() + 300.0,
     )
     owned_tag = "repotrial-runtime:" + "1" * 32
-    image_id = "sha256:" + "2" * 64
+    image_id = "2" * 12
     provider._runtime_template_tag = owned_tag
     provider._runtime_template_image_id = image_id
     provider._runtime_template_expected_identity = "3" * 64
+    identity = RuntimeTemplateIdentity(
+        repository="docker.io/library/repotrial-runtime",
+        tag="1" * 32,
+        image_id=image_id,
+        image_identity_sha256="3" * 64,
+    )
+    provider._runtime_template_identity = identity
+    provider._runtime_template_audit = RuntimeTemplateAudit(identity=identity)
 
     async def listed(deadline: float | None = None) -> tuple[object, ...]:
         del deadline
@@ -1623,8 +1641,17 @@ def test_runtime_template_finalize_propagates_remove_failure_and_uses_tag(
     )
     owned_tag = "repotrial-runtime:" + "7" * 32
     provider._runtime_template_tag = owned_tag
-    provider._runtime_template_image_id = "sha256:" + "8" * 64
+    image_id = "8" * 12
+    provider._runtime_template_image_id = image_id
     provider._runtime_template_expected_identity = "9" * 64
+    identity = RuntimeTemplateIdentity(
+        repository="docker.io/library/repotrial-runtime",
+        tag="7" * 32,
+        image_id=image_id,
+        image_identity_sha256="9" * 64,
+    )
+    provider._runtime_template_identity = identity
+    provider._runtime_template_audit = RuntimeTemplateAudit(identity=identity)
     references: list[str] = []
 
     async def remove(reference: str, *, deadline: float | None) -> None:
@@ -1777,6 +1804,16 @@ def test_create_uses_active_runtime_template_with_clone_and_policy_flags(
         deadline=time.monotonic() + 300.0,
     )
     provider._runtime_template_tag = "repotrial-runtime:" + "c" * 32
+    identity = RuntimeTemplateIdentity(
+        repository="docker.io/library/repotrial-runtime",
+        tag="c" * 32,
+        image_id="c" * 12,
+        image_identity_sha256="a" * 64,
+    )
+    provider._runtime_template_identity = identity
+    provider._runtime_template_image_id = identity.image_id
+    provider._runtime_template_expected_identity = identity.image_identity_sha256
+    provider._runtime_template_audit = RuntimeTemplateAudit(identity=identity)
 
     sandbox_id = _create(provider, tmp_path)
 

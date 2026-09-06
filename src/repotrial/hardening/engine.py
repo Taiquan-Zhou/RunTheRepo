@@ -77,6 +77,14 @@ class _ExperimentSandboxFailure(RuntimeError):
         self.after = after
 
 
+class RuntimeTemplatePreparationError(RuntimeError):
+    """Mark only a runtime-template warmup callback failure."""
+
+    def __init__(self, failure: BaseException) -> None:
+        super().__init__("runtime template preparation failed")
+        self.failure = failure
+
+
 def _stage_failure_reason(error: DockerSbxError, fallback: str) -> str:
     """Preserve the bounded provider deadline reason at the public boundary."""
     if error.reason == "total_duration_exhausted":

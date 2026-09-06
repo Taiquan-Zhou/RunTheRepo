@@ -5,7 +5,14 @@ from typing import cast
 
 import pytest
 
-from repotrial.sandbox.base import ExecResult, NetworkLogResult, SandboxProvider
+from repotrial.sandbox.base import (
+    ExecResult,
+    NetworkLogResult,
+    RuntimeTemplateAudit,
+    RuntimeTemplateIdentity,
+    RuntimeTemplateUse,
+    SandboxProvider,
+)
 from repotrial.sandbox.fake import FakeSandboxProvider
 
 
@@ -300,3 +307,42 @@ def test_network_log_distinguishes_observed_empty_from_unsupported(
     assert unsupported.events == []
     assert unsupported.supported is False
     assert unsupported.unsupported_reason
+
+
+def test_runtime_template_audit_is_immutable_and_bounded() -> None:
+    identity = RuntimeTemplateIdentity(
+        repository="docker.io/library/repotrial-runtime",
+        tag="a" * 32,
+        image_id="a" * 12,
+        image_identity_sha256="b" * 64,
+    )
+    use = RuntimeTemplateUse(sandbox_id="repotrial-candidate-a", identity=identity)
+    audit = RuntimeTemplateAudit(identity=identity, uses=(use,), removal_confirmed=True)
+
+    assert audit.identity is identity
+    assert audit.uses == (use,)
+    assert audit.removal_confirmed is True
+    with pytest.raises((AttributeError, TypeError)):
+        audit.removal_confirmed = False
+
+    with pytest.raises(ValueError, match="image_id"):
+        RuntimeTemplateIdentity(
+            repository="docker.io/library/repotrial-runtime",
+            tag="a" * 32,
+            image_id="a" * 11,
+            image_identity_sha256="b" * 64,
+        )
+    other = RuntimeTemplateIdentity(
+        repository="docker.io/library/repotrial-runtime",
+        tag="c" * 32,
+        image_id="c" * 12,
+        image_identity_sha256="d" * 64,
+    )
+    with pytest.raises(ValueError, match="identity"):
+        RuntimeTemplateAudit(
+            identity=identity,
+            uses=(
+                RuntimeTemplateUse(sandbox_id="repotrial-candidate-b", identity=other),
+            ),
+            removal_confirmed=False,
+        )

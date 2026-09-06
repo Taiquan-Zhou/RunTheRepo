@@ -1,5 +1,6 @@
 import json
 import math
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -232,6 +233,183 @@ def get_partial_create_cleanup_context(
     return None
 
 
+_RUNTIME_TEMPLATE_REPOSITORY_PATTERN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,511}\Z"
+)
+_RUNTIME_TEMPLATE_TAG_PATTERN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z")
+_RUNTIME_TEMPLATE_IMAGE_ID_PATTERN = re.compile(r"[0-9a-f]{12}\Z")
+_RUNTIME_TEMPLATE_HASH_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+_RUNTIME_TEMPLATE_SANDBOX_ID_PATTERN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z"
+)
+_MAX_RUNTIME_TEMPLATE_USES = 128
+
+
+def _runtime_template_text(
+    value: object,
+    *,
+    field: str,
+    pattern: re.Pattern[str],
+    max_bytes: int,
+) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"runtime template {field} must be a string")
+    normalized = value.strip()
+    if not normalized or any(
+        ord(character) < 32 or ord(character) == 127 or character.isspace()
+        for character in normalized
+    ):
+        raise ValueError(f"runtime template {field} is invalid")
+    if len(normalized.encode("utf-8")) > max_bytes:
+        raise ValueError(f"runtime template {field} is too large")
+    if pattern.fullmatch(normalized) is None:
+        raise ValueError(f"runtime template {field} is invalid")
+    return normalized
+
+
+def _normalize_runtime_template_repository(value: object) -> str:
+    repository = _runtime_template_text(
+        value,
+        field="repository",
+        pattern=_RUNTIME_TEMPLATE_REPOSITORY_PATTERN,
+        max_bytes=512,
+    ).lower()
+    parts = repository.split("/")
+    if any(not part for part in parts):
+        raise ValueError("runtime template repository is invalid")
+    if parts[0] in {"docker.io", "index.docker.io"}:
+        parts[0] = "docker.io"
+        if len(parts) == 2:
+            parts.insert(1, "library")
+    elif len(parts) == 1:
+        parts = ["docker.io", "library", parts[0]]
+    elif "." not in parts[0] and ":" not in parts[0] and parts[0] != "localhost":
+        parts.insert(0, "docker.io")
+    return "/".join(parts)
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeTemplateIdentity:
+    """The bounded provider identity of one owned SBX runtime template."""
+
+    repository: str
+    tag: str
+    image_id: str
+    image_identity_sha256: str
+
+    def __post_init__(self) -> None:
+        repository = _normalize_runtime_template_repository(self.repository)
+        tag = _runtime_template_text(
+            self.tag,
+            field="tag",
+            pattern=_RUNTIME_TEMPLATE_TAG_PATTERN,
+            max_bytes=128,
+        )
+        image_id = _runtime_template_text(
+            self.image_id,
+            field="image_id",
+            pattern=_RUNTIME_TEMPLATE_IMAGE_ID_PATTERN,
+            max_bytes=12,
+        )
+        image_identity_sha256 = _runtime_template_text(
+            self.image_identity_sha256,
+            field="image_identity_sha256",
+            pattern=_RUNTIME_TEMPLATE_HASH_PATTERN,
+            max_bytes=64,
+        )
+        object.__setattr__(self, "repository", repository)
+        object.__setattr__(self, "tag", tag)
+        object.__setattr__(self, "image_id", image_id)
+        object.__setattr__(self, "image_identity_sha256", image_identity_sha256)
+
+    def as_public_record(self) -> dict[str, str]:
+        """Return only bounded, non-sensitive identity fields."""
+
+        return {
+            "repository": self.repository,
+            "tag": self.tag,
+            "image_id": self.image_id,
+            "image_identity_sha256": self.image_identity_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeTemplateUse:
+    """One successful sandbox create that consumed a runtime template."""
+
+    sandbox_id: str
+    identity: RuntimeTemplateIdentity
+
+    def __post_init__(self) -> None:
+        sandbox_id = _runtime_template_text(
+            self.sandbox_id,
+            field="sandbox_id",
+            pattern=_RUNTIME_TEMPLATE_SANDBOX_ID_PATTERN,
+            max_bytes=128,
+        )
+        if not isinstance(self.identity, RuntimeTemplateIdentity):
+            raise TypeError("runtime template use identity is invalid")
+        object.__setattr__(self, "sandbox_id", sandbox_id)
+
+    def as_public_record(self) -> dict[str, str]:
+        return {
+            "sandbox_id": self.sandbox_id,
+            **self.identity.as_public_record(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeTemplateAudit:
+    """Immutable bounded audit state for one provider invocation."""
+
+    identity: RuntimeTemplateIdentity | None = None
+    uses: tuple[RuntimeTemplateUse, ...] = ()
+    removal_confirmed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.identity is not None and not isinstance(
+            self.identity, RuntimeTemplateIdentity
+        ):
+            raise TypeError("runtime template audit identity is invalid")
+        if type(self.uses) is not tuple:
+            raise TypeError("runtime template audit uses must be a tuple")
+        if len(self.uses) > _MAX_RUNTIME_TEMPLATE_USES:
+            raise ValueError("runtime template audit uses exceed the maximum size")
+        for use in self.uses:
+            if not isinstance(use, RuntimeTemplateUse):
+                raise TypeError("runtime template audit use is invalid")
+            if self.identity is None or use.identity != self.identity:
+                raise ValueError("runtime template audit use identity mismatch")
+        if type(self.removal_confirmed) is not bool:
+            raise TypeError("runtime template audit removal_confirmed is invalid")
+
+    def with_use(self, sandbox_id: str) -> "RuntimeTemplateAudit":
+        """Return a new audit containing one successful template create."""
+
+        if self.identity is None:
+            raise ValueError("runtime template use has no identity")
+        if self.removal_confirmed:
+            raise ValueError("runtime template was already finalized")
+        if len(self.uses) >= _MAX_RUNTIME_TEMPLATE_USES:
+            raise ValueError("runtime template audit uses exceed the maximum size")
+        return RuntimeTemplateAudit(
+            identity=self.identity,
+            uses=(*self.uses, RuntimeTemplateUse(sandbox_id, self.identity)),
+            removal_confirmed=False,
+        )
+
+    def as_public_record(self) -> dict[str, object]:
+        """Return bounded identity/use/removal fields for graph evidence."""
+
+        return {
+            "template_identity": (
+                None if self.identity is None else self.identity.as_public_record()
+            ),
+            "template_uses": [use.as_public_record() for use in self.uses],
+            "removal_confirmed": self.removal_confirmed,
+        }
+
+
 class SandboxProvider(ABC):
     @abstractmethod
     async def create(self, workspace: Path, name: str) -> str: ...
@@ -269,6 +447,11 @@ class SandboxProvider(ABC):
 
     def expected_image_identity_sha256(self) -> str | None:
         return None
+
+    def runtime_template_audit(self) -> RuntimeTemplateAudit:
+        """Return the immutable audit snapshot for this invocation."""
+
+        return RuntimeTemplateAudit(removal_confirmed=True)
 
     async def begin_invocation(self) -> None:
         """Mark the start of one graph invocation for provider-owned state."""
