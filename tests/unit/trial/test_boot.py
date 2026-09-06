@@ -9,6 +9,10 @@ from repotrial.domain.enums import Verdict
 from repotrial.sandbox.base import ExecResult
 from repotrial.sandbox.fake import FakeSandboxProvider
 from repotrial.trial.boot import BootResult, _boot_compose_with_evidence, boot_compose
+from repotrial.trial.image_template import (
+    ImageTemplateError,
+    parse_image_inventory,
+)
 
 COMPOSE_PATH = "/workspace/compose.yml"
 UP_ARGV = (
@@ -134,6 +138,169 @@ def _healthy_ps() -> str:
     return json.dumps(
         {"Service": "web", "State": "running", "Health": "healthy", "ExitCode": 0}
     )
+
+
+def _healthy_ps_with_id() -> str:
+    return json.dumps(
+        {
+            "Service": "web",
+            "State": "running",
+            "Health": "healthy",
+            "ExitCode": 0,
+            "ID": "container-web",
+        }
+    )
+
+
+def _image_inventory_output(*, image_suffix: str = "a") -> str:
+    return json.dumps(
+        {
+            "ID": "sha256:" + image_suffix * 64,
+            "Repository": "alpine",
+            "Tag": "latest",
+            "Digest": "sha256:" + "1" * 64,
+        }
+    )
+
+
+class ActiveTemplateBootProvider(FakeSandboxProvider):
+    def __init__(
+        self,
+        *,
+        inventory_output: str | None = None,
+        expected_identity: str | None = None,
+        up_results: list[ExecResult] | None = None,
+        ps_results: list[ExecResult] | None = None,
+    ) -> None:
+        super().__init__()
+        self.inventory_output = inventory_output or _image_inventory_output()
+        self.expected_identity = (
+            expected_identity or parse_image_inventory(self.inventory_output).sha256
+        )
+        self.up_results = list(up_results or [_result()])
+        self.ps_results = list(ps_results or [_result(stdout=_healthy_ps())])
+        self.exec_calls: list[tuple[str, ...]] = []
+
+    @property
+    def supports_runtime_templates(self) -> bool:
+        return True
+
+    def expected_image_identity_sha256(self) -> str | None:
+        return self.expected_identity
+
+    async def exec(
+        self, sandbox_id: str, argv: list[str], timeout_s: int = 60
+    ) -> ExecResult:
+        self._require_active(sandbox_id)
+        call = tuple(argv)
+        self.exec_calls.append(call)
+        if call[-8:-6] == ("docker", "image"):
+            return _result(stdout=self.inventory_output)
+        if call[-8:] == (
+            "up",
+            "-d",
+            "--wait",
+            "--wait-timeout",
+            "60",
+            "--pull",
+            "never",
+            "--no-build",
+        ):
+            return self.up_results.pop(0)
+        if call[-9:] == (
+            "up",
+            "-d",
+            "--wait",
+            "--wait-timeout",
+            "60",
+            "--pull",
+            "never",
+            "--no-build",
+            "--no-recreate",
+        ):
+            return self.up_results.pop(0)
+        if call[-5:] == ("up", "-d", "--wait", "--wait-timeout", "60"):
+            raise AssertionError("active template startup must disable pull/build")
+        if call[-4:] == ("ps", "--all", "--format", "json"):
+            return self.ps_results.pop(0)
+        if call[-4:] == ("logs", "--no-color", "--tail", "200"):
+            return _result(stdout="logs")
+        raise AssertionError(f"unexpected provider command: {call!r}")
+
+
+def test_boot_active_template_verifies_identity_and_disables_pull_and_build() -> None:
+    provider = ActiveTemplateBootProvider()
+
+    result = _run_active_template_boot(provider)
+
+    assert result.verdict is Verdict.PASS
+    assert provider.exec_calls[0][-8:-6] == ("docker", "image")
+    assert provider.exec_calls[1][-8:] == (
+        "up",
+        "-d",
+        "--wait",
+        "--wait-timeout",
+        "60",
+        "--pull",
+        "never",
+        "--no-build",
+    )
+    assert all("up" not in call for call in provider.exec_calls[0:1])
+
+
+def test_boot_active_template_identity_mismatch_fails_before_startup() -> None:
+    provider = ActiveTemplateBootProvider(expected_identity="f" * 64)
+
+    with pytest.raises(ImageTemplateError) as error:
+        _run_active_template_boot(provider)
+
+    assert getattr(error.value, "reason", None) == "image_identity_mismatch"
+    assert len(provider.exec_calls) == 1
+    assert all("up" not in call for call in provider.exec_calls)
+
+
+def test_boot_active_template_recheck_also_disables_pull_and_build() -> None:
+    provider = ActiveTemplateBootProvider(
+        up_results=[
+            _result(exit_code=1, stderr="container web is unhealthy"),
+            _result(),
+        ],
+        ps_results=[
+            _result(stdout=_healthy_ps_with_id()),
+            _result(stdout=_healthy_ps_with_id()),
+        ],
+    )
+
+    result = _run_active_template_boot(provider)
+
+    assert result.verdict is Verdict.PASS
+    up_calls = [call for call in provider.exec_calls if "up" in call]
+    assert len(up_calls) == 2
+    assert up_calls[1][-9:] == (
+        "up",
+        "-d",
+        "--wait",
+        "--wait-timeout",
+        "60",
+        "--pull",
+        "never",
+        "--no-build",
+        "--no-recreate",
+    )
+
+
+def _run_active_template_boot(provider: ActiveTemplateBootProvider) -> BootResult:
+    async def exercise() -> BootResult:
+        sandbox_id = await provider.create(Path("missing-workspace"), "trial")
+        return await boot_compose(
+            provider,
+            sandbox_id,
+            COMPOSE_PATH,
+            {},
+            attempt=1,
+        )
+
+    return asyncio.run(exercise())
 
 
 class ComposePreflightProvider(FakeSandboxProvider):

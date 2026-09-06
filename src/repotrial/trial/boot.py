@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from repotrial.domain.enums import Verdict
 from repotrial.sandbox.base import ExecResult, SandboxProvider
 from repotrial.trial.boot_evidence import _BootEvidenceSession
+from repotrial.trial.image_template import verify_compose_image_identity
 
 _ENV_KEY_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _CONTROL_ENV_KEYS = {
@@ -146,18 +147,37 @@ async def _boot_compose_with_evidence(
         effective_env,
         unset_env_keys,
     )
+    expected_image_identity = provider.expected_image_identity_sha256()
+    template_active = expected_image_identity is not None
+    if expected_image_identity is not None:
+        try:
+            await verify_compose_image_identity(
+                provider,
+                sandbox_id,
+                expected_image_identity,
+                compose_path=compose_path,
+                env=effective_env,
+                unset_env_keys=unset_env_keys,
+            )
+        except BaseException as error:
+            if evidence is not None:
+                evidence.record_exception("up", error)
+            raise
     try:
+        up_argv = [
+            *prefix,
+            *docker_compose,
+            "up",
+            "-d",
+            "--wait",
+            "--wait-timeout",
+            "60",
+        ]
+        if template_active:
+            up_argv.extend(["--pull", "never", "--no-build"])
         up = await provider.exec(
             sandbox_id,
-            [
-                *prefix,
-                *docker_compose,
-                "up",
-                "-d",
-                "--wait",
-                "--wait-timeout",
-                "60",
-            ],
+            up_argv,
             timeout_s=_COMPOSE_UP_TIMEOUT_S,
         )
     except BaseException as error:
@@ -196,19 +216,23 @@ async def _boot_compose_with_evidence(
             evidence.record_command("up_initial", up)
             evidence.record_command("ps_initial", ps)
         try:
+            recheck_up_argv = [
+                *prefix,
+                *docker_compose,
+                "up",
+                "-d",
+                "--wait",
+                "--wait-timeout",
+                "60",
+            ]
+            if template_active:
+                recheck_up_argv.extend(["--pull", "never", "--no-build"])
+            else:
+                recheck_up_argv.append("--no-build")
+            recheck_up_argv.append("--no-recreate")
             recheck_up = await provider.exec(
                 sandbox_id,
-                [
-                    *prefix,
-                    *docker_compose,
-                    "up",
-                    "-d",
-                    "--wait",
-                    "--wait-timeout",
-                    "60",
-                    "--no-build",
-                    "--no-recreate",
-                ],
+                recheck_up_argv,
                 timeout_s=_COMPOSE_READINESS_RECHECK_TIMEOUT_S,
             )
         except BaseException as error:
