@@ -100,6 +100,8 @@ _ANONYMOUS_CONFIG_RETAINED_NOTE = (
 _ANONYMOUS_CONFIG_CLEANUP_FAILED_NOTE = "anonymous Docker config cleanup failed"
 _IMAGE_BUNDLE_REFERENCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@:-]{0,511}\Z")
 _IMAGE_BUNDLE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_IMAGE_BUNDLE_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z")
+_IMAGE_BUNDLE_REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _IMAGE_BUNDLE_CHUNK_BYTES = 8192
 
 MANDATORY_DENY_NETWORK = frozenset(
@@ -338,6 +340,7 @@ class DockerSbxProvider(SandboxProvider):
         self._command_timeout_s = float(command_timeout_s)
         self._subprocess_environment = _sanitized_environment()
         self._sandbox_states: dict[str, _SandboxState] = {}
+        self._sandbox_workspaces: dict[str, Path] = {}
         self._sandbox_deadlines: dict[str, float] = {}
         self._trial_deadline: float | None = None
         self._network_log_sandboxes: set[str] = set()
@@ -357,6 +360,7 @@ class DockerSbxProvider(SandboxProvider):
         self._runtime_image_bundle_stage_used = False
         self._runtime_template_cleanup_confirmed = True
         self._runtime_image_bundle_file_identity: tuple[int, int] | None = None
+        self._runtime_image_bundle_fd: int | None = None
 
     @property
     def supports_runtime_templates(self) -> bool:
@@ -389,6 +393,7 @@ class DockerSbxProvider(SandboxProvider):
                 self._runtime_image_bundle_file,
                 self._runtime_image_bundle_sha256,
                 self._runtime_image_bundle_size,
+                self._runtime_image_bundle_fd,
                 self._runtime_image_bundle_file_identity,
             )
         ):
@@ -420,6 +425,7 @@ class DockerSbxProvider(SandboxProvider):
         self._runtime_image_bundle_stage_used = False
         self._runtime_template_cleanup_confirmed = False
         self._runtime_image_bundle_file_identity = None
+        self._runtime_image_bundle_fd = None
 
     async def stage_runtime_image_bundle(
         self,
@@ -441,6 +447,7 @@ class DockerSbxProvider(SandboxProvider):
                 self._runtime_image_bundle_file,
                 self._runtime_image_bundle_sha256,
                 self._runtime_image_bundle_size,
+                self._runtime_image_bundle_fd,
             )
         ):
             raise DockerSbxError("image_bundle_stage", "image_bundle_already_staged")
@@ -448,7 +455,9 @@ class DockerSbxProvider(SandboxProvider):
         bundle: BinaryIO | None = None
         try:
             try:
-                temp_root = _image_bundle_temp_root()
+                temp_root = _image_bundle_temp_root(
+                    self._sandbox_workspaces.get(sandbox_id)
+                )
                 fd, raw_path = tempfile.mkstemp(
                     prefix="repotrial-image-bundle-", dir=temp_root
                 )
@@ -469,6 +478,7 @@ class DockerSbxProvider(SandboxProvider):
                 ) from error
             path = Path(raw_path)
             self._runtime_image_bundle_path = path
+            self._runtime_image_bundle_fd = fd
             try:
                 file_stat = os.fstat(fd)
             except OSError:
@@ -476,6 +486,7 @@ class DockerSbxProvider(SandboxProvider):
                     os.close(fd)
                 except OSError:
                     pass
+                self._runtime_image_bundle_fd = None
                 raise
             self._runtime_image_bundle_file_identity = (
                 file_stat.st_dev,
@@ -489,7 +500,9 @@ class DockerSbxProvider(SandboxProvider):
                     os.close(fd)
                 except OSError:
                     pass
+                self._runtime_image_bundle_fd = None
                 raise
+            self._runtime_image_bundle_fd = None
             self._runtime_image_bundle_file = bundle
             max_bytes = calculate_disk_allocation(self._policy.disk_mb).docker_mb * (
                 1024 * 1024
@@ -517,9 +530,14 @@ class DockerSbxProvider(SandboxProvider):
                 bundle_sha256=digest,
                 bundle_size=size,
             )
-        except (DockerSbxError, asyncio.CancelledError, OSError, ValueError):
+        except (DockerSbxError, asyncio.CancelledError):
             await self._discard_runtime_image_bundle()
             raise
+        except (OSError, ValueError) as error:
+            await self._discard_runtime_image_bundle()
+            raise DockerSbxError(
+                "image_bundle_stage", "image_bundle_io_error"
+            ) from error
 
     async def _stream_image_bundle_export(
         self,
@@ -882,6 +900,13 @@ class DockerSbxProvider(SandboxProvider):
                 identity=identity,
                 uses=self._runtime_template_audit.uses,
                 removal_confirmed=True,
+                bundle_sha256=self._runtime_image_bundle_sha256
+                or self._runtime_template_audit.bundle_sha256,
+                bundle_size=(
+                    self._runtime_image_bundle_size
+                    if self._runtime_image_bundle_size is not None
+                    else self._runtime_template_audit.bundle_size
+                ),
             )
         self._runtime_template_tag = None
         self._runtime_template_image_id = None
@@ -905,16 +930,19 @@ class DockerSbxProvider(SandboxProvider):
                     "template_finalize", "image_bundle_identity_invalid"
                 )
             return
-        if path is None or bundle is None:
+        if path is None:
             raise DockerSbxError("template_finalize", "image_bundle_state_invalid")
         try:
-            if not _same_open_file(path, bundle):
-                raise DockerSbxError("template_finalize", "image_bundle_replaced")
-            bundle.close()
-            self._runtime_image_bundle_file = None
-            path.unlink()
-            if path.exists():
-                raise DockerSbxError("template_finalize", "image_bundle_still_present")
+            if bundle is not None:
+                if not _same_open_file(path, bundle):
+                    raise DockerSbxError("template_finalize", "image_bundle_replaced")
+                bundle.close()
+                self._runtime_image_bundle_file = None
+            _unlink_owned_runtime_bundle(
+                path,
+                self._runtime_image_bundle_file_identity,
+                operation="template_finalize",
+            )
         except DockerSbxError:
             raise
         except (OSError, ValueError) as error:
@@ -923,6 +951,7 @@ class DockerSbxProvider(SandboxProvider):
             ) from error
         self._runtime_image_bundle_path = None
         self._runtime_image_bundle_file_identity = None
+        self._runtime_image_bundle_fd = None
         self._runtime_image_bundle_sha256 = None
         self._runtime_image_bundle_size = None
         audit = self._runtime_template_audit
@@ -949,18 +978,11 @@ class DockerSbxProvider(SandboxProvider):
         self._runtime_image_bundle_file = None
         if path is not None:
             try:
-                if path.exists():
-                    if not _same_bundle_identity(
-                        path, self._runtime_image_bundle_file_identity
-                    ):
-                        raise DockerSbxError(
-                            "image_bundle_stage", "image_bundle_replaced"
-                        )
-                    path.unlink()
-                    if path.exists():
-                        raise DockerSbxError(
-                            "image_bundle_stage", "image_bundle_still_present"
-                        )
+                _unlink_owned_runtime_bundle(
+                    path,
+                    self._runtime_image_bundle_file_identity,
+                    operation="image_bundle_stage",
+                )
             except DockerSbxError:
                 raise
             except OSError as error:
@@ -969,6 +991,7 @@ class DockerSbxProvider(SandboxProvider):
                 ) from error
         self._runtime_image_bundle_path = None
         self._runtime_image_bundle_file_identity = None
+        self._runtime_image_bundle_fd = None
         self._runtime_image_bundle_sha256 = None
         self._runtime_image_bundle_size = None
         audit = self._runtime_template_audit
@@ -980,12 +1003,18 @@ class DockerSbxProvider(SandboxProvider):
 
     def _mark_runtime_cleanup_unconfirmed(self) -> None:
         audit = self._runtime_template_audit
+        bundle_sha256 = self._runtime_image_bundle_sha256
+        if bundle_sha256 is None:
+            bundle_sha256 = audit.bundle_sha256
+        bundle_size = self._runtime_image_bundle_size
+        if bundle_size is None:
+            bundle_size = audit.bundle_size
         self._runtime_template_audit = RuntimeTemplateAudit(
             identity=audit.identity,
             uses=audit.uses,
             removal_confirmed=False,
-            bundle_sha256=self._runtime_image_bundle_sha256,
-            bundle_size=self._runtime_image_bundle_size,
+            bundle_sha256=bundle_sha256,
+            bundle_size=bundle_size,
         )
 
     async def _import_runtime_image_bundle(
@@ -1394,6 +1423,7 @@ class DockerSbxProvider(SandboxProvider):
                 partial_create=True,
             )
         self._sandbox_states[sandbox_id] = _SandboxState.ACTIVE
+        self._sandbox_workspaces[sandbox_id] = resolved_workspace
         if first_successful_create:
             self._trial_deadline = deadline
         self._sandbox_deadlines[sandbox_id] = deadline
@@ -1896,6 +1926,7 @@ class DockerSbxProvider(SandboxProvider):
         if result.returncode != 0 and not _is_exact_sandbox_absence(result, sandbox_id):
             _require_success(operation, result)
         self._sandbox_states[sandbox_id] = _SandboxState.CLEANED
+        self._sandbox_workspaces.pop(sandbox_id, None)
         self._sandbox_deadlines.pop(sandbox_id, None)
         self._network_log_sandboxes.discard(sandbox_id)
         self._stopped_sandboxes.discard(sandbox_id)
@@ -2371,23 +2402,45 @@ def _same_open_file(path: Path, file: BinaryIO) -> bool:
     )
 
 
-def _same_bundle_identity(path: Path, identity: tuple[int, int] | None) -> bool:
-    if identity is None:
-        return False
+def _unlink_owned_runtime_bundle(
+    path: Path,
+    identity: tuple[int, int] | None,
+    *,
+    operation: str,
+) -> None:
+    """Remove our private bundle without following a replacement symlink."""
     try:
-        path_stat = path.stat()
-    except OSError:
-        return False
-    return (
-        stat.S_ISREG(path_stat.st_mode)
-        and (path_stat.st_dev, path_stat.st_ino) == identity
-    )
+        path_stat = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise DockerSbxError(operation, "image_bundle_cleanup_failed") from error
+    if not stat.S_ISREG(path_stat.st_mode):
+        raise DockerSbxError(operation, "image_bundle_replaced")
+    if identity is not None and (path_stat.st_dev, path_stat.st_ino) != identity:
+        raise DockerSbxError(operation, "image_bundle_replaced")
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise DockerSbxError(operation, "image_bundle_cleanup_failed") from error
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise DockerSbxError(operation, "image_bundle_cleanup_failed") from error
+    raise DockerSbxError(operation, "image_bundle_still_present")
 
 
-def _image_bundle_temp_root() -> str:
+def _image_bundle_temp_root(workspace: Path | None = None) -> str:
     root = Path(tempfile.gettempdir()).resolve()
-    workspace = Path.cwd().resolve()
-    if root == workspace or workspace in root.parents:
+    checkout = Path.cwd().resolve()
+    target_workspace = (workspace or checkout).resolve()
+    if root == checkout or checkout in root.parents:
+        raise DockerSbxError("image_bundle_stage", "image_bundle_temp_root_invalid")
+    if root == target_workspace or target_workspace in root.parents:
         raise DockerSbxError("image_bundle_stage", "image_bundle_temp_root_invalid")
     return str(root)
 
@@ -2408,6 +2461,7 @@ def _validate_image_bundle_inputs(
             normalized != reference
             or _IMAGE_BUNDLE_REFERENCE.fullmatch(normalized) is None
             or normalized.startswith("-")
+            or not _is_canonical_image_reference(normalized)
         ):
             raise DockerSbxError("image_bundle_stage", "image_bundle_reference_invalid")
         normalized_references.append(normalized)
@@ -2430,6 +2484,29 @@ def _validate_image_bundle_inputs(
     if len(set(ids_tuple)) != len(ids_tuple):
         raise DockerSbxError("image_bundle_stage", "image_bundle_ids_duplicate")
     return references_tuple, ids_tuple
+
+
+def _is_canonical_image_reference(reference: str) -> bool:
+    parts = reference.split("/")
+    if len(parts) < 2:
+        return False
+    registry = parts[0]
+    if registry != registry.lower() or not (
+        "." in registry or ":" in registry or registry == "localhost"
+    ):
+        return False
+    repository_and_tag = parts[1:]
+    if any(
+        _IMAGE_BUNDLE_REPOSITORY.fullmatch(part) is None
+        for part in repository_and_tag[:-1]
+    ):
+        return False
+    image_and_tag = repository_and_tag[-1].rsplit(":", 1)
+    return (
+        len(image_and_tag) == 2
+        and _IMAGE_BUNDLE_REPOSITORY.fullmatch(image_and_tag[0]) is not None
+        and _IMAGE_BUNDLE_TAG.fullmatch(image_and_tag[1]) is not None
+    )
 
 
 async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:

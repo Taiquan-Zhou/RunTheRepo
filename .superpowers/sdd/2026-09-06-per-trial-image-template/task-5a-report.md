@@ -69,3 +69,32 @@ paths were removed.
 Post-gate status also exposed one exact workspace-level
 `repotrial-image-bundle-umidrhut` residue; it was verified as a regular
 mode-0600 non-symlink file and removed by exact pathname.
+
+## Fix round 2
+
+At fix-round-2 HEAD, the required minimal regression command was
+`.venv/bin/uv run pytest -q tests/unit/sandbox/test_docker_sbx_commands.py
+-k 'bundle or temp_root'`: **15 passed, 1 failed, 249 deselected**. The
+failure was the mixed template-failure/bundle-success audit regression; the
+close-success/unlink-failure retry and pre-identity fstat tests were already
+passing at that HEAD, so no RED is claimed for those two cases.
+
+The minimal fix preserves independent bundle ownership after close, retries
+only the exact owned path, retains bundle hash/size through mixed cleanup,
+closes and unlinks a newly-owned path even when fstat fails, binds the temp
+root check to the resolved warmup workspace, and rejects short image aliases
+such as `alpine:latest`. The focused gate is now **41 passed, 238
+deselected**; both sandbox unit files are **278 passed**.
+
+Round-2 verification: `ruff check src/repotrial/sandbox tests/unit/sandbox`,
+`ruff format --check src/repotrial/sandbox tests/unit/sandbox`, `mypy
+src/repotrial/sandbox`, and `git diff --check` all passed. Before the final
+gate, 18 `/tmp/repotrial-image-bundle-*` paths were individually verified by
+`stat` as direct regular mode-0600 non-symlink files (sizes 17 or 22), then
+removed by exact max-depth-one path; the subsequent matching-path check was
+empty (0 matches). No recursive deletion was used.
+
+After the fix commit, the fresh provider focused gate remained **41 passed,
+238 deselected**, and the two sandbox unit files passed **279 tests**. Fresh
+post-commit ruff check, format check, mypy sandbox, and diff-check all passed;
+the post-test `/tmp` and repository-root residue scans both returned 0 paths.

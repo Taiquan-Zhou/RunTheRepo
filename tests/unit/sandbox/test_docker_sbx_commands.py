@@ -1446,7 +1446,11 @@ def test_stage_runtime_image_bundle_streams_export_to_private_bounded_file(
     )
     archive = b"streamed image archive"
     spawner.handler = lambda command: (
-        _Outcome(stdout=archive) if command[:2] == ("sbx", "exec") else _Outcome()
+        _Outcome(stdout=archive)
+        if command[:2] == ("sbx", "exec")
+        else _Outcome(stdout=b'{"images":[]}')
+        if command == ("sbx", "template", "ls", "--json")
+        else _Outcome()
     )
 
     asyncio.run(
@@ -1457,51 +1461,65 @@ def test_stage_runtime_image_bundle_streams_export_to_private_bounded_file(
         )
     )
 
-    export_calls = [call for call in spawner.calls if call[:2] == ("sbx", "exec")]
-    assert export_calls == [
-        (
-            "sbx",
-            "exec",
-            sandbox_id,
-            "--",
-            "docker",
-            "image",
-            "save",
-            "docker.io/library/alpine:latest",
-            "sha256:" + "a" * 64,
+    try:
+        export_calls = [call for call in spawner.calls if call[:2] == ("sbx", "exec")]
+        assert export_calls == [
+            (
+                "sbx",
+                "exec",
+                sandbox_id,
+                "--",
+                "docker",
+                "image",
+                "save",
+                "docker.io/library/alpine:latest",
+                "sha256:" + "a" * 64,
+            )
+        ]
+        bundle_path = provider._runtime_image_bundle_path
+        assert bundle_path is not None
+        assert bundle_path.read_bytes() == archive
+        assert bundle_path.stat().st_mode & 0o777 == 0o600
+        assert (
+            provider.runtime_template_audit().bundle_sha256
+            == hashlib.sha256(archive).hexdigest()
         )
-    ]
-    bundle_path = provider._runtime_image_bundle_path
-    assert bundle_path is not None
-    assert bundle_path.read_bytes() == archive
-    assert bundle_path.stat().st_mode & 0o777 == 0o600
-    assert (
-        provider.runtime_template_audit().bundle_sha256
-        == hashlib.sha256(archive).hexdigest()
-    )
-    assert provider.runtime_template_audit().bundle_size == len(archive)
+        assert provider.runtime_template_audit().bundle_size == len(archive)
+    finally:
+        asyncio.run(provider.finalize_runtime_template())
 
 
 @pytest.mark.parametrize(
     "references,ids,reason",
     [
         ((), ("sha256:" + "a" * 64,), "image_bundle_empty"),
+        (("alpine:latest",), ("sha256:" + "a" * 64,), "image_bundle_reference_invalid"),
         (
             ("-unsafe:latest",),
             ("sha256:" + "a" * 64,),
             "image_bundle_reference_invalid",
         ),
         (
-            ("zulu:latest", "alpine:latest"),
+            (
+                "docker.io/library/zulu:latest",
+                "docker.io/library/alpine:latest",
+            ),
             ("sha256:" + "a" * 64,),
             "image_bundle_references_unsorted",
         ),
         (
-            ("alpine:latest", "alpine:latest"),
+            (
+                "docker.io/library/alpine:latest",
+                "docker.io/library/alpine:latest",
+            ),
             ("sha256:" + "a" * 64,),
             "image_bundle_references_duplicate",
         ),
-        (("alpine:latest",), ("sha256:" + "A" * 64,), "image_bundle_id_invalid"),
+        (
+            ("docker.io/library/alpine:latest",),
+            ("sha256:" + "A" * 64,),
+            "image_bundle_id_invalid",
+        ),
     ],
 )
 def test_stage_runtime_image_bundle_rejects_unsafe_or_ambiguous_identity(
@@ -1535,12 +1553,20 @@ def test_stage_runtime_image_bundle_rejects_oversize_and_cleans_process_and_file
     archive = b"x" * (
         calculate_disk_allocation(provider._policy.disk_mb).docker_mb * 1024 * 1024 + 1
     )
-    spawner.handler = lambda command: _Outcome(stdout=archive)
+    spawner.handler = lambda command: (
+        _Outcome(stdout=archive)
+        if command[:2] == ("sbx", "exec")
+        else _Outcome(stdout=b'{"images":[]}')
+        if command == ("sbx", "template", "ls", "--json")
+        else _Outcome()
+    )
 
     with pytest.raises(DockerSbxError, match="image_bundle_oversize"):
         asyncio.run(
             provider.stage_runtime_image_bundle(
-                sandbox_id, ("alpine:latest",), ("sha256:" + "a" * 64,)
+                sandbox_id,
+                ("docker.io/library/alpine:latest",),
+                ("sha256:" + "a" * 64,),
             )
         )
 
@@ -1560,25 +1586,32 @@ def test_runtime_image_bundle_import_uses_exact_argv_and_hashes_stream(
     spawner.handler = lambda command: _Outcome(stdout=archive)
     asyncio.run(
         provider.stage_runtime_image_bundle(
-            sandbox_id, ("alpine:latest",), ("sha256:" + "a" * 64,)
+            sandbox_id,
+            ("docker.io/library/alpine:latest",),
+            ("sha256:" + "a" * 64,),
         )
     )
 
-    asyncio.run(
-        provider._import_runtime_image_bundle("sandbox-new", time.monotonic() + 300.0)
-    )
+    try:
+        asyncio.run(
+            provider._import_runtime_image_bundle(
+                "sandbox-new", time.monotonic() + 300.0
+            )
+        )
 
-    assert spawner.calls[-1] == (
-        "sbx",
-        "exec",
-        "sandbox-new",
-        "--",
-        "docker",
-        "image",
-        "load",
-    )
-    assert spawner.processes[-1].stdin.data == archive
-    assert spawner.processes[-1].stdin.closed is True
+        assert spawner.calls[-1] == (
+            "sbx",
+            "exec",
+            "sandbox-new",
+            "--",
+            "docker",
+            "image",
+            "load",
+        )
+        assert spawner.processes[-1].stdin.data == archive
+        assert spawner.processes[-1].stdin.closed is True
+    finally:
+        asyncio.run(provider.finalize_runtime_template())
 
 
 def test_cancelled_runtime_image_bundle_stage_reaps_process_and_removes_file(
@@ -1593,7 +1626,9 @@ def test_cancelled_runtime_image_bundle_stage_reaps_process_and_removes_file(
     async def exercise() -> None:
         task = asyncio.create_task(
             provider.stage_runtime_image_bundle(
-                sandbox_id, ("alpine:latest",), ("sha256:" + "a" * 64,)
+                sandbox_id,
+                ("docker.io/library/alpine:latest",),
+                ("sha256:" + "a" * 64,),
             )
         )
         await asyncio.sleep(0)
@@ -2114,7 +2149,9 @@ def test_create_uses_active_runtime_template_with_clone_and_policy_flags(
     warmup_id = next(iter(provider._sandbox_states))
     asyncio.run(
         provider.stage_runtime_image_bundle(
-            warmup_id, ("alpine:latest",), ("sha256:" + "a" * 64,)
+            warmup_id,
+            ("docker.io/library/alpine:latest",),
+            ("sha256:" + "a" * 64,),
         )
     )
     provider._runtime_template_tag = "repotrial-runtime:" + "c" * 32
@@ -2185,7 +2222,9 @@ def test_finalize_keeps_bundle_audit_after_template_and_bundle_are_removed(
     spawner.handler = lambda command: _Outcome(stdout=b"bundle")
     asyncio.run(
         provider.stage_runtime_image_bundle(
-            sandbox_id, ("alpine:latest",), ("sha256:" + "a" * 64,)
+            sandbox_id,
+            ("docker.io/library/alpine:latest",),
+            ("sha256:" + "a" * 64,),
         )
     )
     expected_hash = hashlib.sha256(b"bundle").hexdigest()
@@ -2274,9 +2313,136 @@ def test_stage_rejects_temp_root_inside_current_workspace(
     with pytest.raises(DockerSbxError, match="temp_root"):
         asyncio.run(
             provider.stage_runtime_image_bundle(
-                sandbox_id, ("alpine:latest",), ("sha256:" + "a" * 64,)
+                sandbox_id,
+                ("docker.io/library/alpine:latest",),
+                ("sha256:" + "a" * 64,),
             )
         )
+
+
+def test_finalize_retries_unlink_after_close_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch, spawner, deadline=time.monotonic() + 300.0
+    )
+    spawner.handler = lambda command: (
+        _Outcome(stdout=b"bundle")
+        if command[:2] == ("sbx", "exec")
+        else _Outcome(stdout=b'{"images":[]}')
+        if command == ("sbx", "template", "ls", "--json")
+        else _Outcome()
+    )
+    asyncio.run(
+        provider.stage_runtime_image_bundle(
+            sandbox_id,
+            ("docker.io/library/alpine:latest",),
+            ("sha256:" + "a" * 64,),
+        )
+    )
+    bundle_path = provider._runtime_image_bundle_path
+    assert bundle_path is not None
+    original_unlink = Path.unlink
+    fail_once = True
+
+    def unlink(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal fail_once
+        if path == bundle_path and fail_once:
+            fail_once = False
+            raise PermissionError("synthetic unlink failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with pytest.raises(DockerSbxError, match="image_bundle_cleanup_failed"):
+        asyncio.run(provider.finalize_runtime_template())
+    asyncio.run(provider.finalize_runtime_template())
+    assert provider.runtime_template_audit().removal_confirmed is True
+
+
+def test_mixed_cleanup_preserves_bundle_audit_when_template_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch, spawner, deadline=time.monotonic() + 300.0
+    )
+    spawner.handler = lambda command: (
+        _Outcome(stdout=b"bundle")
+        if command[:2] == ("sbx", "exec")
+        else _Outcome(stdout=b'{"images":[]}')
+        if command == ("sbx", "template", "ls", "--json")
+        else _Outcome()
+    )
+    asyncio.run(
+        provider.stage_runtime_image_bundle(
+            sandbox_id,
+            ("docker.io/library/alpine:latest",),
+            ("sha256:" + "a" * 64,),
+        )
+    )
+    identity = RuntimeTemplateIdentity(
+        repository="docker.io/library/repotrial-runtime",
+        tag="a" * 32,
+        image_id="b" * 12,
+        image_identity_sha256="c" * 64,
+    )
+    provider._runtime_template_tag = "repotrial-runtime:" + "a" * 32
+    provider._runtime_template_identity = identity
+    provider._runtime_template_image_id = identity.image_id
+    provider._runtime_template_expected_identity = identity.image_identity_sha256
+    provider._runtime_template_audit = RuntimeTemplateAudit(
+        identity=identity,
+        bundle_sha256=provider._runtime_image_bundle_sha256,
+        bundle_size=provider._runtime_image_bundle_size,
+    )
+
+    async def fail_template_remove(reference: str, *, deadline: float | None) -> None:
+        del reference, deadline
+        raise DockerSbxError("template_rm", "template_cleanup_failed")
+
+    async def list_owned_template(deadline: float | None = None) -> tuple[object, ...]:
+        del deadline
+        return (
+            docker_sbx._RuntimeTemplate(
+                "docker.io/library/repotrial-runtime", "a" * 32, "b" * 12
+            ),
+        )
+
+    monkeypatch.setattr(provider, "_list_runtime_templates", list_owned_template)
+    monkeypatch.setattr(provider, "_remove_runtime_template", fail_template_remove)
+    with pytest.raises(DockerSbxError, match="template_cleanup_failed"):
+        asyncio.run(provider.finalize_runtime_template())
+    audit = provider.runtime_template_audit()
+    assert audit.bundle_sha256 == hashlib.sha256(b"bundle").hexdigest()
+    assert audit.bundle_size == len(b"bundle")
+    assert audit.removal_confirmed is False
+
+
+def test_stage_fstat_failure_removes_owned_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch, spawner, deadline=time.monotonic() + 300.0
+    )
+    real_fstat = os.fstat
+
+    def fail_fstat(fd: int) -> os.stat_result:
+        del fd
+        raise OSError("synthetic fstat failure")
+
+    monkeypatch.setattr(os, "fstat", fail_fstat)
+    with pytest.raises(DockerSbxError):
+        asyncio.run(
+            provider.stage_runtime_image_bundle(
+                sandbox_id,
+                ("docker.io/library/alpine:latest",),
+                ("sha256:" + "a" * 64,),
+            )
+        )
+    assert provider._runtime_image_bundle_path is None
+    del real_fstat
 
 
 def test_runtime_template_rejects_preexisting_owned_tag(
