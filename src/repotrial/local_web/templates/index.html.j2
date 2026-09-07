@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" content="{{ csrf_token }}">
+    <title>RepoTrial local console</title>
+    <style>
+      :root { color-scheme: light; font-family: system-ui, sans-serif; }
+      body { margin: 0; background: #f5f7fb; color: #1f2937; }
+      main { max-width: 760px; margin: 2rem auto; padding: 0 1rem 3rem; }
+      form { display: grid; gap: .8rem; background: white; padding: 1.2rem; border-radius: .6rem; box-shadow: 0 1px 5px #0001; }
+      label { display: grid; gap: .25rem; font-size: .95rem; }
+      input { padding: .5rem; border: 1px solid #cbd5e1; border-radius: .3rem; font: inherit; }
+      button { width: fit-content; padding: .5rem .9rem; border: 0; border-radius: .3rem; background: #2563eb; color: white; cursor: pointer; }
+      pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+      #status, #environment { min-height: 1.4rem; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>RepoTrial 本地控制台</h1>
+      <p>仅限本机访问，调用现有 CLI，并在一次性隔离环境中运行目标。</p>
+      <p>不会接受或显示模型 API Key；一次只允许运行一个检查。结果不是全局安全保证。</p>
+      <button id="doctor" type="button">检查环境</button>
+      <pre id="environment" aria-live="polite"></pre>
+      <form id="trial-form">
+        <label>GitHub 地址 <input name="url" type="url" required></label>
+        <label>完整小写 Commit SHA <input name="commit_sha" pattern="[0-9a-f]{40}" required></label>
+        <label>容器端口 <input name="container_port" type="number" min="1" max="65535" value="8080" required></label>
+        <label>Compose 相对路径（可选） <input name="compose_path"></label>
+        <label>模型 Endpoint（可选，需与名称同时填写） <input name="model_endpoint" type="url"></label>
+        <label>模型名称（可选） <input name="model_name"></label>
+        <button type="submit">开始检查</button>
+      </form>
+      <pre id="status" aria-live="polite"></pre>
+      <p id="reports"></p>
+    </main>
+    <script>
+      const token = document.querySelector('meta[name="csrf-token"]').content;
+      const status = document.getElementById('status');
+      const reports = document.getElementById('reports');
+      const headers = {'Content-Type': 'application/json', 'X-CSRF-Token': token};
+      document.getElementById('doctor').addEventListener('click', async () => {
+        const response = await fetch('/api/doctor', {method: 'POST', headers});
+        document.getElementById('environment').textContent = await response.text();
+      });
+      document.getElementById('trial-form').addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const form = new FormData(event.currentTarget);
+        const payload = Object.fromEntries(form.entries());
+        payload.container_port = Number(payload.container_port);
+        for (const key of ['compose_path', 'model_endpoint', 'model_name']) {
+          if (!payload[key]) delete payload[key];
+        }
+        const response = await fetch('/api/jobs', {method: 'POST', headers, body: JSON.stringify(payload)});
+        const result = await response.json();
+        if (!response.ok) { status.textContent = result.detail || '提交失败'; return; }
+        const jobId = result.job_id;
+        const poll = async () => {
+          const current = await (await fetch(`/api/jobs/${encodeURIComponent(jobId)}`)).json();
+          status.textContent = `${current.state}（已用时 ${current.elapsed_seconds} 秒）${current.error ? `：${current.error}` : ''}`;
+          if (current.reports) {
+            reports.replaceChildren();
+            for (const [label, href] of Object.entries(current.reports)) {
+              const link = document.createElement('a'); link.href = href; link.textContent = `${label} report`;
+              reports.append(link, document.createTextNode(' '));
+            }
+          } else if (current.state === 'running') { setTimeout(poll, 500); }
+        };
+        poll();
+      });
+    </script>
+  </body>
+</html>

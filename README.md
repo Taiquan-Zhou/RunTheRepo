@@ -45,6 +45,22 @@ and documentation changes.
 
 ## Fastest supported setup
 
+For a trusted local preview, start the loopback-only console from the supported
+WSL checkout:
+
+```bash
+uv run repotrial serve --port 8765
+```
+
+Open `http://127.0.0.1:8765/`. The page is a thin wrapper around the existing
+`inspect` CLI: it accepts a public GitHub URL, a full lowercase commit SHA, the
+container port, and optional safe Compose/model settings. The model key remains
+in the server environment and is never accepted or displayed by the page. One
+trial can run at a time; status and elapsed time are real subprocess state, and
+reports are served only from validated, server-owned run artifacts. This local
+preview does not provide public binding, arbitrary shell or file downloads,
+durable job history, granular graph progress, or real-target browser journeys.
+
 The tested topology is Windows 11 -> dedicated Ubuntu 24.04 WSL2 distro ->
 official Linux Docker Sandboxes v0.39.0 -> disposable Linux sandbox. The
 checkout must be on the distro's ext4 filesystem. Target Compose workloads must

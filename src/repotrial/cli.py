@@ -305,6 +305,17 @@ def create_app(
         typer.echo(f"attempt_evidence={evidence_path}")
         raise typer.Exit(terminal.exit_code)
 
+    @app.command()
+    def serve(
+        port: Annotated[int, typer.Option(min=1, max=65535)] = 8765,
+    ) -> None:
+        """Run the local loopback console around the existing CLI."""
+        import uvicorn
+
+        from repotrial.local_web.app import create_app as create_local_app
+
+        uvicorn.run(create_local_app(Path.cwd()), host="127.0.0.1", port=port)
+
     return app
 
 
