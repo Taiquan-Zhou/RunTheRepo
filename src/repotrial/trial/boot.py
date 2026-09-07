@@ -9,7 +9,11 @@ from pydantic import BaseModel, Field
 from repotrial.domain.enums import Verdict
 from repotrial.sandbox.base import ExecResult, SandboxProvider
 from repotrial.trial.boot_evidence import _BootEvidenceSession
-from repotrial.trial.image_template import verify_compose_image_identity
+from repotrial.trial.image_template import (
+    ImageTemplateError,
+    validate_runtime_compose_mapping,
+    verify_compose_image_identity,
+)
 
 _ENV_KEY_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _CONTROL_ENV_KEYS = {
@@ -95,6 +99,10 @@ async def _boot_compose_with_evidence(
 ) -> BootResult:
     effective_env = dict(env)
     declared_secret_keys = _bounded_declared_secret_keys(declared_secret_env_keys)
+    runtime_plan = provider.runtime_image_plan()
+    runtime_overlay_path = await provider.prepare_runtime_image_bindings(sandbox_id)
+    if runtime_plan is not None and runtime_overlay_path is None:
+        raise ImageTemplateError("runtime_image_overlay_missing")
     docker_compose = ["docker", "compose"]
     if project_directory is not None:
         _validate_project_directory(project_directory)
@@ -106,6 +114,9 @@ async def _boot_compose_with_evidence(
     if overlay_path is not None:
         _validate_compose_path(overlay_path, "overlay_path")
         docker_compose.extend(["-f", overlay_path])
+    if runtime_overlay_path is not None:
+        _validate_compose_path(runtime_overlay_path, "runtime_overlay_path")
+        docker_compose.extend(["-f", runtime_overlay_path])
     redaction_env = dict(effective_env)
     redaction_env.update(
         {
@@ -141,6 +152,24 @@ async def _boot_compose_with_evidence(
         raise
     if evidence is not None and config_result is not None:
         evidence.record_command("config", config_result)
+
+    if runtime_plan is not None:
+        runtime_config = await provider.exec(
+            sandbox_id,
+            [
+                *_validated_compose_env_prefix(
+                    compose_path, effective_env, unset_env_keys
+                ),
+                *docker_compose,
+                "config",
+                "--format",
+                "json",
+            ],
+            timeout_s=_COMPOSE_CONFIG_TIMEOUT_S,
+        )
+        if not isinstance(runtime_config, ExecResult) or runtime_config.exit_code != 0:
+            raise ImageTemplateError("runtime_compose_mapping_invalid")
+        validate_runtime_compose_mapping(runtime_config.stdout, runtime_plan)
 
     prefix = _validated_compose_env_prefix(
         compose_path,

@@ -164,6 +164,7 @@ class TemplateProvider(FakeSandboxProvider):
         self.lifecycle: list[str] = []
         self.activated_identity: str | None = None
         self.staged_bundle: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+        self.staged_plan = None
 
     @property
     def supports_runtime_templates(self) -> bool:
@@ -183,12 +184,15 @@ class TemplateProvider(FakeSandboxProvider):
         sandbox_id: str,
         image_references: tuple[str, ...],
         image_ids: tuple[str, ...],
+        *,
+        runtime_image_plan=None,
     ) -> None:
         self._require_active(sandbox_id)
         if self.provider_error_stage == "stage" and self.provider_error is not None:
             raise self.provider_error
         self.lifecycle.append("stage")
         self.staged_bundle = (image_references, image_ids)
+        self.staged_plan = runtime_image_plan
 
     async def exec(
         self, sandbox_id: str, argv: list[str], timeout_s: int = 60
@@ -203,6 +207,24 @@ class TemplateProvider(FakeSandboxProvider):
             ):
                 raise self.provider_error
             return self._result("config")
+        if call[-3:] == ("config", "--format", "json"):
+            records = [json.loads(line) for line in self.inventory_output.splitlines()]
+            services = {}
+            for index, record in enumerate(records):
+                repository = record["Repository"].strip().lower()
+                if repository in {"<none>", ""}:
+                    repository = "service"
+                if "." not in repository and ":" not in repository.split("/")[0]:
+                    repository = f"docker.io/library/{repository}"
+                tag = record["Tag"].strip()
+                digest = record["Digest"].strip()
+                reference = (
+                    f"{repository}:{tag}"
+                    if tag != "<none>"
+                    else f"{repository}@{digest}"
+                )
+                services[f"service{index}"] = {"image": reference}
+            return self._result("config", stdout=json.dumps({"services": services}))
         if call[-2:] == ("pull", "--ignore-buildable"):
             if self.provider_error_stage == "pull" and self.provider_error is not None:
                 raise self.provider_error
@@ -211,12 +233,33 @@ class TemplateProvider(FakeSandboxProvider):
             if self.provider_error_stage == "build" and self.provider_error is not None:
                 raise self.provider_error
             return self._result("build")
-        if call[-8:-6] == ("docker", "image"):
+        if call[:2] == ("docker", "image"):
             if (
                 self.provider_error_stage == "inventory"
                 and self.provider_error is not None
             ):
                 raise self.provider_error
+            if call[-4:-2] == ("inspect", "--format"):
+                reference = call[-1]
+                records = [
+                    json.loads(line) for line in self.inventory_output.splitlines()
+                ]
+                for record in records:
+                    repository = record["Repository"].strip().lower()
+                    if repository in {"<none>", ""}:
+                        repository = "service"
+                    if "." not in repository and ":" not in repository.split("/")[0]:
+                        repository = f"docker.io/library/{repository}"
+                    tag = record["Tag"].strip()
+                    digest = record["Digest"].strip()
+                    expected = (
+                        f"{repository}:{tag}"
+                        if tag != "<none>"
+                        else f"{repository}@{digest}"
+                    )
+                    if expected == reference:
+                        return self._result("inventory", stdout=record["ID"] + "\n")
+                raise AssertionError(f"unexpected inspect reference: {reference!r}")
             if call[-1] == "{{json .}}":
                 return self._result("inventory", stdout=_REAL_DOCKER_IMAGE_ROW)
             assert call[-1] == _IMAGE_LIST_FORMAT
@@ -304,11 +347,13 @@ def _prepare(provider: TemplateProvider) -> object:
 def _stage(call: tuple[str, ...]) -> str:
     if call[-2:] == ("config", "--quiet"):
         return "config"
+    if call[-3:] == ("config", "--format", "json"):
+        return "config-format"
     if call[-2:] == ("pull", "--ignore-buildable"):
         return "pull"
     if call[-1:] == ("build",):
         return "build"
-    if call[-8:-6] == ("docker", "image"):
+    if call[:2] == ("docker", "image"):
         return "inventory"
     if call[-2:] == ("pwd", "-P"):
         return "pwd"
@@ -379,6 +424,8 @@ def test_prepare_compose_image_template_clears_root_then_activates() -> None:
         "config",
         "pull",
         "build",
+        "config-format",
+        "inventory",
         "inventory",
         "pwd",
         "git-root",
@@ -476,6 +523,8 @@ def test_prepare_rejects_nonempty_clear_proof_before_activation() -> None:
         "config",
         "pull",
         "build",
+        "config-format",
+        "inventory",
         "inventory",
         "pwd",
         "git-root",
@@ -578,11 +627,19 @@ def test_prepare_compose_image_template_fails_closed_before_activation(
         expected_stages = {
             "pull": ("config", "pull"),
             "build": ("config", "pull", "build"),
-            "inventory": ("config", "pull", "build", "inventory"),
+            "inventory": (
+                "config",
+                "pull",
+                "build",
+                "config-format",
+                "inventory",
+            ),
             "remove": (
                 "config",
                 "pull",
                 "build",
+                "config-format",
+                "inventory",
                 "inventory",
                 "pwd",
                 "git-root",
@@ -592,6 +649,8 @@ def test_prepare_compose_image_template_fails_closed_before_activation(
                 "config",
                 "pull",
                 "build",
+                "config-format",
+                "inventory",
                 "inventory",
                 "pwd",
                 "git-root",

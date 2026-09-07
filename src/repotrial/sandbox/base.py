@@ -243,6 +243,13 @@ _RUNTIME_TEMPLATE_SANDBOX_ID_PATTERN = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z"
 )
 _MAX_RUNTIME_TEMPLATE_USES = 128
+_RUNTIME_IMAGE_ID_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_RUNTIME_IMAGE_HASH_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+_RUNTIME_IMAGE_SERVICE_PATTERN = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}\Z")
+_RUNTIME_IMAGE_REFERENCE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@:-]{0,511}\Z")
+_RUNTIME_IMAGE_ALIAS_PATTERN = re.compile(
+    r"docker\.io/library/repotrial-runtime-[0-9a-f]{32}:latest\Z"
+)
 
 
 def _runtime_template_text(
@@ -427,6 +434,82 @@ class RuntimeTemplateAudit:
         }
 
 
+@dataclass(frozen=True, slots=True, order=True)
+class RuntimeImageBinding:
+    """One trusted Compose service binding carried across the provider boundary."""
+
+    service: str
+    source_reference: str
+    image_id: str
+    alias: str
+
+    def __post_init__(self) -> None:
+        for value, pattern, label, max_bytes in (
+            (self.service, _RUNTIME_IMAGE_SERVICE_PATTERN, "service", 128),
+            (
+                self.source_reference,
+                _RUNTIME_IMAGE_REFERENCE_PATTERN,
+                "source_reference",
+                512,
+            ),
+            (self.image_id, _RUNTIME_IMAGE_ID_PATTERN, "image_id", 71),
+            (self.alias, _RUNTIME_IMAGE_ALIAS_PATTERN, "alias", 128),
+        ):
+            if (
+                not isinstance(value, str)
+                or value != value.strip()
+                or len(value.encode("utf-8")) > max_bytes
+                or pattern.fullmatch(value) is None
+            ):
+                raise ValueError(f"runtime image binding {label} is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeImagePlan:
+    """Immutable service bindings and the exact image transport identity set."""
+
+    inventory_sha256: str
+    bindings: tuple[RuntimeImageBinding, ...]
+    image_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.inventory_sha256, str)
+            or _RUNTIME_IMAGE_HASH_PATTERN.fullmatch(self.inventory_sha256) is None
+        ):
+            raise ValueError("runtime image plan inventory hash is invalid")
+        if type(self.bindings) is not tuple or not self.bindings:
+            raise ValueError("runtime image plan bindings are invalid")
+        if any(
+            not isinstance(binding, RuntimeImageBinding) for binding in self.bindings
+        ):
+            raise ValueError("runtime image plan binding is invalid")
+        if self.bindings != tuple(sorted(self.bindings)):
+            raise ValueError("runtime image plan bindings are unsorted")
+        if len({binding.service for binding in self.bindings}) != len(self.bindings):
+            raise ValueError("runtime image plan services are duplicated")
+        if len({binding.alias for binding in self.bindings}) != len(self.bindings):
+            raise ValueError("runtime image plan aliases are duplicated")
+        expected_ids = tuple(sorted({binding.image_id for binding in self.bindings}))
+        if self.image_ids != expected_ids:
+            raise ValueError("runtime image plan image IDs are invalid")
+
+    def as_public_record(self) -> dict[str, object]:
+        return {
+            "inventory_sha256": self.inventory_sha256,
+            "bindings": [
+                {
+                    "service": binding.service,
+                    "source_reference": binding.source_reference,
+                    "image_id": binding.image_id,
+                    "alias": binding.alias,
+                }
+                for binding in self.bindings
+            ],
+            "image_ids": list(self.image_ids),
+        }
+
+
 class SandboxProvider(ABC):
     @abstractmethod
     async def create(self, workspace: Path, name: str) -> str: ...
@@ -467,9 +550,18 @@ class SandboxProvider(ABC):
         sandbox_id: str,
         image_references: tuple[str, ...],
         image_ids: tuple[str, ...],
+        *,
+        runtime_image_plan: RuntimeImagePlan | None = None,
     ) -> None:
-        del sandbox_id, image_references, image_ids
+        del sandbox_id, image_references, image_ids, runtime_image_plan
         raise RuntimeError("runtime image bundles are unsupported")
+
+    def runtime_image_plan(self) -> RuntimeImagePlan | None:
+        return None
+
+    async def prepare_runtime_image_bindings(self, sandbox_id: str) -> str | None:
+        del sandbox_id
+        return None
 
     def expected_image_identity_sha256(self) -> str | None:
         return None

@@ -10,7 +10,12 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final
 
-from repotrial.sandbox.base import ExecResult, SandboxProvider
+from repotrial.sandbox.base import (
+    ExecResult,
+    RuntimeImageBinding,
+    RuntimeImagePlan,
+    SandboxProvider,
+)
 from repotrial.sandbox.docker_sbx import DockerSbxError
 
 _IMAGE_ID_PATTERN: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -21,6 +26,8 @@ _MAX_IMAGE_OUTPUT_BYTES: Final = 256 * 1024
 _MAX_IMAGE_FIELD_BYTES: Final = 512
 _MAX_COMMAND_OUTPUT_BYTES: Final = 65_536
 _IMAGE_FIELDS: Final = frozenset({"ID", "Repository", "Tag", "Digest"})
+_RUNTIME_SERVICE_PATTERN: Final = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}\Z")
+_IMAGE_REFERENCE_PATTERN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@:-]{0,511}\Z")
 _IMAGE_LIST_ARGV: Final = (
     "docker",
     "image",
@@ -117,6 +124,122 @@ class ImageInventory:
             "records": [record.as_public_record() for record in self.records],
             "sha256": self.sha256,
         }
+
+
+def parse_runtime_compose_services(output: str | bytes) -> tuple[tuple[str, str], ...]:
+    """Parse bounded ``docker compose config --format json`` service images."""
+
+    if isinstance(output, bytes):
+        try:
+            output = output.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            raise ImageTemplateError("runtime_service_output_invalid") from None
+    if (
+        not isinstance(output, str)
+        or len(output.encode("utf-8")) > _MAX_COMMAND_OUTPUT_BYTES
+    ):
+        raise ImageTemplateError("runtime_service_output_invalid")
+    try:
+        decoded = json.loads(
+            output,
+            object_pairs_hook=_object_without_duplicate_keys,
+            parse_constant=_reject_nonstandard_constant,
+        )
+    except (ImageInventoryError, RecursionError, ValueError):
+        raise ImageTemplateError("runtime_service_output_invalid") from None
+    if not isinstance(decoded, dict) or set(decoded) != {"services"}:
+        raise ImageTemplateError("runtime_service_output_invalid")
+    services = decoded["services"]
+    if not isinstance(services, dict) or not services:
+        raise ImageTemplateError("runtime_service_output_invalid")
+    parsed: list[tuple[str, str]] = []
+    for service, config in services.items():
+        if (
+            not isinstance(service, str)
+            or _RUNTIME_SERVICE_PATTERN.fullmatch(service) is None
+            or not isinstance(config, dict)
+            or set(config) != {"image"}
+            or not isinstance(config["image"], str)
+        ):
+            raise ImageTemplateError("runtime_service_binding_invalid")
+        reference = config["image"]
+        if (
+            not reference
+            or reference != reference.strip()
+            or len(reference.encode("utf-8")) > _MAX_IMAGE_FIELD_BYTES
+            or _IMAGE_REFERENCE_PATTERN.fullmatch(reference) is None
+        ):
+            raise ImageTemplateError("runtime_service_binding_invalid")
+        parsed.append((service, reference))
+    normalized = tuple(sorted(parsed))
+    if len({service for service, _ in normalized}) != len(normalized):
+        raise ImageTemplateError("runtime_service_duplicate")
+    return normalized
+
+
+def resolve_runtime_image_bindings(
+    services: tuple[tuple[str, str], ...],
+    inspected_ids: Mapping[str, str],
+    *,
+    inventory_sha256: str,
+) -> RuntimeImagePlan:
+    """Bind resolved service references to exact inspect IDs and trusted aliases."""
+
+    if (
+        not isinstance(services, tuple)
+        or not services
+        or not isinstance(inspected_ids, Mapping)
+        or not isinstance(inventory_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}\Z", inventory_sha256) is None
+    ):
+        raise ImageTemplateError("runtime_service_binding_invalid")
+    bindings: list[RuntimeImageBinding] = []
+    for service, reference in services:
+        image_id = inspected_ids.get(reference)
+        if (
+            not isinstance(image_id, str)
+            or _IMAGE_ID_PATTERN.fullmatch(image_id) is None
+        ):
+            raise ImageTemplateError("runtime_image_inspect_invalid")
+        alias_digest = hashlib.sha256(
+            f"{service}\0{reference}\0{image_id}".encode()
+        ).hexdigest()[:32]
+        alias = f"docker.io/library/repotrial-runtime-{alias_digest}:latest"
+        try:
+            bindings.append(
+                RuntimeImageBinding(
+                    service=service,
+                    source_reference=reference,
+                    image_id=image_id,
+                    alias=alias,
+                )
+            )
+        except (TypeError, ValueError):
+            raise ImageTemplateError("runtime_service_binding_invalid") from None
+    try:
+        return RuntimeImagePlan(
+            inventory_sha256=inventory_sha256,
+            bindings=tuple(sorted(bindings)),
+            image_ids=tuple(sorted({binding.image_id for binding in bindings})),
+        )
+    except (TypeError, ValueError):
+        raise ImageTemplateError("runtime_service_binding_invalid") from None
+
+
+def validate_runtime_compose_mapping(
+    output: str | bytes, plan: RuntimeImagePlan
+) -> None:
+    """Require final Compose service images to match every trusted alias exactly."""
+
+    if not isinstance(plan, RuntimeImagePlan):
+        raise ImageTemplateError("runtime_compose_mapping_invalid")
+    try:
+        actual = dict(parse_runtime_compose_services(output))
+    except ImageTemplateError:
+        raise ImageTemplateError("runtime_compose_mapping_invalid") from None
+    expected = {binding.service: binding.alias for binding in plan.bindings}
+    if actual != expected:
+        raise ImageTemplateError("runtime_compose_mapping_mismatch")
 
 
 def parse_image_inventory(output: str | bytes) -> ImageInventory:
@@ -362,6 +485,37 @@ async def prepare_compose_image_template(
         "image_build_failed",
         timeout_s=_IMAGE_COMMAND_TIMEOUT_S,
     )
+    resolved_config = await _exec(
+        provider,
+        sandbox_id,
+        [*prefix, *docker_compose, "config", "--format", "json"],
+        "runtime_service_resolution_failed",
+        timeout_s=30,
+    )
+    try:
+        services = parse_runtime_compose_services(resolved_config.stdout)
+        inspected_ids: dict[str, str] = {}
+        for _, reference in services:
+            inspect = await _exec(
+                provider,
+                sandbox_id,
+                [
+                    *prefix,
+                    "docker",
+                    "image",
+                    "inspect",
+                    "--format",
+                    "{{.Id}}",
+                    reference,
+                ],
+                "runtime_image_inspect_failed",
+                timeout_s=60,
+            )
+            inspected_ids[reference] = _parse_runtime_image_id(inspect.stdout)
+    except ImageTemplateError:
+        raise
+    except (KeyError, TypeError, ValueError):
+        raise ImageTemplateError("runtime_service_resolution_failed") from None
     inventory_result = await _exec(
         provider,
         sandbox_id,
@@ -374,25 +528,22 @@ async def prepare_compose_image_template(
     except ImageInventoryError as error:
         raise ImageTemplateError(error.reason) from None
 
-    image_references = tuple(
-        sorted(
-            {
-                (
-                    f"{record.repository}:{record.tag}"
-                    if record.tag
-                    else f"{record.repository}@{record.digest}"
-                )
-                for record in inventory.records
-                if record.tag or record.digest
-            }
-        )
+    runtime_plan = resolve_runtime_image_bindings(
+        services,
+        inspected_ids,
+        inventory_sha256=inventory.sha256,
     )
-    image_ids = tuple(sorted({record.image_id for record in inventory.records}))
+
+    image_references = tuple(
+        sorted({binding.source_reference for binding in runtime_plan.bindings})
+    )
+    image_ids = runtime_plan.image_ids
     try:
         await provider.stage_runtime_image_bundle(
             sandbox_id,
             image_references,
             image_ids,
+            runtime_image_plan=runtime_plan,
         )
     except DockerSbxError:
         raise
@@ -591,3 +742,12 @@ def _parse_guest_workspace(output: object) -> str:
     except ImageTemplateError:
         raise ImageTemplateError("guest_workspace_verification_failed") from None
     return path
+
+
+def _parse_runtime_image_id(output: object) -> str:
+    if not isinstance(output, str) or output.count("\n") != 1:
+        raise ImageTemplateError("runtime_image_inspect_invalid")
+    image_id = output[:-1]
+    if _IMAGE_ID_PATTERN.fullmatch(image_id) is None:
+        raise ImageTemplateError("runtime_image_inspect_invalid")
+    return image_id

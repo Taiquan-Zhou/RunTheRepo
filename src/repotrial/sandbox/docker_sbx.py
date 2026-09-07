@@ -1,6 +1,7 @@
 """Fail-closed Docker Sandboxes provider."""
 
 import asyncio
+import base64
 import hashlib
 import json
 import math
@@ -21,6 +22,7 @@ from .base import (
     FailureEvidenceRecord,
     FailureEvidenceValue,
     NetworkLogResult,
+    RuntimeImagePlan,
     RuntimeTemplateAudit,
     RuntimeTemplateIdentity,
     SandboxFailureEvidence,
@@ -103,6 +105,28 @@ _IMAGE_BUNDLE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _IMAGE_BUNDLE_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z")
 _IMAGE_BUNDLE_REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _IMAGE_BUNDLE_CHUNK_BYTES = 8192
+_RUNTIME_IMAGE_OVERLAY_PATH = ".repotrial-overlays/runtime-image.overlay.json"
+_RUNTIME_IMAGE_OVERLAY_SCRIPT = """\
+set -eu
+umask 077
+set -C
+if [ "$#" -ne 3 ]; then exit 20; fi
+target_path=$1
+expected_sha256=$2
+payload=$3
+[ "$target_path" = ".repotrial-overlays/runtime-image.overlay.json" ] || exit 21
+if [ -e .repotrial-overlays ] || [ -L .repotrial-overlays ]; then
+    [ -d .repotrial-overlays ] && [ ! -L .repotrial-overlays ] || exit 22
+else
+    mkdir .repotrial-overlays || exit 22
+fi
+if [ -e "$target_path" ] || [ -L "$target_path" ]; then exit 23; fi
+printf '%s' "$payload" | base64 -d > "$target_path" || exit 24
+chmod 600 "$target_path" || exit 25
+[ "$(stat -c '%a' -- "$target_path")" = "600" ] || exit 26
+[ "$(sha256sum -- "$target_path" | cut -d ' ' -f 1)" = "$expected_sha256" ] || exit 27
+printf 'path=%s\\nmode=600\\nsha256=%s\\n' "$target_path" "$expected_sha256"
+"""
 
 MANDATORY_DENY_NETWORK = frozenset(
     {
@@ -361,6 +385,9 @@ class DockerSbxProvider(SandboxProvider):
         self._runtime_template_cleanup_confirmed = True
         self._runtime_image_bundle_file_identity: tuple[int, int] | None = None
         self._runtime_image_bundle_fd: int | None = None
+        self._runtime_image_plan: RuntimeImagePlan | None = None
+        self._runtime_image_overlay_sha256: str | None = None
+        self._runtime_image_overlay_sandboxes: set[str] = set()
 
     @property
     def supports_runtime_templates(self) -> bool:
@@ -383,6 +410,7 @@ class DockerSbxProvider(SandboxProvider):
                 self._runtime_template_expected_identity,
                 self._runtime_template_pending_tag,
                 self._runtime_template_identity,
+                self._runtime_image_plan,
             )
         ):
             raise RuntimeError("runtime template cleanup is not confirmed")
@@ -395,6 +423,7 @@ class DockerSbxProvider(SandboxProvider):
                 self._runtime_image_bundle_size,
                 self._runtime_image_bundle_fd,
                 self._runtime_image_bundle_file_identity,
+                self._runtime_image_overlay_sha256,
             )
         ):
             raise RuntimeError("runtime image bundle cleanup is not confirmed")
@@ -423,6 +452,9 @@ class DockerSbxProvider(SandboxProvider):
         self._runtime_template_identity = None
         self._runtime_template_audit = RuntimeTemplateAudit()
         self._runtime_image_bundle_stage_used = False
+        self._runtime_image_plan = None
+        self._runtime_image_overlay_sha256 = None
+        self._runtime_image_overlay_sandboxes.clear()
         self._runtime_template_cleanup_confirmed = False
         self._runtime_image_bundle_file_identity = None
         self._runtime_image_bundle_fd = None
@@ -432,14 +464,31 @@ class DockerSbxProvider(SandboxProvider):
         sandbox_id: str,
         image_references: tuple[str, ...],
         image_ids: tuple[str, ...],
+        *,
+        runtime_image_plan: RuntimeImagePlan | None = None,
     ) -> None:
         self._require_active(sandbox_id)
         if sandbox_id in self._stopped_sandboxes:
             raise RuntimeError(f"sandbox is stopped: {sandbox_id}")
         if self._runtime_image_bundle_stage_used:
             raise DockerSbxError("image_bundle_stage", "image_bundle_already_staged")
-        self._runtime_image_bundle_stage_used = True
         references, ids = _validate_image_bundle_inputs(image_references, image_ids)
+        if runtime_image_plan is not None and not isinstance(
+            runtime_image_plan, RuntimeImagePlan
+        ):
+            raise DockerSbxError("image_bundle_stage", "image_binding_missing")
+        if runtime_image_plan is not None:
+            expected_references = tuple(
+                sorted(
+                    {
+                        binding.source_reference
+                        for binding in runtime_image_plan.bindings
+                    }
+                )
+            )
+            if references != expected_references or ids != runtime_image_plan.image_ids:
+                raise DockerSbxError("image_bundle_stage", "image_binding_mismatch")
+        self._runtime_image_bundle_stage_used = True
         if any(
             value is not None
             for value in (
@@ -523,6 +572,7 @@ class DockerSbxProvider(SandboxProvider):
             bundle.seek(0)
             self._runtime_image_bundle_sha256 = digest
             self._runtime_image_bundle_size = size
+            self._runtime_image_plan = runtime_image_plan
             audit = self._runtime_template_audit
             self._runtime_template_audit = RuntimeTemplateAudit(
                 identity=audit.identity,
@@ -539,6 +589,209 @@ class DockerSbxProvider(SandboxProvider):
             raise DockerSbxError(
                 "image_bundle_stage", "image_bundle_io_error"
             ) from error
+
+    def runtime_image_plan(self) -> RuntimeImagePlan | None:
+        return self._runtime_image_plan
+
+    async def prepare_runtime_image_bindings(self, sandbox_id: str) -> str | None:
+        self._require_active(sandbox_id)
+        if sandbox_id in self._stopped_sandboxes:
+            raise RuntimeError(f"sandbox is stopped: {sandbox_id}")
+        plan = self._runtime_image_plan
+        if plan is None:
+            return None
+        await self._verify_runtime_image_ids(
+            sandbox_id, plan, self._require_deadline(sandbox_id)
+        )
+        if sandbox_id not in self._runtime_image_overlay_sandboxes:
+            await self._materialize_runtime_image_overlay(
+                sandbox_id, plan, self._require_deadline(sandbox_id)
+            )
+            self._runtime_image_overlay_sandboxes.add(sandbox_id)
+        else:
+            await self._verify_runtime_image_overlay(
+                sandbox_id, self._require_deadline(sandbox_id)
+            )
+        return _RUNTIME_IMAGE_OVERLAY_PATH
+
+    async def _verify_runtime_image_ids(
+        self, sandbox_id: str, plan: RuntimeImagePlan, deadline: float
+    ) -> None:
+        listed = await self._run(
+            "runtime_image_verify",
+            [
+                "exec",
+                sandbox_id,
+                "--",
+                "docker",
+                "image",
+                "ls",
+                "--all",
+                "--no-trunc",
+                "--format",
+                "{{.ID}}",
+            ],
+            self._command_timeout_s,
+            deadline=deadline,
+            sandbox_id=sandbox_id,
+            public_sandbox_id=sandbox_id,
+        )
+        _require_success("runtime_image_verify", listed)
+        imported = _parse_runtime_image_ids(listed.stdout)
+        if imported != frozenset(plan.image_ids):
+            raise DockerSbxError("runtime_image_verify", "image_ids_mismatch")
+        for binding in plan.bindings:
+            inspected = await self._run(
+                "runtime_image_verify",
+                [
+                    "exec",
+                    sandbox_id,
+                    "--",
+                    "docker",
+                    "image",
+                    "inspect",
+                    "--format",
+                    "{{.Id}}",
+                    binding.image_id,
+                ],
+                self._command_timeout_s,
+                deadline=deadline,
+                sandbox_id=sandbox_id,
+                public_sandbox_id=sandbox_id,
+            )
+            _require_success("runtime_image_verify", inspected)
+            if _parse_runtime_image_id(inspected.stdout) != binding.image_id:
+                raise DockerSbxError("runtime_image_verify", "image_id_mismatch")
+            alias_inspect = await self._run(
+                "runtime_image_verify",
+                [
+                    "exec",
+                    sandbox_id,
+                    "--",
+                    "docker",
+                    "image",
+                    "inspect",
+                    "--format",
+                    "{{.Id}}",
+                    binding.alias,
+                ],
+                self._command_timeout_s,
+                deadline=deadline,
+                sandbox_id=sandbox_id,
+                public_sandbox_id=sandbox_id,
+            )
+            if alias_inspect.returncode != 0:
+                tagged = await self._run(
+                    "runtime_image_bind",
+                    [
+                        "exec",
+                        sandbox_id,
+                        "--",
+                        "docker",
+                        "image",
+                        "tag",
+                        binding.image_id,
+                        binding.alias,
+                    ],
+                    self._command_timeout_s,
+                    deadline=deadline,
+                    sandbox_id=sandbox_id,
+                    public_sandbox_id=sandbox_id,
+                )
+                _require_success("runtime_image_bind", tagged)
+                alias_inspect = await self._run(
+                    "runtime_image_verify",
+                    [
+                        "exec",
+                        sandbox_id,
+                        "--",
+                        "docker",
+                        "image",
+                        "inspect",
+                        "--format",
+                        "{{.Id}}",
+                        binding.alias,
+                    ],
+                    self._command_timeout_s,
+                    deadline=deadline,
+                    sandbox_id=sandbox_id,
+                    public_sandbox_id=sandbox_id,
+                )
+            _require_success("runtime_image_verify", alias_inspect)
+            if _parse_runtime_image_id(alias_inspect.stdout) != binding.image_id:
+                raise DockerSbxError("runtime_image_verify", "image_alias_mismatch")
+
+    async def _materialize_runtime_image_overlay(
+        self, sandbox_id: str, plan: RuntimeImagePlan, deadline: float
+    ) -> None:
+        payload = json.dumps(
+            {
+                "services": {
+                    binding.service: {
+                        "image": binding.alias,
+                        "pull_policy": "never",
+                    }
+                    for binding in plan.bindings
+                }
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        payload_hash = hashlib.sha256(payload).hexdigest()
+        result = await self._run(
+            "runtime_image_overlay",
+            [
+                "exec",
+                sandbox_id,
+                "--",
+                "sh",
+                "-eu",
+                "-c",
+                _RUNTIME_IMAGE_OVERLAY_SCRIPT,
+                "repotrial-runtime-image-overlay",
+                _RUNTIME_IMAGE_OVERLAY_PATH,
+                payload_hash,
+                base64.b64encode(payload).decode("ascii"),
+            ],
+            self._command_timeout_s,
+            deadline=deadline,
+            sandbox_id=sandbox_id,
+            public_sandbox_id=sandbox_id,
+        )
+        _require_success("runtime_image_overlay", result)
+        expected = f"path={_RUNTIME_IMAGE_OVERLAY_PATH}\nmode=600\nsha256={payload_hash}\n".encode()
+        if result.stdout != expected or result.stderr:
+            raise DockerSbxError("runtime_image_overlay", "overlay_identity_invalid")
+        self._runtime_image_overlay_sha256 = payload_hash
+
+    async def _verify_runtime_image_overlay(
+        self, sandbox_id: str, deadline: float
+    ) -> None:
+        expected_hash = self._runtime_image_overlay_sha256
+        if expected_hash is None:
+            raise DockerSbxError("runtime_image_overlay", "overlay_identity_invalid")
+        result = await self._run(
+            "runtime_image_overlay",
+            [
+                "exec",
+                sandbox_id,
+                "--",
+                "sha256sum",
+                "--",
+                _RUNTIME_IMAGE_OVERLAY_PATH,
+            ],
+            self._command_timeout_s,
+            deadline=deadline,
+            sandbox_id=sandbox_id,
+            public_sandbox_id=sandbox_id,
+        )
+        _require_success("runtime_image_overlay", result)
+        if (
+            result.stdout
+            != f"{expected_hash}  {_RUNTIME_IMAGE_OVERLAY_PATH}\n".encode()
+        ):
+            raise DockerSbxError("runtime_image_overlay", "overlay_identity_invalid")
 
     async def _stream_image_bundle_export(
         self,
@@ -955,6 +1208,9 @@ class DockerSbxProvider(SandboxProvider):
         self._runtime_image_bundle_fd = None
         self._runtime_image_bundle_sha256 = None
         self._runtime_image_bundle_size = None
+        self._runtime_image_plan = None
+        self._runtime_image_overlay_sha256 = None
+        self._runtime_image_overlay_sandboxes.clear()
         audit = self._runtime_template_audit
         self._runtime_template_audit = RuntimeTemplateAudit(
             identity=audit.identity,
@@ -1418,6 +1674,10 @@ class DockerSbxProvider(SandboxProvider):
                 and self._runtime_image_bundle_path is not None
             ):
                 await self._import_runtime_image_bundle(sandbox_id, deadline)
+                if self._runtime_image_plan is not None:
+                    await self._prepare_runtime_image_bindings(
+                        sandbox_id, self._runtime_image_plan, deadline
+                    )
         except (DockerSbxError, asyncio.CancelledError) as error:
             await self._cleanup_after_uncertain_failure(
                 sandbox_id,
@@ -1436,6 +1696,18 @@ class DockerSbxProvider(SandboxProvider):
                 sandbox_id
             )
         return sandbox_id
+
+    async def _prepare_runtime_image_bindings(
+        self,
+        sandbox_id: str,
+        plan: RuntimeImagePlan | None,
+        deadline: float,
+    ) -> None:
+        if plan is None:
+            raise DockerSbxError("runtime_image_bind", "image_binding_missing")
+        await self._verify_runtime_image_ids(sandbox_id, plan, deadline)
+        await self._materialize_runtime_image_overlay(sandbox_id, plan, deadline)
+        self._runtime_image_overlay_sandboxes.add(sandbox_id)
 
     def _runtime_image_bundle_complete(self) -> bool:
         return (
@@ -1932,6 +2204,7 @@ class DockerSbxProvider(SandboxProvider):
         self._sandbox_deadlines.pop(sandbox_id, None)
         self._network_log_sandboxes.discard(sandbox_id)
         self._stopped_sandboxes.discard(sandbox_id)
+        self._runtime_image_overlay_sandboxes.discard(sandbox_id)
 
     async def _cleanup_after_uncertain_failure(
         self,
@@ -2488,6 +2761,32 @@ def _validate_image_bundle_inputs(
     if len(set(ids_tuple)) != len(ids_tuple):
         raise DockerSbxError("image_bundle_stage", "image_bundle_ids_duplicate")
     return references_tuple, ids_tuple
+
+
+def _parse_runtime_image_ids(output: bytes) -> frozenset[str]:
+    try:
+        text = output.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise DockerSbxError("runtime_image_verify", "image_ids_invalid") from None
+    lines = text.splitlines()
+    if not lines:
+        raise DockerSbxError("runtime_image_verify", "image_ids_invalid")
+    image_ids: set[str] = set()
+    for line in lines:
+        if _IMAGE_BUNDLE_ID.fullmatch(line) is None:
+            raise DockerSbxError("runtime_image_verify", "image_ids_invalid")
+        image_ids.add(line)
+    return frozenset(image_ids)
+
+
+def _parse_runtime_image_id(output: bytes) -> str:
+    try:
+        text = output.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise DockerSbxError("runtime_image_verify", "image_id_invalid") from None
+    if text.count("\n") != 1 or _IMAGE_BUNDLE_ID.fullmatch(text[:-1]) is None:
+        raise DockerSbxError("runtime_image_verify", "image_id_invalid")
+    return text[:-1]
 
 
 def _is_canonical_image_reference(reference: str) -> bool:

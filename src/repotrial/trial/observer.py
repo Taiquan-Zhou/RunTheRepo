@@ -14,6 +14,7 @@ from repotrial.trial.boot import (
     _validate_project_directory,
     _validated_compose_env_prefix,
 )
+from repotrial.trial.image_template import ImageTemplateError
 from repotrial.trial.observation_evidence import (
     ObservationEvidenceError,
     ObservationEvidenceRecorder,
@@ -242,6 +243,10 @@ async def _collect_observation(
     recorder: ObservationEvidenceRecorder | None,
 ) -> ObservationSnapshot:
     budget = _CollectionBudget()
+    runtime_plan = provider.runtime_image_plan()
+    runtime_overlay_path = await provider.prepare_runtime_image_bindings(sandbox_id)
+    if runtime_plan is not None and runtime_overlay_path is None:
+        raise ImageTemplateError("runtime_image_overlay_missing")
     prefix = _validated_compose_env_prefix(compose_path, env, unset_env_keys)
     discovery_argv = [
         *prefix,
@@ -255,6 +260,8 @@ async def _collect_observation(
         discovery_argv.extend(["-f", compatibility_overlay_path])
     if overlay_path is not None:
         discovery_argv.extend(["-f", overlay_path])
+    if runtime_overlay_path is not None:
+        discovery_argv.extend(["-f", runtime_overlay_path])
     discovery_argv.extend(
         [
             "ps",
