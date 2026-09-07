@@ -28,10 +28,16 @@ _MAX_IMAGE_FIELD_BYTES: Final = 512
 _MAX_COMMAND_OUTPUT_BYTES: Final = 65_536
 _IMAGE_FIELDS: Final = frozenset({"ID", "Repository", "Tag", "Digest"})
 _RUNTIME_SERVICE_PATTERN: Final = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}\Z")
+_IMAGE_NAME_COMPONENT: Final = r"[a-z0-9][a-z0-9._-]{0,127}"
 _IMAGE_REFERENCE_PATTERN: Final = re.compile(
     r"[a-z0-9][a-z0-9.-]{0,127}(?::[0-9]{1,5})?/"
-    r"[a-z0-9][a-z0-9._-]{0,127}(?:/[a-z0-9][a-z0-9._-]{0,127})*"
+    + _IMAGE_NAME_COMPONENT
+    + rf"(?:/{_IMAGE_NAME_COMPONENT})*"
     r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}|@sha256:[0-9a-f]{64})\Z"
+)
+_IMAGE_REFERENCE_WITHOUT_SUFFIX_PATTERN: Final = re.compile(
+    rf"{_IMAGE_NAME_COMPONENT}(?:/{_IMAGE_NAME_COMPONENT})*"
+    rf"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{{0,127}}|@sha256:[0-9a-f]{{64}})?\Z"
 )
 _IMAGE_LIST_ARGV: Final = (
     "docker",
@@ -159,9 +165,41 @@ def parse_compose_image_output(output: str | bytes, *, service: str) -> str:
     if len(lines) != 1:
         raise ImageTemplateError("runtime_image_output_invalid")
     reference = lines[0]
-    if _IMAGE_REFERENCE_PATTERN.fullmatch(reference) is None:
+    try:
+        reference = _canonicalize_compose_image_reference(reference)
+    except ValueError:
         raise ImageTemplateError("runtime_image_output_invalid")
     return reference
+
+
+def _canonicalize_compose_image_reference(reference: str) -> str:
+    if _IMAGE_REFERENCE_WITHOUT_SUFFIX_PATTERN.fullmatch(reference) is None:
+        raise ValueError("image reference is invalid")
+    path, separator, suffix = reference.partition("@")
+    if separator:
+        suffix = separator + suffix
+    else:
+        path, separator, tag = reference.rpartition(":")
+        if not separator or "/" in tag:
+            path = reference
+            suffix = ""
+        else:
+            suffix = ":" + tag
+    segments = path.split("/")
+    first = segments[0]
+    has_registry = len(segments) > 1 and (
+        "." in first or ":" in first or first == "localhost"
+    )
+    if len(segments) == 1:
+        prefix = "docker.io/library/"
+    elif has_registry:
+        prefix = ""
+    else:
+        prefix = "docker.io/"
+    canonical = prefix + path + (suffix or ":latest")
+    if _IMAGE_REFERENCE_PATTERN.fullmatch(canonical) is None:
+        raise ValueError("image reference is not canonical")
+    return canonical
 
 
 def _decode_bounded_runtime_output(output: str | bytes, reason: str) -> str:

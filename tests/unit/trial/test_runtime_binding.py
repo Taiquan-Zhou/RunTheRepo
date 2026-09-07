@@ -13,6 +13,22 @@ _IMAGE_A = "sha256:" + "a" * 64
 _IMAGE_B = "sha256:" + "b" * 64
 
 
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        (
+            "real-smoke-fixture-build_web",
+            "docker.io/library/real-smoke-fixture-build_web:latest",
+        ),
+        ("busybox:1.36.1", "docker.io/library/busybox:1.36.1"),
+    ],
+)
+def test_compose_image_output_canonicalizes_familiar_names(
+    output: str, expected: str
+) -> None:
+    assert parse_compose_image_output(output, service="web") == expected
+
+
 def test_resolves_each_compose_service_to_one_exact_inspect_id_and_alias() -> None:
     services = (
         ("web", "docker.io/library/web:latest"),
