@@ -3093,19 +3093,23 @@ def _require_success(operation: str, result: _CommandResult) -> None:
 def _is_exact_sandbox_absence(result: _CommandResult, sandbox_id: str) -> bool:
     if result.stdout != b"":
         return False
-    exact_error = (
-        f"Error: sandbox \x27{sandbox_id}\x27 not found "
-        "(run \x27sbx ls\x27 to see your sandboxes)"
-    ).encode()
+    exact_errors = tuple(
+        (
+            f"{prefix}sandbox \x27{sandbox_id}\x27 not found "
+            "(run \x27sbx ls\x27 to see your sandboxes)"
+        ).encode()
+        for prefix in ("Error: ", "ERROR: ")
+    )
     warning = (
         b"WARN: could not acquire docker hub refresh lock, proceeding without "
         b"cross-process lock: context deadline exceeded"
     )
-    allowed_stderr = (
-        exact_error,
-        exact_error + b"\n",
-        warning + b"\n" + exact_error,
-        warning + b"\n" + exact_error + b"\n",
+    allowed_stderr = tuple(
+        exact_error + suffix for exact_error in exact_errors for suffix in (b"", b"\n")
+    ) + tuple(
+        warning + b"\n" + exact_error + suffix
+        for exact_error in exact_errors
+        for suffix in (b"", b"\n")
     )
     return result.stderr in allowed_stderr
 

@@ -90,6 +90,10 @@ OBSERVED_ABSENCE_STDERR = (
     b"Error: sandbox \x27sandbox-17\x27 not found "
     b"(run \x27sbx ls\x27 to see your sandboxes)\n"
 )
+OBSERVED_042_ABSENCE_STDERR = (
+    b"ERROR: sandbox \x27sandbox-17\x27 not found "
+    b"(run \x27sbx ls\x27 to see your sandboxes)\n"
+)
 
 
 @dataclass(frozen=True)
@@ -4743,6 +4747,12 @@ def test_failed_destroy_keeps_provider_state_for_retry(
             "observed exact-ID absence",
             b"",
             OBSERVED_ABSENCE_STDERR,
+            True,
+        ),
+        (
+            "observed v0.42 exact-ID absence",
+            b"",
+            OBSERVED_042_ABSENCE_STDERR,
             True,
         ),
         (

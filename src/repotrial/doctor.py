@@ -24,7 +24,7 @@ from typing import Literal, Protocol
 
 type CheckStatus = Literal["PASS", "FAIL", "UNSUPPORTED"]
 
-SUPPORTED_SBX_VERSION = "v0.39.0"
+SUPPORTED_SBX_VERSION = "v0.42.0"
 PID_HARD_BOUND_LIMITATION = "pid_hard_bound_unsupported"
 DEFAULT_COMMAND_TIMEOUT_S = 30.0
 DEFAULT_MAX_OUTPUT_BYTES = 65_536
@@ -481,7 +481,7 @@ class Doctor:
                 "FAIL",
                 True,
                 "sbx version could not be verified",
-                "Install Docker Sandboxes v0.39.0 and retry the preflight.",
+                "Install Docker Sandboxes v0.42.0 and retry the preflight.",
             )
         match = _VERSION_RE.fullmatch(result.stdout.strip())
         if match is not None and match.group("version") == SUPPORTED_SBX_VERSION:
@@ -489,15 +489,15 @@ class Doctor:
                 "sbx_version",
                 "PASS",
                 True,
-                "Docker Sandboxes v0.39.0 is supported",
+                "Docker Sandboxes v0.42.0 is supported",
                 None,
             )
         return DoctorCheck(
             "sbx_version",
             "UNSUPPORTED",
             True,
-            "Docker Sandboxes is not the reviewed v0.39.0 runtime",
-            "Install and select Docker Sandboxes v0.39.0.",
+            "Docker Sandboxes is not the reviewed v0.42.0 runtime",
+            "Install and select Docker Sandboxes v0.42.0.",
         )
 
     def _check_diagnose(self) -> DoctorCheck:
@@ -604,7 +604,7 @@ class Doctor:
             "pid_hard_bound",
             "UNSUPPORTED",
             False,
-            "Docker Sandboxes v0.39.0 does not expose a PID hard bound",
+            "Docker Sandboxes v0.42.0 does not expose a PID hard bound",
             None,
         )
 
@@ -618,7 +618,7 @@ class Doctor:
             ),
             self._check_executable(
                 "sbx",
-                "Install Docker Sandboxes v0.39.0 and ensure sbx is available on PATH.",
+                "Install Docker Sandboxes v0.42.0 and ensure sbx is available on PATH.",
             ),
             self._check_sbx_version(),
             self._check_diagnose(),

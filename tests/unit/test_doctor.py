@@ -87,7 +87,7 @@ def _healthy_runner() -> _StubRunner:
         {
             ("sbx", "version"): CommandResult(
                 returncode=0,
-                stdout=f"sbx version: v0.39.0 {_SBX_COMMIT}\n",
+                stdout=f"sbx version: v0.42.0 {_SBX_COMMIT}\n",
                 stderr="",
             ),
             ("sbx", "diagnose", "--output", "json"): CommandResult(
@@ -138,7 +138,7 @@ def test_healthy_report_is_ordered_and_pid_limit_is_nonblocking() -> None:
         name="pid_hard_bound",
         status="UNSUPPORTED",
         blocking=False,
-        detail="Docker Sandboxes v0.39.0 does not expose a PID hard bound",
+        detail="Docker Sandboxes v0.42.0 does not expose a PID hard bound",
         remediation=None,
     )
     assert {timeout for _argv, timeout in command_runner.calls} == {30.0}
@@ -184,10 +184,13 @@ def test_local_prerequisite_failures_are_blocking(failure: str) -> None:
     assert check.remediation
 
 
-def test_version_mismatch_is_blocking_unsupported() -> None:
+@pytest.mark.parametrize("version", ["v0.39.0", "v0.38.0"])
+def test_version_mismatch_is_blocking_unsupported(version: str) -> None:
     runner = _StubRunner(
         {
-            ("sbx", "version"): CommandResult(0, "sbx version: v0.38.0 deadbeef\n", ""),
+            ("sbx", "version"): CommandResult(
+                0, f"sbx version: {version} {_SBX_COMMIT}\n", ""
+            ),
             ("sbx", "diagnose", "--output", "json"): CommandResult(1, "", ""),
             ("sbx", "list"): CommandResult(1, "", ""),
             ("python", "-m", "playwright", "install", "--list"): CommandResult(
