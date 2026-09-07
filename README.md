@@ -9,27 +9,39 @@ verified.
 
 ## Current status
 
-This branch is a demo-ready release candidate; it is not a published or tagged
-release. On execution HEAD
-`4c13b8b9521427b9491e0de8a9f77e64169754ac`, two representative public
-repositories completed the full URL -> exact SHA -> sandbox -> Compose ->
-journey -> report -> cleanup path:
+This branch is a limited CLI technical preview, not a complete or published
+release. At production HEAD
+`7808b9b5485969f65f242d4acf78ffc79215a3e5`, two representative public
+repositories completed the URL -> exact SHA -> sandbox -> Compose -> journey
+-> report -> cleanup path:
 
 | Repository | Pinned commit | Result | Run ID |
 | --- | --- | --- | --- |
-| changedetection.io | `5d9c7c6da76340597243e8163c4f2439237fa0e8` | `exit_code=0`; `completed` / `no_remaining_mutations`; `GET /` -> `200` assertion passed; JSON+HTML; create/destroy success; inventory empty | `f883cb75-405c-4f01-b99c-b30c0cb2c8d0` |
-| Listmonk | `670c01717d48647093335cc23a6be6f4b79c3b6b` | `exit_code=0`; `completed` / `consecutive_failures`; baseline `GET /` -> `200` assertion passed; JSON+HTML; create/destroy success; inventory empty | `df30728a-ab0a-4eec-b251-afd407400d71` |
+| Linkding | `65813a75404b1319aca8b09700fadc0b15adabaf` | `exit_code=0`; `completed` / `no_remaining_mutations`; `GET /` passed; JSON+HTML; cleanup PASS; template removed; inventory empty | `083f1d4e-697b-4a73-b469-9c5ed7b079f8` |
+| changedetection.io | `5d9c7c6da76340597243e8163c4f2439237fa0e8` | `exit_code=0`; `completed` / `no_remaining_mutations`; `GET /` passed; JSON+HTML; cleanup PASS; template removed; inventory empty | `2ca27a00-b609-4155-9b14-f48526f27778` |
 
-Both runs exited with code 0, produced JSON and HTML reports, and recorded
-successful create/destroy lifecycle events for every created sandbox. The
-official `sbx list` was empty after each run. The Listmonk
-`consecutive_failures` stop reason is from rolled-back hardening candidates
-after the baseline Journey passed; it is not a baseline failure.
+The original gate (7/10 repositories autonomously complete and 5/10
+demonstrate meaningful regression-passing hardening) has not been demonstrated
+at this HEAD.
 
-Fresh quality gates: `1794 passed, 11 skipped, 1 warning`; branch coverage is
-86.07% (`>=85%`). Ruff check, Ruff format (140 files), mypy (47 files), and
-pre-commit all-files pass. `uv lock --check`, `uv build` (sdist + wheel), a
-fresh wheel install, and `repotrial --help` smoke also pass.
+Known limitations:
+
+- Browser execution is tested only with trusted fixtures; real-target browser
+  journeys return unsupported.
+- There is no single cumulative hardened overlay; accepted configuration and
+  experiment overlays remain separate.
+- No public resume entry point is exposed.
+- The default API container has no `sbx` execution integration and no UI.
+- The two canaries do not demonstrate an accepted LLM-generated journey:
+  changedetection used a `policy_rejected` fallback `GET`, while Linkding used
+  a deterministic README journey.
+
+Quality checks: `2120 passed, 12 skipped, 1 warning`; coverage is 85.02%.
+Ruff check, Ruff format (150 files), mypy (49 files), and pre-commit all pass.
+Wheel build and fresh wheel installation were validated at production HEAD
+`7808b9b5485969f65f242d4acf78ffc79215a3e5`; a fresh installed-wheel
+`repotrial --help` smoke passes. The current working tree contains only tests
+and documentation changes.
 
 ## Fastest supported setup
 

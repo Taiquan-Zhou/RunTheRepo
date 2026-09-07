@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import time
 from collections.abc import Callable
@@ -9,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
 
@@ -16,6 +18,8 @@ from repotrial.sandbox import docker_sbx
 from repotrial.sandbox.base import (
     ExecResult,
     NetworkLogResult,
+    RuntimeImageBinding,
+    RuntimeImagePlan,
     RuntimeTemplateAudit,
     RuntimeTemplateIdentity,
     get_sandbox_failure_evidence,
@@ -1495,6 +1499,121 @@ def test_stage_runtime_image_bundle_streams_export_to_private_bounded_file(
         asyncio.run(provider.finalize_runtime_template())
 
 
+def test_stage_runtime_image_bundle_rejects_stderr_overflow_and_cleans_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch, spawner, deadline=time.monotonic() + 300.0
+    )
+    monkeypatch.setattr(docker_sbx, "_image_bundle_temp_root", lambda _: str(tmp_path))
+    spawner.handler = lambda command: _Outcome(
+        stdout=b"archive",
+        stderr=b"x" * (docker_sbx.MAX_OUTPUT_BYTES + 1),
+    )
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(
+            provider.stage_runtime_image_bundle(
+                sandbox_id,
+                ("docker.io/library/alpine:latest",),
+                ("sha256:" + "a" * 64,),
+            )
+        )
+
+    process = spawner.processes[-1]
+    assert raised.value.reason == "image_bundle_stderr_overflow"
+    assert process.waited is True
+    assert provider._runtime_image_bundle_path is None
+    assert list(tmp_path.iterdir()) == []
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.operation == "image_bundle_stage"
+    assert evidence.reason == "image_bundle_stderr_overflow"
+    assert evidence.sandbox_id == sandbox_id
+    assert evidence.subprocess_started is True
+
+
+def test_stage_runtime_image_bundle_timeout_kills_reaps_and_cleans_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch,
+        spawner,
+        deadline=time.monotonic() + 300.0,
+    )
+    provider._command_timeout_s = 0.05
+    monkeypatch.setattr(docker_sbx, "_image_bundle_temp_root", lambda _: str(tmp_path))
+    spawner.handler = lambda command: _Outcome(hang=True)
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(
+            provider.stage_runtime_image_bundle(
+                sandbox_id,
+                ("docker.io/library/alpine:latest",),
+                ("sha256:" + "a" * 64,),
+            )
+        )
+
+    process = spawner.processes[-1]
+    assert raised.value.reason == "timeout"
+    assert process.killed is True
+    assert process.waited is True
+    assert provider._runtime_image_bundle_path is None
+    assert list(tmp_path.iterdir()) == []
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.operation == "image_bundle_stage"
+    assert evidence.reason == "timeout"
+    assert evidence.sandbox_id == sandbox_id
+    assert evidence.subprocess_started is True
+
+
+def test_stage_runtime_image_bundle_write_failure_reaps_and_cleans_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch, spawner, deadline=time.monotonic() + 300.0
+    )
+    monkeypatch.setattr(docker_sbx, "_image_bundle_temp_root", lambda _: str(tmp_path))
+    original_fdopen = docker_sbx.os.fdopen
+
+    def failing_fdopen(fd: int, *args: object, **kwargs: object) -> Mock:
+        bundle = Mock(wraps=original_fdopen(fd, *args, **kwargs))
+        bundle.write.side_effect = OSError("synthetic bundle write failure")
+        return bundle
+
+    monkeypatch.setattr(docker_sbx.os, "fdopen", failing_fdopen)
+    spawner.handler = lambda command: _Outcome(stdout=b"archive")
+
+    with pytest.raises(DockerSbxError) as raised:
+        asyncio.run(
+            provider.stage_runtime_image_bundle(
+                sandbox_id,
+                ("docker.io/library/alpine:latest",),
+                ("sha256:" + "a" * 64,),
+            )
+        )
+
+    process = spawner.processes[-1]
+    assert raised.value.reason == "io_error"
+    assert process.killed is True
+    assert process.waited is True
+    assert provider._runtime_image_bundle_path is None
+    assert list(tmp_path.iterdir()) == []
+    evidence = get_sandbox_failure_evidence(raised.value)
+    assert evidence is not None
+    assert evidence.operation == "image_bundle_stage"
+    assert evidence.reason == "io_error"
+    assert evidence.sandbox_id == sandbox_id
+    assert evidence.subprocess_started is True
+
+
 @pytest.mark.parametrize(
     "references,ids,reason",
     [
@@ -1580,6 +1699,303 @@ def test_bundle_validator_rejects_malformed_or_short_digest(reference: str) -> N
         docker_sbx._validate_image_bundle_inputs((reference,), ("sha256:" + "b" * 64,))
 
 
+def _runtime_image_plan() -> RuntimeImagePlan:
+    return RuntimeImagePlan(
+        inventory_sha256="c" * 64,
+        bindings=(
+            RuntimeImageBinding(
+                service="web",
+                source_reference="docker.io/library/busybox:1.36.1",
+                image_id="sha256:" + "a" * 64,
+                alias=(
+                    "docker.io/library/repotrial-runtime-"
+                    + "1" * 32
+                    + "-"
+                    + "2" * 32
+                    + ":latest"
+                ),
+            ),
+        ),
+        image_ids=("sha256:" + "a" * 64, "sha256:" + "b" * 64),
+    )
+
+
+def _runtime_binding_handler(
+    plan: RuntimeImagePlan,
+    *,
+    listed_ids: tuple[str, ...] | None = None,
+    source_inspect: _Outcome | None = None,
+    alias_inspect: _Outcome | None = None,
+    verify_overlay: _Outcome | None = None,
+) -> Callable[[tuple[str, ...]], _Outcome]:
+    alias_probe_count = 0
+    payload = json.dumps(
+        {
+            "services": {
+                binding.service: {
+                    "image": binding.alias,
+                    "pull_policy": "never",
+                }
+                for binding in plan.bindings
+            }
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    overlay_hash = hashlib.sha256(payload).hexdigest()
+    overlay_output = (
+        f"path=/tmp/repotrial-runtime-image.overlay.json\n"
+        f"mode=600\nuid=1000\nsha256={overlay_hash}\n"
+    ).encode()
+
+    def handler(command: tuple[str, ...]) -> _Outcome:
+        nonlocal alias_probe_count
+        inner = command[4:]
+        if inner[:3] == ("docker", "image", "save"):
+            return _Outcome(stdout=b"runtime image archive")
+        if inner == (
+            "docker",
+            "image",
+            "ls",
+            "--all",
+            "--no-trunc",
+            "--format",
+            "{{.ID}}",
+        ):
+            ids = listed_ids or plan.image_ids
+            return _Outcome(stdout=("\n".join(ids) + "\n").encode())
+        if inner[:5] == (
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+        ):
+            target = inner[5]
+            if target == plan.bindings[0].image_id:
+                if source_inspect is not None:
+                    return source_inspect
+                return _Outcome(stdout=(target + "\n").encode())
+            if target == plan.bindings[0].alias:
+                alias_probe_count += 1
+                if alias_inspect is not None:
+                    return alias_inspect
+                if alias_probe_count == 1:
+                    return _Outcome(returncode=1, stderr=b"not found")
+                return _Outcome(stdout=(plan.bindings[0].image_id + "\n").encode())
+        if inner[:3] == ("docker", "image", "tag"):
+            return _Outcome()
+        if inner[:3] == ("sh", "-eu", "-c"):
+            if inner[4] == "repotrial-runtime-image-overlay":
+                return _Outcome(stdout=overlay_output)
+            if inner[4] == "repotrial-runtime-image-verify":
+                return verify_overlay or _Outcome(stdout=overlay_output)
+        return _Outcome(returncode=1, stderr=b"unexpected command")
+
+    return handler
+
+
+def _stage_runtime_binding_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    spawner: _SbxSpawner,
+    plan: RuntimeImagePlan,
+) -> tuple[DockerSbxProvider, str]:
+    provider, sandbox_id = _active_provider(
+        monkeypatch, spawner, deadline=time.monotonic() + 300.0
+    )
+    asyncio.run(
+        provider.stage_runtime_image_bundle(
+            sandbox_id,
+            (plan.bindings[0].source_reference,),
+            plan.image_ids,
+            runtime_image_plan=plan,
+        )
+    )
+    return provider, sandbox_id
+
+
+def test_prepare_runtime_image_bindings_verifies_ids_aliases_and_reuses_overlay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _runtime_image_plan()
+    spawner = _SbxSpawner()
+    spawner.handler = _runtime_binding_handler(plan)
+    provider, sandbox_id = _stage_runtime_binding_plan(monkeypatch, spawner, plan)
+
+    try:
+        assert (
+            asyncio.run(provider.prepare_runtime_image_bindings(sandbox_id))
+            == "/tmp/repotrial-runtime-image.overlay.json"
+        )
+        assert (
+            asyncio.run(provider.prepare_runtime_image_bindings(sandbox_id))
+            == "/tmp/repotrial-runtime-image.overlay.json"
+        )
+        assert provider.runtime_image_plan() == plan
+        assert any(
+            call[4:7] == ("docker", "image", "save") and plan.image_ids[1] in call
+            for call in spawner.calls
+        )
+        assert any(call[4:7] == ("docker", "image", "tag") for call in spawner.calls)
+        assert any(
+            len(call) > 8 and call[8] == "repotrial-runtime-image-verify"
+            for call in spawner.calls
+        )
+    finally:
+        asyncio.run(provider.finalize_runtime_template())
+
+
+def test_prepare_runtime_image_bindings_rejects_wrong_imported_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _runtime_image_plan()
+    spawner = _SbxSpawner()
+    spawner.handler = _runtime_binding_handler(plan, listed_ids=(plan.image_ids[0],))
+    provider, sandbox_id = _stage_runtime_binding_plan(monkeypatch, spawner, plan)
+
+    try:
+        with pytest.raises(DockerSbxError, match="image_ids_mismatch"):
+            asyncio.run(provider.prepare_runtime_image_bindings(sandbox_id))
+        assert not any(
+            len(call) > 8 and call[8] == "repotrial-runtime-image-overlay"
+            for call in spawner.calls
+        )
+    finally:
+        asyncio.run(provider.finalize_runtime_template())
+
+
+def test_prepare_runtime_image_bindings_rejects_wrong_alias_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _runtime_image_plan()
+    spawner = _SbxSpawner()
+    spawner.handler = _runtime_binding_handler(
+        plan,
+        alias_inspect=_Outcome(stdout=(plan.image_ids[1] + "\n").encode()),
+    )
+    provider, sandbox_id = _stage_runtime_binding_plan(monkeypatch, spawner, plan)
+
+    try:
+        with pytest.raises(DockerSbxError, match="image_alias_mismatch"):
+            asyncio.run(provider.prepare_runtime_image_bindings(sandbox_id))
+        assert not any(
+            len(call) > 8 and call[8] == "repotrial-runtime-image-overlay"
+            for call in spawner.calls
+        )
+    finally:
+        asyncio.run(provider.finalize_runtime_template())
+
+
+def test_prepare_runtime_image_bindings_rejects_wrong_source_id_before_alias_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _runtime_image_plan()
+    spawner = _SbxSpawner()
+    spawner.handler = _runtime_binding_handler(
+        plan,
+        source_inspect=_Outcome(stdout=(plan.image_ids[1] + "\n").encode()),
+    )
+    provider, sandbox_id = _stage_runtime_binding_plan(monkeypatch, spawner, plan)
+
+    try:
+        with pytest.raises(DockerSbxError, match="image_id_mismatch"):
+            asyncio.run(provider.prepare_runtime_image_bindings(sandbox_id))
+        assert not any(
+            call[4:7] == ("docker", "image", "tag")
+            or (
+                len(call) > 8
+                and call[8]
+                in (
+                    "repotrial-runtime-image-overlay",
+                    "repotrial-runtime-image-verify",
+                )
+            )
+            for call in spawner.calls
+        )
+    finally:
+        asyncio.run(provider.finalize_runtime_template())
+
+
+@pytest.mark.parametrize(
+    ("verify_overlay", "expected_error"),
+    [
+        pytest.param(
+            _Outcome(returncode=1, stderr=b"attribute"),
+            "nonzero_exit",
+            id="attribute",
+        ),
+        pytest.param(
+            _Outcome(
+                stdout=(
+                    b"path=/tmp/repotrial-runtime-image.overlay.json\n"
+                    b"mode=600\nuid=1000\nsha256=" + b"0" * 64 + b"\n"
+                )
+            ),
+            "overlay_identity_invalid",
+            id="hash",
+        ),
+    ],
+)
+def test_prepare_runtime_image_bindings_rejects_overlay_attribute_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    verify_overlay: _Outcome,
+    expected_error: str,
+) -> None:
+    plan = _runtime_image_plan()
+    spawner = _SbxSpawner()
+    spawner.handler = _runtime_binding_handler(plan, verify_overlay=verify_overlay)
+    provider, sandbox_id = _stage_runtime_binding_plan(monkeypatch, spawner, plan)
+
+    try:
+        asyncio.run(provider.prepare_runtime_image_bindings(sandbox_id))
+        with pytest.raises(DockerSbxError, match=expected_error):
+            asyncio.run(provider.prepare_runtime_image_bindings(sandbox_id))
+    finally:
+        asyncio.run(provider.finalize_runtime_template())
+
+
+@pytest.mark.parametrize(
+    ("attribute", "expected_returncode"),
+    [("symlink", 22), ("mode", 23), ("hash", 25)],
+)
+def test_runtime_image_overlay_verify_script_rejects_real_attributes(
+    tmp_path: Path,
+    attribute: str,
+    expected_returncode: int,
+) -> None:
+    target = tmp_path / "runtime-image.overlay.json"
+    target_literal = str(target)
+    script = docker_sbx._RUNTIME_IMAGE_VERIFY_SCRIPT.replace(
+        docker_sbx._RUNTIME_IMAGE_OVERLAY_PATH, target_literal
+    )
+    expected_hash = "a" * 64
+    if attribute == "symlink":
+        payload = tmp_path / "payload"
+        payload.write_bytes(b"overlay")
+        target.symlink_to(payload)
+    else:
+        target.write_bytes(b"wrong overlay" if attribute == "hash" else b"overlay")
+        target.chmod(0o600)
+        if attribute == "mode":
+            target.chmod(0o644)
+
+    result = subprocess.run(
+        [
+            "sh",
+            "-eu",
+            "-c",
+            script,
+            "repotrial-runtime-image-verify",
+            target_literal,
+            expected_hash,
+        ],
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == expected_returncode
+
+
 def test_stage_runtime_image_bundle_rejects_oversize_and_cleans_process_and_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1655,6 +2071,226 @@ def test_runtime_image_bundle_import_uses_exact_argv_and_hashes_stream(
         )
         assert spawner.processes[-1].stdin.data == archive
         assert spawner.processes[-1].stdin.closed is True
+    finally:
+        asyncio.run(provider.finalize_runtime_template())
+
+
+def _stage_bundle_for_import(
+    monkeypatch: pytest.MonkeyPatch,
+    spawner: _SbxSpawner,
+    archive: bytes = b"bundle-for-import",
+) -> tuple[DockerSbxProvider, str]:
+    provider, sandbox_id = _active_provider(
+        monkeypatch, spawner, deadline=time.monotonic() + 300.0
+    )
+    spawner.handler = lambda command: _Outcome(stdout=archive)
+    asyncio.run(
+        provider.stage_runtime_image_bundle(
+            sandbox_id,
+            ("docker.io/library/alpine:latest",),
+            ("sha256:" + "a" * 64,),
+        )
+    )
+    return provider, sandbox_id
+
+
+def test_timed_out_runtime_image_bundle_import_kills_reaps_and_records_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _stage_bundle_for_import(monkeypatch, spawner)
+    import_started = asyncio.Event()
+    import_command_prefix = ("sbx", "exec", "-i", sandbox_id)
+
+    def outcome(command: tuple[str, ...]) -> _Outcome:
+        if command[:4] == import_command_prefix:
+            return _Outcome(hang=True)
+        return _Outcome(returncode=1, stderr=b"unexpected command")
+
+    spawner.handler = outcome
+    spawner.before_spawn = lambda command: (
+        import_started.set() if command[:4] == import_command_prefix else None
+    )
+    monkeypatch.setattr(
+        docker_sbx.asyncio,
+        "timeout",
+        lambda _: _TimeoutAfterProcessCreation(import_started),
+    )
+
+    try:
+        with pytest.raises(DockerSbxError) as raised:
+            asyncio.run(
+                provider._import_runtime_image_bundle(
+                    sandbox_id, time.monotonic() + 300.0
+                )
+            )
+        process = spawner.processes[-1]
+        assert raised.value.reason == "timeout"
+        assert process.killed is True
+        assert process.waited is True
+        evidence = get_sandbox_failure_evidence(raised.value)
+        assert evidence is not None
+        assert evidence.operation == "image_bundle_import"
+        assert evidence.reason == "timeout"
+        assert evidence.sandbox_id == sandbox_id
+        assert evidence.subprocess_started is True
+    finally:
+        asyncio.run(provider.finalize_runtime_template())
+
+
+def test_cancelled_runtime_image_bundle_import_kills_reaps_and_preserves_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _stage_bundle_for_import(monkeypatch, spawner)
+    import_command_prefix = ("sbx", "exec", "-i", sandbox_id)
+    spawner.handler = lambda command: (
+        _Outcome(hang=True)
+        if command[:4] == import_command_prefix
+        else _Outcome(returncode=1, stderr=b"unexpected command")
+    )
+
+    async def exercise() -> asyncio.CancelledError:
+        task = asyncio.create_task(
+            provider._import_runtime_image_bundle(sandbox_id, time.monotonic() + 300.0)
+        )
+        while not any(
+            command[:4] == import_command_prefix for command in spawner.calls
+        ):
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        return raised.value
+
+    try:
+        cancellation = asyncio.run(exercise())
+        process = spawner.processes[-1]
+        assert process.killed is True
+        assert process.waited is True
+        evidence = get_sandbox_failure_evidence(cancellation)
+        assert evidence is not None
+        assert evidence.operation == "image_bundle_import"
+        assert evidence.reason == "cancelled"
+        assert evidence.sandbox_id == sandbox_id
+        assert evidence.subprocess_started is True
+    finally:
+        asyncio.run(provider.finalize_runtime_template())
+
+
+def test_runtime_image_bundle_import_io_failure_kills_reaps_and_records_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _stage_bundle_for_import(monkeypatch, spawner)
+    import_command_prefix = ("sbx", "exec", "-i", sandbox_id)
+
+    def fail_write(_: _FakeStdin, __: bytes) -> None:
+        raise OSError("synthetic import write failure")
+
+    monkeypatch.setattr(_FakeStdin, "write", fail_write)
+    spawner.handler = lambda command: (
+        _Outcome()
+        if command[:4] == import_command_prefix
+        else _Outcome(returncode=1, stderr=b"unexpected command")
+    )
+
+    try:
+        with pytest.raises(DockerSbxError) as raised:
+            asyncio.run(
+                provider._import_runtime_image_bundle(
+                    sandbox_id, time.monotonic() + 300.0
+                )
+            )
+        process = spawner.processes[-1]
+        assert raised.value.reason == "image_bundle_io_error"
+        assert process.killed is True
+        assert process.waited is True
+        evidence = get_sandbox_failure_evidence(raised.value)
+        assert evidence is not None
+        assert evidence.operation == "image_bundle_import"
+        assert evidence.reason == "image_bundle_io_error"
+        assert evidence.sandbox_id == sandbox_id
+        assert evidence.subprocess_started is True
+    finally:
+        asyncio.run(provider.finalize_runtime_template())
+
+
+@pytest.mark.parametrize("mutation", ["modified", "truncated"])
+def test_runtime_image_bundle_import_rejects_changed_bundle_and_reaps_process(
+    mutation: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = b"bundle-for-import"
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _stage_bundle_for_import(
+        monkeypatch, spawner, archive=archive
+    )
+    bundle_path = provider._runtime_image_bundle_path
+    assert bundle_path is not None
+    if mutation == "modified":
+        bundle_path.write_bytes(b"x" * len(archive))
+    else:
+        bundle_path.write_bytes(b"")
+
+    import_command_prefix = ("sbx", "exec", "-i", sandbox_id)
+    spawner.handler = lambda command: (
+        _Outcome()
+        if command[:4] == import_command_prefix
+        else _Outcome(returncode=1, stderr=b"unexpected command")
+    )
+
+    try:
+        with pytest.raises(DockerSbxError) as raised:
+            asyncio.run(
+                provider._import_runtime_image_bundle(
+                    sandbox_id, time.monotonic() + 300.0
+                )
+            )
+        process = spawner.processes[-1]
+        assert raised.value.reason == "image_bundle_changed"
+        assert process.waited is True
+        assert process.returncode is not None
+        evidence = get_sandbox_failure_evidence(raised.value)
+        assert evidence is not None
+        assert evidence.operation == "image_bundle_import"
+        assert evidence.reason == "image_bundle_changed"
+        assert evidence.sandbox_id == sandbox_id
+        assert evidence.subprocess_started is True
+    finally:
+        asyncio.run(provider.finalize_runtime_template())
+
+
+def test_runtime_image_bundle_import_load_failure_reaps_process_and_records_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _stage_bundle_for_import(monkeypatch, spawner)
+    import_command_prefix = ("sbx", "exec", "-i", sandbox_id)
+    spawner.handler = lambda command: (
+        _Outcome(returncode=17, stderr=b"docker load failed")
+        if command[:4] == import_command_prefix
+        else _Outcome(returncode=1, stderr=b"unexpected command")
+    )
+
+    try:
+        with pytest.raises(DockerSbxError) as raised:
+            asyncio.run(
+                provider._import_runtime_image_bundle(
+                    sandbox_id, time.monotonic() + 300.0
+                )
+            )
+        process = spawner.processes[-1]
+        assert raised.value.reason == "nonzero_exit"
+        assert process.waited is True
+        assert process.returncode == 17
+        evidence = get_sandbox_failure_evidence(raised.value)
+        assert evidence is not None
+        assert evidence.operation == "image_bundle_import"
+        assert evidence.reason == "nonzero_exit"
+        assert evidence.returncode == 17
+        assert evidence.sandbox_id == sandbox_id
+        assert evidence.subprocess_started is True
     finally:
         asyncio.run(provider.finalize_runtime_template())
 

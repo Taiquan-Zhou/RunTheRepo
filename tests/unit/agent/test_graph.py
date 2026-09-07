@@ -39,6 +39,7 @@ from repotrial.domain.models import (
 from repotrial.models.base import RecoveryAction
 from repotrial.sandbox.base import (
     ExecResult,
+    RuntimeImagePlan,
     RuntimeTemplateAudit,
     RuntimeTemplateIdentity,
     SandboxFailureEvidence,
@@ -81,6 +82,7 @@ def _is_allowed_runtime_template_command(
 
 _GRAPH_COMPOSE_ROUTES = {
     ("config", "--format", "json"): "config_format",
+    ("config", "--services"): "config_services",
     ("config", "--quiet"): "config_quiet",
     ("up", "-d", "--wait", "--wait-timeout", "60"): "up",
     (
@@ -115,6 +117,12 @@ def _graph_safe_relative_path(value: str) -> bool:
         and not any(
             unicodedata.category(character).startswith("C") for character in value
         )
+    )
+
+
+def _graph_compose_path(value: str) -> bool:
+    return value == "/tmp/repotrial-runtime-image.overlay.json" or (
+        _graph_safe_relative_path(value)
     )
 
 
@@ -358,6 +366,14 @@ class GraphProvider(FakeSandboxProvider):
                     ),
                     stderr="",
                 )
+            if route_name == "config_services":
+                return ExecResult(exit_code=0, stdout="web\n", stderr="")
+            if route_name == "config_images":
+                image = "docker.io/example/web:1"
+                runtime_plan = getattr(self, "_runtime_image_plan", None)
+                if runtime_plan is not None:
+                    image = runtime_plan.bindings[0].alias
+                return ExecResult(exit_code=0, stdout=f"{image}\n", stderr="")
             healthy = self._healthy[sandbox_id]
             if route_name == "config_quiet":
                 return ExecResult(
@@ -404,9 +420,7 @@ class GraphProvider(FakeSandboxProvider):
             index += 2
         compose_files: list[str] = []
         while index < len(command) and command[index] == "-f":
-            if index + 1 >= len(command) or not _graph_safe_relative_path(
-                command[index + 1]
-            ):
+            if index + 1 >= len(command) or not _graph_compose_path(command[index + 1]):
                 return None
             compose_files.append(command[index + 1])
             index += 2
@@ -414,7 +428,19 @@ class GraphProvider(FakeSandboxProvider):
             set(compose_files)
         ):
             return None
-        route_name = _GRAPH_COMPOSE_ROUTES.get(tuple(command[index:]))
+        command_tail = tuple(command[index:])
+        route_name = _GRAPH_COMPOSE_ROUTES.get(command_tail)
+        if (
+            route_name is None
+            and len(command_tail) == 3
+            and command_tail[:2]
+            == (
+                "config",
+                "--images",
+            )
+            and command_tail[2] == "web"
+        ):
+            route_name = "config_images"
         if route_name is None:
             return None
         files = tuple(compose_files)
@@ -2776,6 +2802,7 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         self._runtime_template_finalization_confirmed = True
         self._trial_deadline: int | None = None
         self.staged_bundle: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+        self._runtime_image_plan: RuntimeImagePlan | None = None
 
     @property
     def supports_runtime_templates(self) -> bool:
@@ -2800,6 +2827,7 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         self._trial_deadline = None
         self._runtime_template_finalization_confirmed = False
         self.staged_bundle = None
+        self._runtime_image_plan = None
 
     async def create(self, workspace: Path, name: str) -> str:
         if self._trial_deadline is None:
@@ -2826,6 +2854,19 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         self, sandbox_id: str, argv: list[str], timeout_s: int = 60
     ) -> ExecResult:
         snapshot = tuple(argv)
+        if snapshot[-4:] == (
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            "docker.io/example/web:1",
+        ):
+            self._require_active(sandbox_id)
+            self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
+            return ExecResult(
+                exit_code=0,
+                stdout="sha256:" + "a" * 64 + "\n",
+                stderr="",
+            )
         if "image" in snapshot and "ls" in snapshot:
             self._require_active(sandbox_id)
             self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
@@ -2889,20 +2930,6 @@ class RuntimeTemplateGraphProvider(GraphProvider):
                     stderr="",
                 )
             if snapshot[-5:] in {
-                ("rm", "--recursive", "--force", "--", self.guest_root),
-                ("rm", "--recursive", "--force", "--", self.git_root),
-            }:
-                command = snapshot[-5:]
-                if not _is_allowed_runtime_template_command(snapshot, command):
-                    raise AssertionError(f"unexpected guest-root command: {snapshot!r}")
-                self._require_active(sandbox_id)
-                self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
-                return ExecResult(
-                    exit_code=1,
-                    stdout="",
-                    stderr="clone root is an active mountpoint",
-                )
-            if snapshot[-5:] in {
                 ("find", self.guest_root, "-mindepth", "1", "-delete"),
                 ("find", self.git_root, "-mindepth", "1", "-delete"),
             }:
@@ -2929,6 +2956,8 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         sandbox_id: str,
         image_references: tuple[str, ...],
         image_ids: tuple[str, ...],
+        *,
+        runtime_image_plan: RuntimeImagePlan | None = None,
     ) -> None:
         self._require_active(sandbox_id)
         if self._roles.get(sandbox_id) != "warmup":
@@ -2939,13 +2968,23 @@ class RuntimeTemplateGraphProvider(GraphProvider):
             ("docker.io/example/web:1",),
             ("sha256:" + "a" * 64,),
         )
-        if (image_references, image_ids) != expected:
+        if (image_references, image_ids) != expected or runtime_image_plan is None:
             raise AssertionError(
                 f"unexpected image bundle identity: {image_references!r}, {image_ids!r}"
             )
         if self.staged_bundle is not None:
             raise AssertionError("image bundle staging invoked more than once")
         self.staged_bundle = (image_references, image_ids)
+        self._runtime_image_plan = runtime_image_plan
+
+    def runtime_image_plan(self) -> RuntimeImagePlan | None:
+        return self._runtime_image_plan
+
+    async def prepare_runtime_image_bindings(self, sandbox_id: str) -> str | None:
+        self._require_active(sandbox_id)
+        if self._runtime_image_plan is None:
+            return None
+        return "/tmp/repotrial-runtime-image.overlay.json"
 
     async def activate_runtime_template(
         self, sandbox_id: str, image_identity_sha256: str
