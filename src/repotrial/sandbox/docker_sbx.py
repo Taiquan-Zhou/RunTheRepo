@@ -105,7 +105,7 @@ _IMAGE_BUNDLE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _IMAGE_BUNDLE_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z")
 _IMAGE_BUNDLE_REPOSITORY = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _IMAGE_BUNDLE_CHUNK_BYTES = 8192
-_RUNTIME_IMAGE_OVERLAY_PATH = ".repotrial-overlays/runtime-image.overlay.json"
+_RUNTIME_IMAGE_OVERLAY_PATH = "/tmp/repotrial-runtime-image.overlay.json"
 _RUNTIME_IMAGE_OVERLAY_SCRIPT = """\
 set -eu
 umask 077
@@ -114,18 +114,26 @@ if [ "$#" -ne 3 ]; then exit 20; fi
 target_path=$1
 expected_sha256=$2
 payload=$3
-[ "$target_path" = ".repotrial-overlays/runtime-image.overlay.json" ] || exit 21
-if [ -e .repotrial-overlays ] || [ -L .repotrial-overlays ]; then
-    [ -d .repotrial-overlays ] && [ ! -L .repotrial-overlays ] || exit 22
-else
-    mkdir .repotrial-overlays || exit 22
-fi
+[ "$target_path" = "/tmp/repotrial-runtime-image.overlay.json" ] || exit 21
 if [ -e "$target_path" ] || [ -L "$target_path" ]; then exit 23; fi
 printf '%s' "$payload" | base64 -d > "$target_path" || exit 24
 chmod 600 "$target_path" || exit 25
 [ "$(stat -c '%a' -- "$target_path")" = "600" ] || exit 26
+[ "$(stat -c '%F' -- "$target_path")" = "regular file" ] || exit 26
+[ "$(stat -c '%u' -- "$target_path")" = "$(id -u)" ] || exit 26
 [ "$(sha256sum -- "$target_path" | cut -d ' ' -f 1)" = "$expected_sha256" ] || exit 27
-printf 'path=%s\\nmode=600\\nsha256=%s\\n' "$target_path" "$expected_sha256"
+printf 'path=%s\\nmode=600\\nuid=%s\\nsha256=%s\\n' "$target_path" "$(id -u)" "$expected_sha256"
+"""
+_RUNTIME_IMAGE_VERIFY_SCRIPT = """\
+set -eu
+target_path=$1
+expected_sha256=$2
+[ "$target_path" = "/tmp/repotrial-runtime-image.overlay.json" ] || exit 21
+[ -f "$target_path" ] && [ ! -L "$target_path" ] || exit 22
+[ "$(stat -c '%a' -- "$target_path")" = "600" ] || exit 23
+[ "$(stat -c '%u' -- "$target_path")" = "$(id -u)" ] || exit 24
+[ "$(sha256sum -- "$target_path" | cut -d ' ' -f 1)" = "$expected_sha256" ] || exit 25
+printf 'path=%s\\nmode=600\\nuid=%s\\nsha256=%s\\n' "$target_path" "$(id -u)" "$expected_sha256"
 """
 
 MANDATORY_DENY_NETWORK = frozenset(
@@ -486,7 +494,9 @@ class DockerSbxProvider(SandboxProvider):
                     }
                 )
             )
-            if references != expected_references or ids != runtime_image_plan.image_ids:
+            if not set(expected_references).issubset(references) or (
+                ids != runtime_image_plan.image_ids
+            ):
                 raise DockerSbxError("image_bundle_stage", "image_binding_mismatch")
         self._runtime_image_bundle_stage_used = True
         if any(
@@ -600,19 +610,23 @@ class DockerSbxProvider(SandboxProvider):
         plan = self._runtime_image_plan
         if plan is None:
             return None
-        await self._verify_runtime_image_ids(
-            sandbox_id, plan, self._require_deadline(sandbox_id)
+        await self._ensure_runtime_image_bindings(
+            sandbox_id, self._require_deadline(sandbox_id)
         )
+        return _RUNTIME_IMAGE_OVERLAY_PATH
+
+    async def _ensure_runtime_image_bindings(
+        self, sandbox_id: str, deadline: float
+    ) -> None:
+        plan = self._runtime_image_plan
+        if plan is None:
+            raise DockerSbxError("runtime_image_bind", "image_binding_missing")
+        await self._verify_runtime_image_ids(sandbox_id, plan, deadline)
         if sandbox_id not in self._runtime_image_overlay_sandboxes:
-            await self._materialize_runtime_image_overlay(
-                sandbox_id, plan, self._require_deadline(sandbox_id)
-            )
+            await self._materialize_runtime_image_overlay(sandbox_id, plan, deadline)
             self._runtime_image_overlay_sandboxes.add(sandbox_id)
         else:
-            await self._verify_runtime_image_overlay(
-                sandbox_id, self._require_deadline(sandbox_id)
-            )
-        return _RUNTIME_IMAGE_OVERLAY_PATH
+            await self._verify_runtime_image_overlay(sandbox_id, deadline)
 
     async def _verify_runtime_image_ids(
         self, sandbox_id: str, plan: RuntimeImagePlan, deadline: float
@@ -760,8 +774,13 @@ class DockerSbxProvider(SandboxProvider):
             public_sandbox_id=sandbox_id,
         )
         _require_success("runtime_image_overlay", result)
-        expected = f"path={_RUNTIME_IMAGE_OVERLAY_PATH}\nmode=600\nsha256={payload_hash}\n".encode()
-        if result.stdout != expected or result.stderr:
+        output = result.stdout.decode("utf-8", errors="strict")
+        expected = re.fullmatch(
+            rf"path={re.escape(_RUNTIME_IMAGE_OVERLAY_PATH)}\n"
+            rf"mode=600\nuid=[0-9]+\nsha256={payload_hash}\n",
+            output,
+        )
+        if expected is None or result.stderr:
             raise DockerSbxError("runtime_image_overlay", "overlay_identity_invalid")
         self._runtime_image_overlay_sha256 = payload_hash
 
@@ -777,9 +796,13 @@ class DockerSbxProvider(SandboxProvider):
                 "exec",
                 sandbox_id,
                 "--",
-                "sha256sum",
-                "--",
+                "sh",
+                "-eu",
+                "-c",
+                _RUNTIME_IMAGE_VERIFY_SCRIPT,
+                "repotrial-runtime-image-verify",
                 _RUNTIME_IMAGE_OVERLAY_PATH,
+                expected_hash,
             ],
             self._command_timeout_s,
             deadline=deadline,
@@ -787,9 +810,20 @@ class DockerSbxProvider(SandboxProvider):
             public_sandbox_id=sandbox_id,
         )
         _require_success("runtime_image_overlay", result)
+        try:
+            output = result.stdout.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            raise DockerSbxError(
+                "runtime_image_overlay", "overlay_identity_invalid"
+            ) from None
         if (
-            result.stdout
-            != f"{expected_hash}  {_RUNTIME_IMAGE_OVERLAY_PATH}\n".encode()
+            re.fullmatch(
+                rf"path={re.escape(_RUNTIME_IMAGE_OVERLAY_PATH)}\n"
+                rf"mode=600\nuid=[0-9]+\nsha256={expected_hash}\n",
+                output,
+            )
+            is None
+            or result.stderr
         ):
             raise DockerSbxError("runtime_image_overlay", "overlay_identity_invalid")
 
@@ -1552,6 +1586,8 @@ class DockerSbxProvider(SandboxProvider):
             or len(self._runtime_template_audit.uses) >= 128
         ):
             raise DockerSbxError("create", "template_identity_invalid")
+        if template_identity is not None and self._runtime_image_plan is None:
+            raise DockerSbxError("create", "image_binding_missing")
         if template_identity is not None and not self._runtime_image_bundle_complete():
             raise DockerSbxError("create", "image_bundle_required")
         deadline = self._trial_deadline
@@ -1675,9 +1711,7 @@ class DockerSbxProvider(SandboxProvider):
             ):
                 await self._import_runtime_image_bundle(sandbox_id, deadline)
                 if self._runtime_image_plan is not None:
-                    await self._prepare_runtime_image_bindings(
-                        sandbox_id, self._runtime_image_plan, deadline
-                    )
+                    await self._ensure_runtime_image_bindings(sandbox_id, deadline)
         except (DockerSbxError, asyncio.CancelledError) as error:
             await self._cleanup_after_uncertain_failure(
                 sandbox_id,
@@ -1696,18 +1730,6 @@ class DockerSbxProvider(SandboxProvider):
                 sandbox_id
             )
         return sandbox_id
-
-    async def _prepare_runtime_image_bindings(
-        self,
-        sandbox_id: str,
-        plan: RuntimeImagePlan | None,
-        deadline: float,
-    ) -> None:
-        if plan is None:
-            raise DockerSbxError("runtime_image_bind", "image_binding_missing")
-        await self._verify_runtime_image_ids(sandbox_id, plan, deadline)
-        await self._materialize_runtime_image_overlay(sandbox_id, plan, deadline)
-        self._runtime_image_overlay_sandboxes.add(sandbox_id)
 
     def _runtime_image_bundle_complete(self) -> bool:
         return (

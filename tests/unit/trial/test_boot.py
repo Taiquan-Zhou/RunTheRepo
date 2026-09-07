@@ -6,7 +6,7 @@ from typing import cast
 import pytest
 
 from repotrial.domain.enums import Verdict
-from repotrial.sandbox.base import ExecResult
+from repotrial.sandbox.base import ExecResult, RuntimeImageBinding, RuntimeImagePlan
 from repotrial.sandbox.fake import FakeSandboxProvider
 from repotrial.trial.boot import BootResult, _boot_compose_with_evidence, boot_compose
 from repotrial.trial.image_template import (
@@ -128,6 +128,9 @@ COMPATIBILITY_OVERLAY_LOGS_ARGV = (
     "--tail",
     "200",
 )
+RUNTIME_ALIAS = (
+    "docker.io/library/repotrial-runtime-" + "b" * 32 + "-" + "c" * 32 + ":latest"
+)
 
 
 def _result(*, exit_code: int = 0, stdout: str = "", stderr: str = "") -> ExecResult:
@@ -169,14 +172,28 @@ class ActiveTemplateBootProvider(FakeSandboxProvider):
         *,
         inventory_output: str | None = None,
         expected_identity: str | None = None,
+        final_image: str = RUNTIME_ALIAS,
         up_results: list[ExecResult] | None = None,
         ps_results: list[ExecResult] | None = None,
     ) -> None:
         super().__init__()
         self.inventory_output = inventory_output or _image_inventory_output()
-        self.expected_identity = (
-            expected_identity or parse_image_inventory(self.inventory_output).sha256
+        inventory = parse_image_inventory(self.inventory_output)
+        self.expected_identity = expected_identity or inventory.sha256
+        image_id = inventory.records[0].image_id
+        self.runtime_plan = RuntimeImagePlan(
+            inventory_sha256=inventory.sha256,
+            bindings=(
+                RuntimeImageBinding(
+                    service="web",
+                    source_reference="docker.io/library/alpine:latest",
+                    image_id=image_id,
+                    alias=RUNTIME_ALIAS,
+                ),
+            ),
+            image_ids=(image_id,),
         )
+        self.final_image = final_image
         self.up_results = list(up_results or [_result()])
         self.ps_results = list(ps_results or [_result(stdout=_healthy_ps())])
         self.exec_calls: list[tuple[str, ...]] = []
@@ -188,14 +205,23 @@ class ActiveTemplateBootProvider(FakeSandboxProvider):
     def expected_image_identity_sha256(self) -> str | None:
         return self.expected_identity
 
+    def runtime_image_plan(self) -> RuntimeImagePlan | None:
+        return self.runtime_plan
+
+    async def prepare_runtime_image_bindings(self, sandbox_id: str) -> str | None:
+        self._require_active(sandbox_id)
+        return "/tmp/repotrial-runtime-image.overlay.json"
+
     async def exec(
         self, sandbox_id: str, argv: list[str], timeout_s: int = 60
     ) -> ExecResult:
         self._require_active(sandbox_id)
         call = tuple(argv)
         self.exec_calls.append(call)
-        if call[-8:-6] == ("docker", "image"):
-            return _result(stdout=self.inventory_output)
+        if call[-2:] == ("config", "--services"):
+            return _result(stdout="web\n")
+        if call[-3:-1] == ("config", "--images"):
+            return _result(stdout=self.final_image + "\n")
         if call[-8:] == (
             "up",
             "-d",
@@ -234,8 +260,9 @@ def test_boot_active_template_verifies_identity_and_disables_pull_and_build() ->
     result = _run_active_template_boot(provider)
 
     assert result.verdict is Verdict.PASS
-    assert provider.exec_calls[0][-8:-6] == ("docker", "image")
-    assert provider.exec_calls[1][-8:] == (
+    assert provider.exec_calls[0][-2:] == ("config", "--services")
+    assert provider.exec_calls[1][-3:-1] == ("config", "--images")
+    assert provider.exec_calls[2][-8:] == (
         "up",
         "-d",
         "--wait",
@@ -255,7 +282,7 @@ def test_boot_active_template_identity_mismatch_fails_before_startup() -> None:
         _run_active_template_boot(provider)
 
     assert getattr(error.value, "reason", None) == "image_identity_mismatch"
-    assert len(provider.exec_calls) == 1
+    assert len(provider.exec_calls) == 2
     assert all("up" not in call for call in provider.exec_calls)
 
 

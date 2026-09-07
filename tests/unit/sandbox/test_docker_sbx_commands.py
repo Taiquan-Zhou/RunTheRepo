@@ -2205,20 +2205,9 @@ def test_create_uses_active_runtime_template_with_clone_and_policy_flags(
         bundle_size=provider._runtime_image_bundle_size,
     )
 
-    try:
-        sandbox_id = _create(provider, tmp_path)
-
-        create_call = _actual_create_call(spawner)
-        assert create_call[4] == "--clone"
-        assert ("--template", provider._runtime_template_tag) == create_call[-4:-2]
-        assert create_call[-2:] == ("shell", str(tmp_path))
-        assert sandbox_id in create_call
-        load_call = ("sbx", "exec", "-i", sandbox_id, "--", "docker", "image", "load")
-        load_index = spawner.calls.index(load_call)
-        assert spawner.calls.index(create_call) < load_index
-        assert spawner.processes[load_index].stdin.data == b"runtime-image-bundle"
-    finally:
-        asyncio.run(provider.finalize_runtime_template())
+    with pytest.raises(DockerSbxError, match="image_binding_missing"):
+        _create(provider, tmp_path)
+    assert not any(call[:2] == ("sbx", "create") for call in spawner.calls)
 
 
 def test_create_rejects_active_runtime_template_without_complete_bundle(
@@ -2241,7 +2230,7 @@ def test_create_rejects_active_runtime_template_without_complete_bundle(
     provider._runtime_template_expected_identity = identity.image_identity_sha256
     provider._runtime_template_audit = RuntimeTemplateAudit(identity=identity)
 
-    with pytest.raises(DockerSbxError, match="image_bundle"):
+    with pytest.raises(DockerSbxError, match="image_binding_missing"):
         _create(provider, tmp_path)
 
     assert provider.runtime_template_audit().uses == ()

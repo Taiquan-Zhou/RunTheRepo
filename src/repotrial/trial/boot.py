@@ -11,6 +11,7 @@ from repotrial.sandbox.base import ExecResult, SandboxProvider
 from repotrial.trial.boot_evidence import _BootEvidenceSession
 from repotrial.trial.image_template import (
     ImageTemplateError,
+    resolve_compose_service_images,
     validate_runtime_compose_mapping,
     verify_compose_image_identity,
 )
@@ -100,6 +101,9 @@ async def _boot_compose_with_evidence(
     effective_env = dict(env)
     declared_secret_keys = _bounded_declared_secret_keys(declared_secret_env_keys)
     runtime_plan = provider.runtime_image_plan()
+    expected_image_identity = provider.expected_image_identity_sha256()
+    if expected_image_identity is not None and runtime_plan is None:
+        raise ImageTemplateError("image_binding_missing")
     runtime_overlay_path = await provider.prepare_runtime_image_bindings(sandbox_id)
     if runtime_plan is not None and runtime_overlay_path is None:
         raise ImageTemplateError("runtime_image_overlay_missing")
@@ -154,29 +158,19 @@ async def _boot_compose_with_evidence(
         evidence.record_command("config", config_result)
 
     if runtime_plan is not None:
-        runtime_config = await provider.exec(
+        runtime_services = await resolve_compose_service_images(
+            provider,
             sandbox_id,
-            [
-                *_validated_compose_env_prefix(
-                    compose_path, effective_env, unset_env_keys
-                ),
-                *docker_compose,
-                "config",
-                "--format",
-                "json",
-            ],
-            timeout_s=_COMPOSE_CONFIG_TIMEOUT_S,
+            docker_compose,
+            _validated_compose_env_prefix(compose_path, effective_env, unset_env_keys),
         )
-        if not isinstance(runtime_config, ExecResult) or runtime_config.exit_code != 0:
-            raise ImageTemplateError("runtime_compose_mapping_invalid")
-        validate_runtime_compose_mapping(runtime_config.stdout, runtime_plan)
+        validate_runtime_compose_mapping(runtime_services, runtime_plan)
 
     prefix = _validated_compose_env_prefix(
         compose_path,
         effective_env,
         unset_env_keys,
     )
-    expected_image_identity = provider.expected_image_identity_sha256()
     template_active = expected_image_identity is not None
     if expected_image_identity is not None:
         try:

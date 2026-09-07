@@ -248,7 +248,7 @@ _RUNTIME_IMAGE_HASH_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _RUNTIME_IMAGE_SERVICE_PATTERN = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}\Z")
 _RUNTIME_IMAGE_REFERENCE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@:-]{0,511}\Z")
 _RUNTIME_IMAGE_ALIAS_PATTERN = re.compile(
-    r"docker\.io/library/repotrial-runtime-[0-9a-f]{32}:latest\Z"
+    r"docker\.io/library/repotrial-runtime-[0-9a-f]{32}-[0-9a-f]{32}:latest\Z"
 )
 
 
@@ -490,8 +490,18 @@ class RuntimeImagePlan:
             raise ValueError("runtime image plan services are duplicated")
         if len({binding.alias for binding in self.bindings}) != len(self.bindings):
             raise ValueError("runtime image plan aliases are duplicated")
-        expected_ids = tuple(sorted({binding.image_id for binding in self.bindings}))
-        if self.image_ids != expected_ids:
+        if (
+            type(self.image_ids) is not tuple
+            or not self.image_ids
+            or self.image_ids != tuple(sorted(self.image_ids))
+            or len(set(self.image_ids)) != len(self.image_ids)
+        ):
+            raise ValueError("runtime image plan image IDs are invalid")
+        if any(
+            not isinstance(image_id, str)
+            or _RUNTIME_IMAGE_ID_PATTERN.fullmatch(image_id) is None
+            for image_id in self.image_ids
+        ):
             raise ValueError("runtime image plan image IDs are invalid")
 
     def as_public_record(self) -> dict[str, object]:

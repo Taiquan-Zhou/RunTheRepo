@@ -207,24 +207,26 @@ class TemplateProvider(FakeSandboxProvider):
             ):
                 raise self.provider_error
             return self._result("config")
-        if call[-3:] == ("config", "--format", "json"):
+        if call[-2:] == ("config", "--services"):
             records = [json.loads(line) for line in self.inventory_output.splitlines()]
-            services = {}
-            for index, record in enumerate(records):
-                repository = record["Repository"].strip().lower()
-                if repository in {"<none>", ""}:
-                    repository = "service"
-                if "." not in repository and ":" not in repository.split("/")[0]:
-                    repository = f"docker.io/library/{repository}"
-                tag = record["Tag"].strip()
-                digest = record["Digest"].strip()
-                reference = (
-                    f"{repository}:{tag}"
-                    if tag != "<none>"
-                    else f"{repository}@{digest}"
-                )
-                services[f"service{index}"] = {"image": reference}
-            return self._result("config", stdout=json.dumps({"services": services}))
+            return self._result(
+                "config-services",
+                stdout="".join(f"service{index}\n" for index in range(len(records))),
+            )
+        if call[-3:-1] == ("config", "--images"):
+            index = int(call[-1].removeprefix("service"))
+            record = json.loads(self.inventory_output.splitlines()[index])
+            repository = record["Repository"].strip().lower()
+            if repository in {"<none>", ""}:
+                repository = "service"
+            if "." not in repository and ":" not in repository.split("/")[0]:
+                repository = f"docker.io/library/{repository}"
+            tag = record["Tag"].strip()
+            digest = record["Digest"].strip()
+            reference = (
+                f"{repository}:{tag}" if tag != "<none>" else f"{repository}@{digest}"
+            )
+            return self._result("config-images", stdout=f"{reference}\n")
         if call[-2:] == ("pull", "--ignore-buildable"):
             if self.provider_error_stage == "pull" and self.provider_error is not None:
                 raise self.provider_error
@@ -347,8 +349,10 @@ def _prepare(provider: TemplateProvider) -> object:
 def _stage(call: tuple[str, ...]) -> str:
     if call[-2:] == ("config", "--quiet"):
         return "config"
-    if call[-3:] == ("config", "--format", "json"):
-        return "config-format"
+    if call[-2:] == ("config", "--services"):
+        return "config-services"
+    if call[-3:-1] == ("config", "--images"):
+        return "config-images"
     if call[-2:] == ("pull", "--ignore-buildable"):
         return "pull"
     if call[-1:] == ("build",):
@@ -424,7 +428,8 @@ def test_prepare_compose_image_template_clears_root_then_activates() -> None:
         "config",
         "pull",
         "build",
-        "config-format",
+        "config-services",
+        "config-images",
         "inventory",
         "inventory",
         "pwd",
@@ -523,7 +528,8 @@ def test_prepare_rejects_nonempty_clear_proof_before_activation() -> None:
         "config",
         "pull",
         "build",
-        "config-format",
+        "config-services",
+        "config-images",
         "inventory",
         "inventory",
         "pwd",
@@ -631,14 +637,16 @@ def test_prepare_compose_image_template_fails_closed_before_activation(
                 "config",
                 "pull",
                 "build",
-                "config-format",
+                "config-services",
+                "config-images",
                 "inventory",
             ),
             "remove": (
                 "config",
                 "pull",
                 "build",
-                "config-format",
+                "config-services",
+                "config-images",
                 "inventory",
                 "inventory",
                 "pwd",
@@ -649,7 +657,8 @@ def test_prepare_compose_image_template_fails_closed_before_activation(
                 "config",
                 "pull",
                 "build",
-                "config-format",
+                "config-services",
+                "config-images",
                 "inventory",
                 "inventory",
                 "pwd",
