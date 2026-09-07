@@ -2827,10 +2827,17 @@ def _is_canonical_image_reference(reference: str) -> bool:
     ):
         return False
     if "@" in repository_and_tag[-1]:
+        if repository_and_tag[-1].count("@") != 1:
+            return False
         image, digest = repository_and_tag[-1].split("@", 1)
+        if _IMAGE_BUNDLE_ID.fullmatch(digest) is None:
+            return False
+        image_and_tag = image.rsplit(":", 1)
+        if len(image_and_tag) == 1:
+            return _IMAGE_BUNDLE_REPOSITORY.fullmatch(image) is not None
         return (
-            _IMAGE_BUNDLE_REPOSITORY.fullmatch(image) is not None
-            and _IMAGE_BUNDLE_ID.fullmatch(digest) is not None
+            _IMAGE_BUNDLE_REPOSITORY.fullmatch(image_and_tag[0]) is not None
+            and _IMAGE_BUNDLE_TAG.fullmatch(image_and_tag[1]) is not None
         )
     image_and_tag = repository_and_tag[-1].rsplit(":", 1)
     return (

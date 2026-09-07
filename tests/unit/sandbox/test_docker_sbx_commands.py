@@ -1554,6 +1554,16 @@ def test_bundle_validator_accepts_canonical_digest(repository: str) -> None:
     )
 
 
+def test_bundle_validator_accepts_canonical_tagged_digest() -> None:
+    reference = "docker.io/library/busybox:1.36.1@sha256:" + "7" * 64
+    image_id = "sha256:" + "b" * 64
+
+    assert docker_sbx._validate_image_bundle_inputs((reference,), (image_id,)) == (
+        (reference,),
+        (image_id,),
+    )
+
+
 @pytest.mark.parametrize(
     "reference",
     [
