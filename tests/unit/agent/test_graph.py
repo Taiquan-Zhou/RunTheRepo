@@ -362,11 +362,13 @@ class GraphProvider(FakeSandboxProvider):
         if route is not None:
             route_name, _compose_files, _prefix = route
             if route_name == "config_format":
+                image = "example/web:1"
+                runtime_plan = getattr(self, "_runtime_image_plan", None)
+                if runtime_plan is not None:
+                    image = runtime_plan.bindings[0].alias
                 return ExecResult(
                     exit_code=0,
-                    stdout=json.dumps(
-                        {"services": {"web": {"image": "example/web:1"}}}
-                    ),
+                    stdout=json.dumps({"services": {"web": {"image": image}}}),
                     stderr="",
                 )
             if route_name == "config_services":
@@ -435,13 +437,8 @@ class GraphProvider(FakeSandboxProvider):
         route_name = _GRAPH_COMPOSE_ROUTES.get(command_tail)
         if (
             route_name is None
-            and len(command_tail) == 3
-            and command_tail[:2]
-            == (
-                "config",
-                "--images",
-            )
-            and command_tail[2] == "web"
+            and command_tail[:2] == ("config", "--images")
+            and (len(command_tail) == 2 or command_tail[2] == "web")
         ):
             route_name = "config_images"
         if route_name is None:

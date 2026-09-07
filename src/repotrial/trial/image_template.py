@@ -28,6 +28,7 @@ _MAX_IMAGE_FIELD_BYTES: Final = 512
 _MAX_COMMAND_OUTPUT_BYTES: Final = 65_536
 _IMAGE_FIELDS: Final = frozenset({"ID", "Repository", "Tag", "Digest"})
 _RUNTIME_SERVICE_PATTERN: Final = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}\Z")
+_COMPOSE_PROJECT_NAME_PATTERN: Final = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}\Z")
 _IMAGE_NAME_COMPONENT: Final = r"[a-z0-9][a-z0-9._-]{0,127}"
 _IMAGE_TAG: Final = r":[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}"
 _IMAGE_DIGEST: Final = r"@sha256:[0-9a-f]{64}"
@@ -176,6 +177,83 @@ def parse_compose_image_output(output: str | bytes, *, service: str) -> str:
     return reference
 
 
+def parse_compose_resolved_image_output(
+    output: str | bytes, *, services: tuple[str, ...]
+) -> tuple[tuple[str, str], ...]:
+    """Parse service images from one bounded, resolved Compose JSON object."""
+
+    if (
+        not isinstance(services, tuple)
+        or not services
+        or services != tuple(sorted(services))
+        or len(set(services)) != len(services)
+        or any(
+            not isinstance(service, str)
+            or _RUNTIME_SERVICE_PATTERN.fullmatch(service) is None
+            for service in services
+        )
+    ):
+        raise ImageTemplateError("runtime_service_mapping_invalid")
+    text = _decode_bounded_runtime_output(output, "runtime_service_mapping_invalid")
+    try:
+        resolved = json.loads(
+            text,
+            object_pairs_hook=_object_without_duplicate_keys,
+            parse_constant=_reject_nonstandard_constant,
+        )
+    except (json.JSONDecodeError, RecursionError, UnicodeError, ValueError):
+        raise ImageTemplateError("runtime_service_mapping_invalid") from None
+    if not isinstance(resolved, dict):
+        raise ImageTemplateError("runtime_service_mapping_invalid")
+    project_name = resolved.get("name")
+    resolved_services = resolved.get("services")
+    if not isinstance(resolved_services, dict) or set(resolved_services) != set(
+        services
+    ):
+        raise ImageTemplateError("runtime_service_mapping_mismatch")
+    mapped: list[tuple[str, str]] = []
+    for service in services:
+        config = resolved_services.get(service)
+        if not isinstance(config, dict):
+            raise ImageTemplateError("runtime_service_mapping_invalid")
+        if "image" in config:
+            image = config["image"]
+            if not isinstance(image, str) or not image.strip():
+                raise ImageTemplateError("runtime_service_image_missing")
+        else:
+            build = config.get("build")
+            if (
+                not isinstance(build, dict)
+                or not build
+                or not isinstance(project_name, str)
+                or _COMPOSE_PROJECT_NAME_PATTERN.fullmatch(project_name) is None
+            ):
+                raise ImageTemplateError("runtime_service_image_missing")
+            image = f"{project_name}-{service}"
+        try:
+            reference = _canonicalize_compose_image_reference(image.strip())
+        except ValueError:
+            raise ImageTemplateError("runtime_image_output_invalid") from None
+        mapped.append((service, reference))
+    return tuple(mapped)
+
+
+def parse_compose_images_output(output: str | bytes) -> tuple[str, ...]:
+    """Parse the bounded global image set emitted by Compose."""
+
+    text = _decode_bounded_runtime_output(output, "runtime_image_output_invalid")
+    lines = text.splitlines()
+    if not lines or any(not line.strip() for line in lines):
+        raise ImageTemplateError("runtime_image_output_invalid")
+    references: list[str] = []
+    for line in lines:
+        try:
+            references.append(_canonicalize_compose_image_reference(line.strip()))
+        except ValueError:
+            raise ImageTemplateError("runtime_image_output_invalid") from None
+    return tuple(references)
+
+
 def _canonicalize_compose_image_reference(reference: str) -> str:
     if _IMAGE_REFERENCE_WITHOUT_SUFFIX_PATTERN.fullmatch(reference) is None:
         raise ValueError("image reference is invalid")
@@ -309,19 +387,27 @@ async def resolve_compose_service_images(
         timeout_s=30,
     )
     services = parse_compose_services_output(services_result.stdout)
-    resolved: list[tuple[str, str]] = []
-    for service in services:
-        image_result = await _exec(
-            provider,
-            sandbox_id,
-            [*prefix, *compose_argv, "config", "--images", service],
-            "runtime_image_resolution_failed",
-            timeout_s=30,
-        )
-        resolved.append(
-            (service, parse_compose_image_output(image_result.stdout, service=service))
-        )
-    return tuple(resolved)
+    config_result = await _exec(
+        provider,
+        sandbox_id,
+        [*prefix, *compose_argv, "config", "--format", "json"],
+        "runtime_service_mapping_failed",
+        timeout_s=30,
+    )
+    resolved = parse_compose_resolved_image_output(
+        config_result.stdout, services=services
+    )
+    images_result = await _exec(
+        provider,
+        sandbox_id,
+        [*prefix, *compose_argv, "config", "--images"],
+        "runtime_image_resolution_failed",
+        timeout_s=30,
+    )
+    global_images = parse_compose_images_output(images_result.stdout)
+    if set(global_images) != {reference for _, reference in resolved}:
+        raise ImageTemplateError("runtime_service_mapping_mismatch")
+    return resolved
 
 
 def parse_image_inventory(output: str | bytes) -> ImageInventory:

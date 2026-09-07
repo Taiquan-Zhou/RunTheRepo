@@ -220,6 +220,12 @@ class ActiveTemplateBootProvider(FakeSandboxProvider):
         self.exec_calls.append(call)
         if call[-2:] == ("config", "--services"):
             return _result(stdout="web\n")
+        if call[-3:] == ("config", "--format", "json"):
+            return _result(
+                stdout=json.dumps({"services": {"web": {"image": self.final_image}}})
+            )
+        if call[-2:] == ("config", "--images"):
+            return _result(stdout=self.final_image + "\n")
         if call[-3:-1] == ("config", "--images"):
             return _result(stdout=self.final_image + "\n")
         if call[-8:] == (
@@ -261,8 +267,9 @@ def test_boot_active_template_verifies_identity_and_disables_pull_and_build() ->
 
     assert result.verdict is Verdict.PASS
     assert provider.exec_calls[0][-2:] == ("config", "--services")
-    assert provider.exec_calls[1][-3:-1] == ("config", "--images")
-    assert provider.exec_calls[2][-8:] == (
+    assert provider.exec_calls[1][-3:] == ("config", "--format", "json")
+    assert provider.exec_calls[2][-2:] == ("config", "--images")
+    assert provider.exec_calls[3][-8:] == (
         "up",
         "-d",
         "--wait",
@@ -282,7 +289,7 @@ def test_boot_active_template_identity_mismatch_fails_before_startup() -> None:
         _run_active_template_boot(provider)
 
     assert getattr(error.value, "reason", None) == "image_identity_mismatch"
-    assert len(provider.exec_calls) == 2
+    assert len(provider.exec_calls) == 3
     assert all("up" not in call for call in provider.exec_calls)
 
 

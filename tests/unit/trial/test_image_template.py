@@ -15,8 +15,10 @@ from repotrial.sandbox.docker_sbx import DockerSbxError
 from repotrial.sandbox.fake import FakeSandboxProvider
 from repotrial.trial.image_template import (
     ImageTemplateError,
+    parse_compose_resolved_image_output,
     parse_image_inventory,
     prepare_compose_image_template,
+    resolve_compose_service_images,
     verify_compose_image_identity,
 )
 
@@ -136,6 +138,111 @@ def test_parse_image_inventory_rejects_excessive_output() -> None:
         parse_image_inventory("x" * 300_000)
 
 
+def test_resolve_compose_service_images_uses_explicit_resolved_service_mapping() -> (
+    None
+):
+    provider = FakeSandboxProvider(
+        scripts={
+            ("docker", "compose", "config", "--services"): ExecResult(
+                exit_code=0, stdout="web\ndb\n", stderr=""
+            ),
+            ("docker", "compose", "config", "--format", "json"): ExecResult(
+                exit_code=0,
+                stdout=json.dumps(
+                    {
+                        "services": {
+                            "web": {"image": "busybox:1.36.1"},
+                            "db": {"image": "alpine:3.20"},
+                        }
+                    }
+                ),
+                stderr="",
+            ),
+            ("docker", "compose", "config", "--images", "web"): ExecResult(
+                exit_code=0,
+                stdout="busybox:1.36.1\nalpine:3.20\n",
+                stderr="",
+            ),
+            ("docker", "compose", "config", "--images", "db"): ExecResult(
+                exit_code=0,
+                stdout="alpine:3.20\n",
+                stderr="",
+            ),
+            ("docker", "compose", "config", "--images"): ExecResult(
+                exit_code=0,
+                stdout="busybox:1.36.1\nalpine:3.20\n",
+                stderr="",
+            ),
+        }
+    )
+    sandbox_id = asyncio.run(provider.create(Path("fixture"), "image-resolution"))
+
+    resolved = asyncio.run(
+        resolve_compose_service_images(provider, sandbox_id, ["docker", "compose"], ())
+    )
+
+    assert resolved == (
+        ("db", "docker.io/library/alpine:3.20"),
+        ("web", "docker.io/library/busybox:1.36.1"),
+    )
+    assert ("docker", "compose", "config", "--format", "json") in [
+        call[2] for call in provider.calls if call[0] == "exec"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("output", "reason"),
+    [
+        (
+            '{"services":{"web":{"image":"busybox"},"web":{}}}',
+            "runtime_service_mapping_invalid",
+        ),
+        ('{"services":{"web":[]}}', "runtime_service_mapping_invalid"),
+        ('{"services":{"web":{"image":""}}}', "runtime_service_image_missing"),
+        ('{"services":{"web":{"image":null}}}', "runtime_service_image_missing"),
+        ('{"services":{"db":{"image":"alpine"}}}', "runtime_service_mapping_mismatch"),
+    ],
+)
+def test_parse_compose_resolved_image_output_fails_closed(
+    output: str, reason: str
+) -> None:
+    with pytest.raises(ImageTemplateError) as error:
+        parse_compose_resolved_image_output(output, services=("web",))
+
+    assert error.value.reason == reason
+
+
+def test_parse_compose_resolved_image_output_supports_verified_build_only_name() -> (
+    None
+):
+    output = json.dumps(
+        {
+            "name": "buildonlysmoke",
+            "services": {"builder": {"build": {"context": "."}}},
+        }
+    )
+
+    assert parse_compose_resolved_image_output(output, services=("builder",)) == (
+        ("builder", "docker.io/library/buildonlysmoke-builder:latest"),
+    )
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        '{"services":{"builder":{"build":{"context":"."}}}}',
+        '{"name":"bad.name","services":{"builder":{"build":{"context":"."}}}}',
+        '{"name":"buildonlysmoke","services":{"builder":{"command":[]}}}',
+        "x" * 65_537,
+    ],
+)
+def test_parse_compose_resolved_image_output_rejects_unverified_build_only(
+    output: str,
+) -> None:
+    with pytest.raises(ImageTemplateError):
+        parse_compose_resolved_image_output(output, services=("builder",))
+
+
 class TemplateProvider(FakeSandboxProvider):
     def __init__(
         self,
@@ -213,6 +320,43 @@ class TemplateProvider(FakeSandboxProvider):
                 "config-services",
                 stdout="".join(f"service{index}\n" for index in range(len(records))),
             )
+        if call[-3:] == ("config", "--format", "json"):
+            records = [json.loads(line) for line in self.inventory_output.splitlines()]
+            services = {}
+            for index, record in enumerate(records):
+                repository = record["Repository"].strip().lower()
+                if repository in {"<none>", ""}:
+                    repository = "service"
+                if "." not in repository and ":" not in repository.split("/")[0]:
+                    repository = f"docker.io/library/{repository}"
+                tag = record["Tag"].strip()
+                digest = record["Digest"].strip()
+                reference = (
+                    f"{repository}:{tag}"
+                    if tag != "<none>"
+                    else f"{repository}@{digest}"
+                )
+                services[f"service{index}"] = {"image": reference}
+            return self._result(
+                "config-format", stdout=json.dumps({"services": services})
+            )
+        if call[-2:] == ("config", "--images"):
+            records = [json.loads(line) for line in self.inventory_output.splitlines()]
+            references = []
+            for record in records:
+                repository = record["Repository"].strip().lower()
+                if repository in {"<none>", ""}:
+                    repository = "service"
+                if "." not in repository and ":" not in repository.split("/")[0]:
+                    repository = f"docker.io/library/{repository}"
+                tag = record["Tag"].strip()
+                digest = record["Digest"].strip()
+                references.append(
+                    f"{repository}:{tag}"
+                    if tag != "<none>"
+                    else f"{repository}@{digest}"
+                )
+            return self._result("config-images", stdout="\n".join(references) + "\n")
         if call[-3:-1] == ("config", "--images"):
             index = int(call[-1].removeprefix("service"))
             record = json.loads(self.inventory_output.splitlines()[index])
@@ -351,6 +495,10 @@ def _stage(call: tuple[str, ...]) -> str:
         return "config"
     if call[-2:] == ("config", "--services"):
         return "config-services"
+    if call[-3:] == ("config", "--format", "json"):
+        return "config-format"
+    if call[-2:] == ("config", "--images"):
+        return "config-images"
     if call[-3:-1] == ("config", "--images"):
         return "config-images"
     if call[-2:] == ("pull", "--ignore-buildable"):
@@ -429,6 +577,7 @@ def test_prepare_compose_image_template_clears_root_then_activates() -> None:
         "pull",
         "build",
         "config-services",
+        "config-format",
         "config-images",
         "inventory",
         "inventory",
@@ -529,6 +678,7 @@ def test_prepare_rejects_nonempty_clear_proof_before_activation() -> None:
         "pull",
         "build",
         "config-services",
+        "config-format",
         "config-images",
         "inventory",
         "inventory",
@@ -638,6 +788,7 @@ def test_prepare_compose_image_template_fails_closed_before_activation(
                 "pull",
                 "build",
                 "config-services",
+                "config-format",
                 "config-images",
                 "inventory",
             ),
@@ -646,6 +797,7 @@ def test_prepare_compose_image_template_fails_closed_before_activation(
                 "pull",
                 "build",
                 "config-services",
+                "config-format",
                 "config-images",
                 "inventory",
                 "inventory",
@@ -658,6 +810,7 @@ def test_prepare_compose_image_template_fails_closed_before_activation(
                 "pull",
                 "build",
                 "config-services",
+                "config-format",
                 "config-images",
                 "inventory",
                 "inventory",
