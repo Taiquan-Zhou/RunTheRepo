@@ -479,6 +479,7 @@ class DockerSbxProvider(SandboxProvider):
             path = Path(raw_path)
             self._runtime_image_bundle_path = path
             self._runtime_image_bundle_fd = fd
+            self._mark_runtime_cleanup_unconfirmed()
             try:
                 file_stat = os.fstat(fd)
             except OSError:
@@ -1055,6 +1056,7 @@ class DockerSbxProvider(SandboxProvider):
                 process = await asyncio.create_subprocess_exec(
                     "sbx",
                     "exec",
+                    "-i",
                     sandbox_id,
                     "--",
                     "docker",
@@ -2415,6 +2417,8 @@ def _unlink_owned_runtime_bundle(
         return
     except OSError as error:
         raise DockerSbxError(operation, "image_bundle_cleanup_failed") from error
+    if identity is None:
+        raise DockerSbxError(operation, "image_bundle_cleanup_failed")
     if not stat.S_ISREG(path_stat.st_mode):
         raise DockerSbxError(operation, "image_bundle_replaced")
     if identity is not None and (path_stat.st_dev, path_stat.st_ino) != identity:
@@ -2501,6 +2505,12 @@ def _is_canonical_image_reference(reference: str) -> bool:
         for part in repository_and_tag[:-1]
     ):
         return False
+    if "@" in repository_and_tag[-1]:
+        image, digest = repository_and_tag[-1].split("@", 1)
+        return (
+            _IMAGE_BUNDLE_REPOSITORY.fullmatch(image) is not None
+            and _IMAGE_BUNDLE_ID.fullmatch(digest) is not None
+        )
     image_and_tag = repository_and_tag[-1].rsplit(":", 1)
     return (
         len(image_and_tag) == 2

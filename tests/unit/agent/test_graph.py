@@ -2775,6 +2775,7 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         self._runtime_template_activation_used = False
         self._runtime_template_finalization_confirmed = True
         self._trial_deadline: int | None = None
+        self.staged_bundle: tuple[tuple[str, ...], tuple[str, ...]] | None = None
 
     @property
     def supports_runtime_templates(self) -> bool:
@@ -2798,6 +2799,7 @@ class RuntimeTemplateGraphProvider(GraphProvider):
         self._template_audit = RuntimeTemplateAudit()
         self._trial_deadline = None
         self._runtime_template_finalization_confirmed = False
+        self.staged_bundle = None
 
     async def create(self, workspace: Path, name: str) -> str:
         if self._trial_deadline is None:
@@ -2921,6 +2923,29 @@ class RuntimeTemplateGraphProvider(GraphProvider):
                 self.calls.append(("exec", sandbox_id, snapshot, timeout_s))
                 return ExecResult(exit_code=0, stdout="", stderr="")
         return await super().exec(sandbox_id, argv, timeout_s)
+
+    async def stage_runtime_image_bundle(
+        self,
+        sandbox_id: str,
+        image_references: tuple[str, ...],
+        image_ids: tuple[str, ...],
+    ) -> None:
+        self._require_active(sandbox_id)
+        if self._roles.get(sandbox_id) != "warmup":
+            raise AssertionError("image bundle must stage in warmup sandbox")
+        if not self._warmup_prepared:
+            raise AssertionError("image bundle staging requires prepared warmup")
+        expected = (
+            ("docker.io/example/web:1",),
+            ("sha256:" + "a" * 64,),
+        )
+        if (image_references, image_ids) != expected:
+            raise AssertionError(
+                f"unexpected image bundle identity: {image_references!r}, {image_ids!r}"
+            )
+        if self.staged_bundle is not None:
+            raise AssertionError("image bundle staging invoked more than once")
+        self.staged_bundle = (image_references, image_ids)
 
     async def activate_runtime_template(
         self, sandbox_id: str, image_identity_sha256: str

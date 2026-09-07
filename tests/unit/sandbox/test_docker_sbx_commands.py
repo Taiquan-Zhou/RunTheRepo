@@ -210,6 +210,12 @@ class _SbxSpawner:
 
     async def __call__(self, *argv: str, **kwargs: object) -> _FakeProcess:
         command = tuple(argv)
+        if command[:2] == ("sbx", "exec") and command[-3:] == (
+            "docker",
+            "image",
+            "load",
+        ):
+            assert command[2] == "-i", "sbx exec requires -i to forward stdin"
         if self.before_spawn is not None:
             self.before_spawn(command)
         if self.before_spawn_with_kwargs is not None:
@@ -1536,6 +1542,34 @@ def test_stage_runtime_image_bundle_rejects_unsafe_or_ambiguous_identity(
         asyncio.run(provider.stage_runtime_image_bundle(sandbox_id, references, ids))
 
 
+@pytest.mark.parametrize(
+    "repository", ["docker.io/library/alpine", "localhost:5000/team/image"]
+)
+def test_bundle_validator_accepts_canonical_digest(repository: str) -> None:
+    reference = repository + "@sha256:" + "a" * 64
+    image_id = "sha256:" + "b" * 64
+    assert docker_sbx._validate_image_bundle_inputs((reference,), (image_id,)) == (
+        (reference,),
+        (image_id,),
+    )
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "alpine@sha256:" + "a" * 64,
+        "library/alpine@sha256:" + "a" * 64,
+        "docker.io/library/alpine@sha256:" + "a" * 63,
+        "docker.io/library/alpine@sha256:" + "A" * 64,
+        "docker.io/library/alpine@sha512:" + "a" * 64,
+        "docker.io/library/alpine@@sha256:" + "a" * 64,
+    ],
+)
+def test_bundle_validator_rejects_malformed_or_short_digest(reference: str) -> None:
+    with pytest.raises(DockerSbxError, match="image_bundle_reference_invalid"):
+        docker_sbx._validate_image_bundle_inputs((reference,), ("sha256:" + "b" * 64,))
+
+
 def test_stage_runtime_image_bundle_rejects_oversize_and_cleans_process_and_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1602,6 +1636,7 @@ def test_runtime_image_bundle_import_uses_exact_argv_and_hashes_stream(
         assert spawner.calls[-1] == (
             "sbx",
             "exec",
+            "-i",
             "sandbox-new",
             "--",
             "docker",
@@ -2178,10 +2213,10 @@ def test_create_uses_active_runtime_template_with_clone_and_policy_flags(
         assert ("--template", provider._runtime_template_tag) == create_call[-4:-2]
         assert create_call[-2:] == ("shell", str(tmp_path))
         assert sandbox_id in create_call
-        assert any(
-            call == ("sbx", "exec", sandbox_id, "--", "docker", "image", "load")
-            for call in spawner.calls
-        )
+        load_call = ("sbx", "exec", "-i", sandbox_id, "--", "docker", "image", "load")
+        load_index = spawner.calls.index(load_call)
+        assert spawner.calls.index(create_call) < load_index
+        assert spawner.processes[load_index].stdin.data == b"runtime-image-bundle"
     finally:
         asyncio.run(provider.finalize_runtime_template())
 
@@ -2260,6 +2295,11 @@ def test_finalize_retries_bundle_after_template_cleanup_was_confirmed(
     bundle.seek(0)
     provider._runtime_image_bundle_path = Path(raw_path)
     provider._runtime_image_bundle_file = bundle
+    bundle_stat = os.fstat(bundle.fileno())
+    provider._runtime_image_bundle_file_identity = (
+        bundle_stat.st_dev,
+        bundle_stat.st_ino,
+    )
     provider._runtime_image_bundle_sha256 = hashlib.sha256(b"bundle").hexdigest()
     provider._runtime_image_bundle_size = len(b"bundle")
     removed = False
@@ -2419,14 +2459,15 @@ def test_mixed_cleanup_preserves_bundle_audit_when_template_cleanup_fails(
     assert audit.removal_confirmed is False
 
 
-def test_stage_fstat_failure_removes_owned_path(
+def test_stage_fstat_failure_refuses_to_remove_unknown_identity_replacement(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spawner = _SbxSpawner()
     provider, sandbox_id = _active_provider(
         monkeypatch, spawner, deadline=time.monotonic() + 300.0
     )
-    real_fstat = os.fstat
+    monkeypatch.setattr(docker_sbx, "_image_bundle_temp_root", lambda _: str(tmp_path))
 
     def fail_fstat(fd: int) -> os.stat_result:
         del fd
@@ -2441,8 +2482,26 @@ def test_stage_fstat_failure_removes_owned_path(
                 ("sha256:" + "a" * 64,),
             )
         )
-    assert provider._runtime_image_bundle_path is None
-    del real_fstat
+    assert provider._runtime_image_bundle_path is not None
+    assert provider._runtime_image_bundle_path.is_file()
+    assert provider._runtime_template_audit.removal_confirmed is False
+
+
+def test_bundle_cleanup_preserves_regular_file_when_identity_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(monkeypatch, _SbxSpawner())
+    sentinel = tmp_path / "replacement.tar"
+    sentinel.write_bytes(b"unrelated replacement")
+    provider._runtime_image_bundle_path = sentinel
+
+    with pytest.raises(DockerSbxError, match="image_bundle_cleanup_failed"):
+        asyncio.run(provider.finalize_runtime_template())
+
+    assert sentinel.read_bytes() == b"unrelated replacement"
+    assert provider._runtime_image_bundle_path == sentinel
+    assert provider._runtime_template_audit.removal_confirmed is False
 
 
 def test_runtime_template_rejects_preexisting_owned_tag(

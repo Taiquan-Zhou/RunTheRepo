@@ -374,6 +374,33 @@ async def prepare_compose_image_template(
     except ImageInventoryError as error:
         raise ImageTemplateError(error.reason) from None
 
+    image_references = tuple(
+        sorted(
+            {
+                (
+                    f"{record.repository}:{record.tag}"
+                    if record.tag
+                    else f"{record.repository}@{record.digest}"
+                )
+                for record in inventory.records
+                if record.tag or record.digest
+            }
+        )
+    )
+    image_ids = tuple(sorted({record.image_id for record in inventory.records}))
+    try:
+        await provider.stage_runtime_image_bundle(
+            sandbox_id,
+            image_references,
+            image_ids,
+        )
+    except DockerSbxError:
+        raise
+    except ImageTemplateError:
+        raise
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        raise ImageTemplateError("image_bundle_stage_failed") from None
+
     pwd_result = await _exec(
         provider,
         sandbox_id,

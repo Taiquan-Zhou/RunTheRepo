@@ -161,7 +161,9 @@ class TemplateProvider(FakeSandboxProvider):
         self.provider_error_stage = provider_error_stage
         self.activation_error = activation_error
         self.exec_calls: list[tuple[str, ...]] = []
+        self.lifecycle: list[str] = []
         self.activated_identity: str | None = None
+        self.staged_bundle: tuple[tuple[str, ...], tuple[str, ...]] | None = None
 
     @property
     def supports_runtime_templates(self) -> bool:
@@ -173,7 +175,20 @@ class TemplateProvider(FakeSandboxProvider):
         self._require_active(sandbox_id)
         if self.activation_error is not None:
             raise self.activation_error
+        self.lifecycle.append("activate")
         self.activated_identity = image_identity_sha256
+
+    async def stage_runtime_image_bundle(
+        self,
+        sandbox_id: str,
+        image_references: tuple[str, ...],
+        image_ids: tuple[str, ...],
+    ) -> None:
+        self._require_active(sandbox_id)
+        if self.provider_error_stage == "stage" and self.provider_error is not None:
+            raise self.provider_error
+        self.lifecycle.append("stage")
+        self.staged_bundle = (image_references, image_ids)
 
     async def exec(
         self, sandbox_id: str, argv: list[str], timeout_s: int = 60
@@ -247,6 +262,7 @@ class TemplateProvider(FakeSandboxProvider):
                 and self.provider_error is not None
             ):
                 raise self.provider_error
+            self.lifecycle.append("clear")
             return self._result("remove")
         if call[-6:] in {
             ("find", self.guest_root, "-mindepth", "1", "-print", "-quit"),
@@ -369,6 +385,83 @@ def test_prepare_compose_image_template_clears_root_then_activates() -> None:
         "remove",
         "remove-proof",
     ]
+
+
+def test_prepare_stages_sorted_unique_image_references_and_ids_before_activation() -> (
+    None
+):
+    provider = TemplateProvider(
+        inventory_output="\n".join(
+            [
+                _line(
+                    _IMAGE_B,
+                    repository="zulu",
+                    tag="release",
+                    digest="<none>",
+                ),
+                _line(repository="alpine", tag="latest"),
+            ]
+        )
+    )
+
+    inventory = _prepare(provider)
+
+    assert provider.staged_bundle == (
+        ("docker.io/library/alpine:latest", "docker.io/library/zulu:release"),
+        (_IMAGE_A, _IMAGE_B),
+    )
+    assert provider.activated_identity == inventory.sha256
+
+
+def test_prepare_stages_digest_only_reference_before_workspace_clear() -> None:
+    provider = TemplateProvider(
+        inventory_output="\n".join(
+            [
+                _line(
+                    _IMAGE_B,
+                    repository="docker.io/library/zulu",
+                    tag="<none>",
+                    digest=_DIGEST_A,
+                ),
+                _line(
+                    _IMAGE_A,
+                    repository="ALPINE",
+                    tag="latest",
+                    digest="<none>",
+                ),
+            ]
+        )
+    )
+
+    _prepare(provider)
+
+    assert provider.staged_bundle == (
+        (
+            "docker.io/library/alpine:latest",
+            "docker.io/library/zulu@" + _DIGEST_A,
+        ),
+        (_IMAGE_A, _IMAGE_B),
+    )
+    assert provider.lifecycle == ["stage", "clear", "activate"]
+
+
+def test_prepare_stage_failure_prevents_workspace_clear_and_activation() -> None:
+    provider_error = DockerSbxError("image_bundle_stage", "image_bundle_empty")
+    provider = TemplateProvider(
+        provider_error=provider_error,
+        provider_error_stage="stage",
+    )
+
+    with pytest.raises(DockerSbxError) as raised:
+        _prepare(provider)
+
+    assert raised.value is provider_error
+    assert provider.staged_bundle is None
+    assert provider.activated_identity is None
+    assert not any(
+        call[-5:] == ("find", provider.guest_root, "-mindepth", "1", "-delete")
+        for call in provider.exec_calls
+    )
 
 
 def test_prepare_rejects_nonempty_clear_proof_before_activation() -> None:
