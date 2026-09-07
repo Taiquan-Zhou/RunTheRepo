@@ -1327,6 +1327,109 @@ def test_supported_capabilities_allow_create_without_pid_hard_bound(
     assert len(_non_help_create_calls(spawner)) == 1
 
 
+def _probe_cache_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[DockerSbxProvider, _SbxSpawner, Path]:
+    executable = tmp_path / "sbx"
+    executable.write_text("trusted CLI fixture", encoding="utf-8")
+    executable.chmod(0o755)
+    spawner = _SbxSpawner()
+    provider = _provider(monkeypatch, spawner)
+    provider._subprocess_environment["PATH"] = str(tmp_path)
+    return provider, spawner, executable
+
+
+def test_probe_cache_reuses_help_but_rechecks_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider, spawner, _ = _probe_cache_fixture(tmp_path, monkeypatch)
+    for _ in range(2):
+        assert asyncio.run(provider._probe(time.monotonic() + 300)) is True
+    assert spawner.calls.count(("sbx", "version")) == 2
+    assert spawner.calls.count(("sbx", "create", "--help")) == 1
+
+
+@pytest.mark.parametrize("change", ["binary", "version", "invocation", "unknown"])
+def test_probe_cache_invalidates_changed_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    provider, spawner, executable = _probe_cache_fixture(tmp_path, monkeypatch)
+    asyncio.run(provider._probe(time.monotonic() + 300))
+    if change == "binary":
+        executable.write_text("different CLI fixture", encoding="utf-8")
+    elif change == "version":
+        spawner.overrides[("sbx", "version")] = _Outcome(stdout=b"new version\n")
+    elif change == "invocation":
+        asyncio.run(provider.begin_invocation())
+    else:
+        executable.unlink()
+    assert asyncio.run(provider._probe(time.monotonic() + 300)) is True
+    assert spawner.calls.count(("sbx", "create", "--help")) == 2
+
+
+def test_probe_cache_version_failure_discards_previous_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider, spawner, _ = _probe_cache_fixture(tmp_path, monkeypatch)
+    asyncio.run(provider._probe(time.monotonic() + 300))
+    spawner.overrides[("sbx", "version")] = _Outcome(returncode=1)
+    with pytest.raises(DockerSbxUnsupportedError):
+        asyncio.run(provider._probe(time.monotonic() + 300))
+    del spawner.overrides[("sbx", "version")]
+    asyncio.run(provider._probe(time.monotonic() + 300))
+    assert spawner.calls.count(("sbx", "create", "--help")) == 2
+
+
+@pytest.mark.parametrize("optional", [False, True])
+def test_probe_cache_does_not_store_failed_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, optional: bool
+) -> None:
+    provider, spawner, _ = _probe_cache_fixture(tmp_path, monkeypatch)
+    command = (
+        ("sbx", "policy", "log", "--help") if optional else ("sbx", "rm", "--help")
+    )
+    spawner.overrides[command] = _Outcome(returncode=1)
+    if optional:
+        assert asyncio.run(provider._probe(time.monotonic() + 300)) is False
+    else:
+        with pytest.raises(DockerSbxUnsupportedError):
+            asyncio.run(provider._probe(time.monotonic() + 300))
+    del spawner.overrides[command]
+    assert asyncio.run(provider._probe(time.monotonic() + 300)) is True
+    assert spawner.calls.count(("sbx", "create", "--help")) == 2
+
+
+def test_probe_cache_rejects_expired_deadline_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider, spawner, _ = _probe_cache_fixture(tmp_path, monkeypatch)
+    asyncio.run(provider._probe(time.monotonic() + 300))
+    calls = len(spawner.calls)
+    with pytest.raises(DockerSbxError) as error:
+        asyncio.run(provider._probe(time.monotonic() - 1))
+    assert error.value.reason == "total_duration_exhausted"
+    assert len(spawner.calls) == calls
+
+
+@pytest.mark.parametrize(
+    "replacement", ["changed during help", "changed CLI binary during help"]
+)
+def test_probe_cache_does_not_store_binary_changed_during_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement: str
+) -> None:
+    provider, spawner, executable = _probe_cache_fixture(tmp_path, monkeypatch)
+
+    def replace_during_help(command: tuple[str, ...]) -> None:
+        if command == ("sbx", "create", "--help"):
+            executable.write_text(replacement, encoding="utf-8")
+
+    spawner.before_spawn = replace_during_help
+    asyncio.run(provider._probe(time.monotonic() + 300))
+    spawner.before_spawn = None
+    asyncio.run(provider._probe(time.monotonic() + 300))
+    assert spawner.calls.count(("sbx", "create", "--help")) == 2
+
+
 def test_runtime_template_probe_requires_all_template_help_commands(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

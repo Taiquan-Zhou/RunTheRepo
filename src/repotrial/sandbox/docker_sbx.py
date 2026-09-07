@@ -35,6 +35,7 @@ from .base import (
 )
 
 MAX_OUTPUT_BYTES = 65_536
+type _SbxExecutableIdentity = tuple[str, int, int, int, int, int, bytes]
 MAX_NETWORK_EVENTS = 100
 REAP_TIMEOUT_SECONDS = 5
 _TRUNCATION_MARKER = b"\n...[truncated]"
@@ -371,6 +372,7 @@ class DockerSbxProvider(SandboxProvider):
         self._policy = policy
         self._command_timeout_s = float(command_timeout_s)
         self._subprocess_environment = _sanitized_environment()
+        self._capability_cache: tuple[_SbxExecutableIdentity, bytes, bool] | None = None
         self._sandbox_states: dict[str, _SandboxState] = {}
         self._sandbox_workspaces: dict[str, Path] = {}
         self._sandbox_deadlines: dict[str, float] = {}
@@ -456,6 +458,7 @@ class DockerSbxProvider(SandboxProvider):
             raise RuntimeError("sandbox cleanup is not confirmed")
         self._runtime_template_activation_used = False
         self._trial_deadline = None
+        self._capability_cache = None
         self._runtime_template_finalization_confirmed = False
         self._runtime_template_identity = None
         self._runtime_template_audit = RuntimeTemplateAudit()
@@ -2309,12 +2312,68 @@ class DockerSbxProvider(SandboxProvider):
             subprocess_started=cleanup_evidence.subprocess_started,
         )
 
+    def _probe_executable_identity(self) -> _SbxExecutableIdentity | None:
+        """Identify the CLI resolved by the subprocess environment, or decline reuse."""
+        try:
+            executable = shutil.which(
+                "sbx", path=self._subprocess_environment.get("PATH", os.defpath)
+            )
+            if executable is None:
+                return None
+            path = Path(executable).resolve(strict=True)
+            descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+            with os.fdopen(descriptor, "rb") as stream:
+                metadata = os.fstat(stream.fileno())
+                # Oversized/unknown executables remain usable without caching.
+                limit = 256 * 1024 * 1024
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > limit:
+                    return None
+                digest = hashlib.sha256()
+                remaining = limit + 1
+                while remaining:
+                    chunk = stream.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                updated = os.fstat(stream.fileno())
+                if remaining == 0 or (
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    metadata.st_ctime_ns,
+                ) != (updated.st_size, updated.st_mtime_ns, updated.st_ctime_ns):
+                    return None
+            return (
+                str(path),
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+                digest.digest(),
+            )
+        except (OSError, RuntimeError):
+            return None
+
     async def _probe(self, deadline: float) -> bool:
+        cached = self._capability_cache
+        # Failed or cancelled discovery must never retain a previous success.
+        self._capability_cache = None
+        identity = self._probe_executable_identity()
         version = await self._probe_call("version", ["version"], deadline)
         if version.returncode != 0:
             raise DockerSbxUnsupportedError(
                 "version_probe_failed", stderr=_decode_human_output(version.stderr)
             )
+        version_identity = self._probe_executable_identity()
+        if (
+            identity is not None
+            and identity == version_identity
+            and cached is not None
+            and cached[:2] == (identity, version.stdout)
+        ):
+            self._capability_cache = cached
+            return cached[2]
 
         required_help = (
             ("create", ["create", "--help"], (*_CREATE_FLAGS, "--template")),
@@ -2364,9 +2423,16 @@ class DockerSbxProvider(SandboxProvider):
             }:
                 raise
             return False
-        return log_help.returncode == 0 and all(
+        supported = log_help.returncode == 0 and all(
             _has_token(log_help.stdout, token) for token in ("--type", "--json")
         )
+        if (
+            log_help.returncode == 0
+            and identity is not None
+            and identity == version_identity == self._probe_executable_identity()
+        ):
+            self._capability_cache = (identity, version.stdout, supported)
+        return supported
 
     async def _probe_call(
         self, capability: str, arguments: list[str], deadline: float
