@@ -23,6 +23,11 @@
     {% endfor %}
   </ul>
 
+  {% if report.operator_journey_provenance is defined %}
+  <h2>Operator-authored Journey input</h2>
+  <p>{{ report.operator_journey_provenance }}</p>
+  {% endif %}
+
   <h2>Synthetic recovery environment keys</h2>
   <ul>{% for key in report.recovery_env_keys %}<li>{{ key }}</li>{% endfor %}</ul>
 

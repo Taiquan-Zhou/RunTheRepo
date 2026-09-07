@@ -51,6 +51,11 @@ def verify_baseline_journeys(path: Path, journeys: Sequence[Journey]) -> str:
     return expected_hash
 
 
+def canonical_journey_payload_sha256(journeys: Sequence[Journey]) -> str:
+    """Return the hash used by the canonical baseline Journey artifact."""
+    return _document_for(journeys)[1]
+
+
 def _document_for(journeys: Sequence[Journey]) -> tuple[bytes, str]:
     payload = _canonical_payload(journeys)
     payload_hash = _sha256(payload)

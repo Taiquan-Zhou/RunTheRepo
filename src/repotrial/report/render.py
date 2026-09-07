@@ -56,7 +56,7 @@ def _project(state: RunState) -> dict[str, object]:
     }
     if state.baseline_compose_path is not None:
         identity["baseline_compose_reference"] = state.baseline_compose_path
-    return {
+    report: dict[str, object] = {
         "disclaimer": (
             "This tested-journey/workload-conditioned hardened candidate is not a "
             "security proof."
@@ -112,6 +112,11 @@ def _project(state: RunState) -> dict[str, object]:
             "hardened_overlay": _hardened_overlay(state),
         },
     }
+    if state.operator_journey_provenance is not None:
+        report["operator_journey_provenance"] = (
+            state.operator_journey_provenance.model_dump(mode="json")
+        )
+    return report
 
 
 def _validated_state(state: RunState) -> RunState:

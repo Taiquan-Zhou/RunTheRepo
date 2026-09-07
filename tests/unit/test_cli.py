@@ -148,6 +148,92 @@ def test_dry_run_accepts_case_insensitive_github_hostname_and_git_suffix(
     assert (artifacts_root / FIXED_RUN_ID).is_dir()
 
 
+def test_rejects_invalid_operator_journeys_before_layout_or_provider(
+    tmp_path: Path,
+) -> None:
+    artifacts_root = tmp_path / "artifacts"
+    source = tmp_path / "operator.json"
+    source.write_text('{"journeys": []}', encoding="utf-8")
+
+    def unexpected_provider(_name: str) -> SandboxProvider:
+        raise AssertionError("operator validation reached provider construction")
+
+    app = create_app(
+        artifacts_root=artifacts_root,
+        run_id_generator=fixed_run_id,
+        provider_factory=unexpected_provider,
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "inspect",
+            "--journeys-file",
+            str(source),
+            "https://github.com/a/b",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "invalid operator journeys" in result.output
+    assert not artifacts_root.exists()
+
+
+def test_dry_run_validates_operator_journeys_without_graph_or_provider(
+    tmp_path: Path,
+) -> None:
+    artifacts_root = tmp_path / "artifacts"
+    source = tmp_path / "operator.json"
+    source.write_text(
+        json.dumps(
+            {
+                "journeys": [
+                    {
+                        "journey_id": "health",
+                        "name": "Health",
+                        "steps": [
+                            {
+                                "step_id": "get",
+                                "tool": "http",
+                                "action": "request",
+                                "params": {"method": "GET", "path": "/health"},
+                                "assertions": [
+                                    {
+                                        "kind": "status_code",
+                                        "target": "response.status",
+                                        "expected": 200,
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def unexpected_provider(_name: str) -> SandboxProvider:
+        raise AssertionError("dry run reached provider construction")
+
+    result = CliRunner().invoke(
+        create_app(
+            artifacts_root=artifacts_root,
+            run_id_generator=fixed_run_id,
+            provider_factory=unexpected_provider,
+        ),
+        [
+            "inspect",
+            "--dry-run",
+            "--journeys-file",
+            str(source),
+            "https://github.com/a/b",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (artifacts_root / FIXED_RUN_ID).is_dir()
+
+
 @pytest.mark.parametrize(
     "url",
     [

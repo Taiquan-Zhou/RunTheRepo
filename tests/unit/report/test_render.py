@@ -12,6 +12,7 @@ from repotrial.domain.models import (
     JourneyStep,
     Mutation,
     ObservationSnapshot,
+    OperatorJourneyProvenance,
     RiskFinding,
     RunState,
 )
@@ -185,6 +186,35 @@ def test_renderer_writes_complete_stable_json_and_html_snapshot(tmp_path: Path) 
         encoding="utf-8"
     )
     assert "repotrial-synthetic-value" not in html
+
+
+def test_renderer_projects_operator_journey_provenance_without_source_path(
+    tmp_path: Path,
+) -> None:
+    state = _state().model_copy(
+        update={
+            "operator_journey_provenance": OperatorJourneyProvenance(
+                source_kind="operator-authored",
+                raw_file_sha256="a" * 64,
+                canonical_payload_sha256="b" * 64,
+                schema_version=1,
+            )
+        }
+    )
+
+    paths = _render(state, tmp_path)
+    report = json.loads(paths.json_path.read_text(encoding="utf-8"))
+    html = paths.html_path.read_text(encoding="utf-8")
+
+    assert report["operator_journey_provenance"] == {
+        "source_kind": "operator-authored",
+        "raw_file_sha256": "a" * 64,
+        "canonical_payload_sha256": "b" * 64,
+        "schema_version": 1,
+    }
+    assert "a" * 64 in html
+    assert "b" * 64 in html
+    assert "/operator" not in html
 
 
 def test_renderer_keeps_untested_and_unsupported_coverage_distinct(

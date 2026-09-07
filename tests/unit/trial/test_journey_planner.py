@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import inspect
 import json
 import os
@@ -10,7 +11,7 @@ from pydantic import BaseModel, ValidationError
 from repotrial.domain.models import Journey, JourneyAssertion, JourneyStep
 from repotrial.models.openai_compat import ModelAdapterError
 from repotrial.trial import planner as planner_module
-from repotrial.trial.planner import plan_journeys
+from repotrial.trial.planner import load_operator_journeys, plan_journeys
 
 
 class FakeModelAdapter:
@@ -172,6 +173,84 @@ def _nested_json(depth: int) -> object:
     for _ in range(depth):
         value = [value]
     return value
+
+
+def test_operator_journey_loader_returns_validated_snapshot_and_hashes(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "operator.json"
+    payload = {"journeys": [_http_journey("/operator")]}
+    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    source.write_bytes(raw)
+
+    loaded = load_operator_journeys(source)
+
+    assert [journey.steps[0].params["path"] for journey in loaded.journeys] == [
+        "/operator"
+    ]
+    assert loaded.provenance.source_kind == "operator-authored"
+    assert loaded.provenance.raw_file_sha256 == hashlib.sha256(raw).hexdigest()
+    canonical = json.dumps(
+        [journey.model_dump(mode="json") for journey in loaded.journeys],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    assert (
+        loaded.provenance.canonical_payload_sha256
+        == hashlib.sha256(canonical).hexdigest()
+    )
+    assert loaded.provenance.schema_version == 1
+    source.write_text('{"journeys": []}', encoding="utf-8")
+    assert loaded.journeys[0].steps[0].params["path"] == "/operator"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [b"", b"{invalid", b'{"journeys": []}', b"\xff"],
+)
+def test_operator_journey_loader_rejects_invalid_input(
+    content: bytes, tmp_path: Path
+) -> None:
+    source = tmp_path / "operator.json"
+    source.write_bytes(content)
+
+    with pytest.raises(ValueError, match="invalid operator journeys"):
+        load_operator_journeys(source)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "directory"])
+def test_operator_journey_loader_rejects_non_regular_paths(
+    kind: str, tmp_path: Path
+) -> None:
+    source = tmp_path / "operator.json"
+    target = tmp_path / "target"
+    if kind == "symlink":
+        target.write_text("{}", encoding="utf-8")
+        source.symlink_to(target)
+    else:
+        source.mkdir()
+
+    with pytest.raises(ValueError, match="invalid operator journeys"):
+        load_operator_journeys(source)
+
+
+def test_operator_journey_loader_rejects_oversized_file(tmp_path: Path) -> None:
+    source = tmp_path / "operator.json"
+    valid = json.dumps({"journeys": [_http_journey()]}, separators=(",", ":"))
+    source.write_text(valid + " " * (65_537 - len(valid)), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid operator journeys"):
+        load_operator_journeys(source)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO unsupported")
+def test_operator_journey_loader_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    source = tmp_path / "operator.json"
+    os.mkfifo(source)
+
+    with pytest.raises(ValueError, match="invalid operator journeys"):
+        load_operator_journeys(source)
 
 
 def test_declared_journeys_are_authoritative_and_never_call_model(

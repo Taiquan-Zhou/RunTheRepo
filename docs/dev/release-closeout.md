@@ -23,21 +23,36 @@ PID limitation. Keep the original frozen 10-repository denominator.
   `repotrial-overlay-merge-smoke-0fc3c18d4477` was destroyed successfully and
   official inventory was empty. No application image was pulled or started.
 
+## Completed: operator-authored business Journey input
+
+- `inspect --journeys-file PATH` reads a bounded, validated snapshot before
+  intake and preserves the pinned repository. Existing baseline/candidate
+  execution replays that snapshot; no graph or sandbox bypass was introduced.
+- Reports identify operator-authored input with raw/canonical SHA-256 hashes;
+  it is not autonomous or LLM-generated coverage. Legacy report shape is retained.
+- A trusted loopback HTTP CRUD fixture verifies POST/GET/DELETE/GET assertions,
+  precedence over repository declarations and baseline/candidate replay.
+  This is not a public-repository or real-SBX canary.
+- Luna implementation and one Sol module review completed without blockers.
+- Final-source full regression: 2174 passed, 12 skipped, 1 dependency
+  deprecation warning in 141.99 seconds; branch coverage 85.15% (85% gate).
+  Ruff, format (160 files), mypy (53 source files), scoped pre-commit and
+  diff checks passed.
+- Wheel/sdist built; installed CLI valid dry-run and invalid-input refusal
+  checked in an isolated Python environment. This is not clean-machine proof.
+
 ## Remaining, in order
 
-1. Meaningful business Journey input/execution: current CLI cannot take an
-   external Journey file; repo declaration and restricted model planning remain.
-   Preserve the pinned repository; do not insert repo-specific workarounds.
-2. Two representative end-to-end canaries on the final implementation HEAD,
+1. Two representative end-to-end canaries on the final implementation HEAD,
    including generated output, complete reports and verified cleanup.
-3. Original frozen cohort gate: 7/10 autonomous completion, 5/10 meaningful
+2. Original frozen cohort gate: 7/10 autonomous completion, 5/10 meaningful
    regression-passing hardening. Do not replace failures in the denominator.
-4. Reproducible supported clean-environment installation, final packaging,
+3. Reproducible supported clean-environment installation, final packaging,
    release quality gates, limitations and troubleshooting documentation.
-5. Real-target browser execution and accepted LLM contribution remain unproven
+4. Real-target browser execution and accepted LLM contribution remain unproven
    product capabilities; explicitly resolve their release scope, never claim
    trusted UI/fixture smoke demonstrates them.
 
 The two successful historical canaries remain at production HEAD 7808b9b5;
-none were rerun during this output module. No release readiness claim follows
+none were rerun during these output/input modules. No release readiness claim follows
 from the module's engineering checks alone.

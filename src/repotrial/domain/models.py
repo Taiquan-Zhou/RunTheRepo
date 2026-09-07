@@ -142,6 +142,22 @@ class HardenedOverlayProvenance(BaseModel):
         return value
 
 
+class OperatorJourneyProvenance(BaseModel):
+    """Non-sensitive identity of an operator-supplied Journey input file."""
+
+    source_kind: Literal["operator-authored"]
+    raw_file_sha256: str
+    canonical_payload_sha256: str
+    schema_version: Literal[1]
+
+    @field_validator("raw_file_sha256", "canonical_payload_sha256")
+    @classmethod
+    def _validate_sha256(cls, value: str) -> str:
+        if _SHA256_RAW_PATTERN.fullmatch(value) is None:
+            raise ValueError("journey provenance hash must be a sha256 digest")
+        return value
+
+
 class RunState(BaseModel):
     model_config = ConfigDict(
         validate_assignment=True,
@@ -159,6 +175,7 @@ class RunState(BaseModel):
     baseline_config_hash: str | None = None
     current_config_hash: str | None = None
     hardened_overlay_provenance: HardenedOverlayProvenance | None = None
+    operator_journey_provenance: OperatorJourneyProvenance | None = None
     recovery_env_keys: list[str] = Field(
         default_factory=list, max_length=_MAX_RECOVERY_ENV_KEYS
     )

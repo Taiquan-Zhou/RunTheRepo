@@ -162,6 +162,50 @@ status `200`. Model transport failures, timeouts, or an unconfigured model can
 still end a run with `insufficient_coverage`; the recorded `stop_reason` is
 preserved.
 
+### Operator-authored HTTP Journeys
+
+Use `--journeys-file` to supply a validated, operator-authored Journey snapshot.
+The file is read before intake and is never copied into or used to modify the
+pinned repository. It is scoped to deterministic HTTP behavior; it is not a
+fabricated real canary and does not grant shell, browser-host, credential, or
+other execution authority.
+
+Minimal example:
+
+```json
+{
+  "journeys": [
+    {
+      "journey_id": "health",
+      "name": "Health endpoint",
+      "steps": [
+        {
+          "step_id": "get-health",
+          "tool": "http",
+          "action": "request",
+          "params": {"method": "GET", "path": "/health"},
+          "assertions": [
+            {"kind": "status_code", "target": "response.status", "expected": 200}
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+Pass it to an exact-commit inspection:
+
+```bash
+uv run repotrial inspect https://github.com/OWNER/REPOSITORY \
+  --provider docker-sbx \
+  --commit-sha 0123456789abcdef0123456789abcdef01234567 \
+  --journeys-file ./operator-journeys.json
+```
+
+The JSON and HTML reports retain only the input source kind and SHA-256
+identities for provenance, never the host path or source bytes.
+
 ## Proxy networks (TUN optional; Rule or Global)
 
 TUN mode is not required. Windows Rule or Global mode is acceptable when WSL,

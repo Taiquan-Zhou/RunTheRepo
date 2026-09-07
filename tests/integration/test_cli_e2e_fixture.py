@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TypeVar
+from typing import ClassVar, TypeVar
 
 import pytest
 from fixture_harness import parse_fixture_materialization
@@ -755,9 +755,72 @@ class _HealthHandler(BaseHTTPRequestHandler):
         del format, args
 
 
+class _BusinessHandler(BaseHTTPRequestHandler):
+    item: ClassVar[dict[str, object] | None] = None
+    operations: ClassVar[list[str]] = []
+
+    def do_POST(self) -> None:
+        if self.path != "/items/fixture":
+            self.send_error(404)
+            return
+        length = int(self.headers.get("content-length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        if not isinstance(payload, dict):
+            self.send_error(400)
+            return
+        type(self).item = {"id": "fixture", "name": payload.get("name")}
+        type(self).operations.append("POST")
+        self._json_response(201, self.item)
+
+    def do_GET(self) -> None:
+        if self.path != "/items/fixture":
+            self.send_error(404)
+            return
+        type(self).operations.append("GET-200" if type(self).item else "GET-404")
+        if type(self).item is None:
+            self._json_response(404, {"detail": "missing"})
+        else:
+            self._json_response(200, type(self).item)
+
+    def do_DELETE(self) -> None:
+        if self.path != "/items/fixture":
+            self.send_error(404)
+            return
+        type(self).operations.append("DELETE")
+        type(self).item = None
+        self.send_response(204)
+        self.end_headers()
+
+    def _json_response(self, status: int, payload: object) -> None:
+        encoded = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, format: str, *args: object) -> None:
+        del format, args
+
+
 @contextmanager
 def healthy_server() -> Iterator[int]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), _HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield int(server.server_address[1])
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@contextmanager
+def business_server() -> Iterator[int]:
+    _BusinessHandler.item = None
+    _BusinessHandler.operations = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _BusinessHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -935,6 +998,145 @@ def test_inspect_runs_local_git_fixture_to_a_report_and_cleans_up(
         [call for call in provider.calls if call[0] == "destroy"]
     )
     assert provider.active_sandboxes == set()
+
+
+def test_inspect_replays_operator_business_journey_for_baseline_and_candidates(
+    tmp_path: Path,
+) -> None:
+    source = create_fixture_repo(tmp_path)
+    operator_file = tmp_path / "operator-journeys.json"
+    operator_file.write_text(
+        json.dumps(
+            {
+                "journeys": [
+                    {
+                        "journey_id": "business-crud",
+                        "name": "Operator CRUD flow",
+                        "steps": [
+                            {
+                                "step_id": "create",
+                                "tool": "http",
+                                "action": "request",
+                                "params": {
+                                    "method": "POST",
+                                    "path": "/items/fixture",
+                                    "json": {"name": "operator"},
+                                },
+                                "assertions": [
+                                    {
+                                        "kind": "status_code",
+                                        "target": "response.status",
+                                        "expected": 201,
+                                    }
+                                ],
+                            },
+                            {
+                                "step_id": "read",
+                                "tool": "http",
+                                "action": "request",
+                                "params": {
+                                    "method": "GET",
+                                    "path": "/items/fixture",
+                                },
+                                "assertions": [
+                                    {
+                                        "kind": "status_code",
+                                        "target": "response.status",
+                                        "expected": 200,
+                                    },
+                                    {
+                                        "kind": "json_path_equals",
+                                        "target": "id",
+                                        "expected": "fixture",
+                                    },
+                                ],
+                            },
+                            {
+                                "step_id": "delete",
+                                "tool": "http",
+                                "action": "request",
+                                "params": {
+                                    "method": "DELETE",
+                                    "path": "/items/fixture",
+                                },
+                                "assertions": [
+                                    {
+                                        "kind": "status_code",
+                                        "target": "response.status",
+                                        "expected": 204,
+                                    }
+                                ],
+                            },
+                            {
+                                "step_id": "confirm-deleted",
+                                "tool": "http",
+                                "action": "request",
+                                "params": {
+                                    "method": "GET",
+                                    "path": "/items/fixture",
+                                },
+                                "assertions": [
+                                    {
+                                        "kind": "status_code",
+                                        "target": "response.status",
+                                        "expected": 404,
+                                    }
+                                ],
+                            },
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    artifacts_root = tmp_path / "artifacts"
+    source_head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=source, text=True
+    ).strip()
+
+    with business_server() as port:
+        provider = FixtureProvider(host_port=port, container_port=3000)
+        result = CliRunner().invoke(
+            make_app(artifacts_root, provider),
+            [
+                "inspect",
+                str(source),
+                "--provider",
+                "fake",
+                "--commit-sha",
+                source_head,
+                "--container-port",
+                "3000",
+                "--journeys-file",
+                str(operator_file),
+            ],
+        )
+
+    run_path = artifacts_root / FIXED_RUN_ID
+    assert result.exit_code == 0, result.output
+    report = json.loads(
+        (run_path / "report" / "trial-report.json").read_text(encoding="utf-8")
+    )
+    assert report["coverage"]["journeys"] == [
+        {
+            "classification": "PASS",
+            "journey_id": "business-crud",
+            "name": "Operator CRUD flow",
+        }
+    ]
+    assert report["operator_journey_provenance"]["source_kind"] == "operator-authored"
+    assert report["operator_journey_provenance"]["schema_version"] == 1
+    assert str(operator_file) not in json.dumps(report)
+    assert not (run_path / "workspace" / operator_file.name).exists()
+    operations = _BusinessHandler.operations
+    chunks = [
+        operations[index : index + 4]
+        for index, operation in enumerate(operations)
+        if operation == "POST"
+    ]
+    assert len(chunks) >= 2
+    assert all(chunk == ["POST", "GET-200", "DELETE", "GET-404"] for chunk in chunks)
 
 
 def test_relative_artifacts_root_uses_absolute_graph_context_paths(

@@ -1,19 +1,30 @@
 import asyncio
+import hashlib
 import json
 import math
 import os
 import re
 import stat
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from unicodedata import category
 from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from repotrial.domain.models import Journey, JourneyAssertion, JourneyStep
+from repotrial.domain.models import (
+    Journey,
+    JourneyAssertion,
+    JourneyStep,
+    OperatorJourneyProvenance,
+)
 from repotrial.models.base import ModelAdapter, RecoveryAction
 from repotrial.models.openai_compat import ModelAdapterError
+from repotrial.trial.journey_artifact import (
+    JourneyArtifactError,
+    canonical_journey_payload_sha256,
+)
 from repotrial.trial.model_evidence import (
     ModelAttemptOutcome,
     ModelAttemptPurpose,
@@ -81,6 +92,52 @@ _MODEL_SUPPORTED_TOOLS = frozenset({"http"})
 _ALLOWED_BROWSER_ROLES = frozenset(
     {"button", "link", "checkbox", "radio", "menuitem", "option", "tab"}
 )
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorJourneyInput:
+    """Validated, immutable operator Journey snapshot and its provenance."""
+
+    journeys: tuple[Journey, ...]
+    provenance: OperatorJourneyProvenance
+
+
+def load_operator_journeys(path: Path) -> OperatorJourneyInput:
+    """Load and validate an operator-authored Journey file exactly once."""
+    if not isinstance(path, Path):
+        raise TypeError("operator journeys path must be a Path")
+    try:
+        metadata = path.lstat()
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size > _MAX_DECLARED_JOURNEYS_BYTES
+        ):
+            raise ValueError("invalid operator journeys")
+        raw = _read_declared_bytes(path, metadata)
+        parsed = json.loads(raw.decode("utf-8"))
+        journeys = _validate_and_materialize_journey_collection(parsed)
+    except (
+        OSError,
+        RecursionError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        JourneyArtifactError,
+        ValueError,
+    ):
+        raise ValueError("invalid operator journeys") from None
+    if journeys is None or not journeys:
+        raise ValueError("invalid operator journeys")
+    snapshot = tuple(journey.model_copy(deep=True) for journey in journeys)
+    return OperatorJourneyInput(
+        journeys=snapshot,
+        provenance=OperatorJourneyProvenance(
+            source_kind="operator-authored",
+            raw_file_sha256=hashlib.sha256(raw).hexdigest(),
+            canonical_payload_sha256=canonical_journey_payload_sha256(snapshot),
+            schema_version=1,
+        ),
+    )
 
 
 class _StrictJourneyTransport(BaseModel):
@@ -356,7 +413,12 @@ def _read_declared_journeys(repo_root: Path) -> list[Journey] | None:
 
 
 def _read_declared_bytes(declaration_path: Path, initial: os.stat_result) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     descriptor: int | None = None
     try:
         descriptor = os.open(declaration_path, flags)

@@ -37,6 +37,7 @@ from repotrial.sandbox.docker_sbx import (
     DockerSbxProvider,
     DockerSbxUnsupportedError,
 )
+from repotrial.trial.planner import load_operator_journeys
 
 type ProviderFactory = Callable[[Literal["fake", "docker-sbx"]], SandboxProvider]
 type DoctorCallable = Callable[[], DoctorReport]
@@ -104,7 +105,15 @@ def create_app(
         compose_path: Annotated[str | None, typer.Option("--compose-path")] = None,
         model_endpoint: Annotated[str | None, typer.Option("--model-endpoint")] = None,
         model_name: Annotated[str | None, typer.Option("--model-name")] = None,
+        journeys_file: Annotated[Path | None, typer.Option("--journeys-file")] = None,
     ) -> None:
+        operator_journey_input = None
+        if journeys_file is not None:
+            try:
+                operator_journey_input = load_operator_journeys(journeys_file)
+            except (OSError, TypeError, ValueError):
+                typer.echo("invalid operator journeys", err=True)
+                raise typer.Exit(2) from None
         if max_experiments != _FROZEN_MAX_EXPERIMENTS:
             raise typer.BadParameter(
                 f"--max-experiments must be {_FROZEN_MAX_EXPERIMENTS}"
@@ -174,6 +183,16 @@ def create_app(
                         run_id=run_id,
                         repo_url=url,
                         compose_path=compose_path,
+                        journeys=(
+                            []
+                            if operator_journey_input is None
+                            else list(operator_journey_input.journeys)
+                        ),
+                        operator_journey_provenance=(
+                            None
+                            if operator_journey_input is None
+                            else operator_journey_input.provenance
+                        ),
                     ),
                     context=GraphContext(
                         provider=_make_provider(selected_provider, provider_factory),
