@@ -18,6 +18,32 @@ from repotrial.domain.models import (
 )
 
 
+def test_run_state_roundtrips_hardened_overlay_provenance() -> None:
+    from repotrial.domain.models import HardenedOverlayProvenance
+
+    provenance = HardenedOverlayProvenance(
+        baseline_reference="compose.yaml",
+        baseline_config_hash="sha256:" + "a" * 64,
+        final_reference=".repotrial-accepted/accepted.compose.yaml",
+        final_config_hash="sha256:" + "b" * 64,
+        overlay_relative_reference=".repotrial-overlays/hardened.overlay.yaml",
+        overlay_raw_sha256="c" * 64,
+        format="repotrial-hardened-overlay",
+        version=1,
+    )
+    state = RunState(
+        run_id="run-provenance",
+        repo_url="https://example.invalid/repo",
+        compose_path=".repotrial-accepted/accepted.compose.yaml",
+        baseline_compose_path="compose.yaml",
+        baseline_config_hash="sha256:" + "a" * 64,
+        current_config_hash="sha256:" + "b" * 64,
+        hardened_overlay_provenance=provenance,
+    )
+
+    assert RunState.model_validate_json(state.model_dump_json()) == state
+
+
 def test_mutation_roundtrip_json() -> None:
     m = Mutation(mutation_id="m1", type=MutationType.SET_READ_ONLY, service="app")
 

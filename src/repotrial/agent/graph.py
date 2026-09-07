@@ -35,7 +35,8 @@ from repotrial.compose.compatibility import (
     plan_loopback_compatibility_overlay,
     write_loopback_compatibility_overlay,
 )
-from repotrial.compose.mutations import apply_mutation
+from repotrial.compose.mutations import MutationError, apply_mutation
+from repotrial.compose.overlay import cumulative_overlay, write_cumulative_overlay
 from repotrial.compose.parser import (
     ComposeParseError,
     canonical_compose_json,
@@ -45,6 +46,7 @@ from repotrial.compose.risk import analyze_risk
 from repotrial.domain.enums import ExperimentVerdict, Verdict
 from repotrial.domain.models import (
     ExperimentRecord,
+    HardenedOverlayProvenance,
     Journey,
     JourneyResult,
     PinnedRepo,
@@ -341,6 +343,12 @@ async def _baseline(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUp
         raise ValueError("current_config_hash does not match compose")
     baseline_update = {
         "compose_path": compose_relative,
+        "baseline_compose_path": (
+            compose_relative
+            if state.run.baseline_compose_path is None
+            and "baseline" not in state.stage_history
+            else state.run.baseline_compose_path
+        ),
         "baseline_config_hash": compose_hash,
         "current_config_hash": compose_hash,
         "risk_findings": analyze_risk(compose),
@@ -1475,12 +1483,129 @@ def _decide(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate:
     }
 
 
-def _report_or_next(state: GraphState) -> NodeUpdate:
-    return {"stage_history": _visit(state, "report_or_next")}
+def _report_or_next(state: GraphState, runtime: Runtime[GraphContext]) -> NodeUpdate:
+    run = state.run.model_copy(deep=True)
+    if run.stop_reason is not None:
+        try:
+            provenance = _materialize_hardened_overlay(run, runtime.context)
+        except (
+            AssertionError,
+            ComposeParseError,
+            MutationError,
+            OSError,
+            TypeError,
+            ValueError,
+        ):
+            # Report projection intentionally treats missing/invalid provenance
+            # as unavailable; the terminal stop reason remains authoritative.
+            run.hardened_overlay_provenance = None
+        else:
+            run.hardened_overlay_provenance = provenance
+            _append_artifact(run, provenance.overlay_relative_reference)
+    return {"run": run, "stage_history": _visit(state, "report_or_next")}
 
 
 def _report_route(state: GraphState) -> ReportRoute:
     return "__end__" if state.run.stop_reason is not None else "propose_mutation"
+
+
+def _materialize_hardened_overlay(
+    run: RunState, context: GraphContext
+) -> HardenedOverlayProvenance:
+    """Validate the complete KEEP/ROLLBACK chain and materialize its final diff."""
+    baseline_reference = run.baseline_compose_path
+    final_reference = run.compose_path
+    baseline_hash = run.baseline_config_hash
+    final_hash = run.current_config_hash
+    if (
+        not isinstance(baseline_reference, str)
+        or not baseline_reference
+        or not isinstance(final_reference, str)
+        or not final_reference
+        or not isinstance(baseline_hash, str)
+        or not baseline_hash
+        or not isinstance(final_hash, str)
+        or not final_hash
+    ):
+        raise ValueError("hardened overlay provenance is unavailable")
+    workspace = _real_directory(context.workspace, "workspace")
+    baseline_source = _compose_source(workspace, baseline_reference)
+    final_source = _compose_source(workspace, final_reference)
+    baseline = load_compose(baseline_source)
+    current_on_disk = load_compose(final_source)
+    if _compose_hash(baseline) != baseline_hash:
+        raise ValueError("baseline compose hash mismatch")
+    if _compose_hash(current_on_disk) != final_hash:
+        raise ValueError("final compose hash mismatch")
+
+    replay = baseline
+    replay_hash = baseline_hash
+    keep_count = 0
+    for record in run.experiments:
+        if record.parent_config_hash != replay_hash:
+            raise ValueError("experiment chain parent hash mismatch")
+        candidate = apply_mutation(replay, record.mutation)
+        candidate_hash = _compose_hash(candidate)
+        if candidate_hash != record.candidate_config_hash:
+            raise ValueError("experiment chain candidate hash mismatch")
+        if record.verdict is ExperimentVerdict.KEEP:
+            replay = candidate
+            replay_hash = candidate_hash
+            keep_count += 1
+        elif record.verdict in {
+            ExperimentVerdict.ROLLBACK,
+            ExperimentVerdict.STOP,
+        }:
+            continue
+        else:
+            raise ValueError("experiment chain verdict is unsupported")
+    if keep_count == 0 or replay_hash != final_hash:
+        raise ValueError("hardened overlay has no validated kept candidate")
+    if canonical_compose_json(replay) != canonical_compose_json(current_on_disk):
+        raise ValueError("final compose does not match kept experiment chain")
+
+    overlay_dir = _real_directory_inside(context.overlay_dir, workspace, "overlay_dir")
+    baseline_identity = baseline_hash.removeprefix("sha256:")
+    final_identity = final_hash.removeprefix("sha256:")
+    target = overlay_dir / (
+        f"hardened-{baseline_identity}-{final_identity}.overlay.yaml"
+    )
+    _require_lexical_path_inside(target, workspace, "hardened overlay")
+    if target.parent.resolve(strict=True) != overlay_dir:
+        raise ValueError("hardened overlay must be a direct child of overlay_dir")
+    expected_overlay = cumulative_overlay(baseline, current_on_disk)
+    if target.exists() or target.is_symlink():
+        existing = _existing_regular_file(target, workspace, "hardened overlay")
+        if canonical_compose_json(load_compose(existing)) != canonical_compose_json(
+            expected_overlay
+        ):
+            raise ValueError("hardened overlay replay mismatch")
+        target = existing
+    else:
+        write_cumulative_overlay(baseline, current_on_disk, target)
+        target = _existing_regular_file(target, workspace, "hardened overlay")
+    raw_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+    overlay_reference = target.relative_to(workspace).as_posix()
+    previous = run.hardened_overlay_provenance
+    if previous is not None and (
+        previous.baseline_reference != baseline_reference
+        or previous.baseline_config_hash != baseline_hash
+        or previous.final_reference != final_reference
+        or previous.final_config_hash != final_hash
+        or previous.overlay_relative_reference != overlay_reference
+        or previous.overlay_raw_sha256 != raw_sha256
+    ):
+        raise ValueError("hardened overlay provenance mismatch")
+    return HardenedOverlayProvenance(
+        baseline_reference=baseline_reference,
+        baseline_config_hash=baseline_hash,
+        final_reference=final_reference,
+        final_config_hash=final_hash,
+        overlay_relative_reference=overlay_reference,
+        overlay_raw_sha256=raw_sha256,
+        format="repotrial-hardened-overlay",
+        version=1,
+    )
 
 
 def _visit(state: GraphState, stage: StageName) -> list[StageName]:

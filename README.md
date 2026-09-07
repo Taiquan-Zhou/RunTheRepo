@@ -9,7 +9,7 @@ verified.
 
 ## Current status
 
-This branch is a limited CLI technical preview, not a complete or published
+This branch is a limited CLI and local Web preview, not a complete or published
 release. At production HEAD
 `7808b9b5485969f65f242d4acf78ffc79215a3e5`, two representative public
 repositories completed the URL -> exact SHA -> sandbox -> Compose -> journey
@@ -28,20 +28,25 @@ Known limitations:
 
 - Browser execution is tested only with trusted fixtures; real-target browser
   journeys return unsupported.
-- There is no single cumulative hardened overlay; accepted configuration and
-  experiment overlays remain separate.
+- New runs can generate a cumulative hardened overlay from the verified KEEP
+  chain, including changes across services. The report records its baseline,
+  final configuration, and file hashes. Legacy or invalid provenance remains
+  `unavailable`; compatibility and runtime environment inputs are not bundled.
 - No public resume entry point is exposed.
 - The default API container has no `sbx` execution integration and no UI.
 - The two canaries do not demonstrate an accepted LLM-generated journey:
   changedetection used a `policy_rejected` fallback `GET`, while Linkding used
   a deterministic README journey.
 
-Quality checks: `2120 passed, 12 skipped, 1 warning`; coverage is 85.02%.
-Ruff check, Ruff format (150 files), mypy (49 files), and pre-commit all pass.
-Wheel build and fresh wheel installation were validated at production HEAD
-`7808b9b5485969f65f242d4acf78ffc79215a3e5`; a fresh installed-wheel
-`repotrial --help` smoke passes. The current working tree contains only tests
-and documentation changes.
+Latest full regression: `2155 passed, 12 skipped, 1 warning`. Subsequent
+test-only additions passed in focused runs (207 tests, then one write-integrity
+test); combined coverage on unchanged production code is 85.0027%.
+Ruff check, Ruff format (160 files), mypy (53 files), and pre-commit pass.
+The local Web wheel was independently installed and browser-smoked before the
+cumulative-overlay changes. A trusted SBX fixture verified real Compose merge
+equivalence for the cumulative writer, followed by successful destruction and
+empty inventory. Neither check is a new real-repository canary or a fresh-machine
+installation proof. See [release closeout](docs/dev/release-closeout.md).
 
 ## Fastest supported setup
 

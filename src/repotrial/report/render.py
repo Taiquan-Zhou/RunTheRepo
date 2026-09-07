@@ -46,19 +46,22 @@ def render_trial_report(state: RunState, output_dir: Path) -> TrialReportPaths:
 def _project(state: RunState) -> dict[str, object]:
     state = _validated_state(state)
     coverage = _coverage(state)
+    identity: dict[str, object] = {
+        "run_id": state.run_id,
+        "repo_url": state.repo_url,
+        "commit_sha": state.commit_sha,
+        "baseline_config_hash": state.baseline_config_hash,
+        "current_config_hash": state.current_config_hash,
+        "current_compose_reference": state.compose_path,
+    }
+    if state.baseline_compose_path is not None:
+        identity["baseline_compose_reference"] = state.baseline_compose_path
     return {
         "disclaimer": (
             "This tested-journey/workload-conditioned hardened candidate is not a "
             "security proof."
         ),
-        "identity": {
-            "run_id": state.run_id,
-            "repo_url": state.repo_url,
-            "commit_sha": state.commit_sha,
-            "baseline_config_hash": state.baseline_config_hash,
-            "current_config_hash": state.current_config_hash,
-            "current_compose_reference": state.compose_path,
-        },
+        "identity": identity,
         "coverage": coverage,
         "stop_reason": state.stop_reason,
         "recovery_env_keys": list(state.recovery_env_keys),
@@ -91,6 +94,11 @@ def _project(state: RunState) -> dict[str, object]:
                 for reference in state.artifacts
                 if reference != state.compose_path
                 and reference != state.compatibility_overlay_path
+                and (
+                    state.hardened_overlay_provenance is None
+                    or reference
+                    != state.hardened_overlay_provenance.overlay_relative_reference
+                )
                 and reference.lower().endswith((".overlay.yaml", ".overlay.yml"))
             ],
             "compatibility_overlay": {
@@ -101,10 +109,7 @@ def _project(state: RunState) -> dict[str, object]:
                 "compose_reference": state.compose_path,
                 "config_hash": state.current_config_hash,
             },
-            "hardened_overlay": {
-                "status": "unavailable",
-                "reason": _HARDENED_OVERLAY_UNAVAILABLE_REASON,
-            },
+            "hardened_overlay": _hardened_overlay(state),
         },
     }
 
@@ -114,6 +119,26 @@ def _validated_state(state: RunState) -> RunState:
         return RunState.model_validate(state)
     except ValidationError:
         raise ValueError("invalid run state") from None
+
+
+def _hardened_overlay(state: RunState) -> dict[str, object]:
+    provenance = state.hardened_overlay_provenance
+    if provenance is None or (
+        provenance.baseline_reference != state.baseline_compose_path
+        or provenance.baseline_config_hash != state.baseline_config_hash
+        or provenance.final_reference != state.compose_path
+        or provenance.final_config_hash != state.current_config_hash
+    ):
+        return {
+            "status": "unavailable",
+            "reason": _HARDENED_OVERLAY_UNAVAILABLE_REASON,
+        }
+    return {
+        "status": "available",
+        "reference": provenance.overlay_relative_reference,
+        "sha256": provenance.overlay_raw_sha256,
+        "provenance": provenance.model_dump(mode="json"),
+    }
 
 
 def _coverage(state: RunState) -> dict[str, object]:

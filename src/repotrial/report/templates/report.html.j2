@@ -49,12 +49,19 @@
 
   <h2>Artifact references</h2>
   <ul>{% for reference in report.artifacts.references %}<li>{{ reference }}</li>{% endfor %}</ul>
+  <h2>Compose artifact ordering</h2>
+  <p>Source Compose: {{ report.identity.baseline_compose_reference }}</p>
   <h2>Compatibility overlay</h2>
   <p>Reference: {{ report.artifacts.compatibility_overlay.reference }}</p>
   <p>SHA-256: {{ report.artifacts.compatibility_overlay.sha256 }}</p>
+  <p>Ordering: source Compose → compatibility overlay (when present) → hardened overlay</p>
   <h2>Experiment overlays</h2>
   <ul>{% for overlay in report.artifacts.experiment_overlays %}<li>{{ overlay }}</li>{% endfor %}</ul>
   <p>Accepted configuration: {{ report.artifacts.accepted_configuration }}</p>
-  <p>Hardened overlay: {{ report.artifacts.hardened_overlay }}</p>
+  <h2>Final hardened overlay</h2>
+  <p>Status: {{ report.artifacts.hardened_overlay.status }}</p>
+  <p>Reference: {{ report.artifacts.hardened_overlay.reference }}</p>
+  <p>SHA-256: {{ report.artifacts.hardened_overlay.sha256 }}</p>
+  <p>{{ report.artifacts.hardened_overlay.reason }}</p>
 </body>
 </html>

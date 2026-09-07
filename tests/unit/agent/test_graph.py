@@ -17,6 +17,7 @@ from typing import TypeVar
 import pytest
 from fixture_harness import parse_fixture_materialization
 from langgraph.errors import NodeCancelledError
+from langgraph.runtime import Runtime
 from pydantic import BaseModel
 from ruamel.yaml import YAML
 
@@ -28,6 +29,7 @@ from repotrial.compose.mutations import apply_mutation
 from repotrial.compose.parser import canonical_compose_json, load_compose
 from repotrial.domain.enums import ExperimentVerdict, MutationType, Verdict
 from repotrial.domain.models import (
+    ExperimentRecord,
     Journey,
     JourneyAssertion,
     JourneyStep,
@@ -36,6 +38,7 @@ from repotrial.domain.models import (
     RepoRef,
     RunState,
 )
+from repotrial.hardening.policy import MutationPolicyDecision
 from repotrial.models.base import RecoveryAction
 from repotrial.sandbox.base import (
     ExecResult,
@@ -1351,6 +1354,9 @@ def test_two_keeps_materialize_full_compose_chain_without_mutating_source(
     with _healthy_server() as (_, port):
         provider = GraphProvider(host_port=port)
         context, source = _context(tmp_path, provider, risks=("root_user", "cap_add"))
+        (context.overlay_dir / "hardened.overlay.yaml").write_text(
+            "services: {}\n", encoding="utf-8"
+        )
         original = source.read_bytes()
 
         result = _run(_state(source.parent), context)
@@ -1368,10 +1374,14 @@ def test_two_keeps_materialize_full_compose_chain_without_mutating_source(
     assert accepted.is_file()
     assert _compose_hash(accepted) == result.run.current_config_hash
     assert source.read_bytes() == original
+    assert result.run.hardened_overlay_provenance is not None
+    hardened_reference = (
+        result.run.hardened_overlay_provenance.overlay_relative_reference
+    )
     overlay_artifacts = [
         context.workspace / path
         for path in result.run.artifacts
-        if path.endswith(".overlay.yaml")
+        if path.endswith(".overlay.yaml") and path != hardened_reference
     ]
     assert len(overlay_artifacts) == 2
     assert all(path.is_file() for path in overlay_artifacts)
@@ -1379,6 +1389,196 @@ def test_two_keeps_materialize_full_compose_chain_without_mutating_source(
     assert not any(
         record.reason == "parent_hash_mismatch" for record in result.run.experiments
     )
+    assert result.run.baseline_compose_path == "compose.yaml"
+    final_overlay = context.workspace / hardened_reference
+    assert final_overlay.is_file()
+    assert (
+        result.run.baseline_config_hash.removeprefix("sha256:")[:16]
+        in hardened_reference
+    )
+    assert (
+        result.run.current_config_hash.removeprefix("sha256:")[:16]
+        in hardened_reference
+    )
+
+
+def test_graph_terminal_overlay_replays_two_keeps_and_one_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    decisions = iter(
+        [
+            MutationPolicyDecision(
+                mutation=Mutation(
+                    mutation_id="keep-user",
+                    type=MutationType.SET_NON_ROOT,
+                    service="web",
+                ),
+                stop_reason=None,
+            ),
+            MutationPolicyDecision(
+                mutation=Mutation(
+                    mutation_id="keep-worker-caps",
+                    type=MutationType.DROP_ALL_CAPS,
+                    service="worker",
+                ),
+                stop_reason=None,
+            ),
+            MutationPolicyDecision(
+                mutation=Mutation(
+                    mutation_id="rollback-tmpfs",
+                    type=MutationType.ADD_TMPFS,
+                    service="web",
+                ),
+                stop_reason=None,
+            ),
+            MutationPolicyDecision(mutation=None, stop_reason="done"),
+        ]
+    )
+    monkeypatch.setattr(graph_module, "propose_mutation", lambda state: next(decisions))
+
+    class SequenceProvider(GraphProvider):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            self.candidate_number = 0
+
+        async def create(self, workspace: Path, name: str) -> str:
+            sandbox_id = await super().create(workspace, name)
+            if name.startswith("repotrial-candidate-"):
+                self.candidate_number += 1
+                self._healthy[sandbox_id] = self.candidate_number != 3
+            return sandbox_id
+
+    with _healthy_server() as (_, port):
+        provider = SequenceProvider(host_port=port)
+        context, source = _context(tmp_path, provider, risks=("root_user", "cap_add"))
+        source.write_text(
+            source.read_text(encoding="utf-8") + "  worker:\n    image: busybox\n",
+            encoding="utf-8",
+        )
+        result = _run(_state(source.parent), context)
+
+    assert [record.verdict for record in result.run.experiments] == [
+        ExperimentVerdict.KEEP,
+        ExperimentVerdict.KEEP,
+        ExperimentVerdict.ROLLBACK,
+    ]
+    provenance = result.run.hardened_overlay_provenance
+    assert provenance is not None
+    overlay = load_compose(context.workspace / provenance.overlay_relative_reference)
+    web_overlay = overlay["services"]["web"]
+    worker_overlay = overlay["services"]["worker"]
+    assert "user" in web_overlay
+    assert "cap_drop" in worker_overlay
+    assert "tmpfs" not in web_overlay
+    assert "tmpfs" not in worker_overlay
+    assert result.run.artifacts.count(provenance.overlay_relative_reference) == 1
+
+
+def test_hardened_overlay_replay_rejects_tampered_baseline_source(
+    tmp_path: Path,
+) -> None:
+    with _healthy_server() as (_, port):
+        provider = GraphProvider(host_port=port)
+        context, source = _context(tmp_path, provider, risks=("root_user",))
+        result = _run(_state(source.parent), context)
+
+    source.write_text(
+        source.read_text(encoding="utf-8") + "\nname: tampered\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="baseline compose hash mismatch"):
+        graph_module._materialize_hardened_overlay(result.run, context)
+
+
+def _terminal_keep_state(tmp_path: Path) -> tuple[GraphContext, RunState]:
+    provider = GraphProvider()
+    context, source = _context(tmp_path, provider, journeys=[])
+    baseline = load_compose(source)
+    mutation = Mutation(
+        mutation_id="keep-user",
+        type=MutationType.SET_NON_ROOT,
+        service="web",
+    )
+    candidate = apply_mutation(baseline, mutation)
+    baseline_hash = _compose_hash(source)
+    candidate_material = canonical_compose_json(candidate).encode("utf-8")
+    candidate_hash = "sha256:" + hashlib.sha256(candidate_material).hexdigest()
+    accepted = context.accepted_compose_dir / "accepted-final.compose.yaml"
+    _write_compose(accepted, candidate)
+    record = ExperimentRecord(
+        experiment_id=mutation.mutation_id,
+        parent_config_hash=baseline_hash,
+        candidate_config_hash=candidate_hash,
+        mutation=mutation,
+        boot=Verdict.PASS,
+        journeys=[],
+        verdict=ExperimentVerdict.KEEP,
+        reason="passed",
+    )
+    state = _state(source.parent, run_id="terminal-boundary").model_copy(
+        update={
+            "compose_path": accepted.relative_to(context.workspace).as_posix(),
+            "baseline_compose_path": source.name,
+            "baseline_config_hash": baseline_hash,
+            "current_config_hash": candidate_hash,
+            "experiments": [record],
+            "stop_reason": "terminal-stop",
+        }
+    )
+    return context, state
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing_baseline",
+        "final_hash_mismatch",
+        "overlay_symlink",
+        "parent_hash",
+        "candidate_hash",
+    ],
+)
+def test_terminal_report_hook_fails_closed_without_artifact_registration(
+    tmp_path: Path, failure: str
+) -> None:
+    context, state = _terminal_keep_state(tmp_path)
+    if failure == "missing_baseline":
+        state.baseline_compose_path = None
+    elif failure == "final_hash_mismatch":
+        state.current_config_hash = "sha256:" + "0" * 64
+    elif failure == "parent_hash":
+        state.experiments[0].parent_config_hash = "sha256:" + "0" * 64
+    elif failure == "candidate_hash":
+        state.experiments[0].candidate_config_hash = "sha256:" + "0" * 64
+    elif failure == "overlay_symlink":
+        initial = graph_module._report_or_next(
+            GraphState(run=state), Runtime(context=context)
+        )["run"]
+        assert isinstance(initial, RunState)
+        assert initial.hardened_overlay_provenance is not None
+        state = initial
+        target = (
+            context.workspace
+            / state.hardened_overlay_provenance.overlay_relative_reference
+        )
+        target.unlink()
+        target.symlink_to(context.workspace / state.compose_path)
+
+    update = graph_module._report_or_next(
+        GraphState(run=state), Runtime(context=context)
+    )
+    returned = update["run"]
+    assert isinstance(returned, RunState)
+    assert returned.hardened_overlay_provenance is None
+    assert returned.stop_reason == "terminal-stop"
+    assert returned.artifacts == state.artifacts
+    report_dir = tmp_path / "report"
+    from repotrial.report.render import render_trial_report
+
+    report = json.loads(
+        render_trial_report(returned, report_dir).json_path.read_text(encoding="utf-8")
+    )
+    assert report["artifacts"]["hardened_overlay"]["status"] == "unavailable"
 
 
 def test_keep_rejects_accepted_directory_reached_through_intermediate_link(

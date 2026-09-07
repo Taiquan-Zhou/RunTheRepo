@@ -388,3 +388,65 @@ def test_renderer_escapes_hostile_html_and_marks_hardened_overlay_unavailable(
         "reason": "A single cumulative hardened overlay is not proven by the current RunState.",
         "status": "unavailable",
     }
+
+
+def test_renderer_projects_hardened_overlay_provenance_without_reading_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from repotrial.domain.models import HardenedOverlayProvenance
+
+    state = _state().model_copy(
+        update={
+            "baseline_compose_path": "compose.yaml",
+            "baseline_config_hash": "sha256:" + "a" * 64,
+            "current_config_hash": "sha256:" + "b" * 64,
+            "compose_path": "artifacts/accepted-compose.yaml",
+            "hardened_overlay_provenance": HardenedOverlayProvenance(
+                baseline_reference="compose.yaml",
+                baseline_config_hash="sha256:" + "a" * 64,
+                final_reference="artifacts/accepted-compose.yaml",
+                final_config_hash="sha256:" + "b" * 64,
+                overlay_relative_reference=".repotrial-overlays/hardened.overlay.yaml",
+                overlay_raw_sha256="c" * 64,
+                format="repotrial-hardened-overlay",
+                version=1,
+            ),
+        }
+    )
+
+    def fail_if_read(*args: object, **kwargs: object) -> str:
+        raise AssertionError("must not read artifact")
+
+    monkeypatch.setattr(Path, "read_text", fail_if_read)
+    report = json.loads(_render(state, tmp_path).json_path.read_bytes().decode("utf-8"))
+
+    assert report["artifacts"]["hardened_overlay"]["status"] == "available"
+    assert (
+        report["artifacts"]["hardened_overlay"]["provenance"]["overlay_raw_sha256"]
+        == "c" * 64
+    )
+
+
+def test_renderer_marks_provenance_with_mismatched_final_identity_unavailable(
+    tmp_path: Path,
+) -> None:
+    from repotrial.domain.models import HardenedOverlayProvenance
+
+    state = _state().model_copy(update={"baseline_compose_path": "compose.yaml"})
+    object.__setattr__(
+        state,
+        "hardened_overlay_provenance",
+        HardenedOverlayProvenance(
+            baseline_reference="compose.yaml",
+            baseline_config_hash="sha256:" + "a" * 64,
+            final_reference="artifacts/accepted-compose.yaml",
+            final_config_hash="sha256:" + "b" * 64,
+            overlay_relative_reference=".repotrial-overlays/hardened.overlay.yaml",
+            overlay_raw_sha256="c" * 64,
+            format="repotrial-hardened-overlay",
+            version=1,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="invalid run state"):
+        _render(state, tmp_path)

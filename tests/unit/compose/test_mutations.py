@@ -417,3 +417,83 @@ def test_write_overlay_creates_only_a_new_regular_file_without_input_mutation(
         pytest.skip("symlinks unavailable on this Windows test host")
     with pytest.raises(MutationError):
         write_overlay(base, candidate, link)
+
+
+def test_write_cumulative_overlay_allows_multiple_changed_services(
+    tmp_path: Path,
+) -> None:
+    from repotrial.compose.overlay import write_cumulative_overlay
+
+    base = {
+        "name": "demo",
+        "services": {
+            "app": {"image": "nginx", "read_only": False},
+            "db": {"image": "postgres", "user": "root"},
+        },
+    }
+    candidate = {
+        "name": "demo",
+        "services": {
+            "app": {"image": "nginx", "read_only": True},
+            "db": {"image": "postgres", "user": "65532:65532"},
+        },
+    }
+    output = tmp_path / "hardened.overlay.yaml"
+
+    write_cumulative_overlay(base, candidate, output)
+    overlay = load_compose(output)
+
+    assert set(overlay) == {"services"}
+    assert set(overlay["services"]) == {"app", "db"}
+    merged = deepcopy(base)
+    for service, service_overlay in overlay["services"].items():
+        merged["services"][service] = _merge_service(
+            merged["services"][service], service_overlay
+        )
+    assert merged == candidate
+
+
+def test_cumulative_overlay_removes_partial_file_when_yaml_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import repotrial.compose.overlay as overlay_module
+
+    class ExplodingYaml:
+        preserve_quotes = False
+
+        def dump(self, overlay: object, output: object) -> None:
+            del overlay, output
+            raise ValueError("serialization failed")
+
+    base = {"services": {"app": {"read_only": False}}}
+    candidate = {"services": {"app": {"read_only": True}}}
+    output = tmp_path / "partial.overlay.yaml"
+    monkeypatch.setattr(overlay_module, "YAML", lambda **kwargs: ExplodingYaml())
+
+    with pytest.raises(ValueError, match="serialization failed"):
+        overlay_module.write_cumulative_overlay(base, candidate, output)
+
+    assert not output.exists()
+
+
+def test_cumulative_overlay_removes_new_file_when_readback_differs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import repotrial.compose.overlay as overlay_module
+
+    class WrongYaml:
+        preserve_quotes = False
+
+        def dump(self, overlay: object, output: object) -> None:
+            del overlay
+            output.write("services:\n  app:\n    read_only: false\n")
+
+    base = {"services": {"app": {"read_only": False}}}
+    candidate = {"services": {"app": {"read_only": True}}}
+    output = tmp_path / "mismatched.overlay.yaml"
+    monkeypatch.setattr(overlay_module, "YAML", lambda **kwargs: WrongYaml())
+
+    with pytest.raises(MutationError, match="write verification failed"):
+        overlay_module.write_cumulative_overlay(base, candidate, output)
+
+    assert not output.exists()

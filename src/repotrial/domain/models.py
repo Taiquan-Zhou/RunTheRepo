@@ -1,7 +1,8 @@
 import re
+import unicodedata
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -13,6 +14,8 @@ _RECOVERY_CONTROL_ENV_KEYS = frozenset(
     {"HOME", "PATH", "PYTHONHOME", "PYTHONPATH", "XDG_CONFIG_HOME"}
 )
 _RECOVERY_CONTROL_ENV_PREFIXES = ("COMPOSE_", "DOCKER_", "DYLD_", "LD_")
+_SHA256_CONFIG_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_SHA256_RAW_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class RepoRef(BaseModel):
@@ -94,6 +97,51 @@ class ExperimentRecord(BaseModel):
     reason: str
 
 
+class HardenedOverlayProvenance(BaseModel):
+    """Identity of a terminal, workload-conditioned hardened overlay."""
+
+    baseline_reference: str
+    baseline_config_hash: str
+    final_reference: str
+    final_config_hash: str
+    overlay_relative_reference: str
+    overlay_raw_sha256: str
+    format: Literal["repotrial-hardened-overlay"]
+    version: Literal[1]
+
+    @field_validator(
+        "baseline_reference", "final_reference", "overlay_relative_reference"
+    )
+    @classmethod
+    def _validate_relative_reference(cls, value: str) -> str:
+        path = Path(value)
+        if (
+            not value
+            or path.is_absolute()
+            or path.drive
+            or ".." in path.parts
+            or "\\" in value
+            or any(part in {"", "."} for part in value.split("/"))
+            or any(unicodedata.category(char).startswith("C") for char in value)
+        ):
+            raise ValueError("artifact reference must be a safe relative path")
+        return value
+
+    @field_validator("baseline_config_hash", "final_config_hash")
+    @classmethod
+    def _validate_config_hash(cls, value: str) -> str:
+        if _SHA256_CONFIG_PATTERN.fullmatch(value) is None:
+            raise ValueError("config hash must be a sha256 digest")
+        return value
+
+    @field_validator("overlay_raw_sha256")
+    @classmethod
+    def _validate_raw_hash(cls, value: str) -> str:
+        if _SHA256_RAW_PATTERN.fullmatch(value) is None:
+            raise ValueError("overlay raw hash must be a sha256 digest")
+        return value
+
+
 class RunState(BaseModel):
     model_config = ConfigDict(
         validate_assignment=True,
@@ -104,11 +152,13 @@ class RunState(BaseModel):
     repo_url: str
     commit_sha: str | None = None
     compose_path: str | None = None
+    baseline_compose_path: str | None = None
     compatibility_overlay_path: str | None = None
     compatibility_overlay_sha256: str | None = None
     sandbox_id: str | None = None
     baseline_config_hash: str | None = None
     current_config_hash: str | None = None
+    hardened_overlay_provenance: HardenedOverlayProvenance | None = None
     recovery_env_keys: list[str] = Field(
         default_factory=list, max_length=_MAX_RECOVERY_ENV_KEYS
     )
@@ -164,6 +214,14 @@ class RunState(BaseModel):
             raise ValueError(
                 "compatibility overlay path and sha256 must be provided together"
             )
+        provenance = self.hardened_overlay_provenance
+        if provenance is not None and (
+            provenance.baseline_reference != self.baseline_compose_path
+            or provenance.baseline_config_hash != self.baseline_config_hash
+            or provenance.final_reference != self.compose_path
+            or provenance.final_config_hash != self.current_config_hash
+        ):
+            raise ValueError("hardened overlay provenance does not match run identity")
         return self
 
     def model_copy(
