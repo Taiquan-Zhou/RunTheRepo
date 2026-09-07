@@ -29,15 +29,19 @@ _MAX_COMMAND_OUTPUT_BYTES: Final = 65_536
 _IMAGE_FIELDS: Final = frozenset({"ID", "Repository", "Tag", "Digest"})
 _RUNTIME_SERVICE_PATTERN: Final = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}\Z")
 _IMAGE_NAME_COMPONENT: Final = r"[a-z0-9][a-z0-9._-]{0,127}"
+_IMAGE_TAG: Final = r":[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}"
+_IMAGE_DIGEST: Final = r"@sha256:[0-9a-f]{64}"
+_IMAGE_SUFFIX: Final = rf"(?:{_IMAGE_TAG}(?:{_IMAGE_DIGEST})?|{_IMAGE_DIGEST})"
 _IMAGE_REFERENCE_PATTERN: Final = re.compile(
     r"[a-z0-9][a-z0-9.-]{0,127}(?::[0-9]{1,5})?/"
     + _IMAGE_NAME_COMPONENT
     + rf"(?:/{_IMAGE_NAME_COMPONENT})*"
-    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}|@sha256:[0-9a-f]{64})\Z"
+    + _IMAGE_SUFFIX
+    + r"\Z"
 )
 _IMAGE_REFERENCE_WITHOUT_SUFFIX_PATTERN: Final = re.compile(
     rf"{_IMAGE_NAME_COMPONENT}(?:/{_IMAGE_NAME_COMPONENT})*"
-    rf"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{{0,127}}|@sha256:[0-9a-f]{{64}})?\Z"
+    rf"(?:{_IMAGE_SUFFIX})?\Z"
 )
 _IMAGE_LIST_ARGV: Final = (
     "docker",

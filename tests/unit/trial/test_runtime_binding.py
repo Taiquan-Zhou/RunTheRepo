@@ -29,6 +29,14 @@ def test_compose_image_output_canonicalizes_familiar_names(
     assert parse_compose_image_output(output, service="web") == expected
 
 
+def test_compose_image_output_canonicalizes_tagged_digest() -> None:
+    digest = "73" * 32
+    output = f"busybox:1.36.1@sha256:{digest}"
+    expected = f"docker.io/library/busybox:1.36.1@sha256:{digest}"
+
+    assert parse_compose_image_output(output, service="web") == expected
+
+
 def test_resolves_each_compose_service_to_one_exact_inspect_id_and_alias() -> None:
     services = (
         ("web", "docker.io/library/web:latest"),
