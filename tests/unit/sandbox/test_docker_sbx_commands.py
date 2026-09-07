@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import json
 import os
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -146,6 +148,7 @@ class _FakeProcess:
             self._release.set()
         self.stdout = _FakeStream(outcome.stdout, self._release)
         self.stderr = _FakeStream(outcome.stderr, self._release)
+        self.stdin = _FakeStdin()
         self.returncode: int | None = None
         self.killed = False
         self.waited = False
@@ -168,6 +171,24 @@ class _FakeProcess:
             raise self._outcome.kill_error
         self.returncode = -9
         self._release.set()
+
+
+class _FakeStdin:
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.data.extend(data)
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
 
 
 class _SbxSpawner:
@@ -1412,6 +1433,218 @@ def test_runtime_template_lifecycle_uses_owned_tag_and_exact_image_id(
     stop_index = spawner.calls.index(("sbx", "stop", sandbox_id))
     save_index = spawner.calls.index(template_calls[1])
     assert stop_index < save_index
+
+
+def test_stage_runtime_image_bundle_streams_export_to_private_bounded_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch,
+        spawner,
+        deadline=time.monotonic() + 300.0,
+    )
+    archive = b"streamed image archive"
+    spawner.handler = lambda command: (
+        _Outcome(stdout=archive) if command[:2] == ("sbx", "exec") else _Outcome()
+    )
+
+    asyncio.run(
+        provider.stage_runtime_image_bundle(
+            sandbox_id,
+            ("docker.io/library/alpine:latest",),
+            ("sha256:" + "a" * 64,),
+        )
+    )
+
+    export_calls = [call for call in spawner.calls if call[:2] == ("sbx", "exec")]
+    assert export_calls == [
+        (
+            "sbx",
+            "exec",
+            sandbox_id,
+            "--",
+            "docker",
+            "image",
+            "save",
+            "docker.io/library/alpine:latest",
+            "sha256:" + "a" * 64,
+        )
+    ]
+    bundle_path = provider._runtime_image_bundle_path
+    assert bundle_path is not None
+    assert bundle_path.read_bytes() == archive
+    assert bundle_path.stat().st_mode & 0o777 == 0o600
+    assert (
+        provider.runtime_template_audit().bundle_sha256
+        == hashlib.sha256(archive).hexdigest()
+    )
+    assert provider.runtime_template_audit().bundle_size == len(archive)
+
+
+@pytest.mark.parametrize(
+    "references,ids,reason",
+    [
+        ((), ("sha256:" + "a" * 64,), "image_bundle_empty"),
+        (
+            ("-unsafe:latest",),
+            ("sha256:" + "a" * 64,),
+            "image_bundle_reference_invalid",
+        ),
+        (
+            ("zulu:latest", "alpine:latest"),
+            ("sha256:" + "a" * 64,),
+            "image_bundle_references_unsorted",
+        ),
+        (
+            ("alpine:latest", "alpine:latest"),
+            ("sha256:" + "a" * 64,),
+            "image_bundle_references_duplicate",
+        ),
+        (("alpine:latest",), ("sha256:" + "A" * 64,), "image_bundle_id_invalid"),
+    ],
+)
+def test_stage_runtime_image_bundle_rejects_unsafe_or_ambiguous_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    references: tuple[str, ...],
+    ids: tuple[str, ...],
+    reason: str,
+) -> None:
+    provider, sandbox_id = _active_provider(
+        monkeypatch, _SbxSpawner(), deadline=time.monotonic() + 300.0
+    )
+
+    with pytest.raises(DockerSbxError, match=reason):
+        asyncio.run(provider.stage_runtime_image_bundle(sandbox_id, references, ids))
+
+
+def test_stage_runtime_image_bundle_rejects_oversize_and_cleans_process_and_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch, spawner, deadline=time.monotonic() + 300.0
+    )
+    provider._policy = DockerSbxPolicy(
+        cpus=1,
+        memory_mb=512,
+        pids_limit=64,
+        disk_mb=7,
+        total_duration_s=300,
+    )
+    archive = b"x" * (
+        calculate_disk_allocation(provider._policy.disk_mb).docker_mb * 1024 * 1024 + 1
+    )
+    spawner.handler = lambda command: _Outcome(stdout=archive)
+
+    with pytest.raises(DockerSbxError, match="image_bundle_oversize"):
+        asyncio.run(
+            provider.stage_runtime_image_bundle(
+                sandbox_id, ("alpine:latest",), ("sha256:" + "a" * 64,)
+            )
+        )
+
+    assert spawner.processes[0].killed is True
+    assert spawner.processes[0].waited is True
+    assert provider._runtime_image_bundle_path is None
+
+
+def test_runtime_image_bundle_import_uses_exact_argv_and_hashes_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch, spawner, deadline=time.monotonic() + 300.0
+    )
+    archive = b"bundle-for-import"
+    spawner.handler = lambda command: _Outcome(stdout=archive)
+    asyncio.run(
+        provider.stage_runtime_image_bundle(
+            sandbox_id, ("alpine:latest",), ("sha256:" + "a" * 64,)
+        )
+    )
+
+    asyncio.run(
+        provider._import_runtime_image_bundle("sandbox-new", time.monotonic() + 300.0)
+    )
+
+    assert spawner.calls[-1] == (
+        "sbx",
+        "exec",
+        "sandbox-new",
+        "--",
+        "docker",
+        "image",
+        "load",
+    )
+    assert spawner.processes[-1].stdin.data == archive
+    assert spawner.processes[-1].stdin.closed is True
+
+
+def test_cancelled_runtime_image_bundle_stage_reaps_process_and_removes_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch, spawner, deadline=time.monotonic() + 300.0
+    )
+    spawner.handler = lambda command: _Outcome(hang=True)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(
+            provider.stage_runtime_image_bundle(
+                sandbox_id, ("alpine:latest",), ("sha256:" + "a" * 64,)
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+    assert spawner.processes[0].killed is True
+    assert spawner.processes[0].waited is True
+    assert provider._runtime_image_bundle_path is None
+
+
+def test_begin_invocation_rejects_unconfirmed_image_bundle_residue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(monkeypatch, _SbxSpawner())
+    provider._runtime_image_bundle_path = Path(
+        tempfile.mkstemp(prefix="repotrial-test-residue-")[1]
+    )
+    try:
+        with pytest.raises(RuntimeError, match="bundle"):
+            asyncio.run(provider.begin_invocation())
+    finally:
+        provider._runtime_image_bundle_path.unlink(missing_ok=True)
+
+
+def test_finalize_runtime_template_attempts_template_and_bundle_cleanup_on_both_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(monkeypatch, _SbxSpawner())
+    calls: list[str] = []
+
+    async def fail_template() -> None:
+        calls.append("template")
+        raise DockerSbxError("template_finalize", "template_failure")
+
+    async def fail_bundle() -> None:
+        calls.append("bundle")
+        raise DockerSbxError("template_finalize", "bundle_failure")
+
+    monkeypatch.setattr(provider, "_finalize_runtime_template_only", fail_template)
+    monkeypatch.setattr(provider, "_cleanup_runtime_image_bundle", fail_bundle)
+
+    with pytest.raises(DockerSbxError, match="dual_cleanup_failed") as error:
+        asyncio.run(provider.finalize_runtime_template())
+
+    assert calls == ["template", "bundle"]
+    assert "template_failure" in str(error.value)
+    assert "bundle_failure" in str(error.value)
+    assert provider._runtime_template_finalization_confirmed is False
 
 
 @pytest.mark.parametrize(

@@ -365,6 +365,8 @@ class RuntimeTemplateAudit:
     identity: RuntimeTemplateIdentity | None = None
     uses: tuple[RuntimeTemplateUse, ...] = ()
     removal_confirmed: bool = False
+    bundle_sha256: str | None = None
+    bundle_size: int | None = None
 
     def __post_init__(self) -> None:
         if self.identity is not None and not isinstance(
@@ -382,6 +384,17 @@ class RuntimeTemplateAudit:
                 raise ValueError("runtime template audit use identity mismatch")
         if type(self.removal_confirmed) is not bool:
             raise TypeError("runtime template audit removal_confirmed is invalid")
+        if self.bundle_sha256 is not None and (
+            not isinstance(self.bundle_sha256, str)
+            or _RUNTIME_TEMPLATE_HASH_PATTERN.fullmatch(self.bundle_sha256) is None
+        ):
+            raise ValueError("runtime template audit bundle hash is invalid")
+        if self.bundle_size is not None and (
+            type(self.bundle_size) is not int or self.bundle_size <= 0
+        ):
+            raise ValueError("runtime template audit bundle size is invalid")
+        if (self.bundle_sha256 is None) != (self.bundle_size is None):
+            raise ValueError("runtime template audit bundle identity is incomplete")
 
     def with_use(self, sandbox_id: str) -> "RuntimeTemplateAudit":
         """Return a new audit containing one successful template create."""
@@ -396,6 +409,8 @@ class RuntimeTemplateAudit:
             identity=self.identity,
             uses=(*self.uses, RuntimeTemplateUse(sandbox_id, self.identity)),
             removal_confirmed=False,
+            bundle_sha256=self.bundle_sha256,
+            bundle_size=self.bundle_size,
         )
 
     def as_public_record(self) -> dict[str, object]:
@@ -407,6 +422,8 @@ class RuntimeTemplateAudit:
             ),
             "template_uses": [use.as_public_record() for use in self.uses],
             "removal_confirmed": self.removal_confirmed,
+            "bundle_sha256": self.bundle_sha256,
+            "bundle_size": self.bundle_size,
         }
 
 
@@ -444,6 +461,15 @@ class SandboxProvider(ABC):
     ) -> None:
         del sandbox_id, image_identity_sha256
         raise RuntimeError("runtime templates are unsupported")
+
+    async def stage_runtime_image_bundle(
+        self,
+        sandbox_id: str,
+        image_references: tuple[str, ...],
+        image_ids: tuple[str, ...],
+    ) -> None:
+        del sandbox_id, image_references, image_ids
+        raise RuntimeError("runtime image bundles are unsupported")
 
     def expected_image_identity_sha256(self) -> str | None:
         return None

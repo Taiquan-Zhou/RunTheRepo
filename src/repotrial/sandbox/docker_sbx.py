@@ -7,13 +7,14 @@ import math
 import os
 import re
 import shutil
+import stat
 import tempfile
 import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, NoReturn
+from typing import Any, BinaryIO, NoReturn
 
 from .base import (
     ExecResult,
@@ -97,6 +98,9 @@ _ANONYMOUS_CONFIG_RETAINED_NOTE = (
     "anonymous Docker config retained because process cleanup is unconfirmed"
 )
 _ANONYMOUS_CONFIG_CLEANUP_FAILED_NOTE = "anonymous Docker config cleanup failed"
+_IMAGE_BUNDLE_REFERENCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@:-]{0,511}\Z")
+_IMAGE_BUNDLE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_IMAGE_BUNDLE_CHUNK_BYTES = 8192
 
 MANDATORY_DENY_NETWORK = frozenset(
     {
@@ -346,6 +350,11 @@ class DockerSbxProvider(SandboxProvider):
         self._runtime_template_finalization_confirmed = True
         self._runtime_template_identity: RuntimeTemplateIdentity | None = None
         self._runtime_template_audit = RuntimeTemplateAudit(removal_confirmed=True)
+        self._runtime_image_bundle_path: Path | None = None
+        self._runtime_image_bundle_file: BinaryIO | None = None
+        self._runtime_image_bundle_sha256: str | None = None
+        self._runtime_image_bundle_size: int | None = None
+        self._runtime_image_bundle_stage_used = False
 
     @property
     def supports_runtime_templates(self) -> bool:
@@ -371,6 +380,21 @@ class DockerSbxProvider(SandboxProvider):
             )
         ):
             raise RuntimeError("runtime template cleanup is not confirmed")
+        if any(
+            value is not None
+            for value in (
+                self._runtime_image_bundle_path,
+                self._runtime_image_bundle_file,
+                self._runtime_image_bundle_sha256,
+                self._runtime_image_bundle_size,
+            )
+        ):
+            raise RuntimeError("runtime image bundle cleanup is not confirmed")
+        if (
+            self._runtime_template_audit.bundle_sha256 is not None
+            or self._runtime_template_audit.bundle_size is not None
+        ):
+            raise RuntimeError("runtime image bundle cleanup is not confirmed")
         if (
             self._runtime_template_audit.identity is not None
             and not self._runtime_template_audit.removal_confirmed
@@ -390,6 +414,273 @@ class DockerSbxProvider(SandboxProvider):
         self._runtime_template_finalization_confirmed = False
         self._runtime_template_identity = None
         self._runtime_template_audit = RuntimeTemplateAudit()
+        self._runtime_image_bundle_stage_used = False
+
+    async def stage_runtime_image_bundle(
+        self,
+        sandbox_id: str,
+        image_references: tuple[str, ...],
+        image_ids: tuple[str, ...],
+    ) -> None:
+        self._require_active(sandbox_id)
+        if sandbox_id in self._stopped_sandboxes:
+            raise RuntimeError(f"sandbox is stopped: {sandbox_id}")
+        if self._runtime_image_bundle_stage_used:
+            raise DockerSbxError("image_bundle_stage", "image_bundle_already_staged")
+        self._runtime_image_bundle_stage_used = True
+        references, ids = _validate_image_bundle_inputs(image_references, image_ids)
+        if any(
+            value is not None
+            for value in (
+                self._runtime_image_bundle_path,
+                self._runtime_image_bundle_file,
+                self._runtime_image_bundle_sha256,
+                self._runtime_image_bundle_size,
+            )
+        ):
+            raise DockerSbxError("image_bundle_stage", "image_bundle_already_staged")
+        path: Path | None = None
+        bundle: BinaryIO | None = None
+        try:
+            try:
+                fd, raw_path = tempfile.mkstemp(prefix="repotrial-image-bundle-")
+            except OSError as error:
+                evidence = self._command_failure_evidence(
+                    "image_bundle_stage",
+                    "image_bundle_io_error",
+                    deadline=self._require_deadline(sandbox_id),
+                    deadline_limited=False,
+                    subprocess_started=False,
+                    sandbox_id=sandbox_id,
+                )
+                raise DockerSbxError(
+                    "image_bundle_stage",
+                    "image_bundle_io_error",
+                    sandbox_id=sandbox_id,
+                    failure_evidence=evidence,
+                ) from error
+            path = Path(raw_path)
+            os.chmod(path, 0o600)
+            bundle = os.fdopen(fd, "w+b", buffering=0)
+            self._runtime_image_bundle_path = path
+            self._runtime_image_bundle_file = bundle
+            max_bytes = calculate_disk_allocation(self._policy.disk_mb).docker_mb * (
+                1024 * 1024
+            )
+            digest, size = await self._stream_image_bundle_export(
+                sandbox_id,
+                references,
+                ids,
+                bundle,
+                max_bytes=max_bytes,
+            )
+            if size == 0:
+                raise DockerSbxError("image_bundle_stage", "image_bundle_empty")
+            bundle.flush()
+            if not _same_open_file(path, bundle):
+                raise DockerSbxError("image_bundle_stage", "image_bundle_replaced")
+            bundle.seek(0)
+            self._runtime_image_bundle_sha256 = digest
+            self._runtime_image_bundle_size = size
+            audit = self._runtime_template_audit
+            self._runtime_template_audit = RuntimeTemplateAudit(
+                identity=audit.identity,
+                uses=audit.uses,
+                removal_confirmed=False,
+                bundle_sha256=digest,
+                bundle_size=size,
+            )
+        except (DockerSbxError, asyncio.CancelledError, OSError):
+            await self._discard_runtime_image_bundle()
+            raise
+
+    async def _stream_image_bundle_export(
+        self,
+        sandbox_id: str,
+        references: tuple[str, ...],
+        ids: tuple[str, ...],
+        bundle: BinaryIO,
+        *,
+        max_bytes: int,
+    ) -> tuple[str, int]:
+        process: asyncio.subprocess.Process | None = None
+        stderr_task: asyncio.Task[tuple[bytes, bool]] | None = None
+        deadline = self._require_deadline(sandbox_id)
+        operation = "image_bundle_stage"
+        try:
+            effective_timeout_s, deadline_limited = self._effective_timeout(
+                operation,
+                self._command_timeout_s,
+                deadline=deadline,
+                public_sandbox_id=sandbox_id,
+                evidence_sandbox_id=sandbox_id,
+            )
+            async with asyncio.timeout(effective_timeout_s):
+                process = await asyncio.create_subprocess_exec(
+                    "sbx",
+                    "exec",
+                    sandbox_id,
+                    "--",
+                    "docker",
+                    "image",
+                    "save",
+                    *references,
+                    *ids,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=self._sandbox_command_environment(),
+                )
+                if process.stdout is None or process.stderr is None:
+                    raise OSError("sbx pipes unavailable")
+                stderr_task = asyncio.create_task(
+                    _read_bounded_with_overflow(process.stderr)
+                )
+                digest = hashlib.sha256()
+                size = 0
+                while True:
+                    chunk = await process.stdout.read(_IMAGE_BUNDLE_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > max_bytes:
+                        evidence = self._command_failure_evidence(
+                            operation,
+                            "image_bundle_oversize",
+                            deadline=deadline,
+                            deadline_limited=deadline_limited,
+                            subprocess_started=True,
+                            sandbox_id=sandbox_id,
+                            details={"max_bytes": max_bytes},
+                        )
+                        raise DockerSbxError(
+                            operation,
+                            "image_bundle_oversize",
+                            sandbox_id=sandbox_id,
+                            failure_evidence=evidence,
+                        )
+                    bundle.write(chunk)
+                    digest.update(chunk)
+                returncode = await process.wait()
+                stderr, stderr_overflow = await stderr_task
+                stderr_task = None
+                if stderr_overflow:
+                    evidence = self._command_failure_evidence(
+                        operation,
+                        "image_bundle_stderr_overflow",
+                        deadline=deadline,
+                        deadline_limited=deadline_limited,
+                        subprocess_started=True,
+                        sandbox_id=sandbox_id,
+                    )
+                    raise DockerSbxError(
+                        operation,
+                        "image_bundle_stderr_overflow",
+                        sandbox_id=sandbox_id,
+                        failure_evidence=evidence,
+                    )
+                result = _CommandResult(
+                    returncode=returncode,
+                    stdout=b"",
+                    stderr=stderr,
+                    _execution_context=_CommandExecutionContext(
+                        operation=operation,
+                        sandbox_id=sandbox_id,
+                        deadline_limited=deadline_limited,
+                        subprocess_started=True,
+                        trial_elapsed_s=None,
+                        trial_remaining_s=None,
+                    ),
+                )
+                _require_success(operation, result)
+                return digest.hexdigest(), size
+        except TimeoutError as error:
+            evidence = self._command_failure_evidence(
+                operation,
+                "total_duration_exhausted" if deadline_limited else "timeout",
+                deadline=deadline,
+                deadline_limited=deadline_limited,
+                subprocess_started=process is not None,
+                sandbox_id=sandbox_id,
+            )
+            if process is not None:
+                await _raise_after_process_cleanup(
+                    operation,
+                    evidence.reason,
+                    process,
+                    error,
+                    sandbox_id=sandbox_id,
+                    failure_evidence=evidence,
+                )
+            raise DockerSbxError(
+                operation, evidence.reason, failure_evidence=evidence
+            ) from error
+        except asyncio.CancelledError as error:
+            if process is not None:
+                attach_sandbox_failure_evidence(
+                    error,
+                    self._command_failure_evidence(
+                        operation,
+                        "cancelled",
+                        deadline=deadline,
+                        deadline_limited=False,
+                        subprocess_started=True,
+                        sandbox_id=sandbox_id,
+                    ),
+                )
+                await _raise_after_process_cleanup(
+                    operation, "cancelled", process, error
+                )
+            raise
+        except DockerSbxError as error:
+            if process is not None:
+                error_evidence = get_sandbox_failure_evidence(error)
+                if error_evidence is None:
+                    error_evidence = self._command_failure_evidence(
+                        operation,
+                        error.reason,
+                        deadline=deadline,
+                        deadline_limited=False,
+                        subprocess_started=True,
+                        sandbox_id=sandbox_id,
+                    )
+                await _raise_after_process_cleanup(
+                    operation,
+                    error.reason,
+                    process,
+                    error,
+                    sandbox_id=sandbox_id,
+                    failure_evidence=error_evidence,
+                )
+            raise
+        except OSError as error:
+            evidence = self._command_failure_evidence(
+                operation,
+                "io_error",
+                deadline=deadline,
+                deadline_limited=False,
+                subprocess_started=process is not None,
+                sandbox_id=sandbox_id,
+            )
+            if process is not None:
+                await _raise_after_process_cleanup(
+                    operation,
+                    "io_error",
+                    process,
+                    error,
+                    sandbox_id=sandbox_id,
+                    failure_evidence=evidence,
+                )
+            raise DockerSbxError(
+                operation, "io_error", failure_evidence=evidence
+            ) from error
+        finally:
+            if stderr_task is not None:
+                stderr_task.cancel()
+                try:
+                    await stderr_task
+                except asyncio.CancelledError:
+                    pass
 
     async def activate_runtime_template(
         self, sandbox_id: str, image_identity_sha256: str
@@ -442,7 +733,11 @@ class DockerSbxProvider(SandboxProvider):
             self._runtime_template_image_id = identity.image_id
             self._runtime_template_expected_identity = image_identity_sha256
             self._runtime_template_identity = identity
-            self._runtime_template_audit = RuntimeTemplateAudit(identity=identity)
+            self._runtime_template_audit = RuntimeTemplateAudit(
+                identity=identity,
+                bundle_sha256=self._runtime_image_bundle_sha256,
+                bundle_size=self._runtime_image_bundle_size,
+            )
         except (DockerSbxError, asyncio.CancelledError) as primary_error:
             if save_attempted:
                 try:
@@ -453,6 +748,36 @@ class DockerSbxProvider(SandboxProvider):
             raise
 
     async def finalize_runtime_template(self) -> None:
+        cleanup_errors: list[BaseException] = []
+        try:
+            await self._finalize_runtime_template_only()
+        except (DockerSbxError, asyncio.CancelledError) as error:
+            cleanup_errors.append(error)
+        try:
+            await self._cleanup_runtime_image_bundle()
+        except (DockerSbxError, asyncio.CancelledError) as error:
+            cleanup_errors.append(error)
+        if not cleanup_errors:
+            return
+        self._runtime_template_finalization_confirmed = False
+        self._mark_runtime_cleanup_unconfirmed()
+        if len(cleanup_errors) == 1:
+            raise cleanup_errors[0]
+        primary, secondary = cleanup_errors
+        if isinstance(primary, asyncio.CancelledError):
+            primary.add_note(f"runtime bundle cleanup failed: {secondary}")
+            raise primary
+        assert isinstance(primary, DockerSbxError)
+        primary.add_note(f"runtime image bundle cleanup failed: {secondary}")
+        raise DockerSbxError(
+            primary.operation,
+            "dual_cleanup_failed",
+            sandbox_id=primary.sandbox_id,
+            cleanup_error=f"{primary}; {secondary}",
+            failure_evidence=get_sandbox_failure_evidence(primary),
+        ) from primary
+
+    async def _finalize_runtime_template_only(self) -> None:
         active_identity = self._runtime_template_identity
         audit_identity = self._runtime_template_audit.identity
         if active_identity is not None and audit_identity != active_identity:
@@ -469,6 +794,8 @@ class DockerSbxProvider(SandboxProvider):
                 identity=identity,
                 uses=self._runtime_template_audit.uses,
                 removal_confirmed=True,
+                bundle_sha256=self._runtime_image_bundle_sha256,
+                bundle_size=self._runtime_image_bundle_size,
             )
             self._runtime_template_finalization_confirmed = True
             return
@@ -530,6 +857,278 @@ class DockerSbxProvider(SandboxProvider):
         self._runtime_template_pending_tag = None
         self._runtime_template_identity = None
         self._runtime_template_finalization_confirmed = True
+
+    async def _cleanup_runtime_image_bundle(self) -> None:
+        path = self._runtime_image_bundle_path
+        bundle = self._runtime_image_bundle_file
+        if path is None and bundle is None:
+            if (
+                self._runtime_image_bundle_sha256 is not None
+                or self._runtime_image_bundle_size is not None
+            ):
+                raise DockerSbxError(
+                    "template_finalize", "image_bundle_identity_invalid"
+                )
+            return
+        if path is None or bundle is None:
+            raise DockerSbxError("template_finalize", "image_bundle_state_invalid")
+        try:
+            if not _same_open_file(path, bundle):
+                raise DockerSbxError("template_finalize", "image_bundle_replaced")
+            bundle.close()
+            self._runtime_image_bundle_file = None
+            path.unlink()
+            if path.exists():
+                raise DockerSbxError("template_finalize", "image_bundle_still_present")
+        except DockerSbxError:
+            raise
+        except (OSError, ValueError) as error:
+            raise DockerSbxError(
+                "template_finalize", "image_bundle_cleanup_failed"
+            ) from error
+        self._runtime_image_bundle_path = None
+        self._runtime_image_bundle_sha256 = None
+        self._runtime_image_bundle_size = None
+        audit = self._runtime_template_audit
+        self._runtime_template_audit = RuntimeTemplateAudit(
+            identity=audit.identity,
+            uses=audit.uses,
+            removal_confirmed=audit.removal_confirmed,
+        )
+
+    async def _discard_runtime_image_bundle(self) -> None:
+        path = self._runtime_image_bundle_path
+        bundle = self._runtime_image_bundle_file
+        if bundle is not None:
+            if path is None or not _same_open_file(path, bundle):
+                raise DockerSbxError("image_bundle_stage", "image_bundle_replaced")
+            try:
+                bundle.close()
+            except OSError as error:
+                raise DockerSbxError(
+                    "image_bundle_stage", "image_bundle_cleanup_failed"
+                ) from error
+        self._runtime_image_bundle_file = None
+        if path is not None:
+            try:
+                if path.exists():
+                    path.unlink()
+                    if path.exists():
+                        raise DockerSbxError(
+                            "image_bundle_stage", "image_bundle_still_present"
+                        )
+            except DockerSbxError:
+                raise
+            except OSError as error:
+                raise DockerSbxError(
+                    "image_bundle_stage", "image_bundle_cleanup_failed"
+                ) from error
+        self._runtime_image_bundle_path = None
+        self._runtime_image_bundle_sha256 = None
+        self._runtime_image_bundle_size = None
+        audit = self._runtime_template_audit
+        self._runtime_template_audit = RuntimeTemplateAudit(
+            identity=audit.identity,
+            uses=audit.uses,
+            removal_confirmed=audit.removal_confirmed,
+        )
+
+    def _mark_runtime_cleanup_unconfirmed(self) -> None:
+        audit = self._runtime_template_audit
+        self._runtime_template_audit = RuntimeTemplateAudit(
+            identity=audit.identity,
+            uses=audit.uses,
+            removal_confirmed=False,
+            bundle_sha256=self._runtime_image_bundle_sha256,
+            bundle_size=self._runtime_image_bundle_size,
+        )
+
+    async def _import_runtime_image_bundle(
+        self, sandbox_id: str, deadline: float
+    ) -> None:
+        path = self._runtime_image_bundle_path
+        bundle = self._runtime_image_bundle_file
+        expected_hash = self._runtime_image_bundle_sha256
+        expected_size = self._runtime_image_bundle_size
+        if (
+            path is None
+            or bundle is None
+            or expected_hash is None
+            or expected_size is None
+        ):
+            raise DockerSbxError("image_bundle_import", "image_bundle_state_invalid")
+        if not _same_open_file(path, bundle):
+            raise DockerSbxError("image_bundle_import", "image_bundle_replaced")
+        try:
+            bundle.seek(0)
+        except (OSError, ValueError) as error:
+            raise DockerSbxError(
+                "image_bundle_import", "image_bundle_io_error"
+            ) from error
+        process: asyncio.subprocess.Process | None = None
+        stderr_task: asyncio.Task[tuple[bytes, bool]] | None = None
+        stdout_task: asyncio.Task[None] | None = None
+        operation = "image_bundle_import"
+        try:
+            effective_timeout_s, deadline_limited = self._effective_timeout(
+                operation,
+                self._command_timeout_s,
+                deadline=deadline,
+                public_sandbox_id=sandbox_id,
+                evidence_sandbox_id=sandbox_id,
+            )
+            async with asyncio.timeout(effective_timeout_s):
+                process = await asyncio.create_subprocess_exec(
+                    "sbx",
+                    "exec",
+                    sandbox_id,
+                    "--",
+                    "docker",
+                    "image",
+                    "load",
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=self._sandbox_command_environment(),
+                )
+                if (
+                    process.stdin is None
+                    or process.stdout is None
+                    or process.stderr is None
+                ):
+                    raise OSError("sbx pipes unavailable")
+                stderr_task = asyncio.create_task(
+                    _read_bounded_with_overflow(process.stderr)
+                )
+                stdout_task = asyncio.create_task(_discard_stream(process.stdout))
+                digest = hashlib.sha256()
+                size = 0
+                while True:
+                    chunk = bundle.read(_IMAGE_BUNDLE_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > expected_size:
+                        raise DockerSbxError(operation, "image_bundle_changed")
+                    digest.update(chunk)
+                    process.stdin.write(chunk)
+                    await process.stdin.drain()
+                process.stdin.close()
+                wait_closed = getattr(process.stdin, "wait_closed", None)
+                if wait_closed is not None:
+                    await wait_closed()
+                returncode = await process.wait()
+                stderr, stderr_overflow = await stderr_task
+                stderr_task = None
+                if stdout_task is not None:
+                    await stdout_task
+                    stdout_task = None
+                if stderr_overflow:
+                    raise DockerSbxError(operation, "image_bundle_stderr_overflow")
+                if size != expected_size or digest.hexdigest() != expected_hash:
+                    raise DockerSbxError(operation, "image_bundle_changed")
+                result = _CommandResult(
+                    returncode=returncode,
+                    stdout=b"",
+                    stderr=stderr,
+                    _execution_context=_CommandExecutionContext(
+                        operation=operation,
+                        sandbox_id=sandbox_id,
+                        deadline_limited=deadline_limited,
+                        subprocess_started=True,
+                        trial_elapsed_s=None,
+                        trial_remaining_s=None,
+                    ),
+                )
+                _require_success(operation, result)
+        except TimeoutError as error:
+            evidence = self._command_failure_evidence(
+                operation,
+                "total_duration_exhausted" if deadline_limited else "timeout",
+                deadline=deadline,
+                deadline_limited=deadline_limited,
+                subprocess_started=process is not None,
+                sandbox_id=sandbox_id,
+            )
+            if process is not None:
+                await _raise_after_process_cleanup(
+                    operation,
+                    evidence.reason,
+                    process,
+                    error,
+                    sandbox_id=sandbox_id,
+                    failure_evidence=evidence,
+                )
+            raise DockerSbxError(
+                operation, evidence.reason, failure_evidence=evidence
+            ) from error
+        except asyncio.CancelledError as error:
+            if process is not None:
+                attach_sandbox_failure_evidence(
+                    error,
+                    self._command_failure_evidence(
+                        operation,
+                        "cancelled",
+                        deadline=deadline,
+                        deadline_limited=False,
+                        subprocess_started=True,
+                        sandbox_id=sandbox_id,
+                    ),
+                )
+                await _raise_after_process_cleanup(
+                    operation, "cancelled", process, error
+                )
+            raise
+        except DockerSbxError as error:
+            if process is not None:
+                error_evidence = get_sandbox_failure_evidence(error)
+                if error_evidence is None:
+                    error_evidence = self._command_failure_evidence(
+                        operation,
+                        error.reason,
+                        deadline=deadline,
+                        deadline_limited=False,
+                        subprocess_started=True,
+                        sandbox_id=sandbox_id,
+                    )
+                await _raise_after_process_cleanup(
+                    operation,
+                    error.reason,
+                    process,
+                    error,
+                    sandbox_id=sandbox_id,
+                    failure_evidence=error_evidence,
+                )
+            raise
+        except (OSError, ValueError) as error:
+            evidence = self._command_failure_evidence(
+                operation,
+                "image_bundle_io_error",
+                deadline=deadline,
+                deadline_limited=False,
+                subprocess_started=process is not None,
+                sandbox_id=sandbox_id,
+            )
+            if process is not None:
+                await _raise_after_process_cleanup(
+                    operation,
+                    "image_bundle_io_error",
+                    process,
+                    error,
+                    sandbox_id=sandbox_id,
+                    failure_evidence=evidence,
+                )
+            raise DockerSbxError(
+                operation, "image_bundle_io_error", failure_evidence=evidence
+            ) from error
+        finally:
+            for task in (stderr_task, stdout_task):
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
 
     async def _finalize_pending_runtime_template(self, tag: str) -> None:
         remaining = await self._list_runtime_templates(deadline=None)
@@ -735,6 +1334,11 @@ class DockerSbxProvider(SandboxProvider):
                 public_sandbox_id=sandbox_id,
             )
             _require_success("allow_network", allow_network)
+            if (
+                template_identity is not None
+                and self._runtime_image_bundle_path is not None
+            ):
+                await self._import_runtime_image_bundle(sandbox_id, deadline)
         except (DockerSbxError, asyncio.CancelledError) as error:
             await self._cleanup_after_uncertain_failure(
                 sandbox_id,
@@ -1091,6 +1695,12 @@ class DockerSbxProvider(SandboxProvider):
                 ),
             }
         )
+        return environment
+
+    def _sandbox_command_environment(self) -> dict[str, str]:
+        environment = self._subprocess_environment.copy()
+        for variable in ("DOCKER_AUTH_CONFIG", "REGISTRY_AUTH_FILE"):
+            environment.pop(variable, None)
         return environment
 
     async def exec(
@@ -1643,16 +2253,25 @@ class DockerSbxProvider(SandboxProvider):
 
 
 async def _read_bounded(stream: asyncio.StreamReader) -> bytes:
+    result, _overflow = await _read_bounded_with_overflow(stream)
+    return result
+
+
+async def _read_bounded_with_overflow(
+    stream: asyncio.StreamReader,
+) -> tuple[bytes, bool]:
     payload_limit = MAX_OUTPUT_BYTES - len(_TRUNCATION_MARKER)
     head_limit = payload_limit // 2
     tail_limit = payload_limit - head_limit
     head = bytearray()
     tail = bytearray()
     truncated = False
+    total = 0
     while True:
         chunk = await stream.read(8192)
         if not chunk:
             break
+        total += len(chunk)
         head_remaining = head_limit - len(head)
         if head_remaining > 0:
             head.extend(chunk[:head_remaining])
@@ -1669,8 +2288,67 @@ async def _read_bounded(stream: asyncio.StreamReader) -> bytes:
             truncated = True
         tail.extend(tail_chunk)
     if truncated:
-        return bytes(head) + _TRUNCATION_MARKER + bytes(tail)
-    return bytes(head) + bytes(tail)
+        return bytes(head) + _TRUNCATION_MARKER + bytes(tail), total > MAX_OUTPUT_BYTES
+    return bytes(head) + bytes(tail), total > MAX_OUTPUT_BYTES
+
+
+async def _discard_stream(stream: asyncio.StreamReader) -> None:
+    while await stream.read(_IMAGE_BUNDLE_CHUNK_BYTES):
+        pass
+
+
+def _same_open_file(path: Path, file: BinaryIO) -> bool:
+    try:
+        path_stat = path.stat()
+        fd_stat = os.fstat(file.fileno())
+    except (OSError, ValueError):
+        return False
+    return (
+        stat.S_ISREG(path_stat.st_mode)
+        and stat.S_ISREG(fd_stat.st_mode)
+        and path_stat.st_dev == fd_stat.st_dev
+        and path_stat.st_ino == fd_stat.st_ino
+    )
+
+
+def _validate_image_bundle_inputs(
+    references: tuple[str, ...], ids: tuple[str, ...]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if not isinstance(references, tuple) or not isinstance(ids, tuple):
+        raise DockerSbxError("image_bundle_stage", "image_bundle_identity_invalid")
+    if not references or not ids:
+        raise DockerSbxError("image_bundle_stage", "image_bundle_empty")
+    normalized_references: list[str] = []
+    for reference in references:
+        if not isinstance(reference, str):
+            raise DockerSbxError("image_bundle_stage", "image_bundle_reference_invalid")
+        normalized = reference.strip()
+        if (
+            normalized != reference
+            or _IMAGE_BUNDLE_REFERENCE.fullmatch(normalized) is None
+            or normalized.startswith("-")
+        ):
+            raise DockerSbxError("image_bundle_stage", "image_bundle_reference_invalid")
+        normalized_references.append(normalized)
+    normalized_ids: list[str] = []
+    for image_id in ids:
+        if (
+            not isinstance(image_id, str)
+            or _IMAGE_BUNDLE_ID.fullmatch(image_id) is None
+        ):
+            raise DockerSbxError("image_bundle_stage", "image_bundle_id_invalid")
+        normalized_ids.append(image_id)
+    references_tuple = tuple(normalized_references)
+    ids_tuple = tuple(normalized_ids)
+    if references_tuple != tuple(sorted(references_tuple)):
+        raise DockerSbxError("image_bundle_stage", "image_bundle_references_unsorted")
+    if len(set(references_tuple)) != len(references_tuple):
+        raise DockerSbxError("image_bundle_stage", "image_bundle_references_duplicate")
+    if ids_tuple != tuple(sorted(ids_tuple)):
+        raise DockerSbxError("image_bundle_stage", "image_bundle_ids_unsorted")
+    if len(set(ids_tuple)) != len(ids_tuple):
+        raise DockerSbxError("image_bundle_stage", "image_bundle_ids_duplicate")
+    return references_tuple, ids_tuple
 
 
 async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
