@@ -1875,6 +1875,24 @@ def _runtime_binding_handler(
             "--format",
             "{{.Id}}",
         ):
+            targets = inner[5:]
+            if len(targets) > 1:
+                outputs: list[bytes] = []
+                for target in targets:
+                    if target == plan.bindings[0].image_id:
+                        outcome = source_inspect or _Outcome(
+                            stdout=(target + "\n").encode()
+                        )
+                    elif target == plan.bindings[0].alias:
+                        outcome = alias_inspect or _Outcome(
+                            returncode=1, stderr=b"not found"
+                        )
+                    else:
+                        return _Outcome(returncode=1, stderr=b"unexpected target")
+                    if outcome.returncode != 0:
+                        return outcome
+                    outputs.append(outcome.stdout)
+                return _Outcome(stdout=b"".join(outputs))
             target = inner[5]
             if target == plan.bindings[0].image_id:
                 if source_inspect is not None:
@@ -1947,6 +1965,168 @@ def test_prepare_runtime_image_bindings_verifies_ids_aliases_and_reuses_overlay(
         )
     finally:
         asyncio.run(provider.finalize_runtime_template())
+
+
+def _two_binding_runtime_image_plan() -> RuntimeImagePlan:
+    return RuntimeImagePlan(
+        inventory_sha256="c" * 64,
+        bindings=(
+            RuntimeImageBinding(
+                service="api",
+                source_reference="docker.io/library/alpine:latest",
+                image_id="sha256:" + "a" * 64,
+                alias="docker.io/library/repotrial-runtime-"
+                + "1" * 32
+                + "-"
+                + "2" * 32
+                + ":latest",
+            ),
+            RuntimeImageBinding(
+                service="web",
+                source_reference="docker.io/library/busybox:latest",
+                image_id="sha256:" + "b" * 64,
+                alias="docker.io/library/repotrial-runtime-"
+                + "3" * 32
+                + "-"
+                + "4" * 32
+                + ":latest",
+            ),
+        ),
+        image_ids=("sha256:" + "a" * 64, "sha256:" + "b" * 64),
+    )
+
+
+def test_verify_runtime_image_ids_batches_source_and_alias_inspect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _two_binding_runtime_image_plan()
+    spawner = _SbxSpawner()
+    references = {binding.image_id: binding.image_id for binding in plan.bindings} | {
+        binding.alias: binding.image_id for binding in plan.bindings
+    }
+
+    def handler(command: tuple[str, ...]) -> _Outcome:
+        inner = command[4:]
+        if inner == (
+            "docker",
+            "image",
+            "ls",
+            "--all",
+            "--no-trunc",
+            "--format",
+            "{{.ID}}",
+        ):
+            return _Outcome(stdout=("\n".join(plan.image_ids) + "\n").encode())
+        if inner[:5] == ("docker", "image", "inspect", "--format", "{{.Id}}"):
+            targets = inner[5:]
+            return _Outcome(
+                stdout=(
+                    "\n".join(references[target] for target in targets) + "\n"
+                ).encode()
+            )
+        return _Outcome(returncode=1, stderr=b"unexpected command")
+
+    spawner.handler = handler
+    provider, sandbox_id = _active_provider(monkeypatch, spawner)
+
+    asyncio.run(
+        provider._verify_runtime_image_ids(sandbox_id, plan, time.monotonic() + 300.0)
+    )
+
+    inspect_calls = [
+        call
+        for call in spawner.calls
+        if call[4:9] == ("docker", "image", "inspect", "--format", "{{.Id}}")
+    ]
+    assert len(inspect_calls) == 1
+    assert inspect_calls[0][9:] == tuple(
+        reference
+        for binding in plan.bindings
+        for reference in (binding.image_id, binding.alias)
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_error"),
+    [
+        ("short", "image_ids_count_mismatch"),
+        ("extra", "image_ids_count_mismatch"),
+        ("reordered", "image_alias_mismatch"),
+        ("wrong_source", "image_id_mismatch"),
+        ("wrong_alias", "image_alias_mismatch"),
+        ("malformed", "image_ids_invalid"),
+    ],
+)
+def test_verify_runtime_image_ids_rejects_malformed_batch_output(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    expected_error: str,
+) -> None:
+    plan = _two_binding_runtime_image_plan()
+    expected_ids = tuple(
+        binding.image_id for binding in plan.bindings for _ in range(2)
+    )
+    output_ids = {
+        "short": expected_ids[:-1],
+        "extra": (*expected_ids, expected_ids[0]),
+        "reordered": (
+            expected_ids[0],
+            expected_ids[2],
+            expected_ids[0],
+            expected_ids[2],
+        ),
+        "wrong_source": (
+            expected_ids[2],
+            expected_ids[1],
+            expected_ids[2],
+            expected_ids[3],
+        ),
+        "wrong_alias": (
+            expected_ids[0],
+            expected_ids[1],
+            expected_ids[2],
+            expected_ids[0],
+        ),
+        "malformed": (
+            expected_ids[0],
+            expected_ids[1],
+            expected_ids[2],
+            "not-an-image-id",
+        ),
+    }[case]
+    spawner = _SbxSpawner()
+
+    def handler(command: tuple[str, ...]) -> _Outcome:
+        inner = command[4:]
+        if inner == (
+            "docker",
+            "image",
+            "ls",
+            "--all",
+            "--no-trunc",
+            "--format",
+            "{{.ID}}",
+        ):
+            return _Outcome(stdout=("\n".join(plan.image_ids) + "\n").encode())
+        if inner[:5] == (
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+        ):
+            return _Outcome(stdout=("\n".join(output_ids) + "\n").encode())
+        return _Outcome(returncode=1, stderr=b"unexpected command")
+
+    spawner.handler = handler
+    provider, sandbox_id = _active_provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError, match=expected_error):
+        asyncio.run(
+            provider._verify_runtime_image_ids(
+                sandbox_id, plan, time.monotonic() + 300.0
+            )
+        )
 
 
 def test_prepare_runtime_image_bindings_rejects_wrong_imported_ids(

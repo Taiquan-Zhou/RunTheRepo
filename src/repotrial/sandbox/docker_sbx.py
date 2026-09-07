@@ -657,6 +657,44 @@ class DockerSbxProvider(SandboxProvider):
         imported = _parse_runtime_image_ids(listed.stdout)
         if imported != frozenset(plan.image_ids):
             raise DockerSbxError("runtime_image_verify", "image_ids_mismatch")
+        inspect_references = tuple(
+            reference
+            for binding in plan.bindings
+            for reference in (binding.image_id, binding.alias)
+        )
+        inspected = await self._run(
+            "runtime_image_verify",
+            [
+                "exec",
+                sandbox_id,
+                "--",
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                "{{.Id}}",
+                *inspect_references,
+            ],
+            self._command_timeout_s,
+            deadline=deadline,
+            sandbox_id=sandbox_id,
+            public_sandbox_id=sandbox_id,
+        )
+        if inspected.returncode == 0:
+            inspected_ids = _parse_runtime_image_inspect_ids(inspected.stdout)
+            if len(inspected_ids) != len(inspect_references):
+                raise DockerSbxError("runtime_image_verify", "image_ids_count_mismatch")
+            for binding, source_id, alias_id in zip(
+                plan.bindings,
+                inspected_ids[::2],
+                inspected_ids[1::2],
+                strict=True,
+            ):
+                if source_id != binding.image_id:
+                    raise DockerSbxError("runtime_image_verify", "image_id_mismatch")
+                if alias_id != binding.image_id:
+                    raise DockerSbxError("runtime_image_verify", "image_alias_mismatch")
+            return
         for binding in plan.bindings:
             inspected = await self._run(
                 "runtime_image_verify",
@@ -2875,6 +2913,19 @@ def _parse_runtime_image_id(output: bytes) -> str:
     if text.count("\n") != 1 or _IMAGE_BUNDLE_ID.fullmatch(text[:-1]) is None:
         raise DockerSbxError("runtime_image_verify", "image_id_invalid")
     return text[:-1]
+
+
+def _parse_runtime_image_inspect_ids(output: bytes) -> tuple[str, ...]:
+    try:
+        text = output.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise DockerSbxError("runtime_image_verify", "image_ids_invalid") from None
+    if not text.endswith("\n"):
+        raise DockerSbxError("runtime_image_verify", "image_ids_invalid")
+    lines = text[:-1].split("\n")
+    if not lines or any(_IMAGE_BUNDLE_ID.fullmatch(line) is None for line in lines):
+        raise DockerSbxError("runtime_image_verify", "image_ids_invalid")
+    return tuple(lines)
 
 
 def _is_canonical_image_reference(reference: str) -> bool:
