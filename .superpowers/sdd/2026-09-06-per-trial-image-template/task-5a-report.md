@@ -42,3 +42,30 @@ focused tests, `.venv/bin/uv run pytest -q tests/unit/sandbox/test_docker_sbx_co
 No real sandbox, daemon, network, API key, full pytest, coverage, or
 pre-commit command was used. Task 5B still owns trial/image-template
 integration and must verify its caller ordering against this provider boundary.
+
+## Fix round 1
+
+Reviewer findings were reproduced with tests added before production changes.
+At base `1e4aca6f`, `pytest -q tests/unit/sandbox/test_docker_sbx_commands.py
+-k 'runtime_template or bundle'` produced **4 failed, 36 passed, 222
+deselected** (active template without bundle, cleanup retry, audit retention,
+and the adjusted create/finalize test). The temp-root regression command
+`pytest -q tests/unit/sandbox/test_docker_sbx_commands.py -k temp_root`
+produced **1 failed, 261 deselected**. The failures matched the intended
+production gaps.
+
+The fix models template cleanup confirmation separately from bundle ownership,
+requires a complete bundle for active templates, retains bundle audit identity
+after successful finalization, validates the temporary root, and takes
+ownership of the path/fd immediately after creation. The focused fix suite
+then passed: **41 passed, 221 deselected** for
+`-k 'runtime_template or bundle or temp_root'`.
+
+Reviewer-reported `/tmp/repotrial-image-bundle-*` residues were first listed
+and verified as 23 regular mode-0600 non-symlink files directly under `/tmp`,
+then those exact files were deleted with max-depth-one matching; no other
+paths were removed.
+
+Post-gate status also exposed one exact workspace-level
+`repotrial-image-bundle-umidrhut` residue; it was verified as a regular
+mode-0600 non-symlink file and removed by exact pathname.

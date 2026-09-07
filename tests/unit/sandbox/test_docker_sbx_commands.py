@@ -1850,7 +1850,11 @@ def test_runtime_template_finalize_removes_by_owned_tag_and_preserves_shared_ima
         image_identity_sha256="a" * 64,
     )
     provider._runtime_template_identity = identity
-    provider._runtime_template_audit = RuntimeTemplateAudit(identity=identity)
+    provider._runtime_template_audit = RuntimeTemplateAudit(
+        identity=identity,
+        bundle_sha256=provider._runtime_image_bundle_sha256,
+        bundle_size=provider._runtime_image_bundle_size,
+    )
     removed: list[str] = []
     removed_owned = False
 
@@ -2100,6 +2104,19 @@ def test_create_uses_active_runtime_template_with_clone_and_policy_flags(
         spawner,
         deadline=time.monotonic() + 300.0,
     )
+    spawner.handler = lambda command: (
+        _Outcome(stdout=b"runtime-image-bundle")
+        if command[:2] == ("sbx", "exec")
+        else _Outcome(stdout=b'{"images":[]}')
+        if command == ("sbx", "template", "ls", "--json")
+        else _Outcome()
+    )
+    warmup_id = next(iter(provider._sandbox_states))
+    asyncio.run(
+        provider.stage_runtime_image_bundle(
+            warmup_id, ("alpine:latest",), ("sha256:" + "a" * 64,)
+        )
+    )
     provider._runtime_template_tag = "repotrial-runtime:" + "c" * 32
     identity = RuntimeTemplateIdentity(
         repository="docker.io/library/repotrial-runtime",
@@ -2110,15 +2127,156 @@ def test_create_uses_active_runtime_template_with_clone_and_policy_flags(
     provider._runtime_template_identity = identity
     provider._runtime_template_image_id = identity.image_id
     provider._runtime_template_expected_identity = identity.image_identity_sha256
+    provider._runtime_template_audit = RuntimeTemplateAudit(
+        identity=identity,
+        bundle_sha256=provider._runtime_image_bundle_sha256,
+        bundle_size=provider._runtime_image_bundle_size,
+    )
+
+    try:
+        sandbox_id = _create(provider, tmp_path)
+
+        create_call = _actual_create_call(spawner)
+        assert create_call[4] == "--clone"
+        assert ("--template", provider._runtime_template_tag) == create_call[-4:-2]
+        assert create_call[-2:] == ("shell", str(tmp_path))
+        assert sandbox_id in create_call
+        assert any(
+            call == ("sbx", "exec", sandbox_id, "--", "docker", "image", "load")
+            for call in spawner.calls
+        )
+    finally:
+        asyncio.run(provider.finalize_runtime_template())
+
+
+def test_create_rejects_active_runtime_template_without_complete_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    provider, _ = _active_provider(
+        monkeypatch, spawner, deadline=time.monotonic() + 300.0
+    )
+    tag = "repotrial-runtime:" + "c" * 32
+    identity = RuntimeTemplateIdentity(
+        repository="docker.io/library/repotrial-runtime",
+        tag="c" * 32,
+        image_id="c" * 12,
+        image_identity_sha256="a" * 64,
+    )
+    provider._runtime_template_tag = tag
+    provider._runtime_template_identity = identity
+    provider._runtime_template_image_id = identity.image_id
+    provider._runtime_template_expected_identity = identity.image_identity_sha256
     provider._runtime_template_audit = RuntimeTemplateAudit(identity=identity)
 
-    sandbox_id = _create(provider, tmp_path)
+    with pytest.raises(DockerSbxError, match="image_bundle"):
+        _create(provider, tmp_path)
 
-    create_call = _actual_create_call(spawner)
-    assert create_call[4] == "--clone"
-    assert ("--template", provider._runtime_template_tag) == create_call[-4:-2]
-    assert create_call[-2:] == ("shell", str(tmp_path))
-    assert sandbox_id in create_call
+    assert provider.runtime_template_audit().uses == ()
+
+
+def test_finalize_keeps_bundle_audit_after_template_and_bundle_are_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch, spawner, deadline=time.monotonic() + 300.0
+    )
+    spawner.handler = lambda command: _Outcome(stdout=b"bundle")
+    asyncio.run(
+        provider.stage_runtime_image_bundle(
+            sandbox_id, ("alpine:latest",), ("sha256:" + "a" * 64,)
+        )
+    )
+    expected_hash = hashlib.sha256(b"bundle").hexdigest()
+
+    asyncio.run(provider.finalize_runtime_template())
+
+    audit = provider.runtime_template_audit()
+    assert audit.bundle_sha256 == expected_hash
+    assert audit.bundle_size == len(b"bundle")
+    assert audit.removal_confirmed is True
+
+
+def test_finalize_retries_bundle_after_template_cleanup_was_confirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(monkeypatch, _SbxSpawner())
+    owned_tag = "repotrial-runtime:" + "a" * 32
+    identity = RuntimeTemplateIdentity(
+        repository="docker.io/library/repotrial-runtime",
+        tag="a" * 32,
+        image_id="b" * 12,
+        image_identity_sha256="c" * 64,
+    )
+    provider._runtime_template_tag = owned_tag
+    provider._runtime_template_image_id = identity.image_id
+    provider._runtime_template_expected_identity = identity.image_identity_sha256
+    provider._runtime_template_identity = identity
+    provider._runtime_template_audit = RuntimeTemplateAudit(identity=identity)
+    fd, raw_path = tempfile.mkstemp(prefix="repotrial-image-bundle-")
+    bundle = os.fdopen(fd, "w+b")
+    bundle.write(b"bundle")
+    bundle.flush()
+    bundle.seek(0)
+    provider._runtime_image_bundle_path = Path(raw_path)
+    provider._runtime_image_bundle_file = bundle
+    provider._runtime_image_bundle_sha256 = hashlib.sha256(b"bundle").hexdigest()
+    provider._runtime_image_bundle_size = len(b"bundle")
+    removed = False
+
+    async def listed(deadline: float | None = None) -> tuple[object, ...]:
+        del deadline
+        if removed:
+            return ()
+        return (
+            docker_sbx._RuntimeTemplate(
+                "docker.io/library/repotrial-runtime", "a" * 32, "b" * 12
+            ),
+        )
+
+    async def remove(reference: str, *, deadline: float | None) -> None:
+        nonlocal removed
+        del deadline
+        assert reference == owned_tag
+        removed = True
+
+    first_bundle_cleanup = True
+    original_bundle_cleanup = provider._cleanup_runtime_image_bundle
+
+    async def cleanup_bundle() -> None:
+        nonlocal first_bundle_cleanup
+        if first_bundle_cleanup:
+            first_bundle_cleanup = False
+            raise DockerSbxError("template_finalize", "bundle_cleanup_failed")
+        await original_bundle_cleanup()
+
+    monkeypatch.setattr(provider, "_list_runtime_templates", listed)
+    monkeypatch.setattr(provider, "_remove_runtime_template", remove)
+    monkeypatch.setattr(provider, "_cleanup_runtime_image_bundle", cleanup_bundle)
+
+    with pytest.raises(DockerSbxError, match="bundle_cleanup_failed"):
+        asyncio.run(provider.finalize_runtime_template())
+    asyncio.run(provider.finalize_runtime_template())
+    assert provider.runtime_template_audit().removal_confirmed is True
+
+
+def test_stage_rejects_temp_root_inside_current_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    provider, sandbox_id = _active_provider(
+        monkeypatch, spawner, deadline=time.monotonic() + 300.0
+    )
+    monkeypatch.setattr(docker_sbx.tempfile, "gettempdir", lambda: str(Path.cwd()))
+    spawner.handler = lambda command: _Outcome(stdout=b"bundle")
+
+    with pytest.raises(DockerSbxError, match="temp_root"):
+        asyncio.run(
+            provider.stage_runtime_image_bundle(
+                sandbox_id, ("alpine:latest",), ("sha256:" + "a" * 64,)
+            )
+        )
 
 
 def test_runtime_template_rejects_preexisting_owned_tag(
