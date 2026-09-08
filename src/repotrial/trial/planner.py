@@ -19,6 +19,7 @@ from repotrial.domain.models import (
     JourneyStep,
     OperatorJourneyProvenance,
 )
+from repotrial.journey.http_auth import parse_http_auth
 from repotrial.models.base import ModelAdapter, RecoveryAction
 from repotrial.models.openai_compat import ModelAdapterError
 from repotrial.trial.journey_artifact import (
@@ -63,7 +64,7 @@ _MAX_DECLARED_JOURNEYS_BYTES = 65_536
 _MAX_JOURNEYS = 5
 _MAX_STEPS_PER_JOURNEY = 8
 _MAX_ASSERTIONS_PER_STEP = 64
-_MAX_ACTION_PARAMS = 3
+_MAX_ACTION_PARAMS = 4
 _MAX_JOURNEY_TEXT_LENGTH = 4_096
 _MAX_PATH_LENGTH = 2_048
 _MAX_JSON_DEPTH = 16
@@ -874,10 +875,21 @@ def _parse_journey(value: object) -> Journey | None:
     ):
         return None
     steps: list[JourneyStep] = []
+    has_captured_bearer = False
     for raw_step in steps_value:
         step = _parse_step(raw_step)
         if step is None:
             return None
+        if step.tool == "http":
+            auth = (
+                parse_http_auth(step.params["auth"]) if "auth" in step.params else None
+            )
+            if "auth" in step.params and auth is None:
+                return None
+            if auth is not None and auth.use_bearer and not has_captured_bearer:
+                return None
+            if auth is not None and auth.capture_path is not None:
+                has_captured_bearer = True
         steps.append(step)
     if not steps or len({step.tool for step in steps}) != 1:
         return None
@@ -916,7 +928,7 @@ def _parse_http_step(
 ) -> JourneyStep | None:
     if (
         not {"method", "path"} <= set(params)
-        or set(params) - {"method", "path", "json"}
+        or set(params) - {"method", "path", "json", "auth"}
         or len(assertions_value) > _MAX_ASSERTIONS_PER_STEP
     ):
         return None
@@ -928,6 +940,12 @@ def _parse_http_step(
         return None
     if "json" in params and not _valid_json_value(params["json"]):
         return None
+    if "auth" in params and parse_http_auth(params["auth"]) is None:
+        return None
+    if "auth" in params:
+        auth = parse_http_auth(params["auth"])
+        if auth is not None and auth.capture_path is not None and not assertions_value:
+            return None
     assertions: list[JourneyAssertion] = []
     for raw_assertion in assertions_value:
         assertion = _parse_assertion(raw_assertion)

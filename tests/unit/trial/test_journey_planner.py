@@ -205,6 +205,70 @@ def test_operator_journey_loader_returns_validated_snapshot_and_hashes(
     assert loaded.journeys[0].steps[0].params["path"] == "/operator"
 
 
+def test_operator_journey_loader_accepts_bounded_bearer_declarations(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "operator.json"
+    payload = {
+        "journeys": [
+            {
+                "journey_id": "auth",
+                "name": "Authenticated CRUD",
+                "steps": [
+                    {
+                        **_http_step("/login"),
+                        "params": {
+                            "method": "POST",
+                            "path": "/login",
+                            "auth": {"capture_bearer": "token"},
+                        },
+                    },
+                    {
+                        **_http_step("/items"),
+                        "params": {
+                            "method": "GET",
+                            "path": "/items",
+                            "auth": {"use_bearer": True},
+                        },
+                    },
+                ],
+            }
+        ]
+    }
+    source.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = load_operator_journeys(source)
+
+    assert loaded.journeys[0].steps[0].params["auth"] == {"capture_bearer": "token"}
+    assert loaded.journeys[0].steps[1].params["auth"] == {"use_bearer": True}
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        {},
+        {"capture_bearer": "items[0].token"},
+        {"capture_bearer": "a." + "b." * 8 + "c"},
+        {"use_bearer": 1},
+        {"use_bearer": True, "capture_bearer": "token"},
+    ],
+)
+def test_operator_journey_loader_rejects_invalid_bearer_declarations(
+    tmp_path: Path, auth: dict[str, object]
+) -> None:
+    source = tmp_path / "operator.json"
+    payload = _http_journey()
+    payload["steps"][0]["params"] = {
+        "method": "GET",
+        "path": "/items",
+        "auth": auth,
+    }
+    source.write_text(json.dumps({"journeys": [payload]}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid operator journeys"):
+        load_operator_journeys(source)
+
+
 @pytest.mark.parametrize(
     "content",
     [b"", b"{invalid", b'{"journeys": []}', b"\xff"],
@@ -1393,7 +1457,7 @@ def test_model_schema_exposes_transport_collection_bounds(tmp_path: Path) -> Non
     assert schema["properties"]["journeys"]["maxItems"] == 5
     assert journey["properties"]["steps"]["maxItems"] == 8
     assert step["properties"]["assertions"]["maxItems"] == 64
-    assert step["properties"]["params"]["maxProperties"] == 3
+    assert step["properties"]["params"]["maxProperties"] == 4
 
 
 def test_over_limit_journeys_are_rejected_before_later_values_are_accessed(

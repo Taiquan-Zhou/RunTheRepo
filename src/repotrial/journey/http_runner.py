@@ -16,6 +16,11 @@ from repotrial.domain.models import (
     JourneyResult,
     JourneyStep,
 )
+from repotrial.journey.http_auth import (
+    HttpAuth,
+    extract_bearer_token,
+    parse_http_auth,
+)
 from repotrial.journey.verifier import evaluate_assertion, validate_assertion
 
 _BODY_LIMIT_BYTES = 65_536
@@ -267,32 +272,46 @@ def _expects_redirect_status(
 
 def _validate_step(
     step: JourneyStep,
-) -> tuple[str | None, str | None, str | None, object | None, bool]:
+) -> tuple[
+    str | None,
+    str | None,
+    str | None,
+    object | None,
+    bool,
+    HttpAuth | None,
+]:
     if step.tool != "http":
-        return "invalid_tool", None, None, None, False
+        return "invalid_tool", None, None, None, False, None
     if step.action != "request":
-        return "invalid_action", None, None, None, False
-    if set(step.params) - {"method", "path", "json"} or not {"method", "path"} <= set(
-        step.params
-    ):
-        return "invalid_params", None, None, None, False
+        return "invalid_action", None, None, None, False, None
+    if set(step.params) - {"method", "path", "json", "auth"} or not {
+        "method",
+        "path",
+    } <= set(step.params):
+        return "invalid_params", None, None, None, False, None
     if len(step.assertions) > _MAX_ASSERTIONS_PER_STEP:
-        return "invalid_assertions", None, None, None, False
+        return "invalid_assertions", None, None, None, False, None
     for item in step.assertions:
         assertion_error = validate_assertion(item)
         if assertion_error is not None:
-            return assertion_error, None, None, None, False
+            return assertion_error, None, None, None, False, None
 
     method = step.params["method"]
     path = step.params["path"]
     if not isinstance(method, str) or method not in _ALLOWED_METHODS:
-        return "invalid_method", None, None, None, False
+        return "invalid_method", None, None, None, False, None
     if not isinstance(path, str):
-        return "invalid_path", None, None, None, False
+        return "invalid_path", None, None, None, False, None
     if _has_controls_or_backslash(path):
-        return "invalid_path", None, None, None, False
+        return "invalid_path", None, None, None, False, None
     if not _validate_request_target(path):
-        return "invalid_path", None, None, None, False
+        return "invalid_path", None, None, None, False, None
+
+    auth: HttpAuth | None = None
+    if "auth" in step.params:
+        auth = parse_http_auth(step.params["auth"])
+        if auth is None or (auth.capture_path is not None and not step.assertions):
+            return "invalid_params", None, None, None, False, None
 
     has_json_body = "json" in step.params
     json_body = step.params.get("json")
@@ -302,8 +321,8 @@ def _validate_step(
                 json_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
             )
         except (TypeError, ValueError):
-            return "invalid_params", None, None, None, False
-    return None, method, path, json_body, has_json_body
+            return "invalid_params", None, None, None, False, None
+    return None, method, path, json_body, has_json_body, auth
 
 
 def _canonical_json_hash(value: object) -> str:
@@ -313,8 +332,12 @@ def _canonical_json_hash(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _redacted_body_hash(body: bytes, truncated: bool) -> str:
+def _redacted_body_hash(
+    body: bytes, truncated: bool, runtime_token: str | None = None
+) -> str:
     text = body.decode("utf-8", errors="replace")
+    if runtime_token is not None:
+        text = text.replace(runtime_token, "<redacted>")
     redacted = _redact_json_body(text)
     if redacted is None:
         redacted = _redact_credential_assignments(text)
@@ -525,6 +548,7 @@ def _evidence(
     body_hash: str | None,
     assertion_outcomes: list[dict[str, object]],
     failure_category: str | None,
+    runtime_token: str | None = None,
     redirects: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
@@ -532,7 +556,20 @@ def _evidence(
         "failure_category": failure_category,
         "redirects": list(redirects or []),
         "request": {
-            "body_sha256": _canonical_json_hash(json_body) if has_json_body else None,
+            "body_sha256": (
+                _redacted_body_hash(
+                    json.dumps(
+                        json_body,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode("utf-8"),
+                    False,
+                    runtime_token,
+                )
+                if has_json_body
+                else None
+            ),
             "method": method,
             "path": path,
         },
@@ -561,7 +598,7 @@ async def run_http_journey(
         return _failure_result(journey, 0, [], "journey:missing_assertions")
 
     for index, step in enumerate(journey.steps):
-        validation_error, _, preflight_path, _, _ = _validate_step(step)
+        validation_error, _, preflight_path, _, _, _ = _validate_step(step)
         if validation_error is not None:
             return _failure_result(
                 journey, 0, [], f"{_step_token(index)}:{validation_error}"
@@ -569,6 +606,16 @@ async def run_http_journey(
         assert preflight_path is not None
         if _request_url(origin, preflight_path) is None:
             return _failure_result(journey, 0, [], f"{_step_token(index)}:invalid_path")
+
+    has_captured_bearer = False
+    for index, step in enumerate(journey.steps):
+        _, _, _, _, _, auth = _validate_step(step)
+        if auth is not None and auth.use_bearer and not has_captured_bearer:
+            return _failure_result(journey, 0, [], f"{_step_token(index)}:auth_failure")
+        if auth is not None and auth.capture_path is not None:
+            has_captured_bearer = True
+
+    captured_token: str | None = None
 
     try:
         evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -591,8 +638,8 @@ async def run_http_journey(
     ) as client:
         for index, step in enumerate(journey.steps):
             evidence_path = evidence_dir / f"step-{index:04d}.json"
-            validation_error, method, path, json_body, has_json_body = _validate_step(
-                step
+            validation_error, method, path, json_body, has_json_body, auth = (
+                _validate_step(step)
             )
             assert validation_error is None
 
@@ -608,6 +655,11 @@ async def run_http_journey(
             truncated: bool | None = None
             failure_category: str | None = None
             request_body = json_body
+            request_headers = (
+                {"Authorization": f"Bearer {captured_token}"}
+                if auth is not None and auth.use_bearer and captured_token is not None
+                else None
+            )
             try:
                 async with asyncio.timeout(_REQUEST_TIMEOUT_SECONDS):
                     while True:
@@ -615,7 +667,10 @@ async def run_http_journey(
                         next_url: httpx.URL | None = None
                         try:
                             async with client.stream(
-                                method, current_url, json=request_body
+                                method,
+                                current_url,
+                                json=request_body,
+                                headers=request_headers,
                             ) as response:
                                 response_status = response.status_code
                                 should_follow = (
@@ -682,6 +737,7 @@ async def run_http_journey(
                         visited_urls.add(_redirect_target_identity(next_url))
                         current_url = next_url
                         request_body = None
+                        request_headers = None
             except TimeoutError:
                 response_status = None
                 body = None
@@ -709,6 +765,7 @@ async def run_http_journey(
                                 body_hash=None,
                                 assertion_outcomes=[],
                                 failure_category=step_failure_category,
+                                runtime_token=captured_token,
                                 redirects=redirects,
                             ),
                         )
@@ -746,6 +803,26 @@ async def run_http_journey(
                     assertion_failure_category = category
                     break
 
+            step_token: str | None = None
+            if (
+                assertion_failure_category is None
+                and auth is not None
+                and auth.capture_path is not None
+            ):
+                if response_status < 200 or response_status >= 300 or truncated:
+                    assertion_failure_category = "auth_failure"
+                else:
+                    try:
+                        parsed_body = json.loads(text)
+                    except (json.JSONDecodeError, RecursionError):
+                        assertion_failure_category = "auth_failure"
+                    else:
+                        step_token = extract_bearer_token(
+                            parsed_body, auth.capture_path
+                        )
+                        if step_token is None:
+                            assertion_failure_category = "auth_failure"
+
             try:
                 evidence_paths.append(
                     _write_evidence(
@@ -757,9 +834,14 @@ async def run_http_journey(
                             has_json_body=has_json_body,
                             status_code=response_status,
                             truncated=truncated,
-                            body_hash=_redacted_body_hash(body, truncated),
+                            body_hash=_redacted_body_hash(
+                                body,
+                                truncated,
+                                step_token or captured_token,
+                            ),
                             assertion_outcomes=outcomes,
                             failure_category=assertion_failure_category,
+                            runtime_token=step_token or captured_token,
                             redirects=redirects,
                         ),
                     )
@@ -778,6 +860,8 @@ async def run_http_journey(
                     evidence_paths,
                     f"{_step_token(index)}:{assertion_failure_category}",
                 )
+            if step_token is not None:
+                captured_token = step_token
             passed_steps += 1
 
     return JourneyResult(

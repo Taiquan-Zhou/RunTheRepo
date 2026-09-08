@@ -309,6 +309,247 @@ def test_invalid_execution_capabilities_fail_closed_without_transport(
     assert invoked is False
 
 
+def test_capture_bearer_declaration_is_admitted_by_http_preflight(
+    tmp_path: Path,
+) -> None:
+    invoked = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal invoked
+        invoked = True
+        return httpx.Response(200, json={"token": "abc"})
+
+    result = run(
+        journey(
+            step(
+                "login",
+                "POST",
+                "/login",
+                [assertion("status_code", "response.status", 200)],
+            ).model_copy(
+                update={
+                    "params": {
+                        "method": "POST",
+                        "path": "/login",
+                        "auth": {"capture_bearer": "token"},
+                    }
+                }
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.verdict is Verdict.PASS
+    assert invoked is True
+
+
+def test_bearer_capture_is_reused_only_on_explicit_authenticated_steps(
+    tmp_path: Path,
+) -> None:
+    token = "fixture.token+1/="
+    requests: list[httpx.Request] = []
+
+    def auth_params(
+        method: str, path: str, *, capture: bool = False
+    ) -> dict[str, object]:
+        return {
+            "method": method,
+            "path": path,
+            "auth": {"capture_bearer": "token"} if capture else {"use_bearer": True},
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/login":
+            return httpx.Response(200, json={"token": token})
+        if request.url.path == "/items" and request.method == "POST":
+            assert request.headers.get("authorization") == f"Bearer {token}"
+            return httpx.Response(201, json={"id": "item-1", "echo": token})
+        if request.url.path == "/items/item-1" and request.method == "GET":
+            assert request.headers.get("authorization") == f"Bearer {token}"
+            return httpx.Response(200, json={"id": "item-1"})
+        if request.url.path == "/items/item-1" and request.method == "DELETE":
+            assert request.headers.get("authorization") == f"Bearer {token}"
+            return httpx.Response(204)
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
+
+    login = step(
+        "login",
+        "POST",
+        "/login",
+        [
+            assertion("status_code", "response.status", 200),
+            assertion("json_path_equals", "token", token),
+        ],
+    ).model_copy(update={"params": auth_params("POST", "/login", capture=True)})
+    create = step(
+        "create",
+        "POST",
+        "/items",
+        [assertion("status_code", "response.status", 201)],
+        {"name": "first", "token": token},
+    ).model_copy(
+        update={
+            "params": {
+                "method": "POST",
+                "path": "/items",
+                "json": {"name": "first", "token": token},
+                "auth": {"use_bearer": True},
+            }
+        }
+    )
+    read = step(
+        "read",
+        "GET",
+        "/items/item-1",
+        [assertion("json_path_equals", "id", "item-1")],
+    ).model_copy(update={"params": auth_params("GET", "/items/item-1")})
+    delete = step(
+        "delete",
+        "DELETE",
+        "/items/item-1",
+        [assertion("status_code", "response.status", 204)],
+    ).model_copy(update={"params": auth_params("DELETE", "/items/item-1")})
+
+    result = run(
+        journey(login, create, read, delete),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.verdict is Verdict.PASS
+    assert [(request.method, request.url.path) for request in requests] == [
+        ("POST", "/login"),
+        ("POST", "/items"),
+        ("GET", "/items/item-1"),
+        ("DELETE", "/items/item-1"),
+    ]
+    evidence = "".join(
+        path.read_text(encoding="utf-8") for path in tmp_path.glob("*.json")
+    )
+    assert token not in evidence
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"token": 123}, {"token": "bad token"}],
+)
+def test_invalid_captured_token_fails_before_downstream_request(
+    tmp_path: Path, payload: dict[str, object]
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/login":
+            return httpx.Response(200, json=payload)
+        return httpx.Response(200)
+
+    login = step(
+        "login",
+        "POST",
+        "/login",
+        [assertion("status_code", "response.status", 200)],
+    ).model_copy(
+        update={
+            "params": {
+                "method": "POST",
+                "path": "/login",
+                "auth": {"capture_bearer": "token"},
+            }
+        }
+    )
+    read = step(
+        "read",
+        "GET",
+        "/items",
+        [assertion("status_code", "response.status", 200)],
+    ).model_copy(
+        update={
+            "params": {"method": "GET", "path": "/items", "auth": {"use_bearer": True}}
+        }
+    )
+
+    result = run(journey(login, read), tmp_path, httpx.MockTransport(handler))
+
+    assert result.verdict is Verdict.FAIL
+    assert result.failure_reason == "step-0000:auth_failure"
+    assert [request.url.path for request in requests] == ["/login"]
+
+
+def test_failed_capture_assertion_does_not_enable_auth(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(401, json={"token": "abc"})
+
+    login = step(
+        "login",
+        "POST",
+        "/login",
+        [assertion("status_code", "response.status", 200)],
+    ).model_copy(
+        update={
+            "params": {
+                "method": "POST",
+                "path": "/login",
+                "auth": {"capture_bearer": "token"},
+            }
+        }
+    )
+    read = step(
+        "read",
+        "GET",
+        "/items",
+        [assertion("status_code", "response.status", 200)],
+    ).model_copy(
+        update={
+            "params": {"method": "GET", "path": "/items", "auth": {"use_bearer": True}}
+        }
+    )
+
+    result = run(journey(login, read), tmp_path, httpx.MockTransport(handler))
+
+    assert result.verdict is Verdict.FAIL
+    assert result.failure_reason == "step-0000:assertion:status_code"
+    assert [request.url.path for request in requests] == ["/login"]
+
+
+def test_use_before_capture_fails_preflight_without_network(tmp_path: Path) -> None:
+    invoked = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal invoked
+        invoked = True
+        return httpx.Response(200)
+
+    result = run(
+        journey(
+            step(
+                "read",
+                "GET",
+                "/items",
+                [assertion("status_code", "response.status", 200)],
+            ).model_copy(
+                update={
+                    "params": {
+                        "method": "GET",
+                        "path": "/items",
+                        "auth": {"use_bearer": True},
+                    }
+                }
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(handler),
+    )
+
+    assert result.failure_reason == "step-0000:auth_failure"
+    assert invoked is False
+
+
 def test_preflight_rejects_a_later_invalid_assertion_before_an_earlier_post(
     tmp_path: Path,
 ) -> None:
