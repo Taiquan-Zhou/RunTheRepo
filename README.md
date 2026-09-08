@@ -1,312 +1,137 @@
-# RepoTrial
+# RunTheRepo
 
-RepoTrial trials an untrusted public GitHub Docker Compose web application at an
-exact commit inside a disposable Docker Sandbox. It boots the application,
-runs deterministic journeys, tests least-privilege mutations with
-KEEP/ROLLBACK semantics, writes JSON/HTML evidence, and attempts forced
-destruction of every sandbox. Cleanup is fail-closed when destruction cannot be
-verified.
+**Run a repo. Verify what works. Test what can be hardened.**
 
-## Current status
+Run GitHub Docker Compose apps in disposable sandboxes. Verify workflows,
+test hardening, and get evidence-backed reports.
 
-This 0.1 branch is a limited CLI and local Web preview, not a stable release or
-a claim that the full product scope is complete. At current validation HEAD
-`7e30606dc64db7d7c5ba2754eedfcf2fbdd944f2`, two representative real-SBX
-canaries completed their bounded paths:
+[Quick start](#quick-start) · [Usage guide](docs/dev/usage.md) · [Setup](docs/dev/wsl2-linux-sbx-setup.md) · [Validation results](docs/dev/release-closeout.md)
 
-| Repository | Pinned commit | Result | Run ID |
-| --- | --- | --- | --- |
-| Umami | `ca661c7057984aa98ed4f7083d84dae2f65bfcb0` | `exit_code=0`; `no_remaining_mutations`; complete JSON+HTML; 6-step operator-authored authenticated HTTP Journey (anonymous rejection, login, create/read/delete/list confirmation); baseline plus 2 KEEP candidates, each 6/6; 6/6 `destroy_success`; template removal confirmed; official inventory empty | `e751fd28-94f9-4d90-9a3c-7aaa8f791b47` (878.047519223s) |
-| changedetection.io | `5d9c7c6da76340597243e8163c4f2439237fa0e8` | `exit_code=0`; `no_remaining_mutations`; complete JSON+HTML; `GET /` plus 2 KEEP candidates; 4/4 `destroy_success`; template removal confirmed; official inventory empty | `3eb07f3a-8e90-4424-984e-bc79d7c22aec` (661.436816016s) |
+> **0.1 Preview** — for pre-configured WSL2 + Docker Sandboxes environments.
+> The CLI and Python package are named `repotrial`.
 
-The historical frozen 10-repository cohort at HEAD
-`25a88527369779fab11221bfac5f7125e85d9bee` remains labeled historical evidence:
-7/10 autonomous completion and 7/10 meaningful regression-passing hardening
-under the single-`GET /` contract. It is not the current two-canary scope and
-does not prove business-workflow preservation. Its n8n entry had no report.
-The CLI now emits reports for handled terminal execution failures in new runs;
-the historical n8n report was not regenerated and its timeout is not fixed.
-The earlier canaries at
-`7808b9b5485969f65f242d4acf78ffc79215a3e5` are historical too.
+## How it works
 
-Known limitations:
-
-- Browser execution is tested only with trusted fixtures; real-target browser
-  journeys return unsupported.
-- New runs can generate a cumulative hardened overlay from the verified KEEP
-  chain, including changes across services. The report records its baseline,
-  final configuration, and file hashes. Legacy or invalid provenance remains
-  `unavailable`; compatibility and runtime environment inputs are not bundled.
-- No public resume entry point is exposed.
-- The default API container has no `sbx` execution integration and no UI.
-- The current operator-authored Umami and changedetection canaries do not
-  demonstrate accepted LLM-generated journey contribution; LLM coverage
-  remains unproven.
-
-Latest fresh full regression: `2238 passed, 12 skipped, 1 warning` in `194.85s`;
-branch coverage is `85.31%`. All-file pre-commit, Ruff/format (163 files), and
-mypy (55 source files) passed. Bounded current-HEAD packaging checks passed
-under `artifacts/release-7e30606d/` (lock consistency check, wheel/sdist build,
-fresh-venv `pip check`, outside-source CLI help/dry-run, installed-file diff,
-and doctor JSON readiness). These checks are not fresh-machine OS/SBX proof
-or publication approval, and a
-dry-run is not a real-wheel canary.
-The local Web wheel was independently installed and browser-smoked before the
-cumulative-overlay changes. A trusted SBX fixture verified real Compose merge
-equivalence for the cumulative writer, followed by successful destruction and
-empty inventory. Neither check is a new real-repository canary or a fresh-machine
-installation proof. See [release closeout](docs/dev/release-closeout.md).
-
-## Fastest supported setup
-
-For a trusted local preview, start the loopback-only console from the supported
-WSL checkout:
-
-```bash
-uv run repotrial serve --port 8765
+```mermaid
+flowchart LR
+    A["GitHub URL + exact commit"] --> B["Disposable sandbox"]
+    B --> C["Boot Compose app"]
+    C --> D["Verify workflows"]
+    D --> E["Test hardening"]
+    E --> F["Keep or roll back"]
+    F --> G["JSON + HTML report"]
+    G --> H["Forced cleanup"]
 ```
 
-Open `http://127.0.0.1:8765/`. The page is a thin wrapper around the existing
-`inspect` CLI: it accepts a public GitHub URL, a full lowercase commit SHA, the
-container port, and optional safe Compose/model settings. The model key remains
-in the server environment and is never accepted or displayed by the page. One
-trial can run at a time; status and elapsed time are real subprocess state, and
-reports are served only from validated, server-owned run artifacts. This local
-preview does not provide public binding, arbitrary shell or file downloads,
-durable job history, granular graph progress, or real-target browser journeys.
+Changes are kept only when the recorded baseline workflows pass again.
+A cleanup failure remains a failed run—even if the sandbox inventory is empty.
 
-The tested topology is Windows 11 -> dedicated Ubuntu 24.04 WSL2 distro ->
-official Linux Docker Sandboxes v0.42.0 -> disposable Linux sandbox. The
-checkout must be on the distro's ext4 filesystem. Target Compose workloads must
-never run through host Docker or Docker Desktop.
+## What you get
 
-Prerequisites:
+| Capability | Result |
+| --- | --- |
+| Commit-pinned trials | Know exactly which source version was tested |
+| Deterministic HTTP checks | Check response status and content, including declared authenticated workflows |
+| Tested hardening | Keep or roll back each change based on replayed checks |
+| Usable outputs | JSON/HTML reports, evidence references and a cumulative hardened overlay when provenance is valid |
+| Local console | Submit one trial, follow its status and open its report |
 
-- WSL2 with systemd, nested KVM, and `/dev/kvm` available;
-- Docker Sandboxes v0.42.0 installed, authenticated, and running with the
-  reviewed default-deny network policy;
-- Git and network access to GitHub, the selected model endpoint, and required
-  container registries.
+Hardening results apply **only to the tested workflows**, not to every feature
+of an application. This is not a security certification.
 
-The supported installation path is a source checkout with the locked `uv`
-environment; arbitrary `pip` dependency combinations are not claimed as
-validated. Install `uv` directly if it is missing:
+## Real runs, not mockups
+
+| Application | Verified workflow | Outcome |
+| --- | --- | --- |
+| Umami | Anonymous access rejection → login → create → read → delete → confirm absence | All 6 steps passed at baseline and after each of 2 kept changes |
+| changedetection.io | HTTP `GET /` | Passed at baseline and after each of 2 kept changes |
+
+Both runs produced reports and completed sandbox/template cleanup with empty
+official inventory. Umami's workflow was **operator-authored**, not generated
+by an LLM. These examples do not imply universal repository compatibility.
+
+<details>
+<summary>View the actual Umami report</summary>
+
+![Actual Umami report showing the pinned source and authenticated Journey passing](docs/assets/umami-report.png)
+
+Unmodified report viewport from run `e751fd28-94f9-4d90-9a3c-7aaa8f791b47`.
+The report still uses the internal name RepoTrial.
+
+</details>
+
+[Exact commits, run IDs, failed cases and quality checks →](docs/dev/release-closeout.md)
+
+## Quick start
+
+**Before you begin:** use the distro's ext4 filesystem with Ubuntu 24.04 on
+WSL2, systemd, accessible nested KVM and authenticated Docker Sandboxes
+**v0.42.0** with the reviewed default-deny policy. Native Windows and host
+Docker execution are not supported. Follow the [one-time setup guide](docs/dev/wsl2-linux-sbx-setup.md)
+if these prerequisites are not ready.
+
+From your checked-out project directory, with `uv` installed:
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-cd /path/to/RepoTrial
 uv sync --locked --all-groups
 uv run playwright install chromium
-```
-
-The complete one-time WSL/SBX setup, including the pinned SBX package hash and
-Playwright OS dependencies, is in
-[`docs/dev/wsl2-linux-sbx-setup.md`](docs/dev/wsl2-linux-sbx-setup.md).
-
-Before a real run, require a healthy runtime and empty inventory:
-
-```bash
 uv run repotrial doctor
-uv run repotrial doctor --json
 ```
 
-The read-only doctor prints one `PASS`, `FAIL`, or `UNSUPPORTED` line per
-check and ends with `READY` or `NOT_READY`; a blocking failure exits with code
-2. The JSON form contains only the stable report object (`ready` and ordered
-`checks`). The known Docker Sandboxes PID hard-bound limitation is reported as
-non-blocking `UNSUPPORTED`.
+Continue only when doctor reports `READY`. The setup guide covers browser OS
+dependencies and proxy configuration.
 
-```bash
-sbx version
-sbx diagnose --output json
-sbx policy ls --type network --json
-sbx list
-```
+### Local Web console
 
-Provide the model key only through the process environment. This prompt avoids
-putting the key in shell history or repository files:
+For model-assisted runs, first set the key in the same WSL Bash session:
 
 ```bash
 read -rsp 'Model API key: ' REPOTRIAL_MODEL_API_KEY && echo
 export REPOTRIAL_MODEL_API_KEY
+uv run repotrial serve --port 8765
 ```
 
-Run one commit-pinned, auditable trial. Replace every placeholder with values
-for the target repository; `--container-port` is the application's internal
-web port, not a random host port.
+Open **http://127.0.0.1:8765/**, enter a public repository URL, its full commit
+SHA and internal web port. Set your model endpoint/name when using a model.
+The console is loopback-only and runs one trial at a time.
+
+### CLI
+
+Example target: Umami. Replace the model endpoint and name with your provider's
+values; this command does not supply the authenticated workflow shown above.
 
 ```bash
-uv run repotrial inspect https://github.com/OWNER/REPOSITORY \
+uv run repotrial inspect https://github.com/umami-software/umami \
   --provider docker-sbx \
-  --commit-sha 0123456789abcdef0123456789abcdef01234567 \
-  --container-port 8080 \
+  --commit-sha ca661c7057984aa98ed4f7083d84dae2f65bfcb0 \
+  --container-port 3000 \
   --compose-path docker-compose.yml \
   --model-endpoint https://MODEL-ENDPOINT/v1 \
   --model-name MODEL_NAME
 ```
 
-RepoTrial prints a `run_id` and artifact directory. The primary outputs are:
+Reports are written to `artifacts/<run_id>/report/`.
+For your own HTTP checks, use [`--journeys-file`](docs/dev/usage.md#operator-authored-http-journeys).
 
-```text
-artifacts/<run_id>/attempt-result.json
-artifacts/<run_id>/report/trial-report.json
-artifacts/<run_id>/report/trial-report.html
-artifacts/<run_id>/evidence/
-```
+## Preview boundaries
 
-A trustworthy successful run has matching `expected_sha` and
-`actual_verified_sha`, `exit_code: 0`, complete reports, successful lifecycle
-destroy events, and an empty `sbx list`. Inventory emptiness alone is not proof
-that cleanup succeeded.
+- **Isolation:** no host Docker fallback. Cleanup is fail-closed; CPU, memory,
+  disk and host-side sandbox-duration bounds remain enforced.
+- **PID limits:** the supported SBX runtime has no verified PID hard bound;
+  fork-bomb protection is not claimed.
+- **Coverage:** real-target browser workflows are unsupported. Accepted LLM
+  contribution has not been demonstrated; operator-authored checks are not LLM evidence.
+- **Installation:** tested on the supported existing WSL/SBX host, not a fresh OS.
+- **Product scope:** no public resume or durable Web history; the default API
+  container is not a ready-to-run sandbox service.
+- **Credentials:** use disposable target test accounts only. Model keys stay
+  in the process environment, never in a Journey file or the Web form.
 
-## Journey and model boundary
+## Documentation
 
-An explicit repository Journey declaration may contain write methods; it remains
-subject to schema validation and deterministic verifiers. Autonomous model
-output is narrower: RepoTrial retains only evidence-supported `GET` journeys.
-External links, images, file paths, and generalized API prose do not authorize a
-route.
-
-When a configured model returns an empty proposal or policy-invalid output, no
-model-proposed request is executed; the fallback is fixed `GET /` with expected
-status `200`. Model transport failures, timeouts, or an unconfigured model can
-still end a run with `insufficient_coverage`; the recorded `stop_reason` is
-preserved.
-
-### Operator-authored HTTP Journeys
-
-Use `--journeys-file` to supply a validated, operator-authored Journey snapshot.
-The file is read before intake and is never copied into or used to modify the
-pinned repository. It is scoped to deterministic HTTP behavior; it is not a
-fabricated real canary and does not grant shell, browser-host, credential, or
-other execution authority.
-
-Minimal example:
-
-```json
-{
-  "journeys": [
-    {
-      "journey_id": "health",
-      "name": "Health endpoint",
-      "steps": [
-        {
-          "step_id": "get-health",
-          "tool": "http",
-          "action": "request",
-          "params": {"method": "GET", "path": "/health"},
-          "assertions": [
-            {"kind": "status_code", "target": "response.status", "expected": 200}
-          ]
-        }
-      ]
-    }
-  ]
-}
-```
-
-Pass it to an exact-commit inspection:
-
-```bash
-uv run repotrial inspect https://github.com/OWNER/REPOSITORY \
-  --provider docker-sbx \
-  --commit-sha 0123456789abcdef0123456789abcdef01234567 \
-  --journeys-file ./operator-journeys.json
-```
-
-The JSON and HTML reports retain only the input source kind and SHA-256
-identities for provenance, never the host path or source bytes.
-
-### Bounded bearer reuse (operator-authored evidence)
-
-An operator-authored HTTP Journey may capture a short-lived bearer from a
-successful login response and explicitly use it on later steps. These are
-parameter fragments, not a complete Journey file:
-
-```json
-{"auth": {"capture_bearer": "token"}}
-{"auth": {"use_bearer": true}}
-```
-
-Use only disposable test accounts; never put real credentials or tokens in a
-Journey file. `capture_bearer` accepts one bounded dotted JSON-object path and
-`use_bearer` is valid only after a prior capture in the same Journey. The token
-is ephemeral and is not written to reports, evidence, stdout, or the Journey;
-arbitrary headers, cookies, and environment interpolation remain unsupported.
-This canary demonstrates operator-authored input only; the model retains its
-GET-only policy. Authorization is sent only on explicit `use_bearer` steps.
-
-## Proxy networks (TUN optional; Rule or Global)
-
-TUN mode is not required. Windows Rule or Global mode is acceptable when WSL,
-the SBX daemon, the disposable sandbox, and the RepoTrial client all have the
-required connectivity. With WSL's default NAT networking, a Windows proxy
-listening on `localhost` is not automatically reachable inside WSL. Use the
-Windows host's WSL-reachable LAN/gateway IP and keep loopback in `NO_PROXY`:
-
-```bash
-export HTTP_PROXY='http://<windows-host-gateway-ip>:<port>'
-export HTTPS_PROXY="$HTTP_PROXY"
-export NO_PROXY='localhost,127.0.0.1'
-export http_proxy="$HTTP_PROXY"
-export https_proxy="$HTTPS_PROXY"
-export no_proxy="$NO_PROXY"
-```
-
-Docker Sandboxes has separate daemon and sandbox proxy settings; configure them
-during initial SBX setup as documented in the WSL guide. Do not inject the
-upstream proxy or its credentials into the untrusted target workload.
-
-## Troubleshooting
-
-- **GitHub, registry, JWKS, or `uv` downloads hang:** for clients that honor the
-  standard proxy variables, verify the proxy is reachable from WSL by its
-  gateway IP. Do not use `localhost` for a Windows proxy under WSL NAT.
-- **The model attempt records `transport_error`:** the model client does not
-  inherit `HTTP_PROXY` or `HTTPS_PROXY`. Verify direct or network-layer routing
-  (for example, an approved TUN/VPN route) from WSL to the configured endpoint,
-  or select an approved, directly reachable OpenAI-compatible
-  `--model-endpoint`. Never put model credentials in the endpoint URL.
-- **`sbx diagnose` fails or `sbx list` is non-empty:** stop new trials, retain
-  the exact output and lifecycle evidence, and investigate the owned sandbox
-  ID. Do not hide the failure with reset/restart loops.
-- **`repotrial doctor` rejects `sbx_version`:** install and select the reviewed
-  Docker Sandboxes `v0.42.0`. The old `v0.39.0` runtime is historical and is
-  rejected by the current doctor.
-- **No report is produced:** inspect `attempt-result.json`, then the referenced
-  evidence. The nonzero exit and `stop_reason` are intentional fail-closed
-  diagnostics.
-- **Boot cannot find the service:** verify the repository's Compose filename
-  and internal HTTP port, then pass the correct `--compose-path` and
-  `--container-port`.
-- **`/dev/kvm` or systemd is unavailable:** the host is unsupported; do not
-  bypass isolation or fall back to host Docker.
-
-## Safety scope and known limitation
-
-- Every real repository requires a full 40-character commit SHA; requested and
-  resolved SHAs are recorded.
-- Target workloads run only through `SandboxProvider` in disposable sandboxes;
-  there is no host Docker/Compose fallback. Cleanup is fail-closed: a cleanup
-  failure remains a failed run, and an empty inventory is not cleanup success.
-- CPU, memory, disk, and host-side total-duration bounds remain enforced by the
-  current provider path.
-- Docker Sandboxes v0.42.0 does not expose the required PID hard bound.
-  RepoTrial records `pid_hard_bound_unsupported` and does not claim fork-bomb
-  protection.
-- Model keys are supplied through the process environment only; never print or
-  record them.
-- Reports are tested-journey/workload-conditioned results, not proof that a
-  repository is globally safe or globally least-privileged.
-
-## Development gates
-
-```bash
-uv lock --check
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy src/repotrial
-uv run pytest -q --cov=repotrial --cov-branch --cov-report=term-missing
-uvx pre-commit run --all-files
-uv build
-```
+| Need | Guide |
+| --- | --- |
+| Install WSL/SBX or fix connectivity | [Environment setup](docs/dev/wsl2-linux-sbx-setup.md) |
+| Write HTTP checks, configure a model or troubleshoot | [Usage guide](docs/dev/usage.md) |
+| Inspect validation evidence and known failures | [Release closeout](docs/dev/release-closeout.md) |
+| Run development quality checks | [Development gates](docs/dev/usage.md#development-gates) |
