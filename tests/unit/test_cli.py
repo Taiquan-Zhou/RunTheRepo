@@ -15,9 +15,14 @@ from repotrial.domain.models import JourneyResult, RunState
 from repotrial.intake import github
 from repotrial.intake.github import RepoIntakeError
 from repotrial.run_outcome import TerminalOutcome, classify_terminal_outcome
-from repotrial.sandbox.base import SandboxProvider
-from repotrial.sandbox.docker_sbx import DockerSbxPolicy
+from repotrial.sandbox.base import (
+    SandboxFailureEvidence,
+    SandboxProvider,
+    attach_sandbox_failure_evidence,
+)
+from repotrial.sandbox.docker_sbx import DockerSbxError, DockerSbxPolicy
 from repotrial.sandbox.fake import FakeSandboxProvider
+from repotrial.sandbox.lifecycle import CleanupError, RuntimeTemplateCleanupError
 
 FIXED_RUN_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -705,6 +710,152 @@ def test_ordinary_exception_does_not_create_private_intake_artifact(
     assert "private_intake_evidence_status" not in attempt
     assert attempt["stop_reason"] == "internal:valueerror"
     assert attempt["exit_code"] == 4
+
+
+def test_docker_exec_timeout_emits_failure_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts_root = tmp_path / "artifacts"
+
+    async def failing_run(*_args: object, **_kwargs: object) -> object:
+        raise DockerSbxError("exec", "timeout", returncode=124)
+
+    monkeypatch.setattr(cli, "ainvoke_run", failing_run)
+    app = create_app(
+        artifacts_root=artifacts_root,
+        run_id_generator=lambda: "run-fixed",
+        provider_factory=lambda _name: FakeSandboxProvider(),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "inspect",
+            "--provider",
+            "fake",
+            "--commit-sha",
+            "a" * 40,
+            "https://github.com/owner/repository",
+        ],
+    )
+
+    assert result.exit_code == 4
+    run_path = artifacts_root / "run-fixed"
+    attempt = json.loads((run_path / "attempt-result.json").read_text(encoding="utf-8"))
+    assert attempt["stop_reason"] == "sandbox:exec:timeout"
+    assert attempt["exit_code"] == 4
+    assert attempt["report_paths"] == {
+        "html": str(run_path / "report" / "trial-report.html"),
+        "json": str(run_path / "report" / "trial-report.json"),
+    }
+    assert f"report_json={run_path / 'report' / 'trial-report.json'}" in result.stdout
+    assert f"report_html={run_path / 'report' / 'trial-report.html'}" in result.stdout
+    report = json.loads(
+        (run_path / "report" / "trial-report.json").read_text(encoding="utf-8")
+    )
+    assert report["report_kind"] == "execution_failure"
+    assert report["completed"] is False
+
+
+def test_failure_report_write_error_keeps_original_attempt_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts_root = tmp_path / "artifacts"
+
+    async def failing_run(*_args: object, **_kwargs: object) -> object:
+        raise DockerSbxError("exec", "timeout", returncode=124)
+
+    def fail_report(*_args: object, **_kwargs: object) -> object:
+        raise cli.FailureReportWriteError("report unavailable")
+
+    monkeypatch.setattr(cli, "ainvoke_run", failing_run)
+    monkeypatch.setattr(cli, "render_failure_report", fail_report)
+    result = CliRunner().invoke(
+        create_app(
+            artifacts_root=artifacts_root,
+            run_id_generator=lambda: "run-fixed",
+            provider_factory=lambda _name: FakeSandboxProvider(),
+        ),
+        [
+            "inspect",
+            "--provider",
+            "fake",
+            "--commit-sha",
+            "a" * 40,
+            "https://github.com/owner/repository",
+        ],
+    )
+
+    assert result.exit_code == 4
+    run_path = artifacts_root / "run-fixed"
+    attempt = json.loads((run_path / "attempt-result.json").read_text(encoding="utf-8"))
+    assert attempt["stop_reason"] == "sandbox:exec:timeout"
+    assert attempt["exit_code"] == 4
+    assert attempt["report_paths"] == {"html": None, "json": None}
+
+
+def test_exception_evidence_projects_structured_sandbox_failure_metadata() -> None:
+    error = DockerSbxError("exec", "timeout", returncode=124)
+    attach_sandbox_failure_evidence(
+        error,
+        SandboxFailureEvidence(
+            operation="exec",
+            reason="timeout",
+            returncode=124,
+            details={"private": "value"},
+        ),
+    )
+
+    evidence = cli._exception_evidence(
+        error,
+        repo_url="https://github.com/owner/repository",
+        expected_sha="a" * 40,
+        actual_verified_sha="a" * 40,
+        container_port=8080,
+        compose_path=None,
+        exit_code=4,
+        timing=cli._AttemptTiming(
+            started_at_utc=None,
+            ended_at_utc=None,
+            monotonic_duration_s=None,
+            timing_status="complete",
+        ),
+    )
+
+    assert evidence["failure_evidence"] == {
+        "operation": "exec",
+        "reason": "timeout",
+        "returncode": 124,
+    }
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        CleanupError("sandbox-1", RuntimeError("destroy"), RuntimeError("body")),
+        RuntimeTemplateCleanupError(RuntimeError("cleanup"), RuntimeError("body")),
+    ],
+)
+def test_structured_cleanup_failure_is_not_reported_as_unverified(
+    error: BaseException,
+) -> None:
+    evidence = cli._exception_evidence(
+        error,
+        repo_url="https://github.com/owner/repository",
+        expected_sha="a" * 40,
+        actual_verified_sha="a" * 40,
+        container_port=8080,
+        compose_path=None,
+        exit_code=4,
+        timing=cli._AttemptTiming(
+            started_at_utc=None,
+            ended_at_utc=None,
+            monotonic_duration_s=None,
+            timing_status="complete",
+        ),
+    )
+
+    assert evidence["cleanup_status"] == "failed"
 
 
 def test_shared_terminal_classifier_preserves_success_exit_semantics() -> None:

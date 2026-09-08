@@ -27,9 +27,18 @@ from repotrial.intake.github import (
 )
 from repotrial.models.base import ModelAdapter
 from repotrial.models.openai_compat import OpenAICompatibleModelAdapter
+from repotrial.report.failure import (
+    FailureReportProjection,
+    FailureReportWriteError,
+    render_failure_report,
+)
 from repotrial.report.render import TrialReportPaths, render_trial_report
 from repotrial.run_outcome import classify_terminal_outcome
-from repotrial.sandbox.base import SandboxProvider
+from repotrial.sandbox.base import (
+    SandboxFailureEvidence,
+    SandboxProvider,
+    find_sandbox_failure_evidence,
+)
 from repotrial.sandbox.docker_sbx import (
     PID_HARD_BOUND_LIMITATION,
     DockerSbxError,
@@ -37,6 +46,7 @@ from repotrial.sandbox.docker_sbx import (
     DockerSbxProvider,
     DockerSbxUnsupportedError,
 )
+from repotrial.sandbox.lifecycle import CleanupError, RuntimeTemplateCleanupError
 from repotrial.trial.planner import load_operator_journeys
 
 type ProviderFactory = Callable[[Literal["fake", "docker-sbx"]], SandboxProvider]
@@ -503,7 +513,7 @@ def _exception_evidence(
     exit_code: int,
     timing: _AttemptTiming,
 ) -> dict[str, object]:
-    return {
+    evidence: dict[str, object] = {
         "actual_verified_sha": actual_verified_sha,
         "compose_path": compose_path,
         "container_port": container_port,
@@ -521,16 +531,61 @@ def _exception_evidence(
         "ended_at_utc": timing.ended_at_utc,
         "timing_status": timing.timing_status,
     }
+    failure_evidence = find_sandbox_failure_evidence(error)
+    if failure_evidence is not None:
+        evidence["failure_evidence"] = _project_failure_evidence(failure_evidence)
+    elif isinstance(error, DockerSbxError):
+        docker_failure_evidence: dict[str, object] = {
+            "operation": _safe_exception_token(error.operation),
+            "reason": _safe_exception_token(error.reason),
+        }
+        if type(error.returncode) is int:
+            docker_failure_evidence["returncode"] = error.returncode
+        evidence["failure_evidence"] = docker_failure_evidence
+    if isinstance(error, (CleanupError, RuntimeTemplateCleanupError)) or (
+        isinstance(error, DockerSbxError) and error.cleanup_error
+    ):
+        evidence["cleanup_status"] = "failed"
+    return evidence
+
+
+def _project_failure_evidence(
+    failure_evidence: SandboxFailureEvidence,
+) -> dict[str, object]:
+    projected: dict[str, object] = {
+        "operation": _safe_exception_token(failure_evidence.operation),
+        "reason": _safe_exception_token(failure_evidence.reason),
+    }
+    if type(failure_evidence.returncode) is int:
+        projected["returncode"] = failure_evidence.returncode
+    return projected
 
 
 def _sanitized_exception_stop_reason(error: BaseException) -> str:
     if isinstance(error, DockerSbxError):
-        return f"sandbox:{error.operation}:{error.reason}"
+        return (
+            f"sandbox:{_safe_exception_token(error.operation)}:"
+            f"{_safe_exception_token(error.reason)}"
+        )
     if isinstance(error, DockerSbxUnsupportedError):
-        return f"sandbox_unsupported:{error.reason}"
+        return f"sandbox_unsupported:{_safe_exception_token(error.reason)}"
     if isinstance(error, RepoIntakeError):
-        return f"intake:{error.operation}"
+        return f"intake:{_safe_exception_token(error.operation)}"
     return f"internal:{type(error).__name__.lower()}"
+
+
+def _safe_exception_token(value: str) -> str:
+    if (
+        value
+        and len(value) <= 128
+        and all(
+            character
+            in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
+            for character in value
+        )
+    ):
+        return value
+    return "unknown"
 
 
 def _utc_now() -> datetime:
@@ -765,11 +820,29 @@ def _exit_after_terminal_evidence(
     if run_id is not None:
         evidence["run_id"] = run_id
     if run_path is not None:
+        created_report_paths: TrialReportPaths | None = None
+        if evidence.get("report_paths") == {"html": None, "json": None}:
+            try:
+                report_paths = render_failure_report(
+                    FailureReportProjection.from_evidence(evidence),
+                    run_path / "report",
+                )
+            except FailureReportWriteError:
+                pass
+            else:
+                created_report_paths = report_paths
+                evidence["report_paths"] = {
+                    "html": str(report_paths.html_path),
+                    "json": str(report_paths.json_path),
+                }
         try:
             evidence_path = _persist_attempt_evidence(run_path, evidence)
         except (OSError, TypeError, ValueError):
             typer.echo("inspect failed: TerminalEvidenceWriteError", err=True)
             raise typer.Exit(4) from None
+        if created_report_paths is not None:
+            typer.echo(f"report_json={created_report_paths.json_path}")
+            typer.echo(f"report_html={created_report_paths.html_path}")
         typer.echo(f"attempt_evidence={evidence_path}")
     typer.echo(f"inspect failed: {evidence['exception_type']}", err=True)
     raise typer.Exit(exit_code) from None
