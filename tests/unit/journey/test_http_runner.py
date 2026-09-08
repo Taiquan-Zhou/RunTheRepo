@@ -16,7 +16,11 @@ from repotrial.domain.models import (
     JourneyResult,
     JourneyStep,
 )
-from repotrial.journey.http_runner import _redacted_body_hash, run_http_journey
+from repotrial.journey.http_runner import (
+    _canonical_json_hash,
+    _redacted_body_hash,
+    run_http_journey,
+)
 
 
 def run(
@@ -431,6 +435,85 @@ def test_bearer_capture_is_reused_only_on_explicit_authenticated_steps(
     assert token not in evidence
 
 
+def test_runtime_token_redaction_handles_json_unicode_escapes() -> None:
+    raw_token = b'{"opaque":"alpha.token"}'
+    escaped_token = b'{"opaque":"alpha\\u002etoken"}'
+
+    assert _redacted_body_hash(raw_token, False, "alpha.token") == _redacted_body_hash(
+        escaped_token, False, "alpha.token"
+    )
+
+
+def test_same_origin_redirect_retains_explicit_bearer_header(
+    tmp_path: Path,
+) -> None:
+    token = "abc.token"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/login":
+            return httpx.Response(200, json={"token": token})
+        assert request.headers.get("authorization") == f"Bearer {token}"
+        if request.url.path == "/redirect":
+            return httpx.Response(302, headers={"location": "/final"})
+        return httpx.Response(200, text="final")
+
+    login = step(
+        "login",
+        "POST",
+        "/login",
+        [assertion("status_code", "response.status", 200)],
+    ).model_copy(
+        update={
+            "params": {
+                "method": "POST",
+                "path": "/login",
+                "auth": {"capture_bearer": "token"},
+            }
+        }
+    )
+    redirect = step(
+        "redirect",
+        "GET",
+        "/redirect",
+        [assertion("status_code", "response.status", 200)],
+    ).model_copy(
+        update={
+            "params": {
+                "method": "GET",
+                "path": "/redirect",
+                "auth": {"use_bearer": True},
+            }
+        }
+    )
+
+    result = run(journey(login, redirect), tmp_path, httpx.MockTransport(handler))
+
+    assert result.verdict is Verdict.PASS
+
+
+def test_plain_request_keeps_legacy_canonical_request_body_hash(
+    tmp_path: Path,
+) -> None:
+    body = {"password": "plain-secret", "name": "item"}
+
+    result = run(
+        journey(
+            step(
+                "create",
+                "POST",
+                "/items",
+                [assertion("status_code", "response.status", 201)],
+                body,
+            )
+        ),
+        tmp_path,
+        httpx.MockTransport(lambda request: httpx.Response(201)),
+    )
+
+    evidence = json.loads(Path(result.evidence_paths[0]).read_text(encoding="utf-8"))
+    assert evidence["request"]["body_sha256"] == _canonical_json_hash(body)
+
+
 @pytest.mark.parametrize(
     "payload",
     [{}, {"token": 123}, {"token": "bad token"}],
@@ -548,6 +631,168 @@ def test_use_before_capture_fails_preflight_without_network(tmp_path: Path) -> N
 
     assert result.failure_reason == "step-0000:auth_failure"
     assert invoked is False
+
+
+def test_truncated_capture_fails_before_downstream_request(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+    body = b'{"token":"abc"}' + b"x" * 70_000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/login":
+            return httpx.Response(200, stream=ChunkedStream([body]))
+        return httpx.Response(200)
+
+    login = step(
+        "login",
+        "POST",
+        "/login",
+        [assertion("status_code", "response.status", 200)],
+    ).model_copy(
+        update={
+            "params": {
+                "method": "POST",
+                "path": "/login",
+                "auth": {"capture_bearer": "token"},
+            }
+        }
+    )
+    read = step(
+        "read",
+        "GET",
+        "/items",
+        [assertion("status_code", "response.status", 200)],
+    ).model_copy(
+        update={
+            "params": {"method": "GET", "path": "/items", "auth": {"use_bearer": True}}
+        }
+    )
+
+    result = run(journey(login, read), tmp_path, httpx.MockTransport(handler))
+
+    assert result.failure_reason == "step-0000:auth_failure"
+    assert [request.url.path for request in requests] == ["/login"]
+
+
+def test_captured_token_is_not_reused_between_journey_invocations(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"token": "abc"})
+
+    capture = step(
+        "login",
+        "POST",
+        "/login",
+        [assertion("status_code", "response.status", 200)],
+    ).model_copy(
+        update={
+            "params": {
+                "method": "POST",
+                "path": "/login",
+                "auth": {"capture_bearer": "token"},
+            }
+        }
+    )
+    first = run(journey(capture), tmp_path / "first", httpx.MockTransport(handler))
+    use = step(
+        "read",
+        "GET",
+        "/items",
+        [assertion("status_code", "response.status", 200)],
+    ).model_copy(
+        update={
+            "params": {"method": "GET", "path": "/items", "auth": {"use_bearer": True}}
+        }
+    )
+    second = run(journey(use), tmp_path / "second", httpx.MockTransport(handler))
+
+    assert first.verdict is Verdict.PASS
+    assert second.failure_reason == "step-0000:auth_failure"
+    assert [request.url.path for request in requests] == ["/login"]
+
+
+def test_captured_token_is_not_sent_on_steps_without_use_bearer(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/login":
+            return httpx.Response(200, json={"token": "abc"})
+        assert request.headers.get("authorization") is None
+        return httpx.Response(200)
+
+    capture = step(
+        "login",
+        "POST",
+        "/login",
+        [assertion("status_code", "response.status", 200)],
+    ).model_copy(
+        update={
+            "params": {
+                "method": "POST",
+                "path": "/login",
+                "auth": {"capture_bearer": "token"},
+            }
+        }
+    )
+    plain = step(
+        "plain", "GET", "/plain", [assertion("status_code", "response.status", 200)]
+    )
+
+    result = run(journey(capture, plain), tmp_path, httpx.MockTransport(handler))
+
+    assert result.verdict is Verdict.PASS
+
+
+def test_cross_origin_redirect_does_not_receive_bearer_or_get_a_second_request(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/login":
+            return httpx.Response(200, json={"token": "abc"})
+        assert request.headers.get("authorization") == "Bearer abc"
+        return httpx.Response(302, headers={"location": "https://attacker.test/final"})
+
+    capture = step(
+        "login",
+        "POST",
+        "/login",
+        [assertion("status_code", "response.status", 200)],
+    ).model_copy(
+        update={
+            "params": {
+                "method": "POST",
+                "path": "/login",
+                "auth": {"capture_bearer": "token"},
+            }
+        }
+    )
+    redirect = step(
+        "redirect",
+        "GET",
+        "/redirect",
+        [assertion("status_code", "response.status", 200)],
+    ).model_copy(
+        update={
+            "params": {
+                "method": "GET",
+                "path": "/redirect",
+                "auth": {"use_bearer": True},
+            }
+        }
+    )
+
+    result = run(journey(capture, redirect), tmp_path, httpx.MockTransport(handler))
+
+    assert result.failure_reason == "step-0001:redirect:origin_change"
+    assert [request.url.path for request in requests] == ["/login", "/redirect"]
 
 
 def test_preflight_rejects_a_later_invalid_assertion_before_an_earlier_post(

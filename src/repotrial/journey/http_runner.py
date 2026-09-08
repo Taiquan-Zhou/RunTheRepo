@@ -338,7 +338,7 @@ def _redacted_body_hash(
     text = body.decode("utf-8", errors="replace")
     if runtime_token is not None:
         text = text.replace(runtime_token, "<redacted>")
-    redacted = _redact_json_body(text)
+    redacted = _redact_json_body(text, runtime_token)
     if redacted is None:
         redacted = _redact_credential_assignments(text)
     redacted = _PEM_PRIVATE_KEY.sub("<redacted-private-key>", redacted)
@@ -348,10 +348,10 @@ def _redacted_body_hash(
     return hashlib.sha256(redacted.encode("utf-8")).hexdigest()
 
 
-def _redact_json_body(text: str) -> str | None:
+def _redact_json_body(text: str, runtime_token: str | None = None) -> str | None:
     try:
         value: object = json.loads(text)
-        redacted = _redact_json_value(value)
+        redacted = _redact_json_value(value, runtime_token)
         return json.dumps(
             redacted,
             sort_keys=True,
@@ -364,18 +364,20 @@ def _redact_json_body(text: str) -> str | None:
         return None
 
 
-def _redact_json_value(value: object) -> object:
+def _redact_json_value(value: object, runtime_token: str | None = None) -> object:
     if isinstance(value, dict):
         redacted: dict[object, object] = {}
         for key, nested_value in value.items():
             redacted[key] = (
                 "<redacted>"
                 if isinstance(key, str) and _credential_key(key)
-                else _redact_json_value(nested_value)
+                else _redact_json_value(nested_value, runtime_token)
             )
         return redacted
     if isinstance(value, list):
-        return [_redact_json_value(item) for item in value]
+        return [_redact_json_value(item, runtime_token) for item in value]
+    if isinstance(value, str) and runtime_token is not None:
+        return value.replace(runtime_token, "<redacted>")
     return value
 
 
@@ -557,15 +559,19 @@ def _evidence(
         "redirects": list(redirects or []),
         "request": {
             "body_sha256": (
-                _redacted_body_hash(
-                    json.dumps(
-                        json_body,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                        ensure_ascii=False,
-                    ).encode("utf-8"),
-                    False,
-                    runtime_token,
+                (
+                    _canonical_json_hash(json_body)
+                    if runtime_token is None
+                    else _redacted_body_hash(
+                        json.dumps(
+                            json_body,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        ).encode("utf-8"),
+                        False,
+                        runtime_token,
+                    )
                 )
                 if has_json_body
                 else None
@@ -737,7 +743,6 @@ async def run_http_journey(
                         visited_urls.add(_redirect_target_identity(next_url))
                         current_url = next_url
                         request_body = None
-                        request_headers = None
             except TimeoutError:
                 response_status = None
                 body = None
