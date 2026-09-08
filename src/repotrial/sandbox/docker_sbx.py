@@ -1835,35 +1835,23 @@ class DockerSbxProvider(SandboxProvider):
             await self._guest_clone_command(sandbox_id, ["pwd"], deadline),
             "guest_pwd_invalid",
         )
-        guest_top_level = _parse_guest_path(
-            await self._guest_clone_command(
-                sandbox_id, ["git", "rev-parse", "--show-toplevel"], deadline
-            ),
-            "guest_top_level_invalid",
-        )
-        if guest_top_level != guest_workspace:
-            raise DockerSbxError("clone_verification", "guest_workspace_mismatch")
-        inside_work_tree = await self._guest_clone_command(
-            sandbox_id,
-            ["git", "rev-parse", "--is-inside-work-tree"],
-            deadline,
-        )
-        if inside_work_tree not in (b"true\n", b"true\r\n"):
-            raise DockerSbxError("clone_verification", "guest_not_work_tree")
-        guest_head = _parse_commit_sha(
+        guest_top_level, guest_head = _parse_guest_revision_output(
             await self._guest_clone_command(
                 sandbox_id,
                 [
                     "git",
                     "rev-parse",
+                    "--show-toplevel",
+                    "--is-inside-work-tree",
                     "--verify",
                     "--end-of-options",
                     "HEAD^{commit}",
                 ],
                 deadline,
             ),
-            "guest_head_invalid",
         )
+        if guest_top_level != guest_workspace:
+            raise DockerSbxError("clone_verification", "guest_workspace_mismatch")
         if guest_head != host_head:
             raise DockerSbxError("clone_verification", "guest_head_mismatch")
         status = await self._guest_clone_command(
@@ -3181,6 +3169,17 @@ def _parse_guest_path(output: bytes, reason: str) -> str:
     if not path.startswith("/") or "\r" in path or "\n" in path:
         raise DockerSbxError("clone_verification", reason)
     return path
+
+
+def _parse_guest_revision_output(output: bytes) -> tuple[str, str]:
+    records = output.split(b"\n")
+    if len(records) != 4 or records[-1] != b"":
+        raise DockerSbxError("clone_verification", "guest_revision_output_invalid")
+    guest_top_level = _parse_guest_path(records[0] + b"\n", "guest_top_level_invalid")
+    if records[1] + b"\n" not in (b"true\n", b"true\r\n"):
+        raise DockerSbxError("clone_verification", "guest_not_work_tree")
+    guest_head = _parse_commit_sha(records[2] + b"\n", "guest_head_invalid")
+    return guest_top_level, guest_head
 
 
 def _parse_git_status_output(

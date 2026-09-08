@@ -406,12 +406,16 @@ def _guest_verification_outcome(command: tuple[str, ...]) -> _Outcome:
     argv = command[4:]
     if argv == ("pwd",):
         return _Outcome(stdout=GUEST_WORKSPACE)
-    if argv == ("git", "rev-parse", "--show-toplevel"):
-        return _Outcome(stdout=GUEST_WORKSPACE)
-    if argv == ("git", "rev-parse", "--is-inside-work-tree"):
-        return _Outcome(stdout=b"true\n")
-    if argv == ("git", "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"):
-        return _Outcome(stdout=HOST_HEAD)
+    if argv == (
+        "git",
+        "rev-parse",
+        "--show-toplevel",
+        "--is-inside-work-tree",
+        "--verify",
+        "--end-of-options",
+        "HEAD^{commit}",
+    ):
+        return _Outcome(stdout=GUEST_WORKSPACE + b"true\n" + HOST_HEAD)
     if argv == (
         "git",
         "-c",
@@ -428,9 +432,15 @@ def _guest_verification_outcome(command: tuple[str, ...]) -> _Outcome:
 def _is_guest_verification_call(command: tuple[str, ...]) -> bool:
     return command[4:] in {
         ("pwd",),
-        ("git", "rev-parse", "--show-toplevel"),
-        ("git", "rev-parse", "--is-inside-work-tree"),
-        ("git", "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"),
+        (
+            "git",
+            "rev-parse",
+            "--show-toplevel",
+            "--is-inside-work-tree",
+            "--verify",
+            "--end-of-options",
+            "HEAD^{commit}",
+        ),
         (
             "git",
             "-c",
@@ -608,7 +618,6 @@ def test_create_binds_resolved_host_head_and_guest_clone_before_network(
     assert create_call[-2:] == ("shell", str(resolved_workspace))
     expected_guest_calls = [
         ("sbx", "exec", sandbox_id, "--", "pwd"),
-        ("sbx", "exec", sandbox_id, "--", "git", "rev-parse", "--show-toplevel"),
         (
             "sbx",
             "exec",
@@ -616,15 +625,8 @@ def test_create_binds_resolved_host_head_and_guest_clone_before_network(
             "--",
             "git",
             "rev-parse",
+            "--show-toplevel",
             "--is-inside-work-tree",
-        ),
-        (
-            "sbx",
-            "exec",
-            sandbox_id,
-            "--",
-            "git",
-            "rev-parse",
             "--verify",
             "--end-of-options",
             "HEAD^{commit}",
@@ -659,6 +661,129 @@ def test_create_binds_resolved_host_head_and_guest_clone_before_network(
         assert {
             key.upper() for key in environment if key.upper().startswith("GIT_")
         } == {"GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT"}
+
+
+def test_guest_clone_revision_verification_batches_rev_parse_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = _SbxSpawner()
+    batched_revision = (
+        "git",
+        "rev-parse",
+        "--show-toplevel",
+        "--is-inside-work-tree",
+        "--verify",
+        "--end-of-options",
+        "HEAD^{commit}",
+    )
+
+    def respond(command: tuple[str, ...]) -> _Outcome:
+        if command[:1] == ("git",):
+            return _Outcome(stdout=HOST_HEAD)
+        if command == ("sbx", "version"):
+            return _Outcome(stdout=b"sbx 99.0.0\n")
+        if command in HELP_OUTPUTS:
+            return _Outcome(stdout=HELP_OUTPUTS[command].encode())
+        if command[:2] == ("sbx", "exec"):
+            if command[4:] == batched_revision:
+                return _Outcome(
+                    stdout=b"/workspace\r\ntrue\r\n" + HOST_HEAD[:-1] + b"\r\n"
+                )
+            return _guest_verification_outcome(command)
+        return _Outcome()
+
+    spawner.intercept = respond
+    provider = _provider(monkeypatch, spawner)
+
+    sandbox_id = _create(provider, tmp_path)
+
+    guest_commands = [
+        call[4:]
+        for call in spawner.calls
+        if call[:4] == ("sbx", "exec", sandbox_id, "--")
+    ]
+    assert guest_commands == [
+        ("pwd",),
+        batched_revision,
+        (
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=no",
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("revision_output", "expected_reason"),
+    [
+        pytest.param(
+            b"/workspace\ntrue\n",
+            "guest_revision_output_invalid",
+            id="missing",
+        ),
+        pytest.param(
+            b"/workspace\ntrue\n" + HOST_HEAD + b"extra\n",
+            "guest_revision_output_invalid",
+            id="extra",
+        ),
+        pytest.param(
+            b"relative\ntrue\n" + HOST_HEAD,
+            "guest_top_level_invalid",
+            id="invalid-path",
+        ),
+        pytest.param(
+            b"/workspace\nfalse\n" + HOST_HEAD,
+            "guest_not_work_tree",
+            id="invalid-work-tree",
+        ),
+        pytest.param(
+            b"/workspace\ntrue\nnot-a-commit\n",
+            "guest_head_invalid",
+            id="invalid-head",
+        ),
+    ],
+)
+def test_guest_clone_revision_verification_rejects_malformed_records(
+    revision_output: bytes,
+    expected_reason: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawner = _SbxSpawner()
+    batched_revision = (
+        "git",
+        "rev-parse",
+        "--show-toplevel",
+        "--is-inside-work-tree",
+        "--verify",
+        "--end-of-options",
+        "HEAD^{commit}",
+    )
+
+    def respond(command: tuple[str, ...]) -> _Outcome:
+        if command[:1] == ("git",):
+            return _Outcome(stdout=HOST_HEAD)
+        if command == ("sbx", "version"):
+            return _Outcome(stdout=b"sbx 99.0.0\n")
+        if command in HELP_OUTPUTS:
+            return _Outcome(stdout=HELP_OUTPUTS[command].encode())
+        if command[:2] == ("sbx", "exec"):
+            if command[4:] == batched_revision:
+                return _Outcome(stdout=revision_output)
+            return _guest_verification_outcome(command)
+        return _Outcome()
+
+    spawner.intercept = respond
+    provider = _provider(monkeypatch, spawner)
+
+    with pytest.raises(DockerSbxError) as raised:
+        _create(provider, tmp_path)
+
+    assert raised.value.reason == expected_reason
 
 
 @pytest.mark.parametrize(
@@ -797,18 +922,42 @@ def test_create_rejects_second_host_head_change_before_sbx_create(
     [
         (("pwd",), _Outcome(returncode=7), "nonzero_exit"),
         (
-            ("git", "rev-parse", "--show-toplevel"),
-            _Outcome(stdout=b"/other\n"),
+            (
+                "git",
+                "rev-parse",
+                "--show-toplevel",
+                "--is-inside-work-tree",
+                "--verify",
+                "--end-of-options",
+                "HEAD^{commit}",
+            ),
+            _Outcome(stdout=b"/other\ntrue\n" + HOST_HEAD),
             "guest_workspace_mismatch",
         ),
         (
-            ("git", "rev-parse", "--is-inside-work-tree"),
-            _Outcome(stdout=b"false\n"),
+            (
+                "git",
+                "rev-parse",
+                "--show-toplevel",
+                "--is-inside-work-tree",
+                "--verify",
+                "--end-of-options",
+                "HEAD^{commit}",
+            ),
+            _Outcome(stdout=GUEST_WORKSPACE + b"false\n" + HOST_HEAD),
             "guest_not_work_tree",
         ),
         (
-            ("git", "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"),
-            _Outcome(stdout=b"ffffffffffffffffffffffffffffffffffffffff\n"),
+            (
+                "git",
+                "rev-parse",
+                "--show-toplevel",
+                "--is-inside-work-tree",
+                "--verify",
+                "--end-of-options",
+                "HEAD^{commit}",
+            ),
+            _Outcome(stdout=GUEST_WORKSPACE + b"true\n" + b"f" * 40 + b"\n"),
             "guest_head_mismatch",
         ),
         (
@@ -879,8 +1028,16 @@ def test_create_cleans_up_when_guest_clone_postcondition_fails(
             id="pwd-invalid-utf8",
         ),
         pytest.param(
-            ("git", "rev-parse", "--show-toplevel"),
-            _Outcome(stdout=b"/workspace"),
+            (
+                "git",
+                "rev-parse",
+                "--show-toplevel",
+                "--is-inside-work-tree",
+                "--verify",
+                "--end-of-options",
+                "HEAD^{commit}",
+            ),
+            _Outcome(stdout=b"/workspace\rfoo\ntrue\n" + HOST_HEAD),
             "guest_top_level_invalid",
             id="top-level-missing-newline",
         ),
@@ -1001,11 +1158,13 @@ def test_guest_malformed_head_enters_partial_create_cleanup(
         if command[:2] == ("sbx", "exec") and command[4:] == (
             "git",
             "rev-parse",
+            "--show-toplevel",
+            "--is-inside-work-tree",
             "--verify",
             "--end-of-options",
             "HEAD^{commit}",
         ):
-            return _Outcome(stdout=b"not-a-commit\n")
+            return _Outcome(stdout=GUEST_WORKSPACE + b"true\nnot-a-commit\n")
         if command[:2] == ("sbx", "exec"):
             return _guest_verification_outcome(command)
         return _Outcome()
@@ -1115,11 +1274,13 @@ def test_guest_clone_cleanup_failure_retains_partial_create_context(
         if command[:2] == ("sbx", "exec") and command[4:] == (
             "git",
             "rev-parse",
+            "--show-toplevel",
+            "--is-inside-work-tree",
             "--verify",
             "--end-of-options",
             "HEAD^{commit}",
         ):
-            return _Outcome(stdout=b"not-a-commit\n")
+            return _Outcome(stdout=GUEST_WORKSPACE + b"true\nnot-a-commit\n")
         if command[:3] == ("sbx", "rm", "--force"):
             return _Outcome(returncode=9, stderr=b"cleanup blocked")
         if command[:2] == ("sbx", "exec"):
@@ -3568,9 +3729,8 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
     expected.extend(("shell", str(tmp_path)))
     assert _actual_create_call(spawner) == tuple(expected)
     create_index = spawner.calls.index(tuple(expected))
-    assert spawner.calls[create_index + 1 : create_index + 6] == [
+    assert spawner.calls[create_index + 1 : create_index + 4] == [
         ("sbx", "exec", sandbox_id, "--", "pwd"),
-        ("sbx", "exec", sandbox_id, "--", "git", "rev-parse", "--show-toplevel"),
         (
             "sbx",
             "exec",
@@ -3578,15 +3738,8 @@ def test_successful_probe_builds_exact_policy_create_argv_and_owns_id(
             "--",
             "git",
             "rev-parse",
+            "--show-toplevel",
             "--is-inside-work-tree",
-        ),
-        (
-            "sbx",
-            "exec",
-            sandbox_id,
-            "--",
-            "git",
-            "rev-parse",
             "--verify",
             "--end-of-options",
             "HEAD^{commit}",
@@ -5530,16 +5683,14 @@ def test_create_deadline_starts_before_probes_and_limits_create_subprocess(
     create_call = _actual_create_call(spawner)
     assert timed_commands[len(PROBE_CALLS) + 1][0][:2] == ("git", "-C")
     assert timed_commands[len(PROBE_CALLS) + 1][1] == 9.0
-    assert [timeout for _, timeout in timed_commands[-7:]] == [
+    assert [timeout for _, timeout in timed_commands[-5:]] == [
         8.0,
         7.0,
         6.0,
         5.0,
         4.0,
-        3.0,
-        2.0,
     ]
-    assert [command for command, _ in timed_commands[-7:]] == [
+    assert [command for command, _ in timed_commands[-5:]] == [
         create_call,
         ("sbx", "exec", sandbox_id, "--", "pwd"),
         (
@@ -5550,23 +5701,7 @@ def test_create_deadline_starts_before_probes_and_limits_create_subprocess(
             "git",
             "rev-parse",
             "--show-toplevel",
-        ),
-        (
-            "sbx",
-            "exec",
-            sandbox_id,
-            "--",
-            "git",
-            "rev-parse",
             "--is-inside-work-tree",
-        ),
-        (
-            "sbx",
-            "exec",
-            sandbox_id,
-            "--",
-            "git",
-            "rev-parse",
             "--verify",
             "--end-of-options",
             "HEAD^{commit}",
@@ -6791,9 +6926,15 @@ def test_clean_guest_clone_does_not_run_diagnostic_commands(
     ]
     assert guest_commands == [
         ("pwd",),
-        ("git", "rev-parse", "--show-toplevel"),
-        ("git", "rev-parse", "--is-inside-work-tree"),
-        ("git", "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"),
+        (
+            "git",
+            "rev-parse",
+            "--show-toplevel",
+            "--is-inside-work-tree",
+            "--verify",
+            "--end-of-options",
+            "HEAD^{commit}",
+        ),
         (
             "git",
             "-c",
