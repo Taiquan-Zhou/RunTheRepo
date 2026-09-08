@@ -1,5 +1,11 @@
 # M7.5 real-repository Pilot protocol and report
 
+> **Historical evidence notice:** Current bounded acceptance is documented in
+> [`docs/dev/release-closeout.md`](release-closeout.md) at HEAD
+> `7e30606dc64db7d7c5ba2754eedfcf2fbdd944f2`. This file retains the historical
+> Pilot record, including its pre-fix `FAIL 0/10` and `3/10` metrics; those
+> figures are not the current release-closeout acceptance result.
+
 > **POST-FIX UNIFIED COHORT COMPLETE — MVP limitations identified**
 
 This document freezes the M7.5 execution protocol and records the append-only Pilot

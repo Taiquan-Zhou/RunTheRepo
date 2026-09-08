@@ -15,15 +15,18 @@ a Provider, change the frozen Pilot cohort, or authorize host Docker fallback.
 - **Docker-official behavior:** the Docker-published Linux SBX package, the
   installed `sbx` CLI, and Docker's documented [upstream proxy
   settings](https://docs.docker.com/ai/sandboxes/configuration/upstream-proxy/).
-- **RepoTrial-tested compatibility:** Windows 11 + WSL2 + a dedicated Ubuntu
-  24.04 distro on D + official Linux SBX v0.39.0 passed the calibration linked
-  below. This label does not turn the WSL topology into a Docker support claim.
-- **Known unsupported:** Docker SBX v0.39.0 has no verified PID hard bound.
+- **RepoTrial-supported runtime:** Windows 11 + WSL2 + a dedicated Ubuntu
+  24.04 distro on D + official Linux SBX v0.42.0 is the current production
+  runtime. This label does not turn the WSL topology into a Docker support
+  claim. The older v0.39.0 calibration remains historical and is not an
+  installation target.
+- **Known unsupported:** Docker SBX v0.42.0 has no verified PID hard bound.
   RepoTrial does not emulate one with `ulimit`, Compose `pids_limit`, polling,
   or memory limits and does not claim fork-bomb/PID hard protection.
 
-Authoritative observed values and hashes are in the
-[calibration report](pilot-evidence/wsl2-linux-sbx-calibration.md).
+Historical calibration values and hashes are in the
+[calibration report](pilot-evidence/wsl2-linux-sbx-calibration.md); the active
+v0.42.0 package and CLI identity are pinned below.
 
 ## Verified topology and safety boundary
 
@@ -45,11 +48,55 @@ disposable SBX microVM.
 
 ## Prerequisites
 
+### Disk-space terminology
+
+Do not equate the VHD capacity, actual allocated storage, free host-drive space,
+or RepoTrial's per-sandbox disk policy. Microsoft documents that WSL VHDs
+[grow as storage is used](https://learn.microsoft.com/en-us/windows/wsl/disk-space);
+the capacity shown inside Linux is not proof that the Windows drive has that
+much free space. Check both locations. Deleting Linux files is not evidence
+that the Windows VHD has immediately returned the same amount of space.
+
+The current CLI configures an 8192 MiB per-sandbox disk budget. This is not a
+whole-installation footprint: OS/runtime assets, downloaded images, temporary
+templates, Python dependencies and retained run artifacts also consume space.
+Single-workload sampled peaks must be labelled as measurements, not universal
+minimum requirements. No automatic deletion or VHD compaction is part of setup.
+
+### Measured example, not a minimum configuration
+
+At production HEAD `25a88527369779fab11221bfac5f7125e85d9bee`, one installed-wheel
+changedetection run (`286023c6-1c9a-460a-ac10-652b63737fe3`, pinned source
+`5d9c7c6da76340597243e8163c4f2439237fa0e8`) completed with exit 0,
+`no_remaining_mutations`, JSON/HTML reports, four successful sandbox destroys,
+confirmed template removal and empty official inventory.
+
+| Measurement | Before | Sampled maximum | After cleanup |
+| --- | ---: | ---: | ---: |
+| SBX state directory, allocated storage (`du -s -B1`) | 2.228 GiB | 3.840 GiB | 2.232 GiB |
+| Whole WSL ext4 filesystem, used blocks (`statvfs`) | 10.018 GiB | 12.001 GiB | 10.051 GiB |
+
+There were 98 samples at a nominal 5-second interval; maximum monotonic gap
+was 5.021 seconds, with no sampling errors. The sampled increases were
+1.611 GiB for SBX state and 1.983 GiB for the whole WSL filesystem. These
+overlap and must not be added together. The Windows D: used-space change was
+only 380,928 bytes in this existing environment; reuse of previously allocated
+VHD space means this is not a cold-install storage requirement. Host and
+whole-filesystem metrics include other processes. Sampling can miss shorter
+peaks, and existing runtime assets/caches were not cleared. This single workload
+does not establish a universal minimum or a worst-case bound for other targets.
+
+Raw samples and the measuring script are retained in the ignored directory
+`artifacts/disk-peak-25a88527/`. No distro was created, no files were deleted,
+and no runtime disk or duration limits were changed for this measurement.
+
 Before provisioning, require:
 
 - Windows 11 with current Microsoft WSL supporting the flags shown below;
 - hardware virtualization and nested KVM visible in WSL2;
-- at least 150 GB free on D before creating the dedicated sparse VHD;
+- sufficient free space on the host drive and inside the distro for the chosen
+  workload, downloaded images, temporary templates and retained evidence;
+  there is no validated universal 150 GB free-space minimum;
 - network access to Ubuntu package archives, GitHub releases, Docker login,
   Docker Hub auth/registry/CDN, and the target public Git repositories;
 - any existing `Ubuntu` or `docker-desktop` distributions, if present, recorded
@@ -71,8 +118,13 @@ that exact state instead of overwriting it.
 
 ## Create the dedicated distro on D
 
-This command uses Microsoft WSL's placement interface. It does not export,
-import, or manually move a VHD:
+This command records the historical development allocation, not a minimum user
+configuration or a requirement to create a second distro for testing. The
+120 GB VHD capacity below is not an installation-footprint measurement. Do not
+derive a 150 GB free-space gate from it. Use an existing supported Linux/WSL
+environment when available and measure the intended workload before setting
+capacity. This command uses Microsoft WSL's placement interface. It does not
+export, import, or manually move a VHD:
 
 ```powershell
 wsl --install Ubuntu-24.04 --name RepoTrial-Ubuntu --location "D:\DockerData\WSL\RepoTrial-Ubuntu" --version 2 --vhd-size 120GB --no-launch
@@ -102,7 +154,7 @@ wsl --list --verbose
 Require Ubuntu 24.04, WSL version 2, default user `repotrial`, accessible
 `/dev/kvm`, and `systemd` as PID 1.
 
-## Install the pinned official Linux SBX package
+## Install the supported official Linux SBX package
 
 Install bounded OS prerequisites as root. Do not install Docker Engine or Docker
 Desktop inside this distro:
@@ -116,14 +168,14 @@ wsl -d RepoTrial-Ubuntu -u root -- install -d -o repotrial -g repotrial -m 0755 
 Download Docker's official Ubuntu 24.04 package as the non-root user:
 
 ```powershell
-wsl -d RepoTrial-Ubuntu -- curl --fail --show-error --location --proto "=https" --tlsv1.2 --output /home/repotrial/downloads/DockerSandboxes-linux-amd64-ubuntu2404.deb https://github.com/docker/sbx-releases/releases/download/v0.39.0/DockerSandboxes-linux-amd64-ubuntu2404.deb
+wsl -d RepoTrial-Ubuntu -- curl --fail --show-error --location --proto "=https" --tlsv1.2 --output /home/repotrial/downloads/DockerSandboxes-linux-amd64-ubuntu2404.deb https://github.com/docker/sbx-releases/releases/download/v0.42.0/DockerSandboxes-linux-amd64-ubuntu2404.deb
 wsl -d RepoTrial-Ubuntu -- sha256sum /home/repotrial/downloads/DockerSandboxes-linux-amd64-ubuntu2404.deb
 ```
 
 The required SHA-256 is:
 
 ```text
-bf36b1ac0a8daf5ee2ff44d138cfba578b3af6812733056c8000982b184f1631
+e8a769b50b0e662626b3d6f95b601211e827965406e600b74ee8cb0b06e180fe
 ```
 
 Do not install a mismatched file. After the hash matches:
@@ -133,9 +185,9 @@ wsl -d RepoTrial-Ubuntu -u root -- apt-get install -y /home/repotrial/downloads/
 wsl -d RepoTrial-Ubuntu -- sbx version
 ```
 
-The calibrated identity is package
-`docker-sbx 0.39.0-1~ubuntu.24.04~noble` and CLI
-`v0.39.0 def8cb0523a77e757bdd6ef52b459fe374f3783e`.
+The reviewed current CLI identity is
+`v0.42.0 ca4a4bd42035628137d78c5a0bef5c0d3301a35a`. The package hash and
+`sbx version` output are both required to match before running RepoTrial.
 
 ## Authentication, daemon, and deny-all policy
 
@@ -329,6 +381,8 @@ the old report.
 
 ## Troubleshooting
 
+- **Doctor rejects the SBX version:** install/select the reviewed Linux SBX
+  `v0.42.0`; current doctor rejects the historical `v0.39.0` runtime.
 - **Docker JWKS/auth/GitHub timeout from the CLI:** test the trusted client proxy
   layer. `proxy.daemon` and `proxy.sandbox` do not configure the `sbx` client.
   Keep `NO_PROXY=localhost,127.0.0.1`; no daemon restart is needed for client

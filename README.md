@@ -9,20 +9,25 @@ verified.
 
 ## Current status
 
-This branch is a limited CLI and local Web preview, not a complete or published
-release. At production HEAD
-`7808b9b5485969f65f242d4acf78ffc79215a3e5`, two representative public
-repositories completed the URL -> exact SHA -> sandbox -> Compose -> journey
--> report -> cleanup path:
+This 0.1 branch is a limited CLI and local Web preview, not a stable release or
+a claim that the full product scope is complete. At current validation HEAD
+`7e30606dc64db7d7c5ba2754eedfcf2fbdd944f2`, two representative real-SBX
+canaries completed their bounded paths:
 
 | Repository | Pinned commit | Result | Run ID |
 | --- | --- | --- | --- |
-| Linkding | `65813a75404b1319aca8b09700fadc0b15adabaf` | `exit_code=0`; `completed` / `no_remaining_mutations`; `GET /` passed; JSON+HTML; cleanup PASS; template removed; inventory empty | `083f1d4e-697b-4a73-b469-9c5ed7b079f8` |
-| changedetection.io | `5d9c7c6da76340597243e8163c4f2439237fa0e8` | `exit_code=0`; `completed` / `no_remaining_mutations`; `GET /` passed; JSON+HTML; cleanup PASS; template removed; inventory empty | `2ca27a00-b609-4155-9b14-f48526f27778` |
+| Umami | `ca661c7057984aa98ed4f7083d84dae2f65bfcb0` | `exit_code=0`; `no_remaining_mutations`; complete JSON+HTML; 6-step operator-authored authenticated HTTP Journey (anonymous rejection, login, create/read/delete/list confirmation); baseline plus 2 KEEP candidates, each 6/6; 6/6 `destroy_success`; template removal confirmed; official inventory empty | `e751fd28-94f9-4d90-9a3c-7aaa8f791b47` (878.047519223s) |
+| changedetection.io | `5d9c7c6da76340597243e8163c4f2439237fa0e8` | `exit_code=0`; `no_remaining_mutations`; complete JSON+HTML; `GET /` plus 2 KEEP candidates; 4/4 `destroy_success`; template removal confirmed; official inventory empty | `3eb07f3a-8e90-4424-984e-bc79d7c22aec` (661.436816016s) |
 
-The original gate (7/10 repositories autonomously complete and 5/10
-demonstrate meaningful regression-passing hardening) has not been demonstrated
-at this HEAD.
+The historical frozen 10-repository cohort at HEAD
+`25a88527369779fab11221bfac5f7125e85d9bee` remains labeled historical evidence:
+7/10 autonomous completion and 7/10 meaningful regression-passing hardening
+under the single-`GET /` contract. It is not the current two-canary scope and
+does not prove business-workflow preservation. Its n8n entry had no report.
+The CLI now emits reports for handled terminal execution failures in new runs;
+the historical n8n report was not regenerated and its timeout is not fixed.
+The earlier canaries at
+`7808b9b5485969f65f242d4acf78ffc79215a3e5` are historical too.
 
 Known limitations:
 
@@ -34,14 +39,18 @@ Known limitations:
   `unavailable`; compatibility and runtime environment inputs are not bundled.
 - No public resume entry point is exposed.
 - The default API container has no `sbx` execution integration and no UI.
-- The two canaries do not demonstrate an accepted LLM-generated journey:
-  changedetection used a `policy_rejected` fallback `GET`, while Linkding used
-  a deterministic README journey.
+- The current operator-authored Umami and changedetection canaries do not
+  demonstrate accepted LLM-generated journey contribution; LLM coverage
+  remains unproven.
 
-Latest full regression: `2155 passed, 12 skipped, 1 warning`. Subsequent
-test-only additions passed in focused runs (207 tests, then one write-integrity
-test); combined coverage on unchanged production code is 85.0027%.
-Ruff check, Ruff format (160 files), mypy (53 files), and pre-commit pass.
+Latest fresh full regression: `2238 passed, 12 skipped, 1 warning` in `194.85s`;
+branch coverage is `85.31%`. All-file pre-commit, Ruff/format (163 files), and
+mypy (55 source files) passed. Bounded current-HEAD packaging checks passed
+under `artifacts/release-7e30606d/` (lock consistency check, wheel/sdist build,
+fresh-venv `pip check`, outside-source CLI help/dry-run, installed-file diff,
+and doctor JSON readiness). These checks are not fresh-machine OS/SBX proof
+or publication approval, and a
+dry-run is not a real-wheel canary.
 The local Web wheel was independently installed and browser-smoked before the
 cumulative-overlay changes. A trusted SBX fixture verified real Compose merge
 equivalence for the cumulative writer, followed by successful destruction and
@@ -67,19 +76,21 @@ preview does not provide public binding, arbitrary shell or file downloads,
 durable job history, granular graph progress, or real-target browser journeys.
 
 The tested topology is Windows 11 -> dedicated Ubuntu 24.04 WSL2 distro ->
-official Linux Docker Sandboxes v0.39.0 -> disposable Linux sandbox. The
+official Linux Docker Sandboxes v0.42.0 -> disposable Linux sandbox. The
 checkout must be on the distro's ext4 filesystem. Target Compose workloads must
 never run through host Docker or Docker Desktop.
 
 Prerequisites:
 
 - WSL2 with systemd, nested KVM, and `/dev/kvm` available;
-- Docker Sandboxes v0.39.0 installed, authenticated, and running with the
+- Docker Sandboxes v0.42.0 installed, authenticated, and running with the
   reviewed default-deny network policy;
 - Git and network access to GitHub, the selected model endpoint, and required
   container registries.
 
-Install `uv` directly if it is missing, then create the locked environment:
+The supported installation path is a source checkout with the locked `uv`
+environment; arbitrary `pip` dependency combinations are not claimed as
+validated. Install `uv` directly if it is missing:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -206,6 +217,25 @@ uv run repotrial inspect https://github.com/OWNER/REPOSITORY \
 The JSON and HTML reports retain only the input source kind and SHA-256
 identities for provenance, never the host path or source bytes.
 
+### Bounded bearer reuse (operator-authored evidence)
+
+An operator-authored HTTP Journey may capture a short-lived bearer from a
+successful login response and explicitly use it on later steps. These are
+parameter fragments, not a complete Journey file:
+
+```json
+{"auth": {"capture_bearer": "token"}}
+{"auth": {"use_bearer": true}}
+```
+
+Use only disposable test accounts; never put real credentials or tokens in a
+Journey file. `capture_bearer` accepts one bounded dotted JSON-object path and
+`use_bearer` is valid only after a prior capture in the same Journey. The token
+is ephemeral and is not written to reports, evidence, stdout, or the Journey;
+arbitrary headers, cookies, and environment interpolation remain unsupported.
+This canary demonstrates operator-authored input only; the model retains its
+GET-only policy. Authorization is sent only on explicit `use_bearer` steps.
+
 ## Proxy networks (TUN optional; Rule or Global)
 
 TUN mode is not required. Windows Rule or Global mode is acceptable when WSL,
@@ -240,6 +270,9 @@ upstream proxy or its credentials into the untrusted target workload.
 - **`sbx diagnose` fails or `sbx list` is non-empty:** stop new trials, retain
   the exact output and lifecycle evidence, and investigate the owned sandbox
   ID. Do not hide the failure with reset/restart loops.
+- **`repotrial doctor` rejects `sbx_version`:** install and select the reviewed
+  Docker Sandboxes `v0.42.0`. The old `v0.39.0` runtime is historical and is
+  rejected by the current doctor.
 - **No report is produced:** inspect `attempt-result.json`, then the referenced
   evidence. The nonzero exit and `stop_reason` are intentional fail-closed
   diagnostics.
@@ -258,7 +291,7 @@ upstream proxy or its credentials into the untrusted target workload.
   failure remains a failed run, and an empty inventory is not cleanup success.
 - CPU, memory, disk, and host-side total-duration bounds remain enforced by the
   current provider path.
-- Docker Sandboxes v0.39.0 does not expose the required PID hard bound.
+- Docker Sandboxes v0.42.0 does not expose the required PID hard bound.
   RepoTrial records `pid_hard_bound_unsupported` and does not claim fork-bomb
   protection.
 - Model keys are supplied through the process environment only; never print or
