@@ -7,21 +7,14 @@ test hardening, and get evidence-backed reports.
 
 [Quick start](#quick-start) · [Usage guide](docs/dev/usage.md) · [Setup](docs/dev/wsl2-linux-sbx-setup.md) · [Validation results](docs/dev/release-closeout.md)
 
+[中文 README](README.zh-CN.md) · English
+
 > **0.1 Preview** — for pre-configured WSL2 + Docker Sandboxes environments.
 > The CLI and Python package are named `repotrial`.
 
 ## How it works
 
-```mermaid
-flowchart LR
-    A["GitHub URL + exact commit"] --> B["Disposable sandbox"]
-    B --> C["Boot Compose app"]
-    C --> D["Verify workflows"]
-    D --> E["Test hardening"]
-    E --> F["Keep or roll back"]
-    F --> G["JSON + HTML report"]
-    G --> H["Forced cleanup"]
-```
+![RunTheRepo workflow: pin, run, verify, harden, report, and clean up](docs/assets/workflow.svg)
 
 Changes are kept only when the recorded baseline workflows pass again.
 A cleanup failure remains a failed run—even if the sandbox inventory is empty.
