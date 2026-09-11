@@ -15,7 +15,6 @@ test hardening, and get evidence-backed reports.
 ## How it works
 
 ![Animated RunTheRepo workflow: pin, run, verify, harden, report, and clean up](docs/assets/workflow.gif)
-The animation lights each step cumulatively from 01 through 08 and holds on the completed workflow.
 
 Changes are kept only when the recorded baseline workflows pass again.
 A cleanup failure remains a failed run—even if the sandbox inventory is empty.
