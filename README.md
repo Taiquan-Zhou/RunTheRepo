@@ -78,10 +78,11 @@ dependencies and proxy configuration.
 For model-assisted runs, open **Advanced options** in the Web console. Enter an
 OpenAI-compatible Base URL and API key, click **Get models**, then choose a
 returned model or enter one manually and save. The key is persisted only in the
-owner-only local configuration file `~/.config/repotrial/model-settings.json`.
-The settings API does not echo the key, it is excluded from public job payloads,
-and a run passes it only to the trusted CLI subprocess. Clear model settings to
-remove it.
+the owner-only XDG configuration directory. By default this is
+`~/.config/repotrial/model-settings.json`; set `XDG_CONFIG_HOME` to use another
+XDG configuration directory. The settings API does not echo the key, it is
+excluded from public job payloads, and a run passes it only to the trusted CLI
+subprocess. Clear model settings to remove it.
 
 Start the console in the same WSL Bash session:
 
@@ -97,6 +98,9 @@ The console is loopback-only and runs one trial at a time.
 
 Example target: Umami. Replace the model endpoint and name with your provider's
 values; this command does not supply the authenticated workflow shown above.
+Authentication provider keys are supplied through `REPOTRIAL_MODEL_API_KEY`;
+see the [usage guide](docs/dev/usage.md#fastest-supported-setup) for the
+complete CLI-only instructions.
 
 ```bash
 uv run repotrial inspect https://github.com/umami-software/umami \
