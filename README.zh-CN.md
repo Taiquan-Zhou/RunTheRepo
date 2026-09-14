@@ -14,7 +14,7 @@
 
 ## 功能演示
 
-### 1.项目信息自动读取
+### 1.项目自动读取与环境检查
 
 https://github.com/user-attachments/assets/ec1fb7e6-3c57-4b43-9705-97b854d1eccd
 
