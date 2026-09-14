@@ -9,16 +9,15 @@ test hardening, and get evidence-backed reports.
 
 [中文 README](README.zh-CN.md) · English
 
-> **0.1 Preview** — for pre-configured WSL2 + Docker Sandboxes environments.
-> The CLI and Python package are named `repotrial`.
-
 ## How it works
 
 ![Animated RunTheRepo workflow: pin, run, verify, harden, report, and clean up](docs/assets/workflow.gif)
-The animation lights each step cumulatively from 01 through 08 and holds on the completed workflow.
 
-Changes are kept only when the recorded baseline workflows pass again.
-A cleanup failure remains a failed run—even if the sandbox inventory is empty.
+## Feature Demo
+
+### 1. Automatic Project Detection and Environment Check
+
+https://github.com/user-attachments/assets/00b480d6-5954-4f11-be6c-9213c2ccecfe
 
 ## What you get
 
@@ -30,10 +29,7 @@ A cleanup failure remains a failed run—even if the sandbox inventory is empty.
 | Usable outputs | JSON/HTML reports, evidence references and a cumulative hardened overlay when provenance is valid |
 | Local console | Submit one trial, follow its status and open its report |
 
-Hardening results apply **only to the tested workflows**, not to every feature
-of an application. This is not a security certification.
-
-## Real runs, not mockups
+## Real-world examples
 
 | Application | Verified workflow | Outcome |
 | --- | --- | --- |
