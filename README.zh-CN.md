@@ -1,6 +1,4 @@
-# RunTheRepo
-
-**运行仓库。验证可用性。测试可加固性。**
+![RunTheRepo——从固定源码到可审计结果](docs/assets/readme-hero.svg)
 
 在一次性沙箱中运行 GitHub Docker Compose 应用，验证工作流、测试加固，并生成有据可查的报告。
 
@@ -8,21 +6,19 @@
 
 [English README](README.md) · 中文
 
-> **0.1 Preview** — 面向预配置的 WSL2 + Docker Sandboxes 环境。
-> CLI 和 Python 包名为 `repotrial`。
-
 ## 工作方式
 
 ![RunTheRepo 中文动态工作流程：固定版本、运行、验证、加固、报告与清理](docs/assets/workflow.zh-CN.gif)
 
-## 中文界面演示
+## 功能演示
 
-[![新建检查中文界面演示](docs/assets/new-check.zh-CN.png)](docs/assets/new-check.zh-CN.mp4)
+### 1.项目自动读取与环境检查
 
-演示从新建检查开始：自动识别提交 SHA、填写项目信息、检查运行环境，然后开始检查。
+https://github.com/user-attachments/assets/4380f694-e0c7-41ef-a5fe-14feead3bedb
 
-只有在记录的基线工作流再次通过后，改动才会被保留。
-即使沙箱清单为空，清理失败仍会使本次运行失败。
+### 2.运行过程与结果
+
+https://github.com/user-attachments/assets/ec45bca0-173c-476b-9086-8473a86d999c
 
 ## 你将获得什么
 
@@ -34,10 +30,7 @@
 | 可用的输出 | JSON/HTML 报告、证据引用，以及在来源有效时生成的累计加固 overlay |
 | 本地控制台 | 提交一次试跑、跟踪状态并打开报告 |
 
-加固结果**仅适用于已测试的工作流**，不代表应用的所有功能。
-这不是安全认证。
-
-## 真实运行，不是演示模型
+## 真实案例
 
 | 应用 | 已验证工作流 | 结果 |
 | --- | --- | --- |
@@ -74,11 +67,14 @@ uv run repotrial doctor
 
 ### 本地 Web 控制台
 
-进行模型辅助运行时，先在同一个 WSL Bash 会话中设置密钥：
+进行模型辅助运行时，请在 Web 控制台的“高级选项”中填写兼容 OpenAI 的
+Base URL 和 API Key，点击“获取模型”，然后选择返回的模型或手动填写模型并
+保存。Key 只持久化在 XDG 配置目录中的 owner-only 设置文件中。默认文件路径是
+`~/.config/repotrial/model-settings.json`；设置 `XDG_CONFIG_HOME` 可使用其他
+XDG 配置目录。设置 API 不会回显 Key，公开 job payload 不包含它，运行任务时
+只会将它传给受信任的 CLI 子进程。清除模型设置即可移除它。
 
 ```bash
-read -rsp 'Model API key: ' REPOTRIAL_MODEL_API_KEY && echo
-export REPOTRIAL_MODEL_API_KEY
 uv run repotrial serve --port 8765
 ```
 
@@ -87,6 +83,8 @@ uv run repotrial serve --port 8765
 ### CLI
 
 示例目标：Umami。将模型端点和名称替换为你的服务商值；此命令不提供上文展示的认证工作流。
+认证 provider 的 Key 通过 `REPOTRIAL_MODEL_API_KEY` 提供；完整的 CLI-only
+说明请参阅[使用指南](docs/dev/usage.md#fastest-supported-setup)。
 
 ```bash
 uv run repotrial inspect https://github.com/umami-software/umami \
@@ -108,7 +106,9 @@ uv run repotrial inspect https://github.com/umami-software/umami \
 - **覆盖范围：** 真实目标的浏览器工作流不受支持。尚未证明 LLM 贡献被接受；操作员编写的检查不是 LLM 证据。
 - **安装：** 已在支持的现有 WSL/SBX 主机上测试，不代表全新操作系统上的安装结果。
 - **产品范围：** 没有公开的恢复或持久化 Web 历史；默认 API 容器不是开箱即用的沙箱服务。
-- **凭据：** 仅使用一次性的目标测试账户。模型密钥只保留在进程环境中，不写入 Journey 文件或 Web 表单。
+- **凭据：** 仅使用一次性的目标测试账户。Web 模型 Key 保存在上文所述的 XDG
+  配置目录中的 owner-only 设置文件中；CLI 模型运行使用进程环境。两种路径都
+  不会把 Key 写入 Journey 文件。
 
 ## 文档
 

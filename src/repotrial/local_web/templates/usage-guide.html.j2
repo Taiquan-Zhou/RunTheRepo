@@ -1,0 +1,110 @@
+{% set is_en = guide_lang == "en" %}
+<!doctype html>
+<html lang="{{ "en" if is_en else "zh-CN" }}">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ "RunTheRepo · User guide" if is_en else "RunTheRepo · 使用文档" }}</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; background: #f7f8f4; color: #202b2b; font: 14px/1.7 "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+a { color: #b9402b; }
+.guide-header { background: #203430; color: #dce9eb; border-bottom: 1px solid #2b4940; padding: 18px clamp(20px,4vw,48px); display: flex; justify-content: space-between; align-items: center; gap: 20px; }
+.brand { font-size: 21px; font-weight: 750; letter-spacing: -1px; }
+.logo { flex:0 0 34px; display: inline-grid; place-items: center; background: #b9402b; color: #fff; width: 34px; height: 34px; border-radius: 9px; margin-right: 10px; }
+.header-links { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; font-size: 12px; }
+main { min-width:0; max-width: 1120px; margin: auto; padding: 42px clamp(20px,4vw,48px) 30px; }
+.eyebrow { color: #b9402b; font-size: 12px; font-weight: 700; letter-spacing: 1.6px; margin-bottom: 8px; }
+h1 { color: #202b2b; font-size: 32px; line-height: 1.2; letter-spacing: -1px; margin: 0 0 9px; }
+h2 { color: #202b2b; font-size: 19px; margin: 32px 0 10px; }
+h3 { font-size: 15px; margin: 0 0 6px; }
+p { color: #63716d; margin: 6px 0 12px; }
+.lead { max-width: 780px; font-size: 16px; }
+.notice { background: #d6e4dd; border: 1px solid #c7e4e4; border-radius: 9px; padding: 14px 16px; margin: 22px 0; }
+.notice p { margin: 0; color: #31564a; }
+.layout { min-width:0; display:grid; grid-template-columns:minmax(0,1fr) 230px; gap:26px; align-items:start; } .layout > * { min-width:0; max-width:100%; }
+.toc, .section { background: #fff; border: 1px solid #d8ded8; border-radius: 9px; box-shadow: 0 5px 16px rgba(26,61,70,.045); }
+.toc { padding: 18px; position: sticky; top: 18px; }
+.toc strong { display: block; margin-bottom: 7px; }
+.toc a { display: block; padding: 5px 0; color: #b9402b; font-size: 13px; text-decoration: none; }
+.section { min-width:0; padding: 22px; margin-bottom: 18px; }
+ol.steps { margin: 10px 0 0; padding-left: 22px; }
+ol.steps li { margin: 8px 0; padding-left: 3px; }
+.grid-two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.tip { background: #edf3ef; border-left: 3px solid #b9402b; padding: 10px 12px; margin: 12px 0; }
+.tip p { margin: 0; font-size: 13px; }
+table { width: 100%; max-width:100%; overflow-wrap:anywhere; border-collapse: collapse; font-size: 13px; }
+th, td { border-bottom: 1px solid #d8ded8; padding: 10px 8px; text-align: left; vertical-align: top; }
+th { color: #202b2b; background: #edf3ef; }
+code { background: #edf3ef; border-radius: 4px; padding: 2px 5px; overflow-wrap: anywhere; }
+pre { max-width:100%; overflow-x: auto; background: #203430; color: #f5f7fb; border-radius: 7px; padding: 12px 14px; font-size: 13px; }
+.footer { color: #63716d; font-size: 12px; margin-top: 24px; }
+.guide-header .header-links a{color:#dce9eb}
+button:focus-visible, a:focus-visible { outline: 3px solid rgba(8,127,140,.35); outline-offset: 2px; }
+@media (max-width: 820px) { .layout { grid-template-columns: 1fr; } .toc { position: static; order: -1; } }
+@media (max-width: 560px) { .guide-header { padding: 16px 18px; align-items: flex-start; } main { padding: 22px 18px; } .grid-two { grid-template-columns: 1fr; } table { display: block; overflow-x: auto; } h1 { font-size: 25px; } }
+</style>
+</head>
+<body>
+<header class="guide-header">
+  <div class="brand"><span class="logo">R</span>RunTheRepo</div>
+  <nav class="header-links" aria-label="{{ "Guide links" if is_en else "文档链接" }}">
+    <a href="/">{{ "Back to console" if is_en else "返回控制台" }}</a>
+    <a href="/?view=guide&lang={{ "zh" if is_en else "en" }}">{{ "中文" if is_en else "English" }}</a>
+  </nav>
+</header>
+<main>
+{% if is_en %}
+  <div class="eyebrow">REPOSITORY TRIAL · FIRST RUN</div>
+  <h1>User guide</h1>
+  <p class="lead">You enter the public GitHub repository of the application you want to check. This is not the RunTheRepo repository. The current flow supports one public GitHub Docker Compose web project at a time: it tries the project in an isolated environment and gives you evidence to review.</p>
+  <div class="notice"><p><strong>Start with the repository URL.</strong> After you enter a valid GitHub URL, the console can look up the latest commit, Compose candidates, and container port. Review the detected values before starting. You can edit the SHA, Compose path, or port manually; when several ports or Compose files are found, choose one explicitly.</p></div>
+  <div class="layout">
+    <div>
+      <section class="section" id="quick-path"><h2>Five steps for a first check</h2><ol class="steps"><li><strong>Check the environment.</strong> Run Environment check. A pass only means this machine has the prerequisite conditions; it does not guarantee the target project will start successfully.</li><li><strong>Enter the repository URL.</strong> Wait for automatic detection, then review the commit link, Compose path, and port. Use the manual fields when detection cannot decide.</li><li><strong>Choose any required candidates.</strong> Several ports or Compose files require an explicit choice. Do not choose a database port for the Web application.</li><li><strong>Start the check.</strong> Run one check at a time and wait for the server state to change.</li><li><strong>Read the evidence.</strong> Review the failure stage, reason, next step, run ID, and HTML report. JSON is the machine-readable version.</li></ol></section>
+      <section class="section" id="fields"><h2>Field quick reference</h2><table><thead><tr><th>Field</th><th>What it is / where to find it</th><th>How to fill / common mistake</th></tr></thead><tbody>
+<tr><td><strong>GitHub repository</strong><br>Required</td><td>The HTTPS address of the target public repository.</td><td>Example format: <code>https://github.com/owner/repository</code>. This is only a format example; it does not start anything. Do not enter the RunTheRepo repository.</td></tr>
+<tr><td><strong>Commit SHA</strong><br>Required</td><td>Automatic detection fills the latest full SHA and shows a link to that commit. You can replace it with a full 40-character lowercase SHA from the repository's <strong>Commits</strong> page. See the <a href="https://docs.github.com/en/pull-requests/reference/commits" target="_blank" rel="noopener">GitHub commit reference</a>.</td><td>Do not use <code>main</code>, a tag, an uppercase SHA, or a 7-character short hash. A manually entered SHA is used to pin Compose and port discovery to that version.</td></tr>
+<tr><td><strong>Application container port</strong><br>Required</td><td>The port the target web service listens on inside its container. Find it in the Compose service for the web app or the project documentation.</td><td>For <code>8080:3000</code>, enter <code>3000</code>, not the host port 8080. Do not use a database port such as 5432 or 3306.</td></tr>
+<tr><td><strong>Compose relative path</strong><br>Optional</td><td>The console lists Compose files found at the selected commit and fills an unambiguous result. You can also type a path from the repository root, for example <code>deploy/compose.yml</code>.</td><td>Choose explicitly when several files are listed. Use forward slashes; absolute paths and <code>..</code> are rejected.</td></tr>
+<tr><td><strong>Model endpoint + model name</strong><br>Optional pair</td><td>An OpenAI-compatible HTTP(S) base URL and model ID saved in this local console. For example, DeepSeek uses <code>https://api.deepseek.com</code>.</td><td>Enter the endpoint and API key, click Get models, then choose a returned model or enter one manually and save. A failed list query can still be bypassed with manual entry; a successful list query does not test inference.</td></tr>
+</tbody></table></section>
+      <section class="section" id="port"><h2>Which path should you use for the port?</h2><p>Choose the situation that matches you. The goal is always the port inside the Web container.</p><h3>A. You found a new project on GitHub</h3><p>This is the usual RunTheRepo case. You do not need to install or start the target first. In the selected commit, find the Web service in its Compose file:</p><pre>ports:
+  - "8080:3000"</pre><p>The left number is the host port and the right number is inside the container. <strong>Last value to enter: 3000</strong>.</p><h3>B. You already have the container running</h3><p>You can use these read-only commands to inspect an existing container. They are examples only; do not start an unfamiliar project just to find a port.</p><pre>docker ps</pre><p>This lists running containers. If you want only the two useful columns, use:</p><pre>{% raw %}docker ps --format "table {{.Names}}\t{{.Ports}}"{% endraw %}</pre><pre>NAMES   PORTS
+my-web  127.0.0.1:8080-&gt;3000/tcp</pre><p><strong>NAMES</strong> is the container name. In <strong>PORTS</strong>, the arrow is host <code>8080</code> to container <code>3000</code>, so enter <strong>3000</strong> for the Web port.</p><p>For the same container, you can run:</p><pre>docker port my-web</pre><pre>3000/tcp -&gt; 127.0.0.1:8080</pre><p>This output is written in the opposite direction: the container port is on the left, so enter <strong>3000</strong>. Use the real name from the <code>NAMES</code> column, not the GitHub repository name. A project may choose a name such as <code>changedetection</code>; the name <code>changedetection.io</code> is not guaranteed to exist.</p><table><thead><tr><th>Where you see it</th><th>Example</th><th>Use for Web input</th></tr></thead><tbody><tr><td>Compose</td><td><code>8080:3000</code></td><td>right side: <strong>3000</strong></td></tr><tr><td><code>docker ps</code></td><td><code>8080-&gt;3000/tcp</code></td><td>container side: <strong>3000</strong></td></tr><tr><td><code>docker port</code></td><td><code>3000/tcp -&gt; 8080</code></td><td>left side: <strong>3000</strong></td></tr></tbody></table><p>Official references: <a href="https://docs.docker.com/reference/cli/docker/container/ls/" target="_blank" rel="noopener">docker ps</a> and <a href="https://docs.docker.com/reference/cli/docker/container/port/" target="_blank" rel="noopener">docker port</a>.</p><p>If there is no <code>PORTS</code> value, the container is not running, or there is no published mapping, that does not prove the app has no listener. Return to the Compose file or the application's documentation. Do not guess a port, and do not use <code>docker run</code> or <code>docker compose up</code> just to discover one.</p></section>
+      <section class="section" id="advanced"><h2>Advanced settings</h2><div class="grid-two"><div><h3>Model settings</h3><p>Model settings are under Advanced options. Enter an OpenAI-compatible Base URL such as <code>https://api.deepseek.com</code> and an API key, then click Get models. Choose a returned model or enter one manually and save. If both endpoint and model name are empty, model assistance is disabled. Getting a list only confirms discovery, not inference.</p></div></div><div class="tip"><p>A failed list request can still use manual model entry. API keys stay in local owner-only settings, are never echoed, and are not sent as browser job data.</p></div></section>
+      <section class="section" id="example"><h2>Filling example</h2><p>For orientation only, you might see an example relationship like this:</p><div class="grid-two"><div><h3>Repository</h3><p><code>https://github.com/example/sample-web</code></p><p>Format placeholder only; it is not a recommended runnable target.</p></div><div><h3>Version and port</h3><p><code>0123456789abcdef0123456789abcdef01234567</code><br>container port <code>3000</code><br>Compose path <code>deploy/compose.yml</code></p><p>The SHA and repository are fake examples. The console does not auto-fill or start this example.</p></div></div></section>
+      <section class="section" id="results"><h2>How to read the result</h2><ul><li><strong>PASS</strong> means that environment check passed. <strong>FAIL</strong> shows a reason and suggested action; fix that condition and check again. <strong>UNSUPPORTED</strong> means the capability could not be verified, not that there is no risk.</li><li>While running, the elapsed clock updates locally between server status checks and reconciles with the server. Completed means terminal process evidence was confirmed, not that the application is globally safe.</li><li>For failed jobs, read the failure stage, reason, next step, error code, and run ID. A failed job can still have an evidence report. HTML is for reading; JSON is machine data. Reports appear only when the backend makes them available.</li><li>A temporary network error triggers another status query and does not stop the task. An explicit unknown state means the status is unavailable; you can operate again. If submission loses its response before a job ID is returned, do not submit again immediately: that submission cannot be recovered by this page.</li><li><strong>Network timeout:</strong> DNS, transport, Git download/fetch, or pinned-version preparation may time out. This is not necessarily a form error and does not require TUN.</li><li>Eligible network cases allow at most two attempts within a shared 300-second budget. This does not mean every failure was retried. A successful download for the same URL and full SHA can be reused from cache while a clean workspace is rebuilt.</li><li>Browser access to GitHub does not prove the WSL backend can reach it. If deployment needs a proxy, configure HTTP(S)_PROXY outside the project; never put proxy credentials in the repository.</li><li>There is no persistent history in this console. Download or save the HTML or JSON report you need; a report link may not remain available after the service restarts.</li></ul></section>
+      <section class="section" id="faq"><h2>Common mistakes</h2><ul><li>Short or uppercase SHA: copy the full lowercase 40-character value.</li><li>Host port or database port: enter the container-side web port.</li><li>Only one model field: fill endpoint and model together, or leave both empty.</li><li>Environment failure: follow its suggested action before retrying.</li><li>No report yet: the job may still be running or evidence may not be available.</li><li>Unknown port: read the target project's documentation or Compose configuration; do not guess.</li></ul></section>
+    </div>
+    <nav class="toc"><strong>On this page</strong><a href="#quick-path">Five steps</a><a href="#fields">Field reference</a><a href="#port">Container port</a><a href="#advanced">Advanced settings</a><a href="#example">Filling example</a><a href="#results">Read results</a><a href="#faq">FAQ</a></nav>
+  </div>
+  <p class="footer">Results apply to the tested workload and journey. They are evidence for this run, not a global safety guarantee.</p>
+{% else %}
+  <div class="eyebrow">REPOSITORY TRIAL · 第一次使用</div>
+  <h1>使用文档</h1>
+  <p class="lead">这里要填的是你想检查的目标应用仓库，不是 RunTheRepo 本身。当前流程支持公开 GitHub 上、使用 Docker Compose 的 Web 项目，一次检查一个项目：系统会在隔离环境中试跑，并给你可以查看的证据。</p>
+  <div class="notice"><p><strong>先输入仓库地址。</strong>输入有效 GitHub 地址后，控制台会自动查询最新提交、Compose 候选和容器端口。开始检查前请确认识别结果。SHA、Compose 路径和端口都可以手动修改；发现多个端口或 Compose 文件时，需要明确选择一个。</p></div>
+  <div class="layout">
+    <div>
+      <section class="section" id="quick-path"><h2>第一次检查的 5 步</h2><ol class="steps"><li><strong>检查环境。</strong>点击“检查环境”。通过只说明本机前置条件满足，不保证目标项目一定能成功启动。</li><li><strong>输入仓库地址。</strong>等待自动识别，然后确认提交链接、Compose 路径和端口。识别不出来时再手动填写。</li><li><strong>选择候选项。</strong>多个端口或 Compose 文件需要明确选择。不要把数据库端口当成 Web 应用端口。</li><li><strong>开始检查。</strong>一次只运行一个检查，等待服务端状态变化。</li><li><strong>查看证据。</strong>阅读失败阶段、具体原因、下一步、运行标识和 HTML 报告。JSON 是机器读取版本。</li></ol></section>
+      <section class="section" id="fields"><h2>字段速查</h2><table><thead><tr><th>字段</th><th>是什么 / 去哪里找</th><th>怎么填 / 常见错误</th></tr></thead><tbody>
+<tr><td><strong>GitHub 仓库</strong><br>必填</td><td>目标公开仓库的 HTTPS 地址。</td><td>格式示例：<code>https://github.com/owner/repository</code>。这只是格式示例，不会启动任何任务。不要填 RunTheRepo 仓库。</td></tr>
+<tr><td><strong>Commit SHA</strong><br>必填</td><td>自动识别会填入最新完整 SHA，并在输入框下显示提交链接。也可以从目标仓库的 <strong>Commits</strong> 页面复制完整 40 位小写 SHA 手动替换。也可参考 <a href="https://docs.github.com/en/pull-requests/reference/commits" target="_blank" rel="noopener">GitHub 提交说明</a>。</td><td>不能填 <code>main</code>、tag、大写 SHA 或 7 位短 hash。手动 SHA 会让 Compose 和端口识别固定在这个版本。</td></tr>
+<tr><td><strong>应用容器端口</strong><br>必填</td><td>目标 Web 服务在容器内部监听的端口。在本次提交的 Compose Web 服务配置或项目文档中查找。</td><td><code>8080:3000</code> 要填 <code>3000</code>，不是宿主端口 8080。不要填数据库端口 5432 或 3306。</td></tr>
+<tr><td><strong>Compose 相对路径</strong><br>选填</td><td>控制台会列出选定提交发现的 Compose 文件；只有一个时会自动填入。也可以手动填写仓库根目录下的路径，例如 <code>deploy/compose.yml</code>。</td><td>多个文件时需要明确选择。使用正斜杠，不能填绝对路径或含 <code>..</code> 的路径。</td></tr>
+<tr><td><strong>模型 Endpoint + 模型名称</strong><br>选填一对</td><td>本地控制台保存的兼容 OpenAI 的 HTTP(S) Base URL 和模型 ID。例如 DeepSeek 可填写 <code>https://api.deepseek.com</code>。</td><td>填写地址和 API Key，点击“获取模型”，然后选择列表中的模型或手动填写并保存。列表查询失败仍可手填；查询成功也不等于推理测试成功。</td></tr>
+</tbody></table></section>
+      <section class="section" id="port"><h2>你应该走哪条路来找端口？</h2><p>按你的情况选择。最终要填的始终是 Web 容器内部的端口。</p><h3>A. 你在 GitHub 找到一个还没运行的陌生项目</h3><p>这是 RunTheRepo 的主要场景。不需要先安装或启动目标项目。在选定提交的 Compose 文件里找到 Web 服务：</p><pre>ports:
+  - "8080:3000"</pre><p>左边是宿主机端口，右边是容器内部端口。<strong>最后填：3000</strong>。</p><h3>B. 你自己已有正在运行的容器</h3><p>可以用下面的只读命令查看已有容器。这里只是查看示例；不要为了查端口启动陌生项目。</p><pre>docker ps</pre><p>它会列出正在运行的容器。只想看两个有用的列时，再使用：</p><pre>{% raw %}docker ps --format "table {{.Names}}\t{{.Ports}}"{% endraw %}</pre><pre>NAMES   PORTS
+my-web  127.0.0.1:8080-&gt;3000/tcp</pre><p><strong>NAMES</strong> 是容器名。<strong>PORTS</strong> 中箭头表示宿主机 <code>8080</code> 指向容器 <code>3000</code>，所以 Web 端口填 <strong>3000</strong>。</p><p>同一个容器还可以运行：</p><pre>docker port my-web</pre><pre>3000/tcp -&gt; 127.0.0.1:8080</pre><p>这个输出方向相反：容器端口在左边，所以填 <strong>3000</strong>。参数要用 <code>NAMES</code> 列里的真实容器名，不是 GitHub 仓库名。项目可能把容器命名为 <code>changedetection</code>；不能保证一定存在 <code>changedetection.io</code> 这个名字。</p><table><thead><tr><th>你看到的位置</th><th>示例</th><th>Web 输入填什么</th></tr></thead><tbody><tr><td>Compose</td><td><code>8080:3000</code></td><td>右侧：<strong>3000</strong></td></tr><tr><td><code>docker ps</code></td><td><code>8080-&gt;3000/tcp</code></td><td>容器侧：<strong>3000</strong></td></tr><tr><td><code>docker port</code></td><td><code>3000/tcp -&gt; 8080</code></td><td>左侧：<strong>3000</strong></td></tr></tbody></table><p>官方参考：<a href="https://docs.docker.com/reference/cli/docker/container/ls/" target="_blank" rel="noopener">docker ps</a> 和 <a href="https://docs.docker.com/reference/cli/docker/container/port/" target="_blank" rel="noopener">docker port</a>。</p><p>没有 <code>PORTS</code>、容器没启动或没有发布映射，都不能证明应用没有监听端口。回到 Compose 文件或应用文档查看。不要猜端口，也不要为了查端口运行 <code>docker run</code> 或 <code>docker compose up</code>。</p></section>
+      <section class="section" id="advanced"><h2>高级设置</h2><div class="grid-two"><div><h3>模型设置</h3><p>模型设置在“高级选项”中。填写兼容 OpenAI 的 Base URL，例如 <code>https://api.deepseek.com</code>，再填写 API Key 并点击“获取模型”。选择返回的模型或手动填写后保存。Endpoint 和模型名称都留空并保存，即可停用模型辅助。获取列表只代表查询成功，不代表推理测试成功。</p></div></div><div class="tip"><p>查询失败时仍可手动填写模型。API Key 只保存在本机用户权限设置，不会回显，也不会进入任务请求、报告、日志、URL 或截图。</p></div></section>
+      <section class="section" id="example"><h2>填写演示</h2><p>下面只用于理解字段对应关系：</p><div class="grid-two"><div><h3>仓库</h3><p><code>https://github.com/example/sample-web</code></p><p>只是格式占位，不是推荐的可运行目标。</p></div><div><h3>版本与端口</h3><p><code>0123456789abcdef0123456789abcdef01234567</code><br>容器端口 <code>3000</code><br>Compose 路径 <code>deploy/compose.yml</code></p><p>仓库和 SHA 都是假的示例。控制台不会自动填入或启动这个示例。</p></div></div></section>
+      <section class="section" id="results"><h2>如何看结果</h2><ul><li><strong>PASS</strong> 表示环境检查通过。<strong>FAIL</strong> 会给出原因和建议，处理后再检查。<strong>UNSUPPORTED</strong> 表示能力无法验证，不等于没有风险。</li><li>运行中已用时间会在服务端查询之间连续更新，并在收到新状态时校准。Completed 只表示流程终态证据已确认，不等于应用全局安全。</li><li>失败任务查看失败阶段、具体原因、下一步、错误代码和运行标识。失败也可能有证据报告。HTML 用来阅读，JSON 用来机器处理；只有后端提供时才显示报告。</li><li>临时网络错误会重新查询状态，不代表任务停止。明确的 unknown 表示状态不可用，可以重新操作。提交响应丢失且没有返回 job ID 时，不要立即重复提交：本页面无法恢复这次提交的标识。</li><li><strong>网络超时：</strong>DNS、传输、Git 下载/拉取或固定版本准备都可能超时。这不一定是表单填写错误，也不要求用户必须打开 TUN。</li><li>符合条件的网络情况最多在共享 300 秒上限内尝试两次。某次失败不代表本次一定已重试；相同 URL 和完整 SHA 成功下载后可以复用缓存，同时重建干净工作区。</li><li>浏览器能访问 GitHub，不等于 WSL 后端能访问；如果部署环境需要代理，由部署者配置 HTTP(S)_PROXY，代理凭据不要放进项目。</li><li>当前控制台没有持久历史。需要的证据请下载或保存 HTML 或 JSON 文件；服务重启后报告链接不一定仍可用。</li></ul></section>
+      <section class="section" id="faq"><h2>常见错误</h2><ul><li>SHA 太短或有大写：复制完整 40 位小写值。</li><li>填了宿主端口或数据库端口：应填 Web 服务容器内部端口。</li><li>只填了一个模型字段：Endpoint 和模型名称必须一起填；两项都留空表示不启用模型辅助，使用规则路径。</li><li>环境失败：先按原因和建议处理，再重试。</li><li>没有报告：任务可能还没结束，或证据暂不可用。</li><li>不知道端口：先看目标项目文档或 Compose 配置，不要乱填。</li></ul></section>
+    </div>
+    <nav class="toc"><strong>本页目录</strong><a href="#quick-path">5 步路径</a><a href="#fields">字段速查</a><a href="#port">容器端口</a><a href="#advanced">高级设置</a><a href="#example">填写演示</a><a href="#results">看懂结果</a><a href="#faq">常见错误</a></nav>
+  </div>
+  <p class="footer">结果只适用于本次已测试的工作负载与旅程，是本次运行的证据，不代表全局安全保证。</p>
+{% endif %}
+</main>
+</body></html>

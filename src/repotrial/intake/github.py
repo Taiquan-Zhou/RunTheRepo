@@ -15,6 +15,9 @@ from repotrial.domain.models import PinnedRepo, RepoRef
 
 COMMAND_TIMEOUT_SECONDS = 120
 REAP_TIMEOUT_SECONDS = 5
+NETWORK_PREPARATION_TIMEOUT_SECONDS = 300
+NETWORK_MAX_ATTEMPTS = 2
+NETWORK_RETRY_DELAY_SECONDS = 1
 _MAX_GIT_OUTPUT_BYTES = 65_536
 _GIT_READ_CHUNK_BYTES = 8_192
 _FULL_COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
@@ -42,10 +45,12 @@ class RepoIntakeError(RuntimeError):
         returncode: int | None = None,
         *,
         failure_class: GitFailureClass | None = None,
+        process_cleanup_succeeded: bool | None = None,
     ) -> None:
         self.operation = operation
         self.returncode = returncode
         self.failure_class = failure_class
+        self.process_cleanup_succeeded = process_cleanup_succeeded
         message = f"repository intake failed: {operation}"
         if returncode is not None:
             message = f"{message} (returncode={returncode})"
@@ -115,16 +120,23 @@ async def clone_and_resolve(
     _validate_requested_ref(requested_ref)
     clone_source = _normalize_clone_source(source)
     destination = _normalize_destination(dest)
-    claim = _claim_destination(destination)
 
-    try:
+    parsed_source = _parse_credential_free_https_url(clone_source)
+    is_remote = parsed_source is not None
+    is_github_remote = bool(
+        is_remote
+        and parsed_source is not None
+        and parsed_source.hostname is not None
+        and parsed_source.hostname.casefold() == "github.com"
+    )
+
+    async def run_attempt() -> tuple[str, Path]:
         git_arguments = [
             "-c",
             "credential.helper=",
             "-c",
             "core.askPass=",
         ]
-        is_remote = _parse_credential_free_https_url(clone_source) is not None
         if is_remote:
             git_arguments.extend(("-c", "http.version=HTTP/1.1"))
         is_exact_remote_commit = bool(
@@ -194,14 +206,53 @@ async def clone_and_resolve(
         ):
             raise RepoIntakeError("commit_sha_mismatch")
         return commit_sha, destination
-    except asyncio.CancelledError:
-        _remove_owned_destination(claim)
-        raise
-    except RepoIntakeError:
-        _remove_owned_destination(claim)
-        raise
-    finally:
-        _close_directory_fd(claim.directory_fd)
+
+    async def run_preparation() -> tuple[str, Path]:
+        attempt = 0
+        while True:
+            attempt += 1
+            claim = _claim_destination(destination)
+            try:
+                return await run_attempt()
+            except asyncio.CancelledError:
+                _remove_owned_destination(claim)
+                raise
+            except RepoIntakeError as error:
+                owner_cleanup_succeeded = _remove_owned_destination(claim)
+                can_retry = (
+                    is_github_remote
+                    and attempt < NETWORK_MAX_ATTEMPTS
+                    and _is_retryable_network_error(error)
+                    and owner_cleanup_succeeded
+                    and _destination_is_absent(destination)
+                )
+                if not can_retry:
+                    raise
+                await asyncio.sleep(NETWORK_RETRY_DELAY_SECONDS)
+            finally:
+                _close_directory_fd(claim.directory_fd)
+
+    if not is_github_remote:
+        return await run_preparation()
+    try:
+        async with asyncio.timeout(NETWORK_PREPARATION_TIMEOUT_SECONDS):
+            return await run_preparation()
+    except TimeoutError:
+        raise RepoIntakeError("preparation_timeout") from None
+
+
+def _is_retryable_network_error(error: RepoIntakeError) -> bool:
+    if error.operation in {"clone_timeout", "fetch_timeout", "checkout_timeout"}:
+        return error.process_cleanup_succeeded is True
+    if error.operation in {"clone", "fetch", "checkout"}:
+        if error.process_cleanup_succeeded is False:
+            return False
+        return error.failure_class in {"dns", "transport"}
+    return False
+
+
+def _destination_is_absent(destination: Path) -> bool:
+    return not destination.exists() and not destination.is_symlink()
 
 
 def _validate_requested_ref(requested_ref: str | None) -> None:
@@ -370,7 +421,10 @@ def _git_environment() -> dict[str, str]:
 
 def _classify_git_failure(stderr: bytes) -> GitFailureClass:
     normalized = stderr.decode("utf-8", "ignore").casefold()
-    if "could not resolve host" in normalized:
+    if (
+        "could not resolve host" in normalized
+        or "could not resolve proxy" in normalized
+    ):
         return "dns"
     if "authentication failed" in normalized or "permission denied" in normalized:
         return "authentication"
@@ -378,7 +432,29 @@ def _classify_git_failure(stderr: bytes) -> GitFailureClass:
         return "http"
     if "couldn't find remote ref" in normalized or "not our ref" in normalized:
         return "missing_ref"
+    if any(
+        marker in normalized
+        for marker in (
+            "certificate verify failed",
+            "ssl certificate problem",
+            "unable to get local issuer certificate",
+            "self signed certificate",
+        )
+    ):
+        return "unknown"
     if "failed to connect" in normalized or "tls" in normalized:
+        return "transport"
+    if any(
+        marker in normalized
+        for marker in (
+            "connection reset by peer",
+            "recv failure",
+            "curl 56",
+            "curl 28",
+            "operation timed out",
+            "remote peer closed",
+        )
+    ):
         return "transport"
     return "unknown"
 
@@ -422,6 +498,7 @@ async def _run_git(operation: str, *arguments: str) -> bytes:
     returncode: int | None = None
     failure_operation: str | None = None
     failure_class: GitFailureClass | None = None
+    process_cleanup_succeeded: bool | None = None
     try:
         async with asyncio.timeout(COMMAND_TIMEOUT_SECONDS):
             try:
@@ -448,8 +525,11 @@ async def _run_git(operation: str, *arguments: str) -> bytes:
                     failure_class = "local_io"
     except TimeoutError:
         if process is not None:
-            await _kill_and_reap(process)
-        raise RepoIntakeError(f"{operation}_timeout") from None
+            process_cleanup_succeeded = await _kill_and_reap(process)
+        raise RepoIntakeError(
+            f"{operation}_timeout",
+            process_cleanup_succeeded=process_cleanup_succeeded,
+        ) from None
     except asyncio.CancelledError:
         if process is not None:
             await _kill_and_reap(process)
@@ -457,8 +537,12 @@ async def _run_git(operation: str, *arguments: str) -> bytes:
 
     if failure_operation is not None:
         if process is not None:
-            await _kill_and_reap(process)
-        raise RepoIntakeError(failure_operation, failure_class=failure_class) from None
+            process_cleanup_succeeded = await _kill_and_reap(process)
+        raise RepoIntakeError(
+            failure_operation,
+            failure_class=failure_class,
+            process_cleanup_succeeded=process_cleanup_succeeded,
+        ) from None
     assert process is not None
     assert returncode is not None
     if returncode != 0:
@@ -470,53 +554,61 @@ async def _run_git(operation: str, *arguments: str) -> bytes:
     return stdout
 
 
-async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
-    if os.name == "posix" or process.returncode is None:
-        _kill_process_group(process)
+async def _kill_and_reap(process: asyncio.subprocess.Process) -> bool:
+    group_cleanup_succeeded = _kill_process_group(process)
     try:
-        await asyncio.wait_for(process.wait(), timeout=REAP_TIMEOUT_SECONDS)
+        returncode = await asyncio.wait_for(
+            process.wait(), timeout=REAP_TIMEOUT_SECONDS
+        )
     except (OSError, ProcessLookupError, TimeoutError):
-        pass
+        return False
+    return group_cleanup_succeeded and (
+        returncode is not None or process.returncode is not None
+    )
 
 
-def _kill_process_group(process: asyncio.subprocess.Process) -> None:
+def _kill_process_group(process: asyncio.subprocess.Process) -> bool:
     if os.name == "posix":
         try:
             os.killpg(process.pid, signal.SIGKILL)
-            return
-        except (AttributeError, OSError, ProcessLookupError):
+            return True
+        except ProcessLookupError:
+            return True
+        except (AttributeError, OSError):
             pass
     if process.returncode is None:
         try:
             process.kill()
         except (OSError, ProcessLookupError):
             pass
+    return os.name != "posix" and process.returncode is not None
 
 
 def _remove_owned_destination(
     claim: _DestinationClaim,
     *,
     allow_unanchored_empty_root_removal: bool = False,
-) -> None:
+) -> bool:
     supports_fd_anchored_cleanup = _supports_fd_anchored_cleanup()
     if not supports_fd_anchored_cleanup and not allow_unanchored_empty_root_removal:
-        return
+        return False
     if claim.directory_fd is not None:
         if not _directory_fd_matches_claim(claim):
-            return
+            return False
         if supports_fd_anchored_cleanup:
             try:
                 entries_removed = _remove_directory_entries(claim.directory_fd)
             except RecursionError:
-                return
+                return False
             if not entries_removed or not _directory_fd_matches_claim(claim):
-                return
+                return False
     if not _path_matches_claim(claim):
-        return
+        return False
     try:
         claim.path.rmdir()
     except OSError:
-        pass
+        return False
+    return True
 
 
 def _supports_fd_anchored_cleanup() -> bool:

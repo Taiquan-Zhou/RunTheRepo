@@ -1,6 +1,4 @@
-# RunTheRepo
-
-**Run a repo. Verify what works. Test what can be hardened.**
+![RunTheRepo — from pinned source to auditable result](docs/assets/readme-hero.svg)
 
 Run GitHub Docker Compose apps in disposable sandboxes. Verify workflows,
 test hardening, and get evidence-backed reports.
@@ -9,15 +7,19 @@ test hardening, and get evidence-backed reports.
 
 [中文 README](README.zh-CN.md) · English
 
-> **0.1 Preview** — for pre-configured WSL2 + Docker Sandboxes environments.
-> The CLI and Python package are named `repotrial`.
-
 ## How it works
 
 ![Animated RunTheRepo workflow: pin, run, verify, harden, report, and clean up](docs/assets/workflow.gif)
 
-Changes are kept only when the recorded baseline workflows pass again.
-A cleanup failure remains a failed run—even if the sandbox inventory is empty.
+## Feature Demo
+
+### 1. Automatic Project Detection and Environment Check
+
+https://github.com/user-attachments/assets/90804069-60ac-4cc4-b164-53350d152066
+
+### 2. Trial Run and Results
+
+https://github.com/user-attachments/assets/86a19206-d66b-4400-9620-831186d2e9df
 
 ## What you get
 
@@ -29,10 +31,7 @@ A cleanup failure remains a failed run—even if the sandbox inventory is empty.
 | Usable outputs | JSON/HTML reports, evidence references and a cumulative hardened overlay when provenance is valid |
 | Local console | Submit one trial, follow its status and open its report |
 
-Hardening results apply **only to the tested workflows**, not to every feature
-of an application. This is not a security certification.
-
-## Real runs, not mockups
+## Real-world examples
 
 | Application | Verified workflow | Outcome |
 | --- | --- | --- |
@@ -76,11 +75,18 @@ dependencies and proxy configuration.
 
 ### Local Web console
 
-For model-assisted runs, first set the key in the same WSL Bash session:
+For model-assisted runs, open **Advanced options** in the Web console. Enter an
+OpenAI-compatible Base URL and API key, click **Get models**, then choose a
+returned model or enter one manually and save. The key is persisted only in an
+owner-only settings file within the XDG configuration directory. By default,
+this file is `~/.config/repotrial/model-settings.json`; set `XDG_CONFIG_HOME` to
+use another XDG configuration directory. The settings API does not echo the key,
+it is excluded from public job payloads, and a run passes it only to the
+trusted CLI subprocess. Clear model settings to remove it.
+
+Start the console in the same WSL Bash session:
 
 ```bash
-read -rsp 'Model API key: ' REPOTRIAL_MODEL_API_KEY && echo
-export REPOTRIAL_MODEL_API_KEY
 uv run repotrial serve --port 8765
 ```
 
@@ -92,6 +98,9 @@ The console is loopback-only and runs one trial at a time.
 
 Example target: Umami. Replace the model endpoint and name with your provider's
 values; this command does not supply the authenticated workflow shown above.
+Authentication provider keys are supplied through `REPOTRIAL_MODEL_API_KEY`;
+see the [usage guide](docs/dev/usage.md#fastest-supported-setup) for the
+complete CLI-only instructions.
 
 ```bash
 uv run repotrial inspect https://github.com/umami-software/umami \
@@ -117,8 +126,10 @@ For your own HTTP checks, use [`--journeys-file`](docs/dev/usage.md#operator-aut
 - **Installation:** tested on the supported existing WSL/SBX host, not a fresh OS.
 - **Product scope:** no public resume or durable Web history; the default API
   container is not a ready-to-run sandbox service.
-- **Credentials:** use disposable target test accounts only. Model keys stay
-  in the process environment, never in a Journey file or the Web form.
+- **Credentials:** use disposable target test accounts only. Web model keys are
+  persisted in the owner-only settings file within the XDG configuration
+  directory described above; CLI model runs use the process environment.
+  Neither path puts keys in a Journey file.
 
 ## Documentation
 

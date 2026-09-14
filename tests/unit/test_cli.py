@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Self
 
@@ -137,6 +138,28 @@ def test_dry_run_inspect_creates_the_required_run_layout(tmp_path: Path) -> None
         "report",
     }
     assert all(path.is_dir() for path in run_directories)
+
+
+def test_cli_consumes_model_key_before_inspection_continues(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("REPOTRIAL_MODEL_API_KEY", "secret-value")
+
+    result = CliRunner().invoke(
+        make_app(tmp_path / "artifacts"),
+        [
+            "inspect",
+            "--dry-run",
+            "https://github.com/a/b",
+            "--model-endpoint",
+            "https://model.example/v1",
+            "--model-name",
+            "model-x",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "REPOTRIAL_MODEL_API_KEY" not in os.environ
 
 
 def test_dry_run_accepts_case_insensitive_github_hostname_and_git_suffix(
@@ -877,3 +900,34 @@ def test_shared_terminal_classifier_preserves_success_exit_semantics() -> None:
 
     assert result.outcome is TerminalOutcome.COMPLETED
     assert result.exit_code == 0
+
+
+def test_serve_bootstraps_proxy_before_starting_console(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uvicorn
+
+    seen: list[object] = []
+    monkeypatch.setattr(
+        cli, "bootstrap_wsl_proxy", lambda environment: seen.append(environment)
+    )
+    monkeypatch.setattr(
+        "repotrial.local_web.app.create_app",
+        lambda _workspace: "app",
+    )
+    started: dict[str, object] = {}
+    monkeypatch.setattr(
+        uvicorn,
+        "run",
+        lambda app, **kwargs: started.update(app=app, **kwargs),
+    )
+
+    serve = next(
+        command.callback
+        for command in cli.create_app().registered_commands
+        if command.callback is not None and command.callback.__name__ == "serve"
+    )
+    serve(8765)
+
+    assert seen == [os.environ]
+    assert started == {"app": "app", "host": "127.0.0.1", "port": 8765}

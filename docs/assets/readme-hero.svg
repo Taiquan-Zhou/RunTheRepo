@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="320" viewBox="0 0 1200 320" role="img" aria-labelledby="title desc">
+  <title id="title">RunTheRepo geometric brand banner</title>
+  <desc id="desc">A white and blue banner with a custom R checkmark symbol and a slanted pixel wordmark.</desc>
+
+  <!-- Centralized brand palette: edit these classes to recolor the banner. -->
+  <style>
+    .canvas { fill: #f8fbff; stroke: #d9e7f8; }
+    .mark-bg { fill: #e6f0ff; }
+    .ink { fill: #0b1f3a; }
+    .primary { fill: #2563eb; }
+    .secondary { fill: #60a5fa; }
+    .accent { fill: #06b6d4; }
+    .accent-stroke { stroke: #06b6d4; }
+    .tagline { fill: #315478; }
+  </style>
+
+  <defs>
+    <!-- Custom block glyphs: no external font dependency. -->
+    <symbol id="g-r" viewBox="0 0 54 70">
+      <path d="M0 0h42v10H10v20h31v10H10v30H0zm40 10h10v20H40zm-14 30h13l15 30H41z"/>
+    </symbol>
+    <symbol id="g-u" viewBox="0 0 50 70">
+      <path d="M0 0h10v58H0zm40 0h10v58H40zM10 60h30v10H10z"/>
+    </symbol>
+    <symbol id="g-n" viewBox="0 0 50 70">
+      <path d="M0 0h10v70H0zm40 0h10v70H40zM10 10h10v15H10zm10 15h10v15H20zm10 15h10v20H30z"/>
+    </symbol>
+    <symbol id="g-t" viewBox="0 0 50 70">
+      <path d="M0 0h50v10H0zm20 10h10v60H20z"/>
+    </symbol>
+    <symbol id="g-h" viewBox="0 0 50 70">
+      <path d="M0 0h10v70H0zm40 0h10v70H40zM10 30h30v10H10z"/>
+    </symbol>
+    <symbol id="g-e" viewBox="0 0 48 70">
+      <path d="M0 0h48v10H0zM0 30h39v10H0zM0 60h48v10H0zM0 10h10v50H0z"/>
+    </symbol>
+    <symbol id="g-p" viewBox="0 0 50 70">
+      <path d="M0 0h40v10H10v20h30v10H10v30H0zm40 10h10v20H40z"/>
+    </symbol>
+    <symbol id="g-o" viewBox="0 0 50 70">
+      <path d="M10 0h30v10H10zM10 60h30v10H10zM0 10h10v50H0zm40 0h10v50H40z"/>
+    </symbol>
+  </defs>
+
+  <rect class="canvas" x="1" y="1" width="1198" height="318" rx="28" stroke-width="2"/>
+
+  <!-- Standalone mark: repository R with a verification cut. -->
+  <g transform="translate(142 82)">
+    <rect class="mark-bg" width="116" height="116" rx="27"/>
+    <path class="primary" d="M25 22h45c20 0 31 10 31 28 0 14-7 23-21 27l24 29H74L55 80H49v26H25zm24 21v18h20c7 0 11-3 11-9s-4-9-11-9z"/>
+    <path class="accent-stroke" d="m76 84 9 9 18-23" fill="none" stroke-width="8" stroke-linecap="square" stroke-linejoin="miter"/>
+    <rect class="secondary" x="95" y="13" width="12" height="12"/>
+  </g>
+
+  <!-- Bespoke slanted pixel wordmark. -->
+  <g class="ink" transform="translate(307 92) skewX(-6)">
+    <use href="#g-r" width="54" height="70" x="0"/>
+    <use href="#g-u" width="50" height="70" x="66"/>
+    <use href="#g-n" width="50" height="70" x="128"/>
+
+    <use href="#g-t" width="50" height="70" x="222"/>
+    <use href="#g-h" width="50" height="70" x="284"/>
+    <use href="#g-e" width="48" height="70" x="346"/>
+
+    <use href="#g-r" width="54" height="70" x="438"/>
+    <use href="#g-e" width="48" height="70" x="504"/>
+    <use href="#g-p" width="50" height="70" x="564"/>
+    <use href="#g-o" width="50" height="70" x="626"/>
+
+    <!-- Two cyan evidence pixels make the wordmark identifiable at a glance. -->
+    <rect class="accent" x="385" y="60" width="9" height="10"/>
+    <rect class="secondary" x="543" y="60" width="9" height="10"/>
+  </g>
+
+  <g transform="translate(307 214)">
+    <rect class="primary" width="30" height="4" rx="2"/>
+    <rect class="accent" x="35" width="9" height="4" rx="2"/>
+    <text class="tagline" x="60" y="8" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="500" letter-spacing=".35">From pinned source to auditable result</text>
+  </g>
+</svg>

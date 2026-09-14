@@ -303,3 +303,97 @@ Use the existing exact repository URLs, frozen SHAs, model endpoint/name, inheri
 ```
 
 Update release-facing README/install/limitations/troubleshooting only from verified final behavior. Do not push, merge, or create a GitHub release without a new explicit Owner instruction.
+
+### Task 5: Stream a bounded image bundle into each isolated sandbox
+
+**Files:**
+- Modify: `src/repotrial/sandbox/base.py`
+- Modify: `src/repotrial/sandbox/docker_sbx.py`
+- Modify: `src/repotrial/trial/image_template.py`
+- Modify: `tests/unit/sandbox/test_docker_sbx_commands.py`
+- Modify: `tests/unit/trial/test_image_template.py`
+- Modify only when required for audit serialization: `tests/unit/agent/test_graph.py`
+
+**Interfaces:**
+- Consumes: Task 2 `ImageInventory`, Task 1 invocation-owned template state,
+  the existing sanitized direct-argv subprocess boundary, per-sandbox trial
+  deadline, and Task 3 guaranteed finalization.
+- Produces: `SandboxProvider.stage_runtime_image_bundle(sandbox_id: str,
+  image_references: tuple[str, ...], image_ids: tuple[str, ...]) -> None`, an
+  invocation-owned private bundle identity in runtime-template audit evidence,
+  automatic direct-stream import before a template-created sandbox is returned,
+  and combined template/bundle cleanup confirmation.
+
+- [ ] **Step 1: Write provider and preparation RED tests**
+
+Add strict behavior tests that fail against the current template-only code and
+name the concrete breaks they catch:
+
+- preparation passes sorted unique immutable IDs plus every validated
+  repository/tag reference needed by Compose, after inventory and before
+  workspace clear/template activation;
+- export uses direct argv `sbx exec <warmup> -- docker image save ...`, streams
+  stdout to one exclusive mode-0600 temporary file outside the repository, and
+  records a non-empty SHA-256/byte-size identity without buffering the archive;
+- archive bytes are rejected and the process reaped when the Docker allocation
+  byte bound is exceeded; malformed IDs/references, empty output, nonzero exit,
+  excessive stderr, timeout, I/O failure, and cancellation fail closed;
+- every template-created sandbox imports through stdin using exact argv `sbx
+  exec <sandbox> -- docker image load` before `create()` returns, within the
+  existing trial deadline; missing/replaced/changed/oversized bundles, write or
+  read failure, nonzero exit, timeout, and cancellation trigger normal sandbox
+  cleanup and never record a successful template use;
+- finalization attempts both exact-tag template removal and exact-file bundle
+  removal after success, primary failure, cancellation, or expired trial
+  deadline; it preserves dual failures and reports cleanup failure unless both
+  removals are confirmed;
+- `begin_invocation()` rejects any leftover or unconfirmed bundle state, and
+  unrelated files/templates are never deleted;
+- public runtime-template audit evidence contains only bundle SHA-256 and byte
+  size, never its path, bytes, environment, or credentials.
+
+Run the smallest named tests and retain their expected failing output before
+editing production code.
+
+- [ ] **Step 2: Implement minimal streaming export/import and ownership**
+
+Keep one provider-owned bundle per invocation. Derive its maximum bytes from the
+existing Docker disk allocation, create it exclusively in the host temporary
+directory with private permissions, and retain exact file identity. Stream
+export chunks directly into the file while hashing and counting; stream the
+same opened file directly into `docker image load` while hashing/counting again.
+Reject a changed identity before accepting import. The host must never invoke
+Docker on the bundle or deserialize it.
+
+Use validated, option-safe image references to preserve Compose-resolvable tags
+and validated full image IDs to preserve untagged images. No shell, pipeline,
+temporary guest archive, host Docker socket, network fallback, second pull, or
+second build is allowed. Insert import inside `DockerSbxProvider.create()` after
+successful sandbox creation/clone verification and before returning or recording
+template use. Keep the later full inventory comparison as the final authority.
+
+Finalization must attempt cleanup of both resources even when either cleanup
+fails and must retain enough exact state to retry safely when confirmation is
+missing. `removal_confirmed=true` means both owned resources are absent.
+
+- [ ] **Step 3: Run GREEN focused gates and commit**
+
+```bash
+.venv/bin/uv run pytest -q tests/unit/sandbox/test_docker_sbx_commands.py tests/unit/trial/test_image_template.py tests/unit/agent/test_graph.py -k 'runtime_template or image_template or image_bundle'
+.venv/bin/uv run pytest -q tests/unit/sandbox/test_docker_sbx_commands.py tests/unit/sandbox/test_lifecycle.py tests/unit/trial/test_image_template.py tests/unit/trial/test_boot.py tests/unit/agent/test_graph.py
+.venv/bin/uv run ruff check src/repotrial/sandbox src/repotrial/trial tests/unit/sandbox tests/unit/trial tests/unit/agent/test_graph.py
+.venv/bin/uv run ruff format --check src/repotrial/sandbox src/repotrial/trial tests/unit/sandbox tests/unit/trial tests/unit/agent/test_graph.py
+.venv/bin/uv run mypy src/repotrial
+git diff --check
+```
+
+Commit only the scoped implementation, regression tests, and this approved
+design/plan amendment using the configured Owner identity and no coauthor.
+
+- [ ] **Step 4: Independent review, then resume Task 4 serial verification**
+
+Obtain an independent Sol-high review of subprocess cleanup, deadline handling,
+bundle ownership/integrity, audit secrecy, no host execution, and sandbox
+isolation. Resolve only Critical/Important evidenced defects via a bounded
+RED→GREEN fix round. After approval, rerun the trusted fixture serially and then
+continue Task 4 from its canary step; do not run real sandboxes in parallel.

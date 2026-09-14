@@ -8,23 +8,49 @@ import ipaddress
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from inspect import isawaitable
 from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
-from repotrial.doctor import DoctorReport, render_json, run_doctor
+from repotrial.doctor import DoctorReport, run_doctor
 from repotrial.intake.github import RepoIntakeError, parse_github_url
+from repotrial.local_web.model_discovery import (
+    ModelDiscoveryError,
+    discover_models,
+    validate_api_key,
+)
+from repotrial.local_web.repository import (
+    GithubRepositoryDiscovery,
+    RepositoryInput,
+    RepositoryMetadata,
+)
 from repotrial.local_web.runner import (
     CliRequest,
     CliRunner,
+    JobNotActiveError,
+    JobNotFoundError,
     Report,
     ReportKind,
     RunnerBusyError,
+)
+from repotrial.local_web.services import (
+    RequiredServices,
+    render_verified_json,
+    verified_ready,
+    verified_report_dict,
+)
+from repotrial.local_web.settings import (
+    ModelSettingsStore,
+    ModelSettingsUpdate,
+    SettingsValidationError,
+    same_endpoint,
 )
 
 
@@ -37,12 +63,21 @@ class Runner(Protocol):
     async def status(self, job_id: str) -> dict[str, object]: ...
 
     async def report(self, job_id: str, kind: ReportKind) -> Report | None: ...
+    async def stop(self, job_id: str) -> dict[str, object]: ...
 
     async def shutdown(self) -> None: ...
 
 
 class Doctor(Protocol):
     def __call__(self) -> DoctorReport: ...
+
+
+class Services(Protocol):
+    def ensure_ready(self) -> DoctorReport: ...
+
+
+class RepositoryService(Protocol):
+    def discover(self, payload: RepositoryInput) -> RepositoryMetadata: ...
 
 
 class JobInput(BaseModel):
@@ -52,8 +87,6 @@ class JobInput(BaseModel):
     commit_sha: str = Field(min_length=40, max_length=40)
     container_port: int = Field(ge=1, le=65535)
     compose_path: str | None = Field(default=None, max_length=256)
-    model_endpoint: str | None = Field(default=None, max_length=2048)
-    model_name: str | None = Field(default=None, max_length=256)
 
     @field_validator("url")
     @classmethod
@@ -89,21 +122,21 @@ class JobInput(BaseModel):
             raise ValueError("compose_path must be a safe relative path")
         return value
 
-    @model_validator(mode="after")
-    def paired_model_settings(self) -> JobInput:
-        if (self.model_endpoint is None) != (self.model_name is None):
-            raise ValueError("model_endpoint and model_name must be supplied together")
-        if self.model_endpoint is not None:
-            parsed = urlparse(self.model_endpoint)
-            if (
-                parsed.scheme not in {"http", "https"}
-                or not parsed.netloc
-                or parsed.username
-            ):
-                raise ValueError(
-                    "model_endpoint must be an HTTP(S) URL without credentials"
-                )
-        return self
+
+class ModelSettingsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    provider: str | None = Field(default=None, max_length=32)
+    endpoint: str | None = Field(default=None, max_length=2048)
+    model_name: str | None = Field(default=None, max_length=256)
+    api_key: SecretStr = Field(default=SecretStr(""))
+
+
+class ModelDiscoveryInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    endpoint: str = Field(min_length=1, max_length=2048)
+    api_key: SecretStr = Field(default=SecretStr(""))
 
 
 def create_app(
@@ -111,20 +144,55 @@ def create_app(
     *,
     runner: Runner | None = None,
     doctor: Doctor | None = None,
+    repository: RepositoryService | None = None,
+    services: Services | None = None,
+    settings_store: ModelSettingsStore | None = None,
+    model_discovery: Callable[
+        [str, str | None], Awaitable[tuple[str, ...]] | tuple[str, ...]
+    ]
+    | None = None,
 ) -> FastAPI:
     actual_runner = runner or CliRunner(workspace)
     actual_doctor = doctor or run_doctor
+    actual_repository = repository or GithubRepositoryDiscovery()
+    actual_services = services or RequiredServices(doctor=actual_doctor)
+    actual_settings = settings_store or ModelSettingsStore()
+    actual_model_discovery = model_discovery or discover_models
     csrf_token = secrets.token_urlsafe(32)
     templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
     admission_lock = asyncio.Lock()
     doctor_running = False
+    startup_report = DoctorReport(checks=())
+    startup_verified = False
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        nonlocal startup_report, startup_verified
+        startup_report = await asyncio.to_thread(actual_services.ensure_ready)
+        startup_verified = True
         yield
         await actual_runner.shutdown()
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(
+        _: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        if any("api_key" in error.get("loc", ()) for error in exc.errors()):
+            return JSONResponse(
+                {"detail": "api_key is invalid"},
+                status_code=422,
+            )
+        detail = [
+            {
+                "loc": error.get("loc", ()),
+                "msg": error.get("msg", "invalid value"),
+                "type": error.get("type", "value_error"),
+            }
+            for error in exc.errors()
+        ]
+        return JSONResponse({"detail": detail}, status_code=422)
 
     @app.middleware("http")
     async def local_guard(
@@ -146,12 +214,84 @@ def create_app(
         return templates.TemplateResponse(
             request=request,
             name="index.html.j2",
-            context={"csrf_token": csrf_token},
+            context={
+                "csrf_token": csrf_token,
+                "startup_report": (
+                    verified_report_dict(startup_report) if startup_verified else None
+                ),
+            },
         )
+
+    @app.get("/api/settings/model")
+    async def model_settings_get() -> Response:
+        return JSONResponse(actual_settings.load_public().as_dict())
+
+    @app.put("/api/settings/model")
+    async def model_settings_put(payload: ModelSettingsInput) -> Response:
+        try:
+            api_key = payload.api_key.get_secret_value()
+            if len(api_key) > 4096 or "\x00" in api_key:
+                raise SettingsValidationError("api_key is invalid")
+            result = actual_settings.save(
+                ModelSettingsUpdate(
+                    provider=payload.provider,
+                    endpoint=payload.endpoint,
+                    model_name=payload.model_name,
+                    api_key=api_key,
+                )
+            )
+        except SettingsValidationError as error:
+            return JSONResponse({"detail": str(error)}, status_code=422)
+        return JSONResponse(result.as_dict())
+
+    @app.post("/api/settings/model/discover")
+    async def model_settings_discover(payload: ModelDiscoveryInput) -> Response:
+        supplied_key = payload.api_key.get_secret_value()
+        try:
+            validate_api_key(supplied_key or None)
+        except ModelDiscoveryError:
+            return JSONResponse({"detail": "api_key is invalid"}, status_code=422)
+        api_key = supplied_key or None
+        if api_key is None:
+            stored = actual_settings.load_resolved()
+            if stored is not None and same_endpoint(stored.endpoint, payload.endpoint):
+                api_key = stored.api_key
+        try:
+            result = await asyncio.to_thread(
+                actual_model_discovery, payload.endpoint, api_key
+            )
+            models = await result if isawaitable(result) else result
+        except ModelDiscoveryError as error:
+            status_code = (
+                422 if error.code in {"invalid_endpoint", "invalid_api_key"} else 502
+            )
+            return JSONResponse({"detail": str(error)}, status_code=status_code)
+        return JSONResponse({"models": list(models)})
+
+    @app.delete("/api/settings/model/key")
+    async def model_settings_clear_key() -> Response:
+        try:
+            result = actual_settings.clear_key()
+        except SettingsValidationError as error:
+            return JSONResponse({"detail": str(error)}, status_code=422)
+        return JSONResponse(result.as_dict())
+
+    @app.delete("/api/settings/model")
+    async def model_settings_clear() -> Response:
+        try:
+            result = actual_settings.clear()
+        except SettingsValidationError as error:
+            return JSONResponse({"detail": str(error)}, status_code=422)
+        return JSONResponse(result.as_dict())
+
+    @app.post("/api/repository")
+    async def repository_route(payload: RepositoryInput) -> Response:
+        metadata = await asyncio.to_thread(actual_repository.discover, payload)
+        return JSONResponse(metadata.to_dict())
 
     @app.post("/api/doctor")
     async def doctor_route() -> Response:
-        nonlocal doctor_running
+        nonlocal doctor_running, startup_report, startup_verified
         async with admission_lock:
             if actual_runner.active or doctor_running:
                 return JSONResponse(
@@ -159,19 +299,50 @@ def create_app(
                 )
             doctor_running = True
         try:
-            report = await _run_doctor(actual_doctor)
+            report = await asyncio.to_thread(actual_services.ensure_ready)
+            if services is not None:
+                doctor_report = await _run_doctor(actual_doctor)
+                existing = {check.name for check in report.checks}
+                report = DoctorReport(
+                    checks=report.checks
+                    + tuple(
+                        check
+                        for check in doctor_report.checks
+                        if check.name not in existing
+                    )
+                )
+            startup_report = report
+            startup_verified = True
         finally:
             doctor_running = False
-        return Response(content=render_json(report), media_type="application/json")
+        return Response(
+            content=render_verified_json(report), media_type="application/json"
+        )
 
     @app.post("/api/jobs", status_code=202)
     async def submit(payload: JobInput) -> Response:
-        request = CliRequest(**payload.model_dump())
         async with admission_lock:
             if doctor_running:
                 return JSONResponse(
                     {"detail": "doctor is currently running"}, status_code=409
                 )
+            if startup_verified and not verified_ready(startup_report):
+                return JSONResponse(
+                    {
+                        "detail": "required local services are not ready; check the environment and retry"
+                    },
+                    status_code=409,
+                )
+            resolved = actual_settings.load_resolved()
+            request = CliRequest(
+                url=payload.url,
+                commit_sha=payload.commit_sha,
+                container_port=payload.container_port,
+                compose_path=payload.compose_path,
+                model_endpoint=resolved.endpoint if resolved is not None else None,
+                model_name=resolved.model_name if resolved is not None else None,
+                model_api_key=resolved.api_key if resolved is not None else None,
+            )
             try:
                 job_id = await actual_runner.submit(request)
             except RunnerBusyError:
@@ -179,6 +350,16 @@ def create_app(
                     {"detail": "a trial is already running"}, status_code=409
                 )
         return JSONResponse({"job_id": job_id}, status_code=202)
+
+    @app.post("/api/jobs/{job_id}/stop", status_code=202)
+    async def stop(job_id: str) -> Response:
+        try:
+            result = await actual_runner.stop(job_id)
+        except JobNotFoundError:
+            return JSONResponse({"detail": "job not found"}, status_code=404)
+        except JobNotActiveError:
+            return JSONResponse({"detail": "job is not active"}, status_code=409)
+        return JSONResponse(result, status_code=202)
 
     @app.get("/api/jobs/{job_id}")
     async def status(job_id: str) -> Response:

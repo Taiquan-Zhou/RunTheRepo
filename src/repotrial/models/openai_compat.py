@@ -186,7 +186,16 @@ def _normalize_endpoint(endpoint: str) -> str:
         parsed = urlsplit(endpoint)
     except ValueError:
         raise ValueError("endpoint must be a valid HTTP URL") from None
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+    try:
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise ValueError("endpoint must be a valid HTTP URL") from None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not hostname
+        or (port is not None and not 1 <= port <= 65535)
+    ):
         raise ValueError("endpoint must be a valid HTTP URL")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("endpoint must not include credentials")
