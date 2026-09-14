@@ -1,75 +1,2610 @@
+{% set view = request.query_params.get("view") %}
+{% set guide_lang = "en" if request.query_params.get("lang") == "en" else "zh" %}
+{% if view == "guide" %}{% include "usage-guide.html.j2" %}{% else %}
 <!doctype html>
 <html lang="zh-CN">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="csrf-token" content="{{ csrf_token }}">
-    <title>RepoTrial local console</title>
-    <style>
-      :root { color-scheme: light; font-family: system-ui, sans-serif; }
-      body { margin: 0; background: #f5f7fb; color: #1f2937; }
-      main { max-width: 760px; margin: 2rem auto; padding: 0 1rem 3rem; }
-      form { display: grid; gap: .8rem; background: white; padding: 1.2rem; border-radius: .6rem; box-shadow: 0 1px 5px #0001; }
-      label { display: grid; gap: .25rem; font-size: .95rem; }
-      input { padding: .5rem; border: 1px solid #cbd5e1; border-radius: .3rem; font: inherit; }
-      button { width: fit-content; padding: .5rem .9rem; border: 0; border-radius: .3rem; background: #2563eb; color: white; cursor: pointer; }
-      pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-      #status, #environment { min-height: 1.4rem; }
-    </style>
-  </head>
-  <body>
-    <main>
-      <h1>RepoTrial 本地控制台</h1>
-      <p>仅限本机访问，调用现有 CLI，并在一次性隔离环境中运行目标。</p>
-      <p>不会接受或显示模型 API Key；一次只允许运行一个检查。结果不是全局安全保证。</p>
-      <button id="doctor" type="button">检查环境</button>
-      <pre id="environment" aria-live="polite"></pre>
-      <form id="trial-form">
-        <label>GitHub 地址 <input name="url" type="url" required></label>
-        <label>完整小写 Commit SHA <input name="commit_sha" pattern="[0-9a-f]{40}" required></label>
-        <label>容器端口 <input name="container_port" type="number" min="1" max="65535" value="8080" required></label>
-        <label>Compose 相对路径（可选） <input name="compose_path"></label>
-        <label>模型 Endpoint（可选，需与名称同时填写） <input name="model_endpoint" type="url"></label>
-        <label>模型名称（可选） <input name="model_name"></label>
-        <button type="submit">开始检查</button>
-      </form>
-      <pre id="status" aria-live="polite"></pre>
-      <p id="reports"></p>
-    </main>
-    <script>
-      const token = document.querySelector('meta[name="csrf-token"]').content;
-      const status = document.getElementById('status');
-      const reports = document.getElementById('reports');
-      const headers = {'Content-Type': 'application/json', 'X-CSRF-Token': token};
-      document.getElementById('doctor').addEventListener('click', async () => {
-        const response = await fetch('/api/doctor', {method: 'POST', headers});
-        document.getElementById('environment').textContent = await response.text();
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="csrf-token" content="{{ csrf_token }}"><title>RunTheRepo · 本地控制台</title>
+<style>
+:root {
+  --canvas:#f5f5f1; --surface:#fff; --surface-soft:#f0f3ee; --ink:#193a32;
+  --muted:#66756f; --line:#d9e0d9; --brand:#c44732; --brand-soft:#fae8e2;
+  --success:#187158; --warning:#9a681c; --danger:#b33b35; --radius-sm:8px; --radius-md:12px;
+}
+*,*::before,*::after { box-sizing:border-box; }
+[hidden] { display:none!important; }
+html { scroll-behavior:smooth; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:14px/1.55 "Ubuntu Sans","Segoe UI","PingFang SC","Microsoft YaHei","WenQuanYi Zen Hei",sans-serif; }
+a { color:var(--brand); }
+button,input,select { font:inherit; }
+button { cursor:pointer; }
+button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible,summary:focus-visible { outline:3px solid rgba(196,71,50,.28); outline-offset:3px; }
+.topbar { min-height:58px; display:flex; align-items:center; justify-content:space-between; gap:20px; padding:10px clamp(18px,4vw,56px); background:var(--surface); border-bottom:1px solid var(--line); }
+.brand { display:flex; align-items:center; gap:10px; color:var(--ink); font-size:16px; font-weight:750; letter-spacing:-.2px; }
+.logo { display:grid; place-items:center; width:30px; height:30px; flex:0 0 30px; border-radius:8px; background:var(--brand); color:#fff; font-weight:800; }
+.header-actions { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+.header-actions>a { color:var(--ink); font-weight:600; text-decoration:none; }
+.pill { padding:4px 9px; border:1px solid var(--line); border-radius:999px; background:var(--surface-soft); color:var(--muted); font-size:12px; }
+.language-label { color:var(--muted); font-size:12px; }
+#language-select { width:auto; min-width:88px; min-height:34px; border:1px solid var(--line); border-radius:var(--radius-sm); padding:5px 8px; color:var(--ink); background:var(--surface); }
+main { width:min(1200px,calc(100% - 40px)); margin:0 auto; padding:34px 0 44px; }
+.workspace-intro { margin-bottom:24px; }
+.workspace-intro h1 { margin:0; color:var(--ink); font-size:30px; line-height:1.15; letter-spacing:-.8px; }
+.workspace-intro p { max-width:650px; margin:8px 0 0; color:var(--muted); }
+.workspace-flow { display:flex; align-items:center; gap:0; margin:-8px 0 16px; color:var(--muted); font-size:12px; }
+.flow-step { position:relative; display:flex; align-items:center; gap:7px; padding:6px 14px 6px 0; }
+.flow-step:not(:last-child)::after { content:""; width:24px; height:1px; margin:0 10px; background:var(--line); }
+.flow-step[aria-current="step"] { color:var(--ink); font-weight:750; }
+.flow-step.is-done { color:var(--success); }
+.flow-mark { width:7px; height:7px; border:1px solid currentColor; border-radius:50%; }
+.workspace-surface { overflow:hidden; border:1px solid var(--line); border-radius:var(--radius-md); background:var(--surface); transition:opacity 160ms ease, transform 160ms ease; }
+.console-grid { display:grid; grid-template-columns:minmax(0,2.05fr) minmax(280px,.95fr); gap:0; align-items:stretch; }
+.card { min-width:0; border:0; border-radius:0; background:transparent; padding:22px; transition:opacity 160ms ease, transform 160ms ease; }
+.card-header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:20px; }
+h2 { margin:0; color:var(--ink); font-size:16px; line-height:1.3; }
+.section-kicker { margin:0 0 5px; color:var(--muted); font-size:12px; font-weight:650; }
+.form-label-row,.field-label { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:7px; }
+.field-label { justify-content:flex-start; }
+.field-label > span:first-child { margin-right:auto; }
+.card form>label,.card form details>label { display:flex; align-items:center; justify-content:flex-end; gap:8px; margin:0 0 7px; color:var(--ink); font-size:13px; font-weight:650; }
+.card form>label>span:first-child,.card form details>label>span:first-child { margin-right:auto; }
+.help { color:var(--muted); font-size:12px; font-weight:450; text-decoration:none; white-space:nowrap; }
+.help:hover { color:var(--brand); }
+input,select { width:100%; min-height:44px; border:1px solid #cbd5cd; border-radius:var(--radius-sm); padding:9px 11px; color:var(--ink); background:var(--surface); }
+input:disabled,button:disabled,select:disabled { cursor:not-allowed; opacity:.58; }
+small,.field-meta { color:var(--muted); font-size:12px; }
+small { display:block; margin:5px 0 14px; }
+.field-meta { display:flex; justify-content:space-between; gap:8px; min-height:16px; margin:-2px 0 5px; }
+.model-key-row { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:6px 0 8px; }
+.model-key-row .field-meta { flex:1; margin:0; }
+.model-settings-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:10px; }
+.model-combobox { position:relative; }
+.model-combobox input { padding-right:42px; }
+.model-combobox-toggle { position:absolute; top:1px; right:1px; width:40px; height:42px; border:0; border-left:1px solid var(--line); border-radius:0 var(--radius-sm) var(--radius-sm) 0; background:var(--surface); color:var(--muted); }
+.model-combobox-toggle:hover { background:var(--surface-soft); color:var(--ink); }
+.model-listbox { position:absolute; z-index:5; top:calc(100% + 4px); left:0; right:0; max-height:220px; overflow:auto; border:1px solid var(--line); border-radius:var(--radius-sm); background:#fff; box-shadow:0 8px 20px rgba(23,34,56,.14); padding:4px; }
+.model-listbox[hidden] { display:none; }
+.model-option { padding:8px 10px; border-radius:6px; color:var(--ink); cursor:pointer; overflow-wrap:anywhere; }
+.model-option:hover,.model-option[aria-selected="true"] { background:var(--brand-soft); color:var(--brand); }
+.model-listbox-empty { padding:8px 10px; color:var(--muted); font-size:12px; }
+.field-meta:empty,.field-meta:has(#commit-link[hidden]):has(#commit-source:empty) { display:none; }
+.field-meta a { overflow-wrap:anywhere; }
+.discovery-select { margin:3px 0 8px; }
+.btn { display:inline-flex; align-items:center; justify-content:center; min-height:40px; border:1px solid transparent; border-radius:var(--radius-sm); padding:8px 14px; background:var(--brand); color:#fff; font-weight:700; text-decoration:none; }
+.btn:hover { filter:brightness(.96); }
+.btn.secondary { border-color:var(--line); background:var(--surface); color:var(--ink); }
+.btn.secondary:hover { background:var(--surface-soft); }
+.btn.wide { width:100%; margin-top:10px; }
+details { margin-top:18px; border-top:1px solid var(--line); padding-top:14px; }
+summary { cursor:pointer; color:var(--ink); font-weight:700; }
+.environment-card { min-height:0; border-left:1px solid var(--line); background:var(--surface-soft); }
+.environment-caption { color:var(--muted); font-size:12px; margin:4px 0 16px; }
+.environment-empty { display:grid; place-items:center; min-height:110px; padding:15px; border:1px dashed var(--line); border-radius:var(--radius-sm); text-align:center; }
+.environment-empty-visual svg { width:36px; height:36px; margin-bottom:4px; stroke:var(--muted); fill:none; stroke-width:1.5; }
+.environment-empty p { margin:0; color:var(--muted); font-size:12px; }
+.check { display:flex; justify-content:space-between; gap:12px; border-top:1px solid var(--line); padding:11px 0; }
+.check-detail,.failure-details { margin:5px 0 12px; border:1px solid #eaded6; border-radius:var(--radius-sm); padding:10px 12px; background:#fffaf6; font-size:12px; overflow-wrap:anywhere; }
+.check-detail.unsupported { background:#fffaf0; border-color:#eadfc6; }
+.check-detail p,.failure-details p { margin:5px 0; color:var(--muted); }
+.ok { color:var(--success); } .warn { color:var(--warning); } .error { color:var(--danger); }
+#form-errors { color:var(--danger); margin-top:8px; }
+#form-errors:empty { min-height:0; height:0; margin:0; }
+.run-workspace { grid-column:1 / -1; border-left:3px solid var(--brand); }
+.run-header { display:flex; justify-content:space-between; align-items:flex-start; gap:18px; margin-bottom:18px; }
+.run-summary { color:var(--muted); font-size:13px; }
+.run-summary strong { display:block; color:var(--ink); font-size:16px; }
+.run-summary code { font:12px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace; }
+.run-state { display:flex; align-items:center; gap:8px; color:var(--muted); font-weight:700; white-space:nowrap; }
+.dot { width:9px; height:9px; flex:0 0 9px; border-radius:50%; background:var(--muted); }
+.status { display:flex; align-items:flex-start; gap:12px; margin-bottom:18px; border:1px solid var(--line); border-radius:var(--radius-sm); padding:16px; background:var(--surface-soft); }
+.status strong { display:block; color:var(--ink); font-size:16px; }
+.muted { color:var(--muted); }
+.metrics { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:14px 0; }
+.metric { border-top:1px solid var(--line); padding-top:10px; }
+.big { color:var(--ink); font-size:20px; font-weight:700; font-variant-numeric:tabular-nums; }
+.detail { border-top:1px solid var(--line); padding-top:12px; color:var(--muted); overflow-wrap:anywhere; }
+.phase-progress { margin-top:18px; border-top:1px solid var(--line); padding-top:16px; }
+.phase-progress-title { color:var(--ink); font-size:13px; font-weight:700; }
+.phase-list { display:grid; gap:4px; margin:9px 0 0; padding:0; list-style:none; }
+.phase-list li { color:#a3ada7; font-size:12px; }
+.phase-list li.confirmed { color:var(--success); } .phase-list li.current { color:var(--brand); font-weight:700; }
+.latest-evidence { margin-top:10px; color:var(--muted); font-size:12px; }
+.report-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; }
+.report-empty { display:grid; place-items:center; min-height:90px; color:var(--muted); }
+.report-empty svg { width:42px; height:42px; stroke:var(--muted); fill:none; stroke-width:1.4; }
+#report-card:has(#html-report:not([hidden])) .report-empty,#report-card:has(#json-report:not([hidden])) .report-empty { display:none; }
+#config-card + #environment-card, #task-card + #report-card { border-left:1px solid var(--line); }
+#task-card + #report-card { border-top:1px solid var(--line); border-left:0; }
+.boundary-note { margin-top:20px; color:var(--muted); font-size:12px; }
+.boundary-note strong { color:var(--ink); margin-right:8px; }
+.run-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:20px; }
+body[data-console-state="running"] #stop-button,body[data-console-state="submitting"] #stop-button { display:inline-flex; }
+.activity { display:none; width:42px; height:4px; margin-top:8px; overflow:hidden; border-radius:999px; background:#d9e4df; }
+.activity::after { content:""; display:block; width:45%; height:100%; border-radius:inherit; background:var(--brand); animation:activity-sweep 1.2s ease-in-out infinite; }
+body[data-console-state="submitting"] .activity,body[data-console-state="running"] .activity { display:block; }
+body[data-console-state="submitting"] .run-actions,body[data-console-state="running"] .run-actions { display:flex; }
+@keyframes activity-sweep { 0% { transform:translateX(-100%); } 100% { transform:translateX(240%); } }
+body[data-console-state="idle"] .run-workspace,body[data-console-state="idle"] #report-card,body[data-console-state="environment-checking"] .run-workspace,body[data-console-state="environment-checking"] #report-card { display:none; }
+body[data-console-state="submitting"] #config-card,body[data-console-state="running"] #config-card,body[data-console-state="completed"] #config-card,body[data-console-state="failed"] #config-card,body[data-console-state="unknown"] #config-card { display:none; }
+body[data-console-state="submitting"] #environment-card,body[data-console-state="running"] #environment-card,body[data-console-state="completed"] #environment-card,body[data-console-state="failed"] #environment-card,body[data-console-state="unknown"] #environment-card { display:none; }
+body[data-console-state="submitting"] #report-card,body[data-console-state="running"] #report-card { display:none; }
+body[data-console-state="completed"] #task-card,body[data-console-state="failed"] #task-card,body[data-console-state="unknown"] #task-card { grid-column:1; }
+body[data-console-state="completed"] #report-card,body[data-console-state="failed"] #report-card,body[data-console-state="unknown"] #report-card { grid-column:2; }
+body[data-console-state="submitting"] .run-workspace { display:block; }
+body[data-console-state="submitting"] .run-workspace,body[data-console-state="running"] .run-workspace { grid-column:1 / -1; }
+dialog { width:min(680px,calc(100vw - 30px)); max-height:85vh; border:1px solid var(--line); border-radius:var(--radius-md); padding:24px; color:var(--ink); }
+dialog::backdrop { background:rgba(25,58,50,.28); }
+dialog article { border-top:1px solid var(--line); padding:15px 0; }
+dialog nav { display:flex; flex-wrap:wrap; gap:12px; margin:15px 0; }
+@media (max-width:820px) { main { width:min(100% - 28px,680px); padding:26px 0 36px; } .console-grid { grid-template-columns:1fr; } .run-header { display:block; } .run-state { margin-top:12px; } }
+@media (max-width:520px) { .topbar { align-items:flex-start; } .header-actions { justify-content:flex-end; gap:8px; } .header-actions .pill { display:none; } main { width:calc(100% - 24px); } .card { padding:17px; } .card form>label,.card form details>label { flex-wrap:wrap; justify-content:flex-start; } .help { margin-left:auto; } .metrics { grid-template-columns:1fr 1fr; } }
+@media (prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } .activity::after { animation:none; transform:translateX(70%); } .workspace-surface,.card { transition:none; } }
+
+/* v4 production refinement */
+#task-card .run-layout { align-items:stretch; }
+#task-card .run-primary { display:flex; flex-direction:column; }
+#task-card .run-secondary { margin-top:auto; }
+#task-card .run-events { grid-column:2; grid-row:1; }
+body[data-console-state="completed"] #task-card,body[data-console-state="failed"] #task-card { grid-column:2; }
+body[data-console-state="completed"] #task-card .run-layout,body[data-console-state="failed"] #task-card .run-layout { display:block; }
+body[data-console-state="completed"] #report-card,body[data-console-state="failed"] #report-card { grid-column:1; grid-row:1; }
+body[data-console-state="completed"] .console-grid,body[data-console-state="failed"] .console-grid,body[data-console-state="unknown"] .console-grid { align-items:start; }
+body[data-console-state="unknown"] #report-card { display:none; }
+body[data-console-state="unknown"] #task-card { grid-column:1 / -1; }
+@media (max-width:820px) { body[data-console-state="completed"] #task-card,body[data-console-state="failed"] #task-card,body[data-console-state="completed"] #report-card,body[data-console-state="failed"] #report-card { grid-column:1; grid-row:auto; } }
+
+:root { --canvas:#f4f5f8; --surface:#fff; --surface-soft:#f7f8fb; --ink:#172238; --muted:#6b7485; --line:#dfe3ea; --brand:#4b55d9; --brand-soft:#eef0ff; }
+.btn { background:var(--brand); }
+.btn.secondary:hover, #production-sidebar a[aria-current=page] { background:var(--brand-soft); color:var(--brand); }
+button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible,summary:focus-visible { outline-color:rgba(75,85,217,.3); }
+.workspace-eyebrow { margin:0 0 6px; color:var(--muted); font-size:12px; font-weight:700; letter-spacing:.02em; }
+.state-badge { display:inline-flex; margin-top:8px; padding:3px 8px; border-radius:999px; background:var(--brand-soft); color:var(--brand); font-size:11px; font-weight:750; }
+.environment-preflight { margin:0 0 14px; color:var(--muted); font-size:12px; }
+.repo-context { display:flex; align-items:center; gap:9px; min-width:0; color:var(--ink); }
+.repo-context-label { color:var(--muted); font-size:12px; }
+.repo-context strong { max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:14px; }
+.menu-mark { color:var(--brand); font-size:18px; line-height:1; }
+#fact-sha { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+#task-card { background:var(--surface); }
+#task-card.run-workspace { border-left:0; }
+#task-card .phase-progress { border:0; border-left:1px solid var(--line); margin:0; padding:22px; min-height:100%; background:#101827; color:#fff; }
+#task-card .phase-progress-title { color:#fff; }
+#task-card .phase-list li { color:#aeb9cc; }
+#task-card .phase-list li.confirmed { color:var(--success); }
+#task-card .phase-list li.current { color:#8f98ff; }
+#task-card .run-primary { min-width:0; }
+#task-card .run-events { min-width:0; }
+#task-card .run-events-heading { color:#fff; font-size:13px; font-weight:750; }
+#task-card .run-layout { display:grid; grid-template-columns:minmax(0,2fr) minmax(260px,1fr); }
+#task-card .run-primary { padding:22px; }
+#task-card .run-primary > .phase-progress { display:none; }
+#task-card .run-events .phase-progress { display:block; }
+#task-card .run-layout > .run-primary > .run-header { margin-top:0; }
+body[data-console-state="running"] #task-card,body[data-console-state="submitting"] #task-card { grid-column:1 / -1; }
+body[data-console-state="completed"] #task-card,body[data-console-state="failed"] #task-card,body[data-console-state="unknown"] #task-card { border-right:1px solid var(--line); }
+@media (max-width:820px) { #task-card .run-layout { grid-template-columns:1fr; } #task-card .run-events { grid-column:1; grid-row:2; width:auto; } #task-card .run-events .phase-progress { border-left:0; border-top:1px solid #263247; min-height:0; } body[data-console-state="completed"] #task-card,body[data-console-state="failed"] #task-card,body[data-console-state="unknown"] #task-card,body[data-console-state="completed"] #report-card,body[data-console-state="failed"] #report-card,body[data-console-state="unknown"] #report-card { grid-column:1; } }
+
+/* v4 product shell */
+#production-sidebar{position:fixed;z-index:4;left:0;top:0;bottom:0;width:240px;padding:20px 15px;background:#fff;border-right:1px solid var(--line);color:var(--ink)}
+#production-sidebar .side-brand{display:flex;align-items:center;gap:9px;padding:0 9px 28px;font-weight:800}
+#production-sidebar .side-logo{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;background:#4b55d9;color:#fff;font-weight:900}
+#production-sidebar .side-label{padding:0 10px 10px;color:var(--muted);font-size:11px;font-weight:700}
+#production-sidebar nav{display:grid;gap:4px}
+#production-sidebar a{display:flex;align-items:center;gap:10px;padding:10px;border-radius:9px;color:var(--muted);text-decoration:none}
+#production-sidebar a[aria-current=page]{background:#f0f1ff;color:#4b55d9;font-weight:800}
+#production-sidebar .side-number{width:25px;height:25px;border-radius:7px;display:grid;place-items:center;background:#f1f3f6;font-size:11px;font-weight:800}
+#production-sidebar a[aria-current=page] .side-number{background:#4b55d9;color:#fff}
+#production-sidebar .side-help{position:absolute;left:15px;right:15px;bottom:20px;padding:14px 10px 0;border-top:1px solid var(--line);font-size:12px}
+#fact-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));margin:0 0 18px;border:1px solid var(--line);border-radius:12px;background:#fff}
+#fact-strip .fact{min-width:0;padding:14px 16px;border-right:1px solid var(--line)}
+#fact-strip .fact:last-child{border-right:0}
+#fact-strip .fact-label{color:var(--muted);font-size:12px}
+#fact-strip .fact-value{display:block;margin-top:6px;font-weight:750;overflow-wrap:anywhere}
+#fact-strip .fact-state{display:block;margin-top:3px;color:var(--success);font-size:11px}
+@media(min-width:821px){body{padding-left:240px}.topbar{margin-left:0}main{width:min(1200px,calc(100% - 40px))}}
+@media(max-width:820px){ body{padding-left:0} #production-sidebar{position:static;width:auto;padding:10px 12px;border-right:0;border-bottom:1px solid var(--line)}#production-sidebar .side-brand{padding:0 5px 9px}#production-sidebar .side-label,#production-sidebar .side-help{display:none}#production-sidebar nav{display:flex;overflow:auto}#production-sidebar a{flex:1 0 auto;padding:8px}#fact-strip{grid-template-columns:repeat(2,minmax(0,1fr))}#fact-strip .fact:nth-child(2){border-right:0}#fact-strip .fact:nth-child(-n+2){border-bottom:1px solid var(--line)}}
+</style>
+</head>
+<body data-console-state="idle"><aside id="production-sidebar"><div class="side-brand"><span class="side-logo">R</span><span>RunTheRepo</span></div><div class="side-label" data-i18n="nav.label">检查导航</div><nav aria-label="检查导航" data-i18n-aria-label="nav.aria"><a href="#config-card" aria-current="page"><span class="side-number">01</span><span data-i18n="nav.new">新建检查</span></a><a href="#task-card"><span class="side-number">02</span><span data-i18n="nav.current">当前任务</span></a><a href="#report-card"><span class="side-number">03</span><span data-i18n="nav.result">结果与证据</span></a></nav><div class="side-help"><span data-i18n="nav.help">帮助</span><br><a id="sidebar-guide" href="/?view=guide&lang=zh" target="_blank" rel="noopener" data-i18n="header.userGuide">使用文档 ↗</a></div></aside>
+<header class="topbar"><div class="repo-context"><span class="menu-mark" aria-hidden="true">☰</span><span class="repo-context-label" data-i18n="header.currentRepository">当前仓库</span><strong id="header-repository">未选择</strong></div><div class="header-actions"><a id="usage-guide" href="/?view=guide&lang=zh" target="_blank" rel="noopener" data-i18n="header.userGuide">使用文档 ↗</a><span class="pill" data-i18n="header.localTask">本机 · 单任务</span><label class="language-label" for="language-select" data-i18n="language.label">语言</label><select id="language-select" aria-label="语言"><option value="zh">中文</option><option value="en">English</option></select></div></header>
+<main>
+<div id="fact-strip" aria-label="检查事实"><div class="fact"><span class="fact-label">Repository</span><span class="fact-value" id="fact-repository">未填写</span><span class="fact-state">待确认</span></div><div class="fact"><span class="fact-label">Commit SHA</span><span class="fact-value" id="fact-sha">未填写</span><span class="fact-state">待固定</span></div><div class="fact"><span class="fact-label">Port</span><span class="fact-value" id="fact-port">未填写</span><span class="fact-state">待配置</span></div><div class="fact"><span class="fact-label">Compose</span><span class="fact-value" id="fact-compose">自动识别</span><span class="fact-state">待找到</span></div></div><section class="workspace-intro"><div id="workspace-eyebrow" class="workspace-eyebrow" data-i18n="intro.eyebrow">仓库检查工作台</div><h1 id="intro-title" data-i18n="intro.title">新建检查</h1><p id="intro-description" data-i18n="intro.description">在一次性隔离环境中运行应用，用可复现的证据查看结果。</p></section>
+<div id="workspace-flow" class="workspace-flow" role="list" aria-label="检查模式"><span class="flow-step" data-flow="repository" role="listitem" aria-current="step"><span class="flow-mark" aria-hidden="true"></span><span data-i18n="flow.repository">仓库</span></span><span class="flow-step" data-flow="run" role="listitem"><span class="flow-mark" aria-hidden="true"></span><span data-i18n="flow.run">运行</span></span><span class="flow-step" data-flow="evidence" role="listitem"><span class="flow-mark" aria-hidden="true"></span><span data-i18n="flow.evidence">证据</span></span></div>
+<div id="workspace-surface" class="workspace-surface"><div class="console-grid">
+<section class="card" id="config-card"><div class="card-header"><div><h2 data-i18n="config.title">配置检查</h2></div><button class="btn secondary" id="detect-repository" type="button" data-i18n="actions.detect">自动识别</button></div>
+<form id="trial-form">
+<div class="form-label-row"><label for="url" data-i18n="fields.repository">GitHub 仓库</label></div><input id="url" name="url" type="url" placeholder="https://github.com/owner/repository" data-i18n-placeholder="fields.repositoryPlaceholder" autocomplete="off" required><div class="field-meta"><span id="repository-meta-status"></span><span><span data-i18n="fields.repositoryHint">公开仓库的 HTTPS 地址</span></span></div>
+<label for="commit_sha"><span data-i18n="fields.commit">Commit SHA</span><span><a class="help" href="#guide-sha" data-guide="sha" data-i18n="fields.help">怎么填 ↗</a> <a class="help guide-doc-link" data-guide-doc href="/?view=guide&lang=zh" target="_blank" rel="noopener" data-i18n="fields.fullGuide">完整文档 ↗</a></span></label><input id="commit_sha" name="commit_sha" pattern="[0-9a-f]{40}" placeholder="输入完整的 40 位小写提交 SHA" data-i18n-placeholder="fields.commitPlaceholder" autocomplete="off" required><div class="field-meta"><a id="commit-link" hidden target="_blank" rel="noopener"></a><span id="commit-source"></span></div><small data-i18n="fields.commitHint">留空时自动使用最新提交；也可以手动填写完整 SHA</small>
+<label for="container_port"><span data-i18n="fields.port">应用容器端口</span><span><a class="help" href="#guide-port" data-guide="port" data-i18n="fields.help">怎么填 ↗</a> <a class="help guide-doc-link" data-guide-doc data-guide-doc-anchor="port" href="/?view=guide&lang=zh#port" target="_blank" rel="noopener" data-i18n="fields.fullGuide">完整文档 ↗</a></span></label><input id="container_port" name="container_port" type="number" min="1" max="65535" placeholder="自动识别或手动填写" data-i18n-placeholder="fields.portPlaceholder" required><select id="port-options" class="discovery-select" hidden aria-label="端口候选"></select><small><span data-i18n="fields.portHint">自动识别到一个端口时会填入；多个端口需要选择</span><span id="port-source"></span></small>
+<label for="compose_path"><span data-i18n="fields.compose">Compose 相对路径</span><span><a class="help" href="#guide-compose" data-guide="compose" data-i18n="fields.help">怎么填 ↗</a> <a class="help guide-doc-link" data-guide-doc data-guide-doc-anchor="compose" href="/?view=guide&lang=zh#compose" target="_blank" rel="noopener" data-i18n="fields.fullGuide">完整文档 ↗</a></span></label><input id="compose_path" name="compose_path" placeholder="自动识别或手动填写，如 compose.yml" data-i18n-placeholder="fields.composePlaceholder" autocomplete="off"><select id="compose-options" class="discovery-select" hidden aria-label="Compose 候选"></select>
+<details id="model-settings"><summary data-i18n="fields.advanced">Advanced options · Model settings</summary>
+<label for="model_endpoint"><span data-i18n="fields.endpoint">Model base URL</span><span><a class="help" href="#guide-endpoint" data-guide="endpoint" data-i18n="fields.help">How to fill ↗</a> <a class="help guide-doc-link" data-guide-doc href="/?view=guide&lang=zh" target="_blank" rel="noopener" data-i18n="fields.fullGuide">Full guide ↗</a></span></label><input id="model_endpoint" name="model_endpoint" type="url" placeholder="https://…/v1" data-i18n-placeholder="fields.endpointPlaceholder" autocomplete="off"><small data-i18n="fields.endpointHint">OpenAI-compatible base URL; include the service's path such as /v1.</small>
+<label for="model_api_key"><span data-i18n="fields.apiKey">API key</span></label><input id="model_api_key" name="model_api_key" type="password" placeholder="••••••••" data-i18n-placeholder="fields.apiKeyPlaceholder" autocomplete="new-password">
+<button class="btn secondary" id="discover-models" type="button" data-i18n="actions.discoverModels">Get models</button>
+<label for="model_name"><span data-i18n="fields.model">Model name</span><span><a class="help" href="#guide-model" data-guide="model" data-i18n="fields.help">How to fill ↗</a> <a class="help guide-doc-link" data-guide-doc href="/?view=guide&lang=zh" target="_blank" rel="noopener" data-i18n="fields.fullGuide">Full guide ↗</a></span></label><div class="model-combobox"><input id="model_name" name="model_name" role="combobox" aria-autocomplete="list" aria-controls="model-name-options" aria-expanded="false" placeholder="Enter manually or choose a fetched model" data-i18n-placeholder="fields.modelPlaceholder" autocomplete="off"><button class="model-combobox-toggle" id="model-name-toggle" type="button" aria-label="Models from service" data-i18n-aria-label="fields.modelOptions">⌄</button><div id="model-name-options" class="model-listbox" role="listbox" aria-label="Models from service" hidden></div></div>
+<div id="model-settings-error" class="error" aria-live="polite"></div><small data-i18n="fields.apiKeyHint">The key is stored locally and is optional for services that allow unauthenticated access.</small><div class="model-settings-actions"><button class="btn secondary" id="clear-model-settings" type="button" data-i18n="actions.clearSettings">Clear model settings</button><button class="btn secondary" id="save-model-settings" type="button" data-i18n="actions.saveModel">Save model settings</button></div>
+</details><div id="form-errors" aria-live="polite"></div><button class="btn wide" id="submit-button" type="submit" data-i18n="actions.start">开始检查</button>
+</form></section>
+<section class="card environment-card" id="environment-card"><div class="card-header"><div><h2 data-i18n="environment.title">环境检查</h2><span id="environment-state-badge" class="state-badge">未检查</span></div><button class="btn secondary" id="doctor" type="button" data-i18n="actions.doctor">检查环境</button></div><p id="environment-preflight" class="environment-preflight" data-i18n="environment.preflight">运行前检查只反映本机条件，不代表项目检查结果。</p><div id="environment" data-environment-state="idle" aria-live="polite"><div class="environment-empty"><div class="environment-empty-visual" aria-hidden="true"><svg viewBox="0 0 48 48"><path d="M9 34h30M13 29V15h22v14M18 21h3m4 0h5"/></svg></div><p data-i18n="environment.empty">尚未检查。检查后会展示各项结果与处理建议。</p></div></div></section>
+<section class="card run-workspace" id="task-card"><div class="run-layout"><div class="run-primary"><div class="run-header"><div id="run-summary" class="run-summary"><strong>Active run</strong><span>Waiting for a submitted inspection</span></div><div class="run-state"><span class="dot" id="state-dot"></span><span id="status-title" data-i18n="task.idleTitle">等待开始</span></div></div><div class="status"><span class="activity" aria-hidden="true"></span><div><div class="muted" id="status-desc" data-i18n="task.idleDescription">配置仓库后启动检查</div></div></div><div class="run-secondary"><div class="metrics"><div class="metric"><div class="muted" data-i18n="task.elapsed">已用时间</div><div class="big" id="elapsed">—</div></div><div class="metric"><div class="muted" data-i18n="task.exitCode">退出码</div><div class="big" id="exit">—</div></div></div><div class="detail" id="reason" data-i18n="task.reasonInitial">运行状态以服务端返回为准</div><div id="failure-details" class="failure-details" hidden><p><strong data-i18n="task.failureStage">失败阶段：</strong><span id="failure-stage"></span></p><p><strong data-i18n="task.failureReason">具体原因：</strong><span id="failure-reason"></span></p><p><strong data-i18n="task.failureNext">下一步：</strong><span id="failure-next-step"></span></p><p><strong data-i18n="task.failureCode">错误代码：</strong><span id="failure-code"></span></p><p><strong data-i18n="task.failureRun">运行标识：</strong><span id="failure-run-id"></span></p></div><div class="run-actions"><button class="btn secondary" id="stop-button" type="button" data-i18n="actions.stop">停止</button><button class="btn secondary" id="retry-button" type="button" data-i18n="actions.rerun">重新运行</button><button class="btn secondary" id="new-inspection-button" type="button" data-i18n="actions.newInspection">新建检查</button></div></div></div><aside class="run-events" id="run-events"><div class="run-events-heading" data-i18n="progress.title">阶段证据</div><div class="phase-progress" id="phase-progress" hidden><div class="phase-progress-title" data-i18n="progress.title">阶段证据</div><ol class="phase-list" id="phase-list"></ol><p class="phase-progress-unavailable" id="phase-progress-unavailable" hidden data-i18n="progress.unavailable">阶段证据暂不可用，等待服务端更新</p><div class="latest-evidence" id="latest-evidence" hidden></div></div></aside></div></section>
+<section class="card" id="report-card"><div class="card-header"><div><h2 data-i18n="report.title">检查报告</h2></div></div><p id="report-desc" data-i18n="report.description">报告生成并校验后，可在这里查看。</p><div class="report-empty" id="report-empty" aria-hidden="true"><svg viewBox="0 0 48 48"><path d="M10 7h21l7 7v27H10zM31 7v8h7M16 23h16M16 29h12M16 35h8"/><path d="m30 31 3 3 6-7"/></svg></div><div class="report-actions"><a class="btn" id="html-report" hidden target="_blank" rel="noopener" data-i18n="report.html">查看 HTML ↗</a><a class="btn secondary" id="json-report" hidden target="_blank" rel="noopener" data-i18n="report.json">查看 JSON ↗</a></div><p id="reports" aria-live="polite"></p></section>
+</div></div><div class="boundary-note"><strong data-i18n="footer.title">隔离运行，证据判定</strong><span data-i18n="footer.description">每次只运行一个检查。结果仅适用于已测试的工作负载与旅程，不代表全局安全保证。</span></div>
+</main>
+<dialog id="guide-dialog" aria-labelledby="guide-title"><div class="card-header"><h2 id="guide-title" data-i18n="guide.title">配置填写指南</h2><button class="btn secondary" id="close-guide" type="button" data-i18n="actions.close">关闭</button></div><p data-i18n="guide.intro">先确认仓库版本与应用端口。没有特殊需求时，可以先留空高级选项。</p><nav><a href="#guide-sha" data-i18n="guide.navSha">Commit SHA</a><a href="#guide-port" data-i18n="guide.navPort">容器端口</a><a href="#guide-compose" data-i18n="guide.navCompose">Compose 路径</a><a href="#guide-endpoint" data-i18n="guide.navEndpoint">Endpoint</a><a href="#guide-model" data-i18n="guide.navModel">模型名称</a></nav><article id="guide-sha" tabindex="-1"><h3 data-i18n="guide.shaTitle">Commit SHA · 固定检查哪个版本</h3><p data-i18n="guide.shaBody">填入目标仓库的完整 40 位小写提交哈希。</p></article><article id="guide-port" tabindex="-1"><h3 data-i18n="guide.portTitle">应用容器端口 · 应用在容器里监听哪里</h3><p data-i18n="guide.portBody">填写 Web 应用在容器内部监听的端口。</p></article><article id="guide-compose" tabindex="-1"><h3 data-i18n="guide.composeTitle">Compose 相对路径 · 指定部署文件</h3><p data-i18n="guide.composeBody">相对于目标仓库根目录填写。</p></article><article id="guide-endpoint" tabindex="-1"><h3 data-i18n="guide.endpointTitle">模型 Endpoint · 模型服务地址</h3><p data-i18n="guide.endpointBody">使用模型服务提供的 HTTP(S) API 基础地址。</p></article><article id="guide-model" tabindex="-1"><h3 data-i18n="guide.modelTitle">模型名称 · 服务端接受的模型 ID</h3><p data-i18n="guide.modelBody">填写对应 Endpoint 实际支持的模型 ID。</p></article></dialog><script>
+const token = document.querySelector('meta[name="csrf-token"]').content;
+const startupReport = {{ startup_report | tojson }};
+const form = document.querySelector('#trial-form');
+const submitButton = document.querySelector('#submit-button');
+const formErrors = document.querySelector('#form-errors');
+const repositoryUrl = document.querySelector('#url');
+const commitShaInput = document.querySelector('#commit_sha');
+const commitLink = document.querySelector('#commit-link');
+const commitSource = document.querySelector('#commit-source');
+const containerPortInput = document.querySelector('#container_port');
+const portSource = document.querySelector('#port-source');
+const portOptions = document.querySelector('#port-options');
+const composePathInput = document.querySelector('#compose_path');
+const composeOptions = document.querySelector('#compose-options');
+const modelEndpointInput = document.querySelector('#model_endpoint');
+const modelNameInput = document.querySelector('#model_name');
+const modelNameOptions = document.querySelector('#model-name-options');
+const modelNameToggle = document.querySelector('#model-name-toggle');
+const modelApiKeyInput = document.querySelector('#model_api_key');
+const modelSettingsError = document.querySelector('#model-settings-error');
+const saveModelSettingsButton = document.querySelector('#save-model-settings');
+const clearModelSettingsButton = document.querySelector('#clear-model-settings');
+const discoverModelsButton = document.querySelector('#discover-models');
+const repositoryMetaStatus = document.querySelector('#repository-meta-status');
+const detectRepositoryButton = document.querySelector('#detect-repository');
+const environment = document.querySelector('#environment');
+const environmentStateBadge = document.querySelector('#environment-state-badge');
+function updateEnvironmentBadge(state) {
+  const labels = { zh: { idle: '未检查', checking: '检查中', ready: 'Ready', error: '需处理' }, en: { idle: 'Not checked', checking: 'Checking', ready: 'Ready', error: 'Needs attention' } };
+  environmentStateBadge.textContent = (labels[language] || labels.zh)[state] || labels.zh.idle;
+}
+const factRepository = document.querySelector('#fact-repository');
+const factSha = document.querySelector('#fact-sha');
+const factPort = document.querySelector('#fact-port');
+const factCompose = document.querySelector('#fact-compose');
+const headerRepository = document.querySelector('#header-repository');
+const factStates = [...document.querySelectorAll('#fact-strip .fact-state')];
+const sidebarNavItems = [...document.querySelectorAll('#production-sidebar nav a')];
+function syncFactStrip() {
+  const url = repositoryUrl.value.trim();
+  const verified = Boolean(currentRepositoryMetadata);
+  const labels = language === 'en'
+    ? { identified: 'Identified', pinned: 'Pinned', configured: 'Configured', found: 'Found', filled: 'Filled' }
+    : { identified: '已识别', pinned: '已固定', configured: '已配置', found: '已找到', filled: '已填写' };
+  const pending = language === 'en'
+    ? ['Awaiting', 'Not pinned', 'Not configured', 'Not found']
+    : ['待确认', '待固定', '待配置', '待找到'];
+  const repository = url.replace(/^https?:\/\/github\.com\//, '');
+  factRepository.textContent = repository || (language === 'en' ? 'Not entered' : '未填写');
+  factStates[0].textContent = repository ? (verified ? labels.identified : labels.filled) : pending[0];
+  headerRepository.textContent = repository || (language === 'en' ? 'Not selected' : '未选择');
+  const sha = commitShaInput.value.trim();
+  factSha.textContent = sha ? sha.slice(0, 12) + '…' : (language === 'en' ? 'Not entered' : '未填写');
+  factStates[1].textContent = sha ? (verified && Boolean(commitSource.textContent) ? labels.pinned : labels.filled) : pending[1];
+  const emptySha = language === 'en' ? 'Not entered' : '未填写';
+  factSha.title = sha || emptySha;
+  factSha.setAttribute('aria-label', sha || emptySha);
+  const port = containerPortInput.value.trim();
+  factPort.textContent = port || (language === 'en' ? 'Not entered' : '未填写');
+  factStates[2].textContent = port ? (verified && Boolean(portSource.textContent) ? labels.configured : labels.filled) : pending[2];
+  const compose = composePathInput.value.trim();
+  factCompose.textContent = compose || (language === 'en' ? 'Auto-detect' : '自动识别');
+  factStates[3].textContent = compose ? (verified && !composeManuallyEdited ? labels.found : labels.filled) : pending[3];
+}
+
+
+const doctorButton = document.querySelector('#doctor');
+const statusTitle = document.querySelector('#status-title');
+const statusDesc = document.querySelector('#status-desc');
+const stateDot = document.querySelector('#state-dot');
+const elapsed = document.querySelector('#elapsed');
+const exitCode = document.querySelector('#exit');
+const reason = document.querySelector('#reason');
+const reportDesc = document.querySelector('#report-desc');
+const reports = document.querySelector('#reports');
+const htmlReport = document.querySelector('#html-report');
+const jsonReport = document.querySelector('#json-report');
+const reportCard = document.querySelector('#report-card');
+const phaseProgress = document.querySelector('#phase-progress');
+const phaseList = document.querySelector('#phase-list');
+const phaseProgressUnavailable = document.querySelector('#phase-progress-unavailable');
+const retryButton = document.querySelector('#retry-button');
+const stopButton = document.querySelector('#stop-button');
+const newInspectionButton = document.querySelector('#new-inspection-button');
+const runSummary = document.querySelector('#run-summary');
+const introTitle = document.querySelector('#intro-title');
+const introDescription = document.querySelector('#intro-description');
+const workspaceFlow = document.querySelector('#workspace-flow');
+const flowSteps = [...document.querySelectorAll('#workspace-flow .flow-step')];
+
+function syncSidebarNavigation(state) {
+  const terminal = ['completed', 'failed', 'unknown'].includes(state);
+  const hasReport = !reportCard.hidden && (!htmlReport.hidden || !jsonReport.hidden);
+  const index = ['submitting', 'running'].includes(state) ? 1 : terminal && hasReport ? 2 : terminal ? 1 : 0;
+  sidebarNavItems.forEach((item, itemIndex) => {
+    const active = itemIndex === index;
+    const accessible = active || (terminal && itemIndex < 2) || (itemIndex === 0 && terminal);
+    if (active) item.setAttribute('aria-current', 'page');
+    else item.removeAttribute('aria-current');
+    item.setAttribute('aria-disabled', accessible ? 'false' : 'true');
+    item.tabIndex = accessible ? 0 : -1;
+  });
+}
+
+function setWorkspaceFlow(state) {
+  const current = ['submitting', 'running'].includes(state)
+    ? 'run'
+    : ['completed', 'failed', 'unknown'].includes(state)
+      ? 'evidence'
+      : 'repository';
+  const order = ['repository', 'run', 'evidence'];
+  flowSteps.forEach((step) => {
+    const index = order.indexOf(step.dataset.flow);
+    const currentIndex = order.indexOf(current);
+    step.classList.toggle('is-done', index < currentIndex);
+    if (index === currentIndex) {
+      step.setAttribute('aria-current', 'step');
+    } else {
+      step.removeAttribute('aria-current');
+    }
+  });
+  workspaceFlow.dataset.flowState = state;
+}
+
+function setWorkspaceState(state) {
+  document.body.dataset.consoleState = state;
+  setWorkspaceFlow(state);
+  syncSidebarNavigation(state);
+  const active = state === 'running' || state === 'submitting';
+  if (state === 'submitting') {
+    statusTitle.textContent = t('task.submitting');
+    statusDesc.textContent = t('task.submittingDescription');
+  }
+  retryButton.disabled = active || !rerunRequestSnapshot;
+  newInspectionButton.disabled = active;
+  if (typeof updateRunActions === 'function') updateRunActions();
+  const intro = translationValue('intro.states.' + state) || translationValue('intro.states.idle');
+  introTitle.textContent = intro.title;
+  introDescription.textContent = intro.description;
+}
+
+function updateRunActions() {
+  const locked = jobActive || submitting || submissionUnknownActive
+    || ['submitting', 'running'].includes(document.body.dataset.consoleState);
+  retryButton.disabled = locked || !rerunRequestSnapshot;
+  stopButton.disabled = !jobActive || submitting || stopInFlight
+    || currentStatus?.control === 'stopping'
+    || currentStatus?.control === 'stopped'
+    || document.body.dataset.consoleState !== 'running';
+  newInspectionButton.disabled = locked;
+}
+
+function updateRunSummary() {
+  const rawUrl = repositoryUrl.value.trim();
+  runSummary.replaceChildren();
+  if (recoverySummary && !rawUrl) {
+    const name = document.createElement('strong');
+    name.textContent = t('task.restoreSummary');
+    const detail = document.createElement('span');
+    detail.textContent = t('task.restoreSummaryDetail');
+    runSummary.append(name, detail);
+    return;
+  }
+  let repository = rawUrl;
+  try {
+    const parsed = new URL(rawUrl);
+    repository = parsed.pathname.replace(/^\//, '').replace(/\.git$/, '') || rawUrl;
+  } catch {
+    repository = rawUrl;
+  }
+  const name = document.createElement('strong');
+  name.textContent = repository;
+  const metadata = document.createElement('span');
+  const sha = commitShaInput.value.trim();
+  const compose = composePathInput.value.trim();
+  metadata.textContent = (sha ? sha.slice(0, 7) : '—') + ' · :' + (containerPortInput.value.trim() || '—') + (compose ? ' · ' + compose : '');
+  runSummary.append(name, metadata);
+}
+
+
+const latestEvidence = document.querySelector('#latest-evidence');
+const headers = { 'Content-Type': 'application/json', 'X-CSRF-Token': token };
+const storageKey = 'repotrial-active-job-id';
+const jobIdPattern = /^[0-9a-f-]{36}$/i;
+
+const languageStorageKey = 'repotrial-language';
+const languageSelect = document.querySelector('#language-select');
+const translations = {
+  zh: {
+    title: 'RunTheRepo · 本地控制台',
+    brand: { localConsole: 'LOCAL CONSOLE' },
+    header: { localTask: '本机 · 单任务', userGuide: '使用文档 ↗', currentRepository: '当前仓库' },
+    language: { label: '语言' },
+    nav: { label: '检查导航', new: '新建检查', current: '当前任务', result: '结果与证据', help: '帮助', aria: '检查导航' },
+    flow: { repository: '仓库', run: '运行', evidence: '证据' },
+    intro: {
+      eyebrow: '仓库检查工作台',
+      title: '新建检查',
+      description: '在一次性隔离环境中运行应用，用可复现的证据查看结果。',
+      submissionUnknownTitle: '无法确认提交状态',
+      submissionUnknownDescription: '为避免重复提交，页面已锁定；请先确认服务端状态。',
+      states: {
+        idle: { title: '新建检查', description: '在一次性隔离环境中运行应用，用可复现的证据查看结果。' },
+        submitting: { title: '当前检查', description: '正在提交检查，请等待服务端确认。' },
+        running: { title: '当前检查', description: '检查正在隔离环境中运行，阶段只显示已确认的证据。' },
+        completed: { title: '检查结果', description: '检查已完成，下面是结果与证据。' },
+        failed: { title: '检查未完成', description: '检查未完成，请查看原因与可用证据。' },
+        unknown: { title: '状态不可用', description: '暂时无法确认终态，稍后可重试或重新开始。' },
+      },
+    },
+    config: { title: '配置检查' },
+    fields: {
+      repository: 'GitHub 仓库',
+      repositoryHint: '公开仓库的 HTTPS 地址',
+      repositoryPlaceholder: 'https://github.com/owner/repository',
+      commit: 'Commit SHA',
+      commitHint: '留空时自动使用最新提交；也可以手动填写完整 SHA',
+      commitPlaceholder: '输入完整的 40 位小写提交 SHA',
+      port: '应用容器端口',
+      portPlaceholder: '自动识别或手动填写',
+      portHint: '自动识别到一个端口时会填入；多个端口需要选择',
+      advanced: '高级选项 · 模型设置',
+      compose: 'Compose 相对路径',
+      composePlaceholder: '自动识别或手动填写，如 compose.yml',
+      endpoint: '模型 Base URL',
+      endpointPlaceholder: 'https://…/v1',
+      endpointHint: '填写兼容 OpenAI 的模型服务基础地址，按服务说明保留 /v1 等路径。',
+      modelOptions: '服务返回的模型',
+      modelOptionsPlaceholder: '获取模型列表后选择',
+      modelOptionsEmpty: '没有匹配的模型，可手动输入。',
+      model: '模型名称',
+      modelPlaceholder: '列表失败时可手动填写',
+      modelHint: '列表查询成功只代表查询成功，不代表推理一定可用。',
+      apiKey: 'API Key', apiKeyPlaceholder: '同一地址可留空复用已保存 Key',
+      apiKeyHint: 'Key 只保存到本机；允许匿名访问的服务可以不填写。',
+      help: '怎么填 ↗',
+      fullGuide: '完整文档 ↗',
+    },
+    actions: { start: '开始检查', doctor: '检查环境', close: '关闭', detect: '自动识别', detecting: '识别中…', retry: '重试', rerun: '重新运行', stop: '停止', newInspection: '新建检查', saveModel: '保存模型设置', clearKey: '清除 Key', clearSettings: '清除模型设置', discoverModels: '获取模型' },
+    environment: {
+      title: '环境检查',
+      empty: '尚未检查。检查后会展示各项结果与处理建议。',
+      running: '正在检查环境…',
+      ready: '基础环境检查通过，可开始任务。项目运行结果以任务检查为准。',
+      blocked: '环境存在需要处理的项目。',
+      unnamed: '未命名检查',
+      failTitle: '原因与处理建议',
+      unsupportedTitle: '能力限制（不等于无风险）',
+      reasonPrefix: '原因：',
+      remediationPrefix: '建议：',
+      requestError: '环境检查失败，请重试。',
+      preflight: '运行前检查只反映本机条件，不代表项目检查结果。',
+      status: { PASS: '通过', FAIL: '未通过', UNSUPPORTED: '不支持' },
+    },
+    task: {
+      title: '当前任务',
+      idleTitle: '等待开始',
+      idleDescription: '配置仓库后启动检查',
+      submitting: '检查进行中…',
+      elapsed: '已用时间',
+      exitCode: '退出码',
+      reasonInitial: '运行状态以服务端返回为准',
+      submittingDescription: '正在提交检查，请等待服务端确认。',
+      restoreSummary: '正在恢复已保存的检查',
+      restoreSummaryDetail: '检查详情在刷新后不可用',
+      completedReason: '检查已完成，终态证据已确认。',
+      failureStage: '失败阶段：',
+      failureReason: '具体原因：',
+      failureNext: '下一步：',
+      failureCode: '错误代码：',
+      failureRun: '运行标识：',
+    },
+    progress: {
+      title: '阶段证据',
+      unavailable: '阶段证据暂不可用，等待服务端更新',
+      confirmed: '已证据确认完成',
+      current: '当前阶段',
+      pending: '尚未确认',
+      latestPrefix: '最近证据：',
+      waiting: '等待新的证据更新',
+      stopped: '阶段证据已停止',
+      stoppedPhase: '已停止',
+      unknown: '阶段状态待确认',
+      unknownPhase: '状态待确认',
+      completed: '终态证据已确认',
+      ageSeconds: '{value} 秒前',
+      ageMinutes: '{value} 分钟前',
+      hardeningRound: '权限收紧实验（第 {index} 轮）',
+      phases: {
+        preparing_repository: '仓库准备', preparing_environment: '环境准备',
+        starting_application: '启动应用', checking_application: '应用检查',
+        collecting_observations: '收集观察结果', hardening: '权限收紧实验',
+        finalizing: '收尾',
+      },
+      events: {
+        application_check_started: '开始应用检查', hardening_started: '开始权限收紧实验',
+        cleanup_started: '开始清理环境',
+      },
+      operations: { http_check: 'HTTP 检查', sandbox_exec: 'Sandbox 执行', cleanup: '清理环境' },
+    },
+    report: {
+      title: '检查报告',
+      description: '报告生成并校验后，可在这里查看。',
+      html: '查看 HTML ↗',
+      json: '查看 JSON ↗',
+      failed: '任务失败，但已生成可查看的证据报告。',
+      completed: '终态证据已确认，报告可访问。',
+      timeBudget: '已保留已有结果，报告可访问。',
+    },
+    footer: {
+      title: '隔离运行，证据判定',
+      description: '每次只运行一个检查。结果仅适用于已测试的工作负载与旅程，不代表全局安全保证。',
+    },
+    guide: {
+      title: '配置填写指南',
+      intro: '先确认仓库版本与应用端口。没有特殊需求时，可以先留空高级选项。',
+      navSha: 'Commit SHA', navPort: '容器端口', navCompose: 'Compose 路径',
+      navEndpoint: 'Endpoint', navModel: '模型名称',
+      shaTitle: 'Commit SHA · 固定检查哪个版本',
+      shaBody: '填入目标仓库的完整 40 位小写提交哈希，不是分支名、标签或短 SHA。格式示例：0123456789abcdef0123456789abcdef01234567。',
+      portTitle: '应用容器端口 · 应用在容器里监听哪里',
+      portBody: '填写 Web 应用在容器内部监听的端口，范围为 1–65535。陌生项目先看选定提交的 Compose；已有容器可只读运行 docker ps 查看 PORTS。docker port 只适用于已运行容器，完整步骤见使用文档。',
+      composeTitle: 'Compose 相对路径 · 指定部署文件',
+      composeBody: '相对于目标仓库根目录填写，例如 deploy/compose.yml。留空使用自动发现逻辑；不接受绝对路径或包含 .. 的路径。',
+      endpointTitle: '模型 Endpoint · 模型服务地址',
+      endpointBody: '填写兼容 OpenAI 的 HTTP(S) API 基础地址（例如包含 /v1），点击获取模型；不要把 API Key、用户名或密码放进地址。部分服务允许不填 Key。',
+      modelTitle: '模型名称 · 服务端接受的模型 ID',
+      modelBody: '可以从服务返回的列表中选择，也可以手动填写。列表查询成功只代表查询成功，不代表推理一定可用。清空 Base URL 和模型名称并保存可停用模型辅助；API Key 只保存在本机，也可以随时清除。',
+    },
+    model: { saved: '已保存', cleared: '模型设置已清除', loadError: '读取模型设置失败', saveError: '保存模型设置失败', discoveryError: '获取模型列表失败', discoveryEmpty: '服务没有返回可用模型，请手动填写模型名称。' },
+    status: {
+      running: { title: '运行中', description: '正在等待服务端终态证据' },
+      stopped: { title: '已停止', description: '服务端已确认任务停止，已有报告仍可查看' },
+      completed: { title: '已完成', description: '终态证据匹配，报告可访问' },
+      failed: { title: '检查失败', description: '任务已停止，可查看停止原因与已有证据' },
+      unknown: { title: '状态未知', description: '无法确认任务终态；恢复连接后会继续查询' },
+      timeBudgetExhausted: { title: '达到时间上限，已停止', description: '已保留已有结果，部分步骤未完成' },
+    },
+    errors: {
+      environmentBlocked: '环境检查未通过，请先处理环境问题后再开始检查。',
+      field: '表单',
+      invalidField: '填写无效',
+      invalidState: '服务返回了无效状态。',
+      invalidRequest: '请求未被接受，请检查填写内容。',
+      network: '网络连接中断，请重试。',
+      invalidResponse: '服务返回了无法读取的响应。',
+      missingJobId: '服务未返回有效任务标识。',
+      unknownSubmission: '提交结果未知；服务未返回任务标识，刷新无法恢复这次提交。请勿重复提交。',
+      submissionTitle: '提交结果未知',
+      submissionDescription: '无法确认任务是否已创建，请勿重复提交',
+      submissionReason: '提交请求已离开页面，但服务端响应不可确认。',
+      unknownReason: '任务状态不可用，无法确认运行状态。',
+      pollRetry: '暂时无法获取状态，当前任务未判定停止；正在重试。',
+      retrySubmit: '提交失败，请重试。',
+      stopFailed: '停止请求未被接受，任务状态仍以服务端为准。',
+      metadataReady: '已识别版本、Compose 和端口',
+      metadataRunning: '正在识别提交、Compose 和端口…',
+      metadataFailed: '自动识别失败，可继续手动填写。',
+      cloneTimeoutReason: '下载仓库超过等待时间，尚未启动应用。',
+      cloneTimeoutNext: '检查网络连接和仓库地址后重试。',
+      preparationTimeoutReason: '仓库准备超过总时间限制，尚未完成指定版本的下载。',
+      preparationTimeoutNext: '请检查运行后端与 GitHub 的连接；网络恢复后可使用相同配置重试。更多说明见使用文档。',
+      checkoutTimeoutReason: '准备指定提交的仓库文件时超时，尚未进入应用启动阶段',
+      checkoutTimeoutNext: '可使用相同提交重试；若持续发生，需要检查 Git 连接和仓库检出日志',
+      sandboxCreateReason: '创建隔离环境失败，任务未进入应用检查。',
+      sandboxCreateNext: '检查 Docker 环境后重试。',
+      terminalEvidenceReason: '终态证据暂不可用，暂时无法确认任务在哪一步停止。',
+      terminalEvidenceNext: '记录运行标识并重试；再次失败时提供失败阶段和运行标识。',
+      genericFailureNext: '按失败阶段检查配置后重试；再次失败时提供错误代码和运行标识。',
+      portCandidates: '请选择应用端口',
+      composeCandidates: '请选择 Compose 文件',
+      commitLink: '打开此提交 ↗',
+      commitManual: '手动指定的提交',
+      commitAuto: '自动识别的最新提交',
+      metadataWarnings: '识别提示：',
+      metadataGitFallback: '使用备用方式读取仓库信息',
+      metadataGitTimeout: '备用仓库信息读取超时，请稍后重试或手动填写。',
+      metadataGitUnavailable: '备用仓库信息读取不可用，请稍后重试或手动填写。',
+      metadataGitLimit: '备用仓库信息读取超过限制，请稍后重试或手动填写。',
+      metadataArchiveLimit: '仓库文件超过自动识别读取上限，请手动填写。',
+      metadataGitLsRemoteFailed: '无法读取最新提交，请稍后重试或手动填写。',
+      metadataGitArchiveFailed: '无法读取仓库文件，请稍后重试或手动填写。',
+      metadataGitArchiveInvalid: '仓库归档不可解析，请检查仓库地址或手动填写。',
+      metadataGitArchiveRedirect: '读取地址跳转被拒绝，请检查仓库地址或手动填写。',
+      metadataGitCommitNotFound: '提交不存在，请检查 SHA 或手动填写。',
+      metadataGitComposeNotFound: '未找到 Compose，请手动填写路径。',
+      metadataGitComposeSelection: '请选择 Compose 文件。',
+      metadataRateLimited: 'GitHub 暂时限制了查询，请稍后重试。',
+      metadataCooldown: 'GitHub 暂时限制查询，请在 {time} 后重试；可继续手动填写',
+      metadataForbidden: 'GitHub 拒绝了查询，请稍后重试或手动填写。',
+      metadataTimeout: 'GitHub 查询超时，请稍后重试或手动填写。',
+      metadataNotFound: '找不到这个公开仓库或提交，请检查地址和 SHA。',
+      metadataNoCompose: '这个提交没有找到 Compose 文件，请手动填写路径。',
+      metadataNoPort: 'Compose 中没有明确的应用端口，请手动填写。',
+      metadataTruncated: '仓库文件列表不完整，自动识别结果可能缺少候选项。',
+      metadataMultiple: '发现多个候选项，请选择后继续。',
+      failureStageUnknown: '无法确认',
+      failureStageIntake: '下载仓库',
+      failureStageCheckout: '准备仓库版本',
+      failureStageCreate: '创建隔离环境',
+      failureStageBoot: '启动应用',
+      failureStageVerify: '验证旅程',
+      failureStageCoverage: '功能验证',
+      failureStageExperiment: '权限收紧实验',
+      failureStageCompatibility: '隔离环境兼容性检查',
+      insufficientCoverageReason: '没有任何通过的功能验证流程，无法继续加固验证',
+      insufficientCoverageNext: '未形成有效的功能验证结果；查看报告确认是缺少验证流程还是已有断言未通过，再处理后重试',
+      experimentSandboxFailedReason: '权限收紧实验未能创建隔离环境；请查看运行证据，应用启动/首页验证可能已通过',
+      experimentSandboxFailedNext: '检查 Docker Sandbox 实验环境的创建状态和运行证据，再重试。',
+      compatibilityMalformedReason: '隔离环境返回的数据不符合工具预期，无法继续检查',
+      compatibilityMalformedNext: '请保留运行标识，供维护者检查隔离环境的校验记录。',
+      timeBudgetReason: '本次运行时间预算已用完，系统停止后续步骤并清理环境',
+      timeBudgetNext: '查看报告中已完成和未完成的检查',
+      failureStageTimeBudget: '运行时间上限',
+    },
+    time: { seconds: '{value} 秒', minutes: '{minutes} 分 {seconds} 秒' },
+  },
+  en: {
+    title: 'RunTheRepo · Local Console',
+    brand: { localConsole: 'LOCAL CONSOLE' },
+    header: { localTask: 'Local · Single task', userGuide: 'User guide ↗', currentRepository: 'Current repository' },
+    language: { label: 'Language' },
+    nav: { label: 'Inspection navigation', new: 'New inspection', current: 'Current run', result: 'Results & evidence', help: 'Help', aria: 'Inspection navigation' },
+    flow: { repository: 'Repository', run: 'Run', evidence: 'Evidence' },
+    intro: {
+      eyebrow: 'Repository inspection workspace',
+      title: 'New inspection',
+      description: 'Run a pinned repository inside a disposable sandbox and review evidence.',
+      submissionUnknownTitle: 'Submission status unavailable',
+      submissionUnknownDescription: 'The page is locked to prevent duplicate submission; confirm the server state first.',
+      states: {
+        idle: { title: 'New inspection', description: 'Run the application in a disposable environment and review reproducible evidence.' },
+        submitting: { title: 'Active run', description: 'Submitting the inspection; waiting for server confirmation.' },
+        running: { title: 'Active run', description: 'The inspection is running in isolation; phases appear only when evidence confirms them.' },
+        completed: { title: 'Inspection result', description: 'The inspection is complete; review the result and evidence below.' },
+        failed: { title: 'Inspection failed', description: 'The inspection did not complete; review the reason and available evidence.' },
+        unknown: { title: 'Run unavailable', description: 'The terminal state cannot be confirmed; retry or start a new inspection.' },
+      },
+    },
+    config: { title: 'Configuration' },
+    fields: {
+      repository: 'GitHub repository',
+      repositoryHint: 'Public repository HTTPS URL',
+      repositoryPlaceholder: 'https://github.com/owner/repository',
+      commit: 'Commit SHA',
+      commitHint: 'Leave empty to use the latest commit, or enter a full SHA manually',
+      commitPlaceholder: 'Enter the full 40-character lowercase commit SHA',
+      port: 'Application container port',
+      portPlaceholder: 'Auto-detect or enter manually',
+      portHint: 'One detected port is filled automatically; choose when there are multiple',
+      advanced: 'Advanced options · Model settings',
+      compose: 'Compose relative path',
+      composePlaceholder: 'Auto-detect or enter manually, e.g. compose.yml',
+      endpoint: 'Model base URL',
+      endpointPlaceholder: 'https://…/v1',
+      endpointHint: 'Use the OpenAI-compatible base URL supplied by the service, including a path such as /v1.',
+      modelOptions: 'Models from service',
+      modelOptionsPlaceholder: 'Fetch models to choose one',
+      modelOptionsEmpty: 'No matching model; enter one manually.',
+      model: 'Model name',
+      modelPlaceholder: 'Enter manually if the list fails',
+      modelHint: 'A successful list query only confirms discovery, not inference availability.',
+      apiKey: 'API key', apiKeyPlaceholder: 'Leave blank to reuse a saved key for this endpoint',
+      apiKeyHint: 'The key is stored locally; services allowing anonymous access do not require one.',
+      help: 'How to fill ↗',
+      fullGuide: 'Full guide ↗',
+    },
+    actions: { start: 'Start check', doctor: 'Check environment', close: 'Close', detect: 'Auto-detect', detecting: 'Detecting…', retry: 'Retry', rerun: 'Rerun', stop: 'Stop', newInspection: 'New inspection', saveModel: 'Save model settings', clearKey: 'Clear key', clearSettings: 'Clear model settings', discoverModels: 'Get models' },
+    environment: {
+      title: 'Environment check',
+      empty: 'Not checked yet. Results and remediation will appear here.',
+      running: 'Checking environment…',
+      ready: 'Basic environment checks passed. You can start a task; project results come from the task check.',
+      blocked: 'Some environment items need attention.',
+      unnamed: 'Unnamed check',
+      failTitle: 'Reason and remediation',
+      unsupportedTitle: 'Capability limit (not the absence of risk)',
+      reasonPrefix: 'Reason: ',
+      remediationPrefix: 'Suggested action: ',
+      requestError: 'Environment check failed. Try again.',
+      preflight: 'Preflight reflects local runtime conditions, not project results.',
+      status: { PASS: 'Pass', FAIL: 'Failed', UNSUPPORTED: 'Unsupported' },
+    },
+    task: {
+      title: 'Current task',
+      idleTitle: 'Waiting to start',
+      idleDescription: 'Configure the repository to start a check',
+      submitting: 'Checking…', cannotConfirm: 'Cannot confirm', elapsed: 'Elapsed',
+      exitCode: 'Exit code', reasonInitial: 'Status comes from the server response', submittingDescription: 'Submitting the inspection; waiting for server confirmation.', restoreSummary: 'Repository details unavailable after refresh', restoreSummaryDetail: 'Restoring the saved inspection', completedReason: 'Completed; terminal evidence was confirmed.',
+      failureStage: 'Failure stage: ', failureReason: 'Reason: ', failureNext: 'Next step: ',
+      failureCode: 'Error code: ', failureRun: 'Run ID: ',
+    },
+    progress: {
+      title: 'Phase evidence',
+      unavailable: 'Phase evidence is not available yet; waiting for a server update',
+      confirmed: 'Confirmed complete by evidence',
+      current: 'Current phase',
+      pending: 'Not confirmed yet',
+      latestPrefix: 'Recent evidence: ',
+      waiting: 'Waiting for new evidence',
+      stopped: 'Phase evidence stopped',
+      stoppedPhase: 'Stopped',
+      unknown: 'Phase status awaiting confirmation',
+      unknownPhase: 'Status awaiting confirmation',
+      completed: 'Terminal evidence confirmed',
+      ageSeconds: '{value} sec ago',
+      ageMinutes: '{value} min ago',
+      hardeningRound: 'Least-privilege experiment (round {index})',
+      phases: {
+        preparing_repository: 'Preparing repository', preparing_environment: 'Preparing environment',
+        starting_application: 'Starting application', checking_application: 'Checking application',
+        collecting_observations: 'Collecting observations', hardening: 'Least-privilege experiment',
+        finalizing: 'Finalizing',
+      },
+      events: {
+        application_check_started: 'Application check started', hardening_started: 'Least-privilege experiment started',
+        cleanup_started: 'Environment cleanup started',
+      },
+      operations: { http_check: 'HTTP check', sandbox_exec: 'Sandbox execution', cleanup: 'Environment cleanup' },
+    },
+    report: {
+      title: 'Check report', description: 'Reports appear here after generation and validation.',
+      html: 'View HTML ↗', json: 'View JSON ↗',
+      failed: 'The task failed, but evidence reports are available.',
+      completed: 'Terminal evidence confirmed; reports are available.',
+      timeBudget: 'Existing results were retained; the report is available.',
+    },
+    footer: {
+      title: 'Isolated run, evidence-based decision',
+      description: 'Only one check runs at a time. Results apply to the tested workload and journey, not to global safety.',
+    },
+    guide: {
+      title: 'Configuration guide',
+      intro: 'Confirm the repository version and application port first. Leave advanced options empty unless needed.',
+      navSha: 'Commit SHA', navPort: 'Container port', navCompose: 'Compose path',
+      navEndpoint: 'Endpoint', navModel: 'Model name',
+      shaTitle: 'Commit SHA · Which version to check',
+      shaBody: 'Enter the full 40-character lowercase commit hash, not a branch, tag, or short SHA. Example: 0123456789abcdef0123456789abcdef01234567.',
+      portTitle: 'Application container port · Where the app listens',
+      portBody: 'Enter the port listened to inside the web application container, from 1 to 65535. For an unfamiliar project, inspect Compose; for an existing container, docker ps can read PORTS. docker port is for an already running container; see the full guide for steps.',
+      composeTitle: 'Compose relative path · Select a deployment file',
+      composeBody: 'Enter a path relative to the repository root, such as deploy/compose.yml. Leave empty for discovery; absolute paths and .. are rejected.',
+      endpointTitle: 'Model endpoint · Model service address',
+      endpointBody: 'Enter the OpenAI-compatible HTTP(S) API base URL supplied by the service, including a path such as /v1, then fetch models. Do not put API keys or credentials in the address; some services allow no key.',
+      modelTitle: 'Model name · Server-accepted model ID',
+      modelBody: 'Choose a returned model ID or enter one manually. A successful list query only confirms discovery, not inference availability. Clear the base URL and model name and save to disable model assistance. Save or clear the API key here.',
+    },
+    status: {
+      running: { title: 'Running', description: 'Waiting for terminal evidence from the server' },
+      stopped: { title: 'Stopped', description: 'The server confirmed the task stopped; existing reports remain available' },
+      completed: { title: 'Completed', description: 'Terminal evidence matches; report is available' },
+      failed: { title: 'Check failed', description: 'The task stopped; review the stop reason and evidence' },
+      unknown: { title: 'Status unknown', description: 'The terminal state cannot be confirmed; polling will resume after recovery' },
+      timeBudgetExhausted: { title: 'Time limit reached; stopped', description: 'Existing results were retained; some steps were not completed' },
+    },
+    errors: {
+      environmentBlocked: 'Environment checks are not ready. Resolve them before starting an inspection.',
+      field: 'Form', invalidField: 'Invalid value',
+      invalidState: 'The service returned an invalid state.',
+      invalidRequest: 'The request was not accepted. Check the fields.',
+      network: 'The network connection was interrupted. Try again.',
+      invalidResponse: 'The service returned an unreadable response.',
+      missingJobId: 'The service did not return a valid job identifier.',
+      unknownSubmission: 'Submission result unknown; no job identifier was returned, so refresh cannot recover this submission. Do not resubmit immediately.',
+      submissionTitle: 'Submission result unknown',
+      submissionDescription: 'The task may exist; do not submit again.',
+      submissionReason: 'The request left the page, but the service response could not be confirmed.',
+      unknownReason: 'Task status unavailable; the running state cannot be confirmed.',
+      pollRetry: 'Status is temporarily unavailable; the task is not marked stopped and will be retried.',
+      retrySubmit: 'Submission failed. Try again.',
+      stopFailed: 'The stop request was not accepted; the server status remains authoritative.',
+      metadataReady: 'Commit, Compose, and port detected',
+      metadataRunning: 'Detecting commit, Compose, and port…',
+      metadataFailed: 'Auto-detection failed; you can continue manually.',
+      cloneTimeoutReason: 'Repository download exceeded the wait limit; the application did not start.',
+      cloneTimeoutNext: 'Check the network connection and repository URL, then retry.',
+      preparationTimeoutReason: 'Preparing the repository exceeded the total time limit; the specified version was not fully downloaded.',
+      preparationTimeoutNext: 'Check the connection between the runtime backend and GitHub; retry with the same configuration after the network recovers. See the user guide for more information.',
+      checkoutTimeoutReason: 'Preparing the specified commit\'s repository files timed out; the application startup stage was not reached.',
+      checkoutTimeoutNext: 'Retry with the same commit; if it continues, check the Git connection and repository checkout logs.',
+      sandboxCreateReason: 'The isolated environment could not be created; the application check did not start.',
+      sandboxCreateNext: 'Check the Docker environment, then retry.',
+      terminalEvidenceReason: 'Terminal evidence is unavailable, so the stopping stage cannot be confirmed yet.',
+      terminalEvidenceNext: 'Record the run ID and retry; provide the failure stage and run ID if it happens again.',
+      genericFailureNext: 'Check the configuration for the reported stage and retry; provide the error code and run ID if it happens again.',
+      portCandidates: 'Choose the application port',
+      composeCandidates: 'Choose a Compose file',
+      commitLink: 'Open this commit ↗',
+      commitManual: 'Manually selected commit',
+      commitAuto: 'Automatically detected latest commit',
+      metadataWarnings: 'Detection note: ',
+      metadataGitFallback: 'Repository information was read using a fallback method.',
+      metadataGitTimeout: 'Fallback repository metadata reading timed out. Try again later or enter the fields manually.',
+      metadataGitUnavailable: 'Fallback repository metadata reading is unavailable. Try again later or enter the fields manually.',
+      metadataGitLimit: 'Fallback repository metadata reading exceeded its limit. Try again later or enter the fields manually.',
+      metadataArchiveLimit: 'The repository files exceed the automatic detection read limit. Enter the fields manually.',
+      metadataGitLsRemoteFailed: 'Could not read the latest commit. Try again later or enter it manually.',
+      metadataGitArchiveFailed: 'Could not read the repository files. Try again later or enter the fields manually.',
+      metadataGitArchiveInvalid: 'The repository archive could not be parsed. Check the repository URL or enter the fields manually.',
+      metadataGitArchiveRedirect: 'The redirect while reading the repository was rejected. Check the repository URL or enter the fields manually.',
+      metadataGitCommitNotFound: 'The commit was not found. Check the SHA or enter it manually.',
+      metadataGitComposeNotFound: 'No Compose file was found. Enter the path manually.',
+      metadataGitComposeSelection: 'Choose a Compose file.',
+      metadataRateLimited: 'GitHub temporarily rate-limited the lookup. Try again later.',
+      metadataCooldown: 'GitHub lookup is temporarily limited; retry after {time}. You can continue entering fields manually.',
+      metadataForbidden: 'GitHub refused the lookup. Try again later or enter the fields manually.',
+      metadataTimeout: 'The GitHub lookup timed out. Try again later or enter the fields manually.',
+      metadataNotFound: 'The public repository or commit was not found. Check the URL and SHA.',
+      metadataNoCompose: 'No Compose file was found at this commit. Enter the path manually.',
+      metadataNoPort: 'No unambiguous application port was found in Compose. Enter one manually.',
+      metadataTruncated: 'The repository file list was truncated; detection may miss candidates.',
+      metadataMultiple: 'Several candidates were found. Choose one to continue.',
+      failureStageUnknown: 'Unknown',
+      failureStageIntake: 'Repository download',
+      failureStageCheckout: 'Preparing repository version',
+      failureStageCreate: 'Sandbox creation',
+      failureStageBoot: 'Application startup',
+      failureStageVerify: 'Journey verification',
+      failureStageCoverage: 'Functional verification',
+      failureStageExperiment: 'Least-privilege experiment',
+      failureStageCompatibility: 'Isolated environment compatibility check',
+      insufficientCoverageReason: 'No functional verification journey passed, so hardening verification cannot continue.',
+      insufficientCoverageNext: 'No valid functional verification result was produced; review the report to determine whether journeys are missing or an existing assertion failed, then retry after addressing it.',
+      experimentSandboxFailedReason: 'The least-privilege experiment could not create its isolated environment; review the run evidence. Application startup or the home-page check may already have passed.',
+      experimentSandboxFailedNext: 'Check Docker Sandbox experiment environment creation and run evidence, then retry.',
+      compatibilityMalformedReason: 'The isolated environment returned data that does not match the tool\'s expected format, so the check could not continue.',
+      compatibilityMalformedNext: 'Keep the run ID so maintainers can inspect the isolated environment validation records.',
+      timeBudgetReason: 'The run time budget was exhausted; remaining steps were stopped and the environment was cleaned up',
+      timeBudgetNext: 'Review completed and incomplete checks in the report',
+      failureStageTimeBudget: 'Run time limit',
+    },
+    model: { saved: 'Saved', cleared: 'Model settings cleared', loadError: 'Could not load model settings', saveError: 'Could not save model settings', discoveryError: 'Could not fetch models', discoveryEmpty: 'The service returned no usable models; enter a model name manually.' },
+    time: { seconds: '{value} sec', minutes: '{minutes} min {seconds} sec' },
+  },
+};
+let language = 'zh';
+let currentDoctor = null;
+let currentDoctorError = null;
+let startupReady = startupReport?.ready === true;
+let currentStatus = null;
+let currentStatusExplicitUnknown = false;
+let currentFormError = null;
+let submissionUnknownActive = false;
+let currentRepositoryMetadata = null;
+let metadataTimer = null;
+let metadataSequence = 0;
+let metadataRequestInFlight = false;
+let metadataRequestKey = '';
+let lastMetadataRequestKey = '';
+let metadataCooldownUntil = 0;
+let autoCommitSha = '';
+let autoComposePath = '';
+let autoContainerPort = '';
+let commitManuallyEdited = false;
+let composeManuallyEdited = false;
+let portManuallyEdited = false;
+let portSelectedFromDiscovery = false;
+
+function translationValue(key) {
+  return key.split('.').reduce(
+    (current, part) => current?.[part],
+    translations[language],
+  );
+}
+
+function t(key, values = {}) {
+  const value = translationValue(key);
+  if (typeof value !== 'string') {
+    return key;
+  }
+  return value.replace(/\{(\w+)\}/g, (_, name) => String(values[name] ?? ''));
+}
+
+function readLanguage() {
+  try {
+    const stored = localStorage.getItem(languageStorageKey);
+    return stored === 'en' || stored === 'zh' ? stored : 'zh';
+  } catch {
+    return 'zh';
+  }
+}
+
+function rememberLanguage() {
+  try {
+    localStorage.setItem(languageStorageKey, language);
+  } catch {
+    // A restricted browser may reject preferences without affecting the console.
+  }
+}
+
+let activeJobId = null;
+let lastProgressJobId = null;
+let lastConfirmedProgress = null;
+let pollTimer = null;
+let pollInFlight = false;
+let stopInFlight = false;
+let rerunRequestSnapshot = null;
+let submitting = false;
+let jobActive = false;
+let doctorRunning = false;
+let elapsedTicker = null;
+let elapsedServerSeconds = null;
+let elapsedAnchorAt = null;
+let elapsedRenderedSeconds = null;
+let elapsedNeedsSync = false;
+let recoverySummary = false;
+
+function stopPolling() {
+  if (pollTimer !== null) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+}
+
+function resetInspection() {
+  stopPolling();
+  activeJobId = null;
+  currentStatus = null;
+  currentStatusExplicitUnknown = false;
+  submissionUnknownActive = false;
+  recoverySummary = false;
+  lastProgressJobId = null;
+  lastConfirmedProgress = null;
+  forgetStoredJobId();
+  invalidateMetadataRequest();
+  if (metadataTimer !== null) {
+    clearTimeout(metadataTimer);
+    metadataTimer = null;
+  }
+  currentRepositoryMetadata = null;
+  metadataRequestKey = '';
+  lastMetadataRequestKey = '';
+  metadataCooldownUntil = 0;
+  autoComposePath = '';
+  commitManuallyEdited = false;
+  composeManuallyEdited = false;
+  portManuallyEdited = false;
+  portSelectedFromDiscovery = false;
+  clearDiscoveryFields();
+  clearReports();
+  setBusy(false);
+  setWorkspaceState('idle');
+}
+
+function clearReports() {
+  reportCard.hidden = true;
+  htmlReport.hidden = true;
+  htmlReport.removeAttribute('href');
+  jsonReport.hidden = true;
+  jsonReport.removeAttribute('href');
+  reports.textContent = '';
+  reportDesc.textContent = t('report.description');
+}
+
+function updateBusyUi() {
+  const busy = jobActive || doctorRunning;
+  for (const element of form.elements) {
+    element.disabled = busy;
+  }
+  doctorButton.disabled = busy;
+  submitButton.disabled = busy || !startupReady;
+  detectRepositoryButton.disabled = busy || metadataRequestInFlight;
+  submitButton.textContent = jobActive ? t('task.submitting') : t('actions.start');
+  if (typeof updateRunActions === 'function') updateRunActions();
+}
+
+function setBusy(busy) {
+  jobActive = busy;
+  updateBusyUi();
+}
+
+function formatElapsed(seconds) {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds)) {
+    return '—';
+  }
+  return seconds < 60
+    ? t('time.seconds', { value: Math.floor(seconds) })
+    : t('time.minutes', {
+        minutes: Math.floor(seconds / 60),
+        seconds: Math.floor(seconds % 60),
       });
-      document.getElementById('trial-form').addEventListener('submit', async (event) => {
-        event.preventDefault();
-        const form = new FormData(event.currentTarget);
-        const payload = Object.fromEntries(form.entries());
-        payload.container_port = Number(payload.container_port);
-        for (const key of ['compose_path', 'model_endpoint', 'model_name']) {
-          if (!payload[key]) delete payload[key];
-        }
-        const response = await fetch('/api/jobs', {method: 'POST', headers, body: JSON.stringify(payload)});
-        const result = await response.json();
-        if (!response.ok) { status.textContent = result.detail || '提交失败'; return; }
-        const jobId = result.job_id;
-        const poll = async () => {
-          const current = await (await fetch(`/api/jobs/${encodeURIComponent(jobId)}`)).json();
-          status.textContent = `${current.state}（已用时 ${current.elapsed_seconds} 秒）${current.error ? `：${current.error}` : ''}`;
-          if (current.reports) {
-            reports.replaceChildren();
-            for (const [label, href] of Object.entries(current.reports)) {
-              const link = document.createElement('a'); link.href = href; link.textContent = `${label} report`;
-              reports.append(link, document.createTextNode(' '));
-            }
-          } else if (current.state === 'running') { setTimeout(poll, 500); }
-        };
-        poll();
-      });
-    </script>
-  </body>
-</html>
+}
+
+function stopElapsedTicker({ reset = false } = {}) {
+  if (elapsedTicker !== null) {
+    clearInterval(elapsedTicker);
+    elapsedTicker = null;
+  }
+  elapsedAnchorAt = null;
+  if (reset) {
+    elapsedServerSeconds = null;
+    elapsedAnchorAt = null;
+    elapsedRenderedSeconds = null;
+    elapsedNeedsSync = false;
+    elapsed.textContent = '—';
+  }
+}
+
+function renderElapsedClock() {
+  if (
+    typeof elapsedServerSeconds !== 'number'
+    || !Number.isFinite(elapsedServerSeconds)
+  ) {
+    return;
+  }
+  const now = performance.now();
+  const clientElapsed = elapsedAnchorAt === null
+    ? elapsedServerSeconds
+    : elapsedServerSeconds + Math.max(0, (now - elapsedAnchorAt) / 1000);
+  const next = Math.max(elapsedRenderedSeconds ?? 0, clientElapsed);
+  elapsedRenderedSeconds = next;
+  elapsed.textContent = formatElapsed(next);
+}
+
+function anchorElapsed(serverSeconds, { running = false } = {}) {
+  if (typeof serverSeconds === 'number' && Number.isFinite(serverSeconds)) {
+    const previous = elapsedRenderedSeconds ?? elapsedServerSeconds ?? 0;
+    elapsedServerSeconds = Math.max(previous, serverSeconds);
+    elapsedAnchorAt = performance.now();
+    elapsedNeedsSync = false;
+  } else if (running) {
+    elapsedNeedsSync = true;
+  }
+  renderElapsedClock();
+  if (running && elapsedTicker === null) {
+    elapsedTicker = setInterval(renderElapsedClock, 250);
+  }
+}
+
+function validRepositoryUrl(value) {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'https:'
+      && parsed.hostname.toLowerCase() === 'github.com'
+      && /^\/[^/\s]+\/[^/\s?#]+\/?$/.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function clearDiscoveryFields() {
+  commitLink.hidden = true;
+  commitLink.removeAttribute('href');
+  commitSource.textContent = '';
+  portOptions.replaceChildren();
+  portOptions.hidden = true;
+  portSource.textContent = '';
+  composeOptions.replaceChildren();
+  composeOptions.hidden = true;
+  if (!commitManuallyEdited && commitShaInput.value === autoCommitSha) {
+    commitShaInput.value = '';
+  }
+  if (
+    !portManuallyEdited
+    && (portSelectedFromDiscovery || containerPortInput.value === autoContainerPort)
+  ) {
+    containerPortInput.value = '';
+  }
+  if (!composeManuallyEdited && composePathInput.value === autoComposePath) {
+    composePathInput.value = '';
+  }
+  autoCommitSha = '';
+  autoContainerPort = '';
+  portSelectedFromDiscovery = false;
+  autoComposePath = '';
+  currentRepositoryMetadata = null;
+  setMetadataStatus('');
+  renderManualCommitLink();
+}
+
+function setMetadataStatus(key) {
+  repositoryMetaStatus.textContent = key ? t(key) : '';
+}
+
+function renderMetadataCooldown() {
+  if (metadataCooldownUntil <= Date.now()) {
+    return false;
+  }
+  const time = new Date(metadataCooldownUntil).toLocaleTimeString(
+    language === 'en' ? 'en-US' : 'zh-CN',
+    { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false },
+  );
+  repositoryMetaStatus.textContent = t('errors.metadataCooldown', { time });
+  return true;
+}
+
+function safeCommitUrl(value, repository, sha) {
+  try {
+    const parsed = new URL(value || (repository + '/commit/' + sha));
+    if (
+      parsed.protocol !== 'https:'
+      || parsed.hostname.toLowerCase() !== 'github.com'
+      || !/\/commit\/[0-9a-f]{40}$/i.test(parsed.pathname)
+    ) {
+      return null;
+    }
+    return parsed.href;
+  } catch {
+    return null;
+  }
+}
+
+function renderManualCommitLink() {
+  const url = repositoryUrl.value.trim();
+  const sha = commitShaInput.value.trim().toLowerCase();
+  const link = validRepositoryUrl(url) && /^[0-9a-f]{40}$/.test(sha)
+    ? safeCommitUrl(null, url, sha)
+    : null;
+  if (!link) {
+    commitLink.hidden = true;
+    commitLink.removeAttribute('href');
+    if (commitManuallyEdited) {
+      commitSource.textContent = '';
+    }
+    return;
+  }
+  commitLink.href = link;
+  commitLink.textContent = t('errors.commitLink');
+  commitLink.hidden = false;
+  commitSource.textContent = t('errors.commitManual');
+}
+
+function renderRepositoryMetadata(metadata) {
+  currentRepositoryMetadata = metadata;
+  if (!metadata || typeof metadata !== 'object') {
+    return;
+  }
+  const url = repositoryUrl.value.trim();
+  const sha = typeof metadata.commit_sha === 'string'
+    ? metadata.commit_sha.toLowerCase()
+    : '';
+  if (/^[0-9a-f]{40}$/.test(sha)) {
+    const link = safeCommitUrl(metadata.commit_url, url, sha);
+    if (link) {
+      commitLink.href = link;
+      commitLink.textContent = t('errors.commitLink');
+      commitLink.hidden = false;
+      commitSource.textContent = commitShaInput.value === sha
+        ? t(commitManuallyEdited ? 'errors.commitManual' : 'errors.commitAuto')
+        : '';
+    }
+    if (!commitManuallyEdited && (!commitShaInput.value || commitShaInput.value === autoCommitSha)) {
+      commitShaInput.value = sha;
+      autoCommitSha = sha;
+      commitSource.textContent = t('errors.commitAuto');
+    }
+  }
+
+  const composeCandidates = Array.isArray(metadata.compose_candidates)
+    ? metadata.compose_candidates.filter((value) => typeof value === 'string' && value)
+    : [];
+  const selectedCompose = typeof metadata.selected_compose_path === 'string'
+    ? metadata.selected_compose_path
+    : '';
+  if (composeCandidates.length > 1) {
+    composeOptions.replaceChildren();
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = t('errors.composeCandidates');
+    composeOptions.append(placeholder);
+    for (const candidate of composeCandidates) {
+      const option = document.createElement('option');
+      option.value = candidate;
+      option.textContent = candidate;
+      composeOptions.append(option);
+    }
+    composeOptions.hidden = false;
+    if (selectedCompose && !composeManuallyEdited) {
+      composeOptions.value = selectedCompose;
+      composePathInput.value = selectedCompose;
+      autoComposePath = selectedCompose;
+    }
+  } else if (composeCandidates.length === 1 && !composeManuallyEdited) {
+    composePathInput.value = selectedCompose || composeCandidates[0];
+    autoComposePath = composePathInput.value;
+  } else if (selectedCompose && !composeManuallyEdited && !composePathInput.value) {
+    composePathInput.value = selectedCompose;
+    autoComposePath = selectedCompose;
+  }
+
+  const ports = Array.isArray(metadata.ports)
+    ? metadata.ports.filter((item) => (
+      item && Number.isInteger(item.port) && item.port >= 1 && item.port <= 65535
+    ))
+    : [];
+  if (ports.length === 1 && !portManuallyEdited) {
+    portOptions.replaceChildren();
+    portOptions.hidden = true;
+    containerPortInput.value = String(ports[0].port);
+    autoContainerPort = containerPortInput.value;
+    portSelectedFromDiscovery = false;
+    portSource.textContent = typeof ports[0].service === 'string' && ports[0].service
+      ? ' · ' + ports[0].service
+      : '';
+  } else if (ports.length > 1) {
+    portOptions.replaceChildren();
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = t('errors.portCandidates');
+    portOptions.append(placeholder);
+    for (const item of ports) {
+      const option = document.createElement('option');
+      option.value = String(item.port);
+      const service = typeof item.service === 'string' && item.service
+        ? item.service + ' · '
+        : '';
+      option.textContent = service + item.port;
+      portOptions.append(option);
+    }
+    portOptions.hidden = false;
+    portSource.textContent = '';
+    if (
+      !portManuallyEdited
+      && (portSelectedFromDiscovery || containerPortInput.value === autoContainerPort)
+    ) {
+      containerPortInput.value = '';
+      autoContainerPort = '';
+    }
+  } else {
+    portOptions.replaceChildren();
+    portOptions.hidden = true;
+    portSelectedFromDiscovery = false;
+    portSource.textContent = '';
+  }
+
+  const errors = Array.isArray(metadata.errors) ? metadata.errors : [];
+  const warnings = Array.isArray(metadata.warnings) ? metadata.warnings : [];
+  if (errors.length) {
+    setMetadataStatus(metadataIssueKey(errors[0]));
+  } else if (warnings.length) {
+    setMetadataStatus(metadataIssueKey(warnings[0]));
+  } else if (sha) {
+    setMetadataStatus('errors.metadataReady');
+  } else if (!ports.length) {
+    setMetadataStatus('errors.metadataNoPort');
+  }
+  syncFactStrip();
+}
+
+function metadataIssueKey(value) {
+  const code = String(value || '').toLowerCase();
+  if (code.includes('git_metadata_fallback')) {
+    return 'errors.metadataGitFallback';
+  }
+  if (code.includes('git_timeout')) {
+    return 'errors.metadataGitTimeout';
+  }
+  if (code.includes('git_unavailable')) {
+    return 'errors.metadataGitUnavailable';
+  }
+  if (code.includes('git_metadata_limit_exceeded')) {
+    return 'errors.metadataGitLimit';
+  }
+  if (code.includes('archive_limit_exceeded')) {
+    return 'errors.metadataArchiveLimit';
+  }
+  if (code.includes('git_compose_selection_required')) {
+    return 'errors.metadataGitComposeSelection';
+  }
+  if (code.includes('git_ls_remote_failed')) {
+    return 'errors.metadataGitLsRemoteFailed';
+  }
+  if (code.includes('git_archive_redirect_rejected')) {
+    return 'errors.metadataGitArchiveRedirect';
+  }
+  if (code.includes('git_archive_invalid')) {
+    return 'errors.metadataGitArchiveInvalid';
+  }
+  if (code.includes('git_archive_failed')) {
+    return 'errors.metadataGitArchiveFailed';
+  }
+  if (code.includes('git_commit_not_found')) {
+    return 'errors.metadataGitCommitNotFound';
+  }
+  if (code.includes('git_compose_not_found')) {
+    return 'errors.metadataGitComposeNotFound';
+  }
+  if (code.includes('rate_limit')) {
+    return 'errors.metadataRateLimited';
+  }
+  if (code.includes('github_forbidden')) {
+    return 'errors.metadataForbidden';
+  }
+  if (code.includes('github_timeout')) {
+    return 'errors.metadataTimeout';
+  }
+  if (code.includes('compose_not_found')) {
+    return 'errors.metadataNoCompose';
+  }
+  if (code.includes('no_port') || code.includes('port_unresolved')) {
+    return 'errors.metadataNoPort';
+  }
+  if (code.includes('tree_truncated')) {
+    return 'errors.metadataTruncated';
+  }
+  if (code.includes('multiple')) {
+    return 'errors.metadataMultiple';
+  }
+  if (code.includes('not_found') || code === 'not_found') {
+    return 'errors.metadataNotFound';
+  }
+  if (code.includes('port')) {
+    return 'errors.metadataNoPort';
+  }
+  return 'errors.metadataFailed';
+}
+
+function repositoryMetadataKey(url = repositoryUrl.value.trim()) {
+  return [url, commitShaInput.value.trim(), composePathInput.value.trim()].join('|');
+}
+
+function invalidateMetadataRequest() {
+  metadataSequence += 1;
+  metadataRequestKey = '';
+  metadataRequestInFlight = false;
+  updateBusyUi();
+}
+
+function scheduleRepositoryDiscovery(delay = 600) {
+  if (metadataTimer !== null) {
+    clearTimeout(metadataTimer);
+  }
+  if (renderMetadataCooldown()) {
+    return;
+  }
+  metadataTimer = setTimeout(() => {
+    metadataTimer = null;
+    void discoverRepository();
+  }, delay);
+}
+
+async function discoverRepository({ force = false } = {}) {
+  const url = repositoryUrl.value.trim();
+  if (!validRepositoryUrl(url) || jobActive || doctorRunning) {
+    return;
+  }
+  if (renderMetadataCooldown()) {
+    return;
+  }
+  const requestKey = repositoryMetadataKey(url);
+  if (!force && (
+    requestKey === metadataRequestKey
+    || (requestKey === lastMetadataRequestKey && currentRepositoryMetadata)
+  )) {
+    return;
+  }
+  const sequence = ++metadataSequence;
+  metadataRequestKey = requestKey;
+  metadataRequestInFlight = true;
+  updateBusyUi();
+  setMetadataStatus('errors.metadataRunning');
+  const payload = { url };
+  const sha = commitShaInput.value.trim();
+  const composePath = composePathInput.value.trim();
+  if (/^[0-9a-f]{40}$/.test(sha)) {
+    payload.commit_sha = sha;
+  }
+  if (composePath) {
+    payload.compose_path = composePath;
+  }
+  try {
+    const metadata = await requestJson('/api/repository', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    });
+    if (sequence !== metadataSequence || repositoryUrl.value.trim() !== url) {
+      return;
+    }
+    const retryAfter = Number(metadata?.retry_after_seconds);
+    if (Number.isFinite(retryAfter) && retryAfter > 0) {
+      metadataCooldownUntil = Date.now() + retryAfter * 1000;
+    }
+    lastMetadataRequestKey = requestKey;
+    renderRepositoryMetadata(metadata);
+    renderMetadataCooldown();
+  } catch {
+    if (sequence === metadataSequence && repositoryUrl.value.trim() === url) {
+      setMetadataStatus('errors.metadataFailed');
+    }
+  } finally {
+    if (sequence === metadataSequence) {
+      metadataRequestKey = '';
+      metadataRequestInFlight = false;
+      updateBusyUi();
+    }
+  }
+}
+
+function validationMessage(detail) {
+  if (!Array.isArray(detail)) {
+    return typeof detail === 'string'
+      ? detail
+      : t('errors.invalidRequest');
+  }
+  return detail
+    .map((item) => {
+      const location = Array.isArray(item?.loc)
+        ? item.loc[item.loc.length - 1]
+        : t('errors.field');
+      return location + '：' + (item?.msg || t('errors.invalidField'));
+    })
+    .join('\n');
+}
+
+function submissionUnknown(message) {
+  const error = new Error(message);
+  error.submissionUnknown = true;
+  return error;
+}
+
+function localizedError(key) {
+  const error = new Error(t(key));
+  error.i18nKey = key;
+  return error;
+}
+
+async function requestJson(url, options) {
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch {
+    throw localizedError('errors.network');
+  }
+
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    if (response.ok) {
+      throw new Error(t('errors.missingJobId'));
+    }
+    const error = localizedError('errors.invalidResponse');
+    error.httpStatus = response.status;
+    throw error;
+  }
+
+  if (!response.ok) {
+    const error = body?.detail === undefined
+      ? localizedError('errors.invalidRequest')
+      : new Error(validationMessage(body.detail));
+    error.httpStatus = response.status;
+    throw error;
+  }
+  return body;
+}
+
+function setModelSettingsError(message = '') {
+  modelSettingsError.textContent = message;
+}
+
+let discoveredModels = [];
+let modelMenuOpen = false;
+let modelActiveIndex = -1;
+let modelFetched = false;
+
+function resetModelOptions() {
+  discoveredModels = [];
+  modelFetched = false;
+  modelActiveIndex = -1;
+  modelNameOptions.replaceChildren();
+  closeModelMenu();
+}
+
+function renderModelOptions(filter = '') {
+  const normalized = filter.trim().toLowerCase();
+  const matches = normalized
+    ? discoveredModels.filter((model) => model.toLowerCase().includes(normalized))
+    : discoveredModels;
+  modelNameOptions.replaceChildren();
+  for (const [index, model] of matches.entries()) {
+    const option = document.createElement('div');
+    option.className = 'model-option';
+    option.id = `model-option-${index}`;
+    option.setAttribute('role', 'option');
+    option.setAttribute('aria-selected', String(index === modelActiveIndex));
+    option.textContent = model;
+    option.addEventListener('mousedown', (event) => event.preventDefault());
+    option.addEventListener('click', () => selectModelOption(model));
+    modelNameOptions.append(option);
+  }
+  if (!matches.length) {
+    const empty = document.createElement('div');
+    empty.className = 'model-listbox-empty';
+    empty.textContent = modelFetched ? t('fields.modelOptionsEmpty') : t('fields.modelOptionsPlaceholder');
+    modelNameOptions.append(empty);
+  }
+}
+
+function openModelMenu({ filter = '' } = {}) {
+  modelMenuOpen = true;
+  modelNameInput.setAttribute('aria-expanded', 'true');
+  renderModelOptions(filter);
+  modelNameOptions.hidden = false;
+}
+
+function closeModelMenu() {
+  modelMenuOpen = false;
+  modelActiveIndex = -1;
+  modelNameInput.setAttribute('aria-expanded', 'false');
+  modelNameOptions.hidden = true;
+}
+
+function selectModelOption(model) {
+  modelNameInput.value = model;
+  closeModelMenu();
+}
+
+function moveModelActive(step) {
+  const options = [...modelNameOptions.querySelectorAll('[role="option"]')];
+  if (!options.length) return;
+  modelActiveIndex = (modelActiveIndex + step + options.length) % options.length;
+  options.forEach((option, index) => option.setAttribute('aria-selected', String(index === modelActiveIndex)));
+  options[modelActiveIndex].scrollIntoView({ block: 'nearest' });
+}
+
+function populateModelOptions(models) {
+  discoveredModels = models.filter((model) => typeof model === 'string' && model);
+  modelFetched = true;
+  closeModelMenu();
+}
+
+let modelDiscoverySequence = 0;
+let modelDiscoveryBusyRequestId = 0;
+
+function normalizeModelEndpoint(value) {
+  return value.trim().replace(/\/+$/, '');
+}
+
+function invalidateModelDiscovery() {
+  modelDiscoverySequence += 1;
+  resetModelOptions();
+  discoverModelsButton.disabled = false;
+}
+
+function renderModelSettings(settings) {
+  modelEndpointInput.value = settings?.endpoint || '';
+  modelNameInput.value = settings?.model_name || '';
+  modelApiKeyInput.value = '';
+  resetModelOptions();
+}
+
+function refreshModelSettingsLabels() {
+  if (!modelMenuOpen && !modelFetched) modelNameOptions.textContent = '';
+}
+
+async function discoverModelList() {
+  const requestId = ++modelDiscoverySequence;
+  modelDiscoveryBusyRequestId = requestId;
+  const endpoint = normalizeModelEndpoint(modelEndpointInput.value);
+  const apiKey = modelApiKeyInput.value;
+  setModelSettingsError('');
+  discoverModelsButton.disabled = true;
+  resetModelOptions();
+  try {
+    const result = await requestJson('/api/settings/model/discover', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ endpoint, api_key: apiKey }),
+    });
+    if (
+      requestId !== modelDiscoverySequence
+      || endpoint !== normalizeModelEndpoint(modelEndpointInput.value)
+      || apiKey !== modelApiKeyInput.value
+    ) {
+      return;
+    }
+    const models = Array.isArray(result?.models) ? result.models : [];
+    populateModelOptions(models);
+    if (models.length === 0) {
+      setModelSettingsError(t('model.discoveryEmpty'));
+    }
+  } catch (error) {
+    if (requestId === modelDiscoverySequence) {
+      setModelSettingsError(error instanceof Error ? error.message : t('model.discoveryError'));
+    }
+  } finally {
+    if (requestId === modelDiscoverySequence) {
+      discoverModelsButton.disabled = false;
+    }
+    if (modelDiscoveryBusyRequestId === requestId) {
+      modelDiscoveryBusyRequestId = 0;
+      discoverModelsButton.disabled = false;
+    }
+  }
+}
+
+async function loadModelSettings() {
+  try {
+    renderModelSettings(await requestJson('/api/settings/model', { headers }));
+  } catch (error) {
+    setModelSettingsError(error instanceof Error ? error.message : t('model.loadError'));
+  }
+}
+
+async function saveModelSettings() {
+  setModelSettingsError('');
+  saveModelSettingsButton.disabled = true;
+  try {
+    const endpoint = normalizeModelEndpoint(modelEndpointInput.value) || null;
+    const modelName = modelNameInput.value.trim() || null;
+    const settings = await requestJson('/api/settings/model', {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({
+        provider: endpoint || modelName ? 'custom' : null,
+        endpoint,
+        model_name: modelName,
+        api_key: modelApiKeyInput.value,
+      }),
+    });
+    renderModelSettings(settings);
+    setModelSettingsError(t('model.saved'));
+  } catch (error) {
+    setModelSettingsError(error instanceof Error ? error.message : t('model.saveError'));
+  } finally {
+    saveModelSettingsButton.disabled = false;
+  }
+}
+
+async function clearModelSettings() {
+  setModelSettingsError('');
+  clearModelSettingsButton.disabled = true;
+  try {
+    renderModelSettings(await requestJson('/api/settings/model', {
+      method: 'DELETE',
+      headers,
+    }));
+    modelEndpointInput.value = '';
+    modelNameInput.value = '';
+    resetModelOptions();
+    setModelSettingsError(t('model.cleared'));
+  } catch (error) {
+    setModelSettingsError(error instanceof Error ? error.message : t('model.saveError'));
+  } finally {
+    clearModelSettingsButton.disabled = false;
+  }
+}
+
+function rememberJobId(jobId) {
+  try {
+    sessionStorage.setItem(storageKey, jobId);
+  } catch {
+    // Querying the active job still works until this page is closed.
+  }
+}
+
+function forgetStoredJobId() {
+  try {
+    sessionStorage.removeItem(storageKey);
+  } catch {
+    // Storage may be unavailable; the active in-memory state remains authoritative.
+  }
+}
+
+function readStoredJobId() {
+  try {
+    const storedJobId = sessionStorage.getItem(storageKey);
+    return storedJobId && jobIdPattern.test(storedJobId) ? storedJobId : null;
+  } catch {
+    return null;
+  }
+}
+
+const phaseOrder = [
+  'preparing_repository', 'preparing_environment', 'starting_application',
+  'checking_application', 'collecting_observations', 'hardening', 'finalizing',
+];
+
+function progressTranslation(section, value) {
+  const translated = translationValue('progress.' + section + '.' + value);
+  return typeof translated === 'string' ? translated : '';
+}
+
+function formatEvidenceAge(seconds) {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) {
+    return '';
+  }
+  if (seconds < 60) {
+    return t('progress.ageSeconds', { value: Math.floor(seconds) });
+  }
+  return t('progress.ageMinutes', { value: Math.floor(seconds / 60) });
+}
+
+function renderProgress(current, state = current?.state) {
+  const progress = current?.progress;
+  const progressState = ['running', 'completed', 'failed', 'unknown'].includes(state)
+    ? state
+    : 'unknown';
+  const hasActivePhase = ['running', 'failed', 'unknown'].includes(progressState);
+  phaseProgress.hidden = !current;
+  phaseList.replaceChildren();
+  phaseProgressUnavailable.hidden = true;
+  latestEvidence.hidden = true;
+  if (!current) {
+    return;
+  }
+  if (!progress || typeof progress !== 'object') {
+    phaseProgressUnavailable.hidden = false;
+    return;
+  }
+  const completed = new Set(
+    Array.isArray(progress.completed_phases)
+      ? progress.completed_phases.filter((value) => phaseOrder.includes(value))
+      : [],
+  );
+  const currentPhase = phaseOrder.includes(progress.phase) ? progress.phase : '';
+  if (!currentPhase && completed.size === 0 && !progress.latest_event && !progress.latest_operation) {
+    phaseProgressUnavailable.hidden = false;
+  }
+  for (const phase of phaseOrder) {
+    const item = document.createElement('li');
+    const isConfirmed = completed.has(phase);
+    const isCurrent = hasActivePhase && !isConfirmed && phase === currentPhase;
+    item.className = isConfirmed ? 'confirmed' : isCurrent ? 'current' : '';
+    item.dataset.phase = phase;
+    let label = progressTranslation('phases', phase);
+    if (phase === 'hardening' && Number.isInteger(progress.experiment_index)
+      && progress.experiment_index > 0) {
+      label = t('progress.hardeningRound', { index: progress.experiment_index });
+    }
+    let stateLabel = t('progress.pending');
+    if (isConfirmed) {
+      stateLabel = t('progress.confirmed');
+    } else if (isCurrent && progressState === 'running') {
+      stateLabel = t('progress.current');
+    } else if (isCurrent && progressState === 'failed') {
+      stateLabel = t('progress.stoppedPhase');
+    } else if (isCurrent && progressState === 'unknown') {
+      stateLabel = t('progress.unknownPhase');
+    }
+    item.textContent = label + ' · ' + stateLabel;
+    phaseList.append(item);
+  }
+
+  if (!phaseList.children.length) {
+    phaseProgressUnavailable.hidden = false;
+  }
+  const eventLabel = progressTranslation('events', progress.latest_event);
+  const operationLabel = progressTranslation('operations', progress.latest_operation);
+  const ageLabel = formatEvidenceAge(progress.evidence_age_seconds);
+  const evidenceParts = [eventLabel, operationLabel].filter(Boolean);
+  let evidenceDetail = evidenceParts.join(' · ');
+  if (ageLabel) {
+    evidenceDetail = evidenceDetail ? evidenceDetail + ' · ' + ageLabel : ageLabel;
+  }
+  latestEvidence.hidden = false;
+  if (evidenceDetail) {
+    latestEvidence.textContent = t('progress.latestPrefix') + evidenceDetail;
+  } else if (progressState === 'failed') {
+    latestEvidence.textContent = t('progress.stopped');
+  } else if (progressState === 'unknown') {
+    latestEvidence.textContent = t('progress.unknown');
+  } else if (progressState === 'completed') {
+    latestEvidence.textContent = t('progress.completed');
+  } else {
+    latestEvidence.textContent = t('progress.waiting');
+  }
+}
+
+function isTimeBudgetExhausted(current) {
+  const value = String(current?.stop_reason || current?.error || '').toLowerCase();
+  return value.includes('total_duration_exhausted');
+}
+
+function renderReports(jobId, current) {
+  clearReports();
+  if (
+    !current ||
+    !['completed', 'failed'].includes(current.state) ||
+    !current.reports ||
+    typeof current.reports !== 'object'
+  ) {
+    return;
+  }
+
+  const base = '/api/jobs/' + encodeURIComponent(jobId) + '/report/';
+  for (const [kind, link] of [['html', htmlReport], ['json', jsonReport]]) {
+    if (Object.prototype.hasOwnProperty.call(current.reports, kind)) {
+      link.href = base + kind;
+      link.hidden = false;
+    }
+  }
+  if (!htmlReport.hidden || !jsonReport.hidden) {
+    reportCard.hidden = false;
+    reportDesc.textContent = isTimeBudgetExhausted(current)
+      ? t('report.timeBudget')
+      : current.state === 'failed'
+        ? t('report.failed')
+      : t('report.completed');
+  }
+  syncSidebarNavigation(document.body.dataset.consoleState || 'idle');
+}
+
+function failureDetails(current) {
+  const evidence = current?.failure_evidence && typeof current.failure_evidence === 'object'
+    ? current.failure_evidence
+    : {};
+  const rawReason = current?.stop_reason || current?.error || '';
+  const safeCode = /^[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*$/.test(rawReason)
+    && rawReason.length <= 512
+    ? rawReason
+    : '';
+  const operation = current?.failure_stage
+    || evidence.operation
+    || (safeCode ? safeCode.split(':')[0] : '');
+  const evidenceReason = evidence.reason || '';
+  const code = current?.error_code
+    || safeCode
+    || (operation && evidenceReason ? operation + ':' + evidenceReason : '')
+    || evidenceReason
+    || '';
+  const searchable = (code + ' ' + rawReason).toLowerCase();
+  let reasonKey = '';
+  let nextKey = 'errors.genericFailureNext';
+  if (searchable.includes('total_duration_exhausted')) {
+    reasonKey = 'errors.timeBudgetReason';
+    nextKey = 'errors.timeBudgetNext';
+  } else if (searchable.includes('guest_output_malformed')) {
+    reasonKey = 'errors.compatibilityMalformedReason';
+    nextKey = 'errors.compatibilityMalformedNext';
+  } else if (searchable.includes('preparation_timeout')) {
+    reasonKey = 'errors.preparationTimeoutReason';
+    nextKey = 'errors.preparationTimeoutNext';
+  } else if (searchable.includes('intake:checkout_timeout')
+    || searchable.includes('checkout_timeout')) {
+    reasonKey = 'errors.checkoutTimeoutReason';
+    nextKey = 'errors.checkoutTimeoutNext';
+  } else if (searchable.includes('clone_timeout')) {
+    reasonKey = 'errors.cloneTimeoutReason';
+    nextKey = 'errors.cloneTimeoutNext';
+  } else if (searchable.includes('sandbox') && searchable.includes('nonzero')) {
+    reasonKey = 'errors.sandboxCreateReason';
+    nextKey = 'errors.sandboxCreateNext';
+  } else if (searchable.includes('terminal evidence unavailable')) {
+    reasonKey = 'errors.terminalEvidenceReason';
+    nextKey = 'errors.terminalEvidenceNext';
+  } else if (searchable.includes('insufficient_coverage')) {
+    reasonKey = 'errors.insufficientCoverageReason';
+    nextKey = 'errors.insufficientCoverageNext';
+  } else if (searchable.includes('experiment:sandbox_failed')) {
+    reasonKey = 'errors.experimentSandboxFailedReason';
+    nextKey = 'errors.experimentSandboxFailedNext';
+  }
+  return {
+    stage: reasonKey === 'errors.timeBudgetReason'
+      ? 'total_duration_exhausted'
+      : reasonKey === 'errors.checkoutTimeoutReason'
+        ? 'intake:checkout_timeout'
+        : reasonKey === 'errors.preparationTimeoutReason'
+          ? 'intake:preparation_timeout'
+        : operation || 'unknown',
+    reason: reasonKey ? t(reasonKey) : rawReason || t('errors.unknownReason'),
+    next: t(nextKey),
+    code: code || '—',
+    runId: typeof current?.run_id === 'string' ? current.run_id : '—',
+  };
+}
+
+function renderFailureDetails(current, state) {
+  const visible = state === 'failed';
+  const details = document.querySelector('#failure-details');
+  details.hidden = !visible;
+  if (!visible) {
+    return;
+  }
+  const info = failureDetails(current);
+  document.querySelector('#failure-stage').textContent = failureStageLabel(info.stage);
+  document.querySelector('#failure-reason').textContent = info.reason;
+  document.querySelector('#failure-next-step').textContent = info.next;
+  document.querySelector('#failure-code').textContent = info.code;
+  document.querySelector('#failure-run-id').textContent = info.runId;
+}
+
+function failureStageLabel(value) {
+  const stage = String(value || '').toLowerCase();
+  if (stage.includes('total_duration_exhausted')) {
+    return t('errors.failureStageTimeBudget');
+  }
+  if (stage.includes('checkout_timeout') || stage.includes('preparation_timeout')) {
+    return t('errors.failureStageCheckout');
+  }
+  if (stage.startsWith('intake') || stage.includes('clone') || stage.includes('download')) {
+    return t('errors.failureStageIntake');
+  }
+  if (stage.includes('experiment') || stage.includes('least-privilege')) {
+    return t('errors.failureStageExperiment');
+  }
+  if (stage.startsWith('create') || stage.includes('sandbox')) {
+    return t('errors.failureStageCreate');
+  }
+  if (stage.includes('insufficient_coverage') || stage.includes('coverage')) {
+    return t('errors.failureStageCoverage');
+  }
+  if (stage.startsWith('boot') || stage.includes('start')) {
+    return t('errors.failureStageBoot');
+  }
+  if (stage.startsWith('verify') || stage.includes('journey') || stage.includes('replay')) {
+    return t('errors.failureStageVerify');
+  }
+  if (stage === 'unknown' || !stage) {
+    return t('errors.failureStageUnknown');
+  }
+  if (stage.startsWith('compatibility') || stage.includes('guest_output')) {
+    return t('errors.failureStageCompatibility');
+  }
+  return value || t('errors.failureStageUnknown');
+}
+
+function requestSnapshot(value) {
+  if (!value || typeof value !== 'object') return null;
+  const { url, commit_sha, container_port, compose_path } = value;
+  if (typeof url !== 'string' || typeof commit_sha !== 'string' || typeof container_port !== 'number') return null;
+  return {
+    url,
+    commit_sha,
+    container_port,
+    ...(typeof compose_path === 'string' && compose_path ? { compose_path } : {}),
+  };
+}
+
+function renderStatus(current, explicitUnknown = false, preserveElapsed = false) {
+  if (
+    activeJobId
+    && current?.progress
+    && typeof current.progress === 'object'
+  ) {
+    lastProgressJobId = activeJobId;
+    lastConfirmedProgress = current.progress;
+  }
+  currentStatus = current;
+  const snapshot = requestSnapshot(current?.request);
+  if (snapshot) rerunRequestSnapshot = snapshot;
+  currentStatusExplicitUnknown = explicitUnknown;
+  submissionUnknownActive = false;
+  const state = current && ['running', 'completed', 'failed', 'unknown'].includes(current.state)
+    ? current.state
+    : 'unknown';
+  const stopped = current?.control === 'stopped';
+  const visualState = stopped ? 'completed' : state;
+  const timeBudgetExhausted = isTimeBudgetExhausted(current);
+  setWorkspaceState(visualState);
+  const statusCopy = stopped
+    ? translationValue('status.stopped')
+    : timeBudgetExhausted
+    ? translationValue('status.timeBudgetExhausted')
+    : translationValue('status.' + state);
+  const color = {
+    running: '#4161df',
+    completed: '#178264',
+    failed: '#c25353',
+    unknown: '#a47126',
+  }[state] || '#a47126';
+  const displayColor = timeBudgetExhausted ? '#a47126' : color;
+
+  statusTitle.textContent = statusCopy.title;
+  statusDesc.textContent = statusCopy.description;
+  stateDot.style.background = displayColor;
+  if (state === 'running' && preserveElapsed) {
+    renderElapsedClock();
+    if (elapsedTicker === null) {
+      elapsedTicker = setInterval(renderElapsedClock, 250);
+    }
+  } else if (state === 'running') {
+    anchorElapsed(current?.elapsed_seconds, { running: true });
+  } else if (typeof current?.elapsed_seconds === 'number') {
+    stopElapsedTicker();
+    elapsedServerSeconds = current.elapsed_seconds;
+    elapsedRenderedSeconds = current.elapsed_seconds;
+    elapsed.textContent = formatElapsed(current.elapsed_seconds);
+  } else {
+    elapsedNeedsSync = true;
+    renderElapsedClock();
+    stopElapsedTicker();
+    renderElapsedClock();
+  }
+  exitCode.textContent = typeof current?.exit_code === 'number'
+    ? current.exit_code
+    : '—';
+  reason.textContent = stopped
+    ? (current?.stop_reason || t('status.stopped.description'))
+    : timeBudgetExhausted
+    ? failureDetails(current).reason
+    : state === 'completed'
+      ? t('task.completedReason')
+      : current?.stop_reason || current?.error || (
+        state === 'unknown'
+          ? t('errors.unknownReason')
+          : t('task.reasonInitial')
+      );
+  renderProgress(current, state);
+  renderFailureDetails(current, state);
+
+  renderReports(activeJobId, current);
+  if (stopped || state === 'completed' || state === 'failed') {
+    stopElapsedTicker();
+    setBusy(false);
+  } else if (state === 'unknown' && explicitUnknown) {
+    stopElapsedTicker();
+    activeJobId = null;
+    forgetStoredJobId();
+    setBusy(false);
+  }
+}
+
+function renderFormError() {
+  formErrors.className = currentFormError ? 'error' : '';
+  formErrors.textContent = currentFormError
+    ? currentFormError.translationKey
+      ? t(currentFormError.translationKey)
+      : currentFormError.message
+    : '';
+}
+
+function showError(message) {
+  const error = message instanceof Error ? message : null;
+  currentFormError = {
+    translationKey: error?.i18nKey || null,
+    message: error?.message || String(message ?? ''),
+  };
+  renderFormError();
+}
+
+function clearFormError() {
+  currentFormError = null;
+  renderFormError();
+}
+
+function renderSubmissionUnknown() {
+  setWorkspaceState('unknown');
+  setBusy(true);
+  introTitle.textContent = t('intro.submissionUnknownTitle');
+  introDescription.textContent = t('intro.submissionUnknownDescription');
+  statusTitle.textContent = t('errors.submissionTitle');
+  statusDesc.textContent = t('errors.submissionDescription');
+  stateDot.style.background = '#a47126';
+  reason.textContent = t('errors.submissionReason');
+  showError(localizedError('errors.unknownSubmission'));
+}
+
+function markSubmissionUnknown() {
+  submissionUnknownActive = true;
+  currentStatus = null;
+  renderSubmissionUnknown();
+}
+
+function schedulePoll(delay = 500) {
+  if (pollTimer !== null) {
+    clearTimeout(pollTimer);
+  }
+  pollTimer = setTimeout(() => {
+    pollTimer = null;
+    void pollStatus();
+  }, delay);
+}
+
+async function pollStatus() {
+  if (!activeJobId || pollInFlight) {
+    return;
+  }
+  pollInFlight = true;
+  try {
+    const current = await requestJson(
+      '/api/jobs/' + encodeURIComponent(activeJobId),
+      { headers: { Accept: 'application/json' } },
+    );
+    if (
+      !current ||
+      !['running', 'completed', 'failed', 'unknown'].includes(current.state)
+    ) {
+      throw new Error(t('errors.invalidState'));
+    }
+    renderStatus(current, current.state === 'unknown');
+    if (current.state === 'running' && current.control !== 'stopped') {
+      schedulePoll(1000);
+    }
+  } catch {
+    const unknownStatus = { state: 'unknown', elapsed_seconds: null };
+    if (lastProgressJobId === activeJobId && lastConfirmedProgress) {
+      unknownStatus.progress = lastConfirmedProgress;
+    }
+    renderStatus(unknownStatus);
+    reason.textContent = t('errors.pollRetry');
+    schedulePoll(1000);
+  } finally {
+    pollInFlight = false;
+  }
+}
+
+function renderDoctor(result) {
+  currentDoctor = result;
+  startupReady = result?.ready === true;
+  currentDoctorError = null;
+  environment.dataset.environmentState = startupReady ? 'ready' : 'error';
+  updateEnvironmentBadge(environment.dataset.environmentState);
+  environment.replaceChildren();
+  const summary = document.createElement('p');
+  summary.style.cssText = 'font-size:12px;margin:0 0 8px';
+  summary.textContent = startupReady
+    ? t('environment.ready')
+    : t('environment.blocked');
+  environment.append(summary);
+  for (const check of Array.isArray(result.checks) ? result.checks : []) {
+    const row = document.createElement('div');
+    row.className = 'check';
+    const name = document.createElement('span');
+    name.textContent = check.name || t('environment.unnamed');
+    const status = document.createElement('span');
+    status.className = check.status === 'PASS' ? 'ok' : 'warn';
+    status.textContent = translations[language].environment.status[check.status]
+      || check.status
+      || 'UNKNOWN';
+    row.append(name, status);
+    environment.append(row);
+    if (check.status === 'FAIL' || check.status === 'UNSUPPORTED') {
+      const detail = document.createElement('details');
+      detail.className = 'check-detail' + (
+        check.status === 'UNSUPPORTED' ? ' unsupported' : ''
+      );
+      detail.open = true;
+      const title = document.createElement('summary');
+      title.textContent = check.status === 'UNSUPPORTED'
+        ? t('environment.unsupportedTitle')
+        : t('environment.failTitle');
+      const why = document.createElement('p');
+      why.textContent = t('environment.reasonPrefix')
+        + (check.detail || '');
+      detail.append(title, why);
+      if (check.remediation) {
+        const next = document.createElement('p');
+        next.textContent = t('environment.remediationPrefix')
+          + check.remediation;
+        detail.append(next);
+      }
+      environment.append(detail);
+    }
+  }
+}
+
+function renderDoctorError(error) {
+  currentDoctor = null;
+  startupReady = false;
+  environment.dataset.environmentState = 'error';
+  updateEnvironmentBadge('error');
+  if (error && typeof error === 'object' && 'message' in error && !(error instanceof Error)) {
+    currentDoctorError = error;
+  } else {
+    currentDoctorError = {
+      key: error instanceof Error ? error.i18nKey : null,
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+  environment.textContent = currentDoctorError.key
+    ? t(currentDoctorError.key)
+    : currentDoctorError.message;
+}
+
+async function runDoctor() {
+  if (doctorButton.disabled || jobActive || submitting) {
+    return;
+  }
+  doctorRunning = true;
+  setWorkspaceState('environment-checking');
+  environment.dataset.environmentState = 'checking';
+  updateEnvironmentBadge('checking');
+  updateBusyUi();
+  environment.textContent = t('environment.running');
+  try {
+    const result = await requestJson('/api/doctor', { method: 'POST', headers });
+    renderDoctor(result);
+  } catch (error) {
+    renderDoctorError(error instanceof Error ? error : t('environment.requestError'));
+  } finally {
+    doctorRunning = false;
+    if (!jobActive) setWorkspaceState('idle');
+    updateBusyUi();
+  }
+}
+
+async function stopActiveJob() {
+  if (!activeJobId || stopInFlight || document.body.dataset.consoleState !== 'running') return;
+  const requestedJobId = activeJobId;
+  stopInFlight = true;
+  updateRunActions();
+  try {
+    const current = await requestJson('/api/jobs/' + encodeURIComponent(requestedJobId) + '/stop', {
+      method: 'POST',
+      headers,
+    });
+    if (activeJobId !== requestedJobId) return;
+    if (current && ['running', 'completed', 'failed', 'unknown'].includes(current.state)) {
+      renderStatus(current, current.state === 'unknown');
+    }
+    if (!current || current.state === 'running') schedulePoll(250);
+  } catch (error) {
+    if (activeJobId !== requestedJobId) return;
+    showError(error instanceof Error ? error : localizedError('errors.stopFailed'));
+    schedulePoll(250);
+  } finally {
+    stopInFlight = false;
+    updateRunActions();
+  }
+}
+
+async function submitJob(event, snapshot = null) {
+  event.preventDefault();
+  if (submitting || jobActive || doctorRunning) {
+    return;
+  }
+  if (!snapshot) {
+    rerunRequestSnapshot = null;
+  }
+  if (!startupReady) {
+    showError(localizedError('errors.environmentBlocked'));
+    return;
+  }
+  clearFormError();
+  clearReports();
+  submissionUnknownActive = false;
+  currentStatus = null;
+  activeJobId = null;
+  lastProgressJobId = null;
+  lastConfirmedProgress = null;
+  forgetStoredJobId();
+  invalidateMetadataRequest();
+  if (metadataTimer !== null) {
+    clearTimeout(metadataTimer);
+    metadataTimer = null;
+  }
+  const payload = snapshot
+    ? { ...snapshot }
+    : Object.fromEntries(new FormData(form).entries());
+  payload.container_port = Number(payload.container_port);
+  if (!payload.compose_path) delete payload.compose_path;
+  for (const key of ['model_endpoint', 'model_name', 'model_api_key']) {
+    delete payload[key];
+  }
+
+  submitting = true;
+  updateRunSummary();
+  setWorkspaceState('submitting');
+  setBusy(true);
+  try {
+    const result = await requestJson('/api/jobs', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    });
+    if (typeof result?.job_id !== 'string' || !jobIdPattern.test(result.job_id)) {
+      throw submissionUnknown(t('errors.missingJobId'));
+    }
+    activeJobId = result.job_id;
+    rememberJobId(activeJobId);
+    renderStatus({ state: 'running', elapsed_seconds: 0 });
+    schedulePoll(0);
+  } catch (error) {
+    if (error?.submissionUnknown || typeof error?.httpStatus !== 'number') {
+      markSubmissionUnknown();
+    } else {
+      setBusy(false);
+      setWorkspaceState('idle');
+      showError(error instanceof Error ? error : localizedError('errors.retrySubmit'));
+    }
+  } finally {
+    submitting = false;
+  }
+}
+
+function updateGuideLinks() {
+  const guideHref = '/?view=guide&lang=' + language;
+  const guide = document.querySelector('#sidebar-guide');
+  if (guide) guide.href = guideHref;
+  const usage = document.querySelector('#usage-guide');
+  if (usage) usage.href = guideHref;
+  document.querySelectorAll('[data-guide-doc]').forEach((element) => {
+    const anchor = element.dataset.guideDocAnchor;
+    element.href = guideHref + (anchor ? '#' + anchor : '');
+  });
+}
+
+function applyLanguage() {
+  document.documentElement.lang = language === 'en' ? 'en' : 'zh-CN';
+  document.title = t('title');
+  languageSelect.value = language;
+  languageSelect.setAttribute('aria-label', t('language.label'));
+  updateGuideLinks();
+  document.querySelectorAll('[data-i18n]').forEach((element) => {
+    element.textContent = t(element.dataset.i18n);
+  });
+  setWorkspaceFlow(document.body.dataset.consoleState || 'idle');
+  document.querySelectorAll('[data-i18n-placeholder]').forEach((element) => {
+    element.placeholder = t(element.dataset.i18nPlaceholder);
+  });
+  document.querySelectorAll('[data-i18n-aria-label]').forEach((element) => {
+    element.setAttribute('aria-label', t(element.dataset.i18nAriaLabel));
+  });
+  refreshModelSettingsLabels();
+  if (doctorRunning) {
+    environment.textContent = t('environment.running');
+  } else if (currentDoctor) {
+    renderDoctor(currentDoctor);
+  } else if (currentDoctorError) {
+    renderDoctorError(currentDoctorError);
+  }
+  if (recoverySummary && !repositoryUrl.value.trim()) {
+    updateRunSummary();
+  }
+  if (currentStatus) {
+    renderStatus(currentStatus, currentStatusExplicitUnknown, true);
+  } else if (submissionUnknownActive) {
+    renderSubmissionUnknown();
+  }
+  if (currentRepositoryMetadata) {
+    if (!commitLink.hidden) {
+      commitLink.textContent = t('errors.commitLink');
+    }
+    if (commitSource.textContent) {
+      commitSource.textContent = t(
+        commitManuallyEdited ? 'errors.commitManual' : 'errors.commitAuto',
+      );
+    }
+    const metadataErrors = Array.isArray(currentRepositoryMetadata.errors)
+      ? currentRepositoryMetadata.errors
+      : [];
+    const metadataWarnings = Array.isArray(currentRepositoryMetadata.warnings)
+      ? currentRepositoryMetadata.warnings
+      : [];
+    setMetadataStatus(
+      metadataErrors.length
+        ? metadataIssueKey(metadataErrors[0])
+        : metadataWarnings.length
+          ? metadataIssueKey(metadataWarnings[0])
+          : currentRepositoryMetadata.commit_sha
+            ? 'errors.metadataReady'
+            : 'errors.metadataNoPort',
+    );
+    renderMetadataCooldown();
+  }
+  if (currentFormError) {
+    renderFormError();
+  }
+  updateBusyUi();
+}
+
+languageSelect.addEventListener('change', () => {
+  language = languageSelect.value === 'en' ? 'en' : 'zh';
+  rememberLanguage();
+  applyLanguage();
+  syncFactStrip();
+  updateEnvironmentBadge(environment.dataset.environmentState || 'idle');
+  updateGuideLinks();
+});
+
+repositoryUrl.addEventListener('input', () => {
+  recoverySummary = false;
+  invalidateMetadataRequest();
+  commitManuallyEdited = false;
+  composeManuallyEdited = false;
+  portManuallyEdited = false;
+  commitShaInput.value = '';
+  containerPortInput.value = '';
+  composePathInput.value = '';
+  clearDiscoveryFields();
+  updateBusyUi();
+  if (validRepositoryUrl(repositoryUrl.value.trim())) {
+    scheduleRepositoryDiscovery();
+  }
+  syncFactStrip();
+});
+commitShaInput.addEventListener('input', () => {
+  commitManuallyEdited = Boolean(commitShaInput.value.trim());
+  invalidateMetadataRequest();
+  clearDiscoveryFields();
+  updateBusyUi();
+  if (
+    validRepositoryUrl(repositoryUrl.value.trim())
+    && (!commitShaInput.value.trim() || /^[0-9a-f]{40}$/.test(commitShaInput.value.trim()))
+  ) {
+    scheduleRepositoryDiscovery(600);
+  }
+  syncFactStrip();
+});
+containerPortInput.addEventListener('input', () => {
+  portManuallyEdited = Boolean(containerPortInput.value.trim());
+  portSelectedFromDiscovery = false;
+  if (portManuallyEdited) {
+    portSource.textContent = '';
+  } else if (validRepositoryUrl(repositoryUrl.value.trim())) {
+    invalidateMetadataRequest();
+    currentRepositoryMetadata = null;
+    portOptions.replaceChildren();
+    portOptions.hidden = true;
+    scheduleRepositoryDiscovery(600);
+  }
+  syncFactStrip();
+});
+composePathInput.addEventListener('input', () => {
+  composeManuallyEdited = Boolean(composePathInput.value.trim());
+  invalidateMetadataRequest();
+  if (
+    !portManuallyEdited
+    && (portSelectedFromDiscovery || containerPortInput.value === autoContainerPort)
+  ) {
+    containerPortInput.value = '';
+    autoContainerPort = '';
+  }
+  portOptions.replaceChildren();
+  portOptions.hidden = true;
+  currentRepositoryMetadata = null;
+  if (validRepositoryUrl(repositoryUrl.value.trim())) {
+    scheduleRepositoryDiscovery(600);
+  }
+  syncFactStrip();
+});
+portOptions.addEventListener('change', () => {
+  if (portOptions.value) {
+    containerPortInput.value = portOptions.value;
+    autoContainerPort = portOptions.value;
+    portManuallyEdited = false;
+    portSelectedFromDiscovery = true;
+    syncFactStrip();
+  }
+});
+composeOptions.addEventListener('change', () => {
+  if (composeOptions.value) {
+    composePathInput.value = composeOptions.value;
+    composeManuallyEdited = true;
+    invalidateMetadataRequest();
+    if (
+      !portManuallyEdited
+      && (portSelectedFromDiscovery || containerPortInput.value === autoContainerPort)
+    ) {
+      containerPortInput.value = '';
+      autoContainerPort = '';
+    }
+    portSelectedFromDiscovery = false;
+    portOptions.replaceChildren();
+    portOptions.hidden = true;
+    currentRepositoryMetadata = null;
+    if (validRepositoryUrl(repositoryUrl.value.trim())) {
+      scheduleRepositoryDiscovery(600);
+    }
+    syncFactStrip();
+  }
+});
+detectRepositoryButton.addEventListener('click', () => {
+  if (metadataTimer !== null) {
+    clearTimeout(metadataTimer);
+    metadataTimer = null;
+  }
+  void discoverRepository({ force: true });
+});
+for (const eventName of ['change', 'blur']) {
+  composePathInput.addEventListener(eventName, () => {
+    if (validRepositoryUrl(repositoryUrl.value.trim())) {
+      scheduleRepositoryDiscovery(0);
+    }
+  });
+}
+sidebarNavItems.forEach((item, itemIndex) => {
+  item.addEventListener('click', (event) => {
+    if (item.getAttribute('aria-disabled') === 'true') {
+      event.preventDefault();
+      return;
+    }
+    if (itemIndex === 0 && ['completed', 'failed', 'unknown'].includes(document.body.dataset.consoleState)) {
+      event.preventDefault();
+      newInspectionButton.click();
+      return;
+    }
+    const target = itemIndex === 1 ? document.querySelector('#task-card') : document.querySelector('#report-card');
+    if (itemIndex > 0 && target) {
+      event.preventDefault();
+      target.scrollIntoView({ block: 'start' });
+    }
+  });
+});
+form.addEventListener('submit', submitJob);
+doctorButton.addEventListener('click', runDoctor);
+discoverModelsButton.addEventListener('click', discoverModelList);
+modelEndpointInput.addEventListener('input', () => {
+  invalidateModelDiscovery();
+});
+modelApiKeyInput.addEventListener('input', () => {
+  invalidateModelDiscovery();
+});
+modelNameToggle.addEventListener('click', () => {
+  if (modelMenuOpen) closeModelMenu();
+  else openModelMenu();
+});
+modelNameInput.addEventListener('input', () => {
+  if (modelFetched) openModelMenu({ filter: modelNameInput.value });
+});
+modelNameInput.addEventListener('keydown', (event) => {
+  if (event.key === 'ArrowDown') {
+    event.preventDefault();
+    if (!modelMenuOpen) openModelMenu();
+    moveModelActive(1);
+  } else if (event.key === 'ArrowUp') {
+    event.preventDefault();
+    if (!modelMenuOpen) openModelMenu();
+    moveModelActive(-1);
+  } else if (event.key === 'Enter' && modelMenuOpen) {
+    const option = modelNameOptions.querySelectorAll('[role="option"]')[modelActiveIndex];
+    if (option) {
+      event.preventDefault();
+      selectModelOption(option.textContent);
+    }
+  } else if (event.key === 'Escape') {
+    closeModelMenu();
+  }
+});
+document.addEventListener('click', (event) => {
+  if (modelMenuOpen && !event.target.closest('.model-combobox')) closeModelMenu();
+});
+saveModelSettingsButton.addEventListener('click', saveModelSettings);
+clearModelSettingsButton.addEventListener('click', clearModelSettings);
+document.querySelector('#close-guide').addEventListener('click', () => {
+  document.querySelector('#guide-dialog').close();
+});
+document.querySelectorAll('[data-guide]').forEach((link) => {
+  link.addEventListener('click', (event) => {
+    event.preventDefault();
+    const dialog = document.querySelector('#guide-dialog');
+    dialog.showModal();
+    const section = document.querySelector('#guide-' + link.dataset.guide);
+    section.scrollIntoView({ block: 'start' });
+    section.focus({ preventScroll: true });
+  });
+});
+document.querySelectorAll('#guide-dialog nav a').forEach((link) => {
+  link.addEventListener('click', (event) => {
+    event.preventDefault();
+    const section = document.querySelector(link.getAttribute('href'));
+    section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    section.focus({ preventScroll: true });
+  });
+});
+
+language = readLanguage();
+applyLanguage();
+syncFactStrip();
+if (startupReport) {
+  renderDoctor(startupReport);
+}
+void loadModelSettings();
+
+const storedJobId = readStoredJobId();
+if (storedJobId) {
+  activeJobId = storedJobId;
+  recoverySummary = true;
+  updateRunSummary();
+  setBusy(true);
+  void pollStatus();
+}
+
+
+retryButton.addEventListener('click', () => {
+  if (retryButton.disabled) return;
+  if (rerunRequestSnapshot) void submitJob({ preventDefault() {} }, rerunRequestSnapshot);
+});
+stopButton.addEventListener('click', () => {
+  void stopActiveJob();
+});
+newInspectionButton.addEventListener('click', () => {
+  if (newInspectionButton.disabled) return;
+  resetInspection();
+  rerunRequestSnapshot = null;
+  form.reset();
+  syncFactStrip();
+  repositoryUrl.focus();
+});
+</script>
+</body></html>
+
+{% endif %}

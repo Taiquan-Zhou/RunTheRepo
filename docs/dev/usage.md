@@ -205,6 +205,20 @@ Docker Sandboxes has separate daemon and sandbox proxy settings; configure them
 during initial SBX setup as documented in the WSL guide. Do not inject the
 upstream proxy or its credentials into the untrusted target workload.
 
+### Local console proxy bootstrap
+
+When repotrial serve runs inside WSL, it can bootstrap the trusted console process
+from an enabled Windows HTTP(S) system proxy when no proxy environment variable is
+already present. It reads only ProxyEnable and ProxyServer, accepts explicit
+unauthenticated HTTP(S) proxy addresses, maps a Windows loopback listener to the
+current WSL default gateway when needed, and verifies an HTTPS CONNECT plus TLS
+handshake to GitHub before changing the current process environment. PAC, SOCKS,
+credential-bearing, and unverified values are ignored. Existing proxy variables
+always win and are never overwritten. Failure to verify a candidate leaves the
+environment unchanged and the console continues without claiming that proxy access
+is ready. This affects the trusted console process only; it does not configure TUN,
+the host system, or the untrusted target workload.
+
 ## Troubleshooting
 
 - **GitHub, registry, JWKS, or `uv` downloads hang:** for clients that honor the

@@ -476,6 +476,25 @@ def test_git_reader_timeout_kills_and_reaps_process(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+def test_git_reap_does_not_confirm_group_cleanup_after_killpg_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(stdout=_FakeStream(), stderr=_FakeStream())
+    process.pid = 12345
+
+    def fail_killpg(*_arguments: object) -> None:
+        raise OSError("killpg unavailable")
+
+    monkeypatch.setattr(github.os, "killpg", fail_killpg)
+
+    cleanup_succeeded = asyncio.run(github._kill_and_reap(process))
+
+    assert cleanup_succeeded is False
+    assert process.killed is True
+    assert process.wait_calls >= 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
 def test_git_timeout_terminates_descendant_and_closes_real_asyncio_pipes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

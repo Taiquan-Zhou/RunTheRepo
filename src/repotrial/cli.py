@@ -25,6 +25,8 @@ from repotrial.intake.github import (
     parse_github_url,
     pin_repository,
 )
+from repotrial.intake.repository_cache import RepositoryCache
+from repotrial.local_web.network import bootstrap_wsl_proxy
 from repotrial.models.base import ModelAdapter
 from repotrial.models.openai_compat import OpenAICompatibleModelAdapter
 from repotrial.report.failure import (
@@ -130,7 +132,10 @@ def create_app(
             )
         _validate_commit_sha(commit_sha)
         _validate_container_port(container_port)
-        configured_model = _configured_model(model, model_endpoint, model_name)
+        model_api_key = os.environ.pop("REPOTRIAL_MODEL_API_KEY", None)
+        configured_model = _configured_model(
+            model, model_endpoint, model_name, api_key=model_api_key
+        )
         if dry_run:
             _validate_github_url(url)
             dry_run_id, dry_run_path = create_run_layout(
@@ -159,6 +164,7 @@ def create_app(
             url,
             expected_commit_sha=commit_sha,
             on_pinned=record_verified_sha,
+            cache_root=artifacts_root.parent / ".repotrial-cache",
         )
         run_id: str | None = None
         run_path: Path | None = None
@@ -343,6 +349,7 @@ def create_app(
 
         from repotrial.local_web.app import create_app as create_local_app
 
+        bootstrap_wsl_proxy(os.environ)
         uvicorn.run(create_local_app(Path.cwd()), host="127.0.0.1", port=port)
 
     return app
@@ -377,6 +384,8 @@ def _configured_model(
     injected_model: ModelAdapter | None,
     model_endpoint: str | None,
     model_name: str | None,
+    *,
+    api_key: str | None = None,
 ) -> ModelAdapter | None:
     if model_endpoint is None and model_name is None:
         return injected_model
@@ -387,7 +396,7 @@ def _configured_model(
     return OpenAICompatibleModelAdapter(
         model_endpoint,
         model_name,
-        api_key=os.environ.get("REPOTRIAL_MODEL_API_KEY"),
+        api_key=api_key,
     )
 
 
@@ -417,13 +426,24 @@ def _repository_pinner_for(
     *,
     expected_commit_sha: str | None,
     on_pinned: Callable[[str], None],
+    cache_root: Path | None = None,
 ) -> RepositoryPinner:
     local_path = Path(url)
     if local_path.exists():
         pinner = _local_repository_pinner(local_path)
     else:
         _validate_github_url(url)
-        pinner = pin_repository
+        cache = RepositoryCache(cache_root)
+
+        async def pinner(
+            repository_url: str, destination: Path, requested_ref: str | None
+        ) -> PinnedRepo:
+            return await cache.pin(
+                repository_url,
+                destination,
+                requested_ref,
+                pin_repository,
+            )
 
     async def pin_expected(
         repository_url: str, destination: Path, requested_ref: str | None

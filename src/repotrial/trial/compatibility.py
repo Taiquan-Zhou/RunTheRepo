@@ -14,9 +14,16 @@ import sys
 import time
 import unicodedata
 from pathlib import Path
+from typing import NoReturn
 
 from repotrial.compose.compatibility import CompatibilityError
-from repotrial.sandbox.base import ExecResult, SandboxProvider
+from repotrial.sandbox.base import (
+    ExecResult,
+    FailureEvidenceValue,
+    SandboxFailureEvidence,
+    SandboxProvider,
+    attach_sandbox_failure_evidence,
+)
 from repotrial.sandbox.lifecycle import CleanupError
 
 _GUEST_VERIFY_TIMEOUT_S = 30
@@ -638,28 +645,119 @@ async def _verify_guest_overlay(
     except CleanupError:
         raise
     except (KeyError, OSError, RuntimeError, TypeError, ValueError):
-        raise CompatibilityError("guest_verify_failed") from None
+        _raise_guest_verification_failure(
+            "guest_verify_failed",
+            failure_branch="command_failed",
+        )
     if not isinstance(result, ExecResult):
-        raise CompatibilityError("guest_output_malformed")
+        _raise_guest_verification_failure(
+            "guest_output_malformed", failure_branch="result_type"
+        )
 
     stdout = _bounded_output(result.stdout)
     stderr = _bounded_output(result.stderr)
     if stdout is None or stderr is None:
-        raise CompatibilityError("guest_output_oversize")
+        _raise_guest_verification_failure(
+            "guest_output_oversize",
+            failure_branch="output_oversize",
+            returncode=(result.exit_code if type(result.exit_code) is int else None),
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
     if type(result.exit_code) is not int:
-        raise CompatibilityError("guest_output_malformed")
+        _raise_guest_verification_failure(
+            "guest_output_malformed",
+            failure_branch="exit_field",
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
     if result.exit_code != 0:
         if stdout:
-            raise CompatibilityError("guest_output_malformed")
-        raise CompatibilityError("guest_artifact_missing")
+            _raise_guest_verification_failure(
+                "guest_output_malformed",
+                failure_branch="command_failed",
+                returncode=result.exit_code,
+                stdout=result.stdout,
+                stderr=result.stderr,
+            )
+        _raise_guest_verification_failure(
+            "guest_artifact_missing",
+            failure_branch="command_failed",
+            returncode=result.exit_code,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
     if stderr:
-        raise CompatibilityError("guest_output_malformed")
+        _raise_guest_verification_failure(
+            "guest_output_malformed",
+            failure_branch="stderr",
+            returncode=result.exit_code,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
 
-    digest, reported_path = _parse_digest_output(stdout)
+    try:
+        digest, reported_path = _parse_digest_output(stdout)
+    except CompatibilityError:
+        _raise_guest_verification_failure(
+            "guest_output_malformed",
+            failure_branch="format",
+            returncode=result.exit_code,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
     if reported_path != relative_path:
-        raise CompatibilityError("guest_output_malformed")
+        _raise_guest_verification_failure(
+            "guest_output_malformed",
+            failure_branch="path",
+            returncode=result.exit_code,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
     if digest != expected_sha256:
-        raise CompatibilityError("guest_hash_mismatch")
+        _raise_guest_verification_failure(
+            "guest_hash_mismatch",
+            failure_branch="hash",
+            returncode=result.exit_code,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
+
+
+def _raise_guest_verification_failure(
+    reason: str,
+    *,
+    failure_branch: str,
+    returncode: int | None = None,
+    stdout: object = None,
+    stderr: object = None,
+) -> NoReturn:
+    details: dict[str, FailureEvidenceValue] = {
+        "check": "overlay_digest",
+        "failure_branch": failure_branch,
+    }
+    for name, output in (("stdout", stdout), ("stderr", stderr)):
+        if isinstance(output, str):
+            try:
+                output_bytes = len(output.encode("utf-8"))
+            except UnicodeError:
+                output_bytes = len(output.encode("utf-8", errors="surrogatepass"))
+            details[f"{name}_bytes"] = output_bytes
+            details[f"{name}_newlines"] = output.count("\n")
+        else:
+            details[f"{name}_bytes"] = None
+            details[f"{name}_newlines"] = None
+    error = CompatibilityError(reason)
+    attach_sandbox_failure_evidence(
+        error,
+        SandboxFailureEvidence(
+            operation="compatibility",
+            reason=reason,
+            returncode=returncode,
+            details=details,
+        ),
+    )
+    raise error from None
 
 
 def _validate_identity(relative_path: str, expected_sha256: str) -> None:

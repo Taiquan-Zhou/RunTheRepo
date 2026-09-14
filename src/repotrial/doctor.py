@@ -224,7 +224,7 @@ class DoctorReport:
 
     @property
     def ready(self) -> bool:
-        return all(
+        return bool(self.checks) and all(
             check.status == "PASS" or not check.blocking for check in self.checks
         )
 
