@@ -227,7 +227,7 @@ class RepositoryCache:
                 except asyncio.CancelledError:
                     _remove_owned_destination(claim)
                     raise
-                except (OSError, _CacheGitError):
+                except (OSError, RepoCacheError, _CacheGitError):
                     _remove_owned_destination(claim)
                     return None
                 finally:

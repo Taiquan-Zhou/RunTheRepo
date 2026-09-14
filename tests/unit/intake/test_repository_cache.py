@@ -219,6 +219,39 @@ def test_cached_pinner_hit_does_not_call_network_pinner(
     assert not called
 
 
+def test_restore_failure_releases_destination_for_pinner_fallback(
+    source_repository: tuple[Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, sha = source_repository
+    cache = RepositoryCache(tmp_path / "cache")
+    assert asyncio.run(cache.store(_pinned(source, sha)))
+
+    async def failing_git(_operation: str, *_arguments: str) -> bytes:
+        raise repository_cache.RepoCacheError("restore_io")
+
+    monkeypatch.setattr(repository_cache, "_run_cache_git", failing_git)
+
+    async def pinner(
+        _url: str, destination: Path, requested_ref: str | None
+    ) -> PinnedRepo:
+        assert requested_ref == sha
+        destination.mkdir()
+        return _pinned(destination, sha)
+
+    restored = asyncio.run(
+        cache.pin(
+            "https://github.com/example/project",
+            tmp_path / "workspace",
+            sha,
+            pinner,
+        )
+    )
+
+    assert restored.local_path == (tmp_path / "workspace").resolve()
+
+
 def test_bad_manifest_is_cache_miss_and_does_not_follow_external_symlink(
     source_repository: tuple[Path, str], tmp_path: Path
 ) -> None:
