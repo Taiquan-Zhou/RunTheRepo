@@ -77,12 +77,12 @@ dependencies and proxy configuration.
 
 For model-assisted runs, open **Advanced options** in the Web console. Enter an
 OpenAI-compatible Base URL and API key, click **Get models**, then choose a
-returned model or enter one manually and save. The key is persisted only in the
-the owner-only XDG configuration directory. By default this is
-`~/.config/repotrial/model-settings.json`; set `XDG_CONFIG_HOME` to use another
-XDG configuration directory. The settings API does not echo the key, it is
-excluded from public job payloads, and a run passes it only to the trusted CLI
-subprocess. Clear model settings to remove it.
+returned model or enter one manually and save. The key is persisted only in an
+owner-only settings file within the XDG configuration directory. By default,
+this file is `~/.config/repotrial/model-settings.json`; set `XDG_CONFIG_HOME` to
+use another XDG configuration directory. The settings API does not echo the key,
+it is excluded from public job payloads, and a run passes it only to the
+trusted CLI subprocess. Clear model settings to remove it.
 
 Start the console in the same WSL Bash session:
 
@@ -127,8 +127,9 @@ For your own HTTP checks, use [`--journeys-file`](docs/dev/usage.md#operator-aut
 - **Product scope:** no public resume or durable Web history; the default API
   container is not a ready-to-run sandbox service.
 - **Credentials:** use disposable target test accounts only. Web model keys are
-  persisted in the owner-only local settings file described above; CLI model
-  runs use the process environment. Neither path puts keys in a Journey file.
+  persisted in the owner-only settings file within the XDG configuration
+  directory described above; CLI model runs use the process environment.
+  Neither path puts keys in a Journey file.
 
 ## Documentation
 

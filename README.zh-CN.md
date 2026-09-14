@@ -69,7 +69,7 @@ uv run repotrial doctor
 
 进行模型辅助运行时，请在 Web 控制台的“高级选项”中填写兼容 OpenAI 的
 Base URL 和 API Key，点击“获取模型”，然后选择返回的模型或手动填写模型并
-保存。Key 只持久化在本机 owner-only 的 XDG 配置目录中。默认路径是
+保存。Key 只持久化在 XDG 配置目录中的 owner-only 设置文件中。默认文件路径是
 `~/.config/repotrial/model-settings.json`；设置 `XDG_CONFIG_HOME` 可使用其他
 XDG 配置目录。设置 API 不会回显 Key，公开 job payload 不包含它，运行任务时
 只会将它传给受信任的 CLI 子进程。清除模型设置即可移除它。
@@ -106,9 +106,9 @@ uv run repotrial inspect https://github.com/umami-software/umami \
 - **覆盖范围：** 真实目标的浏览器工作流不受支持。尚未证明 LLM 贡献被接受；操作员编写的检查不是 LLM 证据。
 - **安装：** 已在支持的现有 WSL/SBX 主机上测试，不代表全新操作系统上的安装结果。
 - **产品范围：** 没有公开的恢复或持久化 Web 历史；默认 API 容器不是开箱即用的沙箱服务。
-- **凭据：** 仅使用一次性的目标测试账户。Web 模型 Key 保存在上文所述的本机
-  owner-only 设置文件中；CLI 模型运行使用进程环境。两种路径都不会把 Key 写入
-  Journey 文件。
+- **凭据：** 仅使用一次性的目标测试账户。Web 模型 Key 保存在上文所述的 XDG
+  配置目录中的 owner-only 设置文件中；CLI 模型运行使用进程环境。两种路径都
+  不会把 Key 写入 Journey 文件。
 
 ## 文档
 
