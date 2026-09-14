@@ -16,12 +16,17 @@ uv run repotrial serve --port 8765
 
 Open `http://127.0.0.1:8765/`. The page is a thin wrapper around the existing
 `inspect` CLI: it accepts a public GitHub URL, a full lowercase commit SHA, the
-container port, and optional safe Compose/model settings. The model key remains
-in the server environment and is never accepted or displayed by the page. One
-trial can run at a time; status and elapsed time are real subprocess state, and
-reports are served only from validated, server-owned run artifacts. This local
-preview does not provide public binding, arbitrary shell or file downloads,
-durable job history, granular graph progress, or real-target browser journeys.
+container port, and optional safe Compose/model settings. In the Web console's
+Advanced settings, enter an OpenAI-compatible Base URL and API key, click Get
+models, then choose a returned model or enter one manually and save. The key is
+persisted only in the owner-only local configuration file
+`~/.config/repotrial/model-settings.json`; the settings API does not echo it,
+public job payloads exclude it, and a run passes it only to the trusted CLI
+subprocess. Clear model settings to remove it. One trial can run at a time;
+status and elapsed time are real subprocess state, and reports are served only
+from validated, server-owned run artifacts. This local preview does not provide
+public binding, arbitrary shell or file downloads, durable job history,
+granular graph progress, or real-target browser journeys.
 
 The tested topology is Windows 11 -> dedicated Ubuntu 24.04 WSL2 distro ->
 official Linux Docker Sandboxes v0.42.0 -> disposable Linux sandbox. The
@@ -71,8 +76,8 @@ sbx policy ls --type network --json
 sbx list
 ```
 
-Provide the model key only through the process environment. This prompt avoids
-putting the key in shell history or repository files:
+CLI only: provide the model key through the process environment. This prompt
+avoids putting the key in shell history or repository files:
 
 ```bash
 read -rsp 'Model API key: ' REPOTRIAL_MODEL_API_KEY && echo
@@ -256,8 +261,9 @@ the host system, or the untrusted target workload.
 - Docker Sandboxes v0.42.0 does not expose the required PID hard bound.
   RepoTrial records `pid_hard_bound_unsupported` and does not claim fork-bomb
   protection.
-- Model keys are supplied through the process environment only; never print or
-  record them.
+- CLI model keys are supplied through the process environment; Web model keys
+  use the owner-only local settings file described above. Never print or record
+  either key.
 - Reports are tested-journey/workload-conditioned results, not proof that a
   repository is globally safe or globally least-privileged.
 

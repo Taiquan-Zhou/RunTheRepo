@@ -75,11 +75,17 @@ dependencies and proxy configuration.
 
 ### Local Web console
 
-For model-assisted runs, first set the key in the same WSL Bash session:
+For model-assisted runs, open **Advanced options** in the Web console. Enter an
+OpenAI-compatible Base URL and API key, click **Get models**, then choose a
+returned model or enter one manually and save. The key is persisted only in the
+owner-only local configuration file `~/.config/repotrial/model-settings.json`.
+The settings API does not echo the key, it is excluded from public job payloads,
+and a run passes it only to the trusted CLI subprocess. Clear model settings to
+remove it.
+
+Start the console in the same WSL Bash session:
 
 ```bash
-read -rsp 'Model API key: ' REPOTRIAL_MODEL_API_KEY && echo
-export REPOTRIAL_MODEL_API_KEY
 uv run repotrial serve --port 8765
 ```
 
@@ -116,8 +122,9 @@ For your own HTTP checks, use [`--journeys-file`](docs/dev/usage.md#operator-aut
 - **Installation:** tested on the supported existing WSL/SBX host, not a fresh OS.
 - **Product scope:** no public resume or durable Web history; the default API
   container is not a ready-to-run sandbox service.
-- **Credentials:** use disposable target test accounts only. Model keys stay
-  in the process environment, never in a Journey file or the Web form.
+- **Credentials:** use disposable target test accounts only. Web model keys are
+  persisted in the owner-only local settings file described above; CLI model
+  runs use the process environment. Neither path puts keys in a Journey file.
 
 ## Documentation
 
