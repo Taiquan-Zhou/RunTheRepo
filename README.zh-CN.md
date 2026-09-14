@@ -8,22 +8,15 @@
 
 [English README](README.md) · 中文
 
-> **0.1 Preview** — 面向预配置的 WSL2 + Docker Sandboxes 环境。
-> CLI 和 Python 包名为 `repotrial`。
-
 ## 工作方式
 
 ![RunTheRepo 中文动态工作流程：固定版本、运行、验证、加固、报告与清理](docs/assets/workflow.zh-CN.gif)
-动画按 01 到 08 依次累积点亮，最后停留在完整工作流程。
 
 ## 功能演示
 
-### 项目自动读取
+### 1.项目自动读取
 
 https://github.com/user-attachments/assets/ec1fb7e6-3c57-4b43-9705-97b854d1eccd
-
-只有在记录的基线工作流再次通过后，改动才会被保留。
-即使沙箱清单为空，清理失败仍会使本次运行失败。
 
 ## 你将获得什么
 
@@ -34,9 +27,6 @@ https://github.com/user-attachments/assets/ec1fb7e6-3c57-4b43-9705-97b854d1eccd
 | 经过测试的加固 | 根据重放后的检查结果保留或回滚每项改动 |
 | 可用的输出 | JSON/HTML 报告、证据引用，以及在来源有效时生成的累计加固 overlay |
 | 本地控制台 | 提交一次试跑、跟踪状态并打开报告 |
-
-加固结果**仅适用于已测试的工作流**，不代表应用的所有功能。
-这不是安全认证。
 
 ## 真实运行，不是演示模型
 
