@@ -1,6 +1,4 @@
-# RunTheRepo
-
-**Run a repo. Verify what works. Test what can be hardened.**
+![RunTheRepo — from pinned source to auditable result](docs/assets/readme-hero.svg)
 
 Run GitHub Docker Compose apps in disposable sandboxes. Verify workflows,
 test hardening, and get evidence-backed reports.

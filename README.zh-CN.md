@@ -1,6 +1,4 @@
-# RunTheRepo
-
-**运行仓库。验证可用性。测试可加固性。**
+![RunTheRepo——从固定源码到可审计结果](docs/assets/readme-hero.svg)
 
 在一次性沙箱中运行 GitHub Docker Compose 应用，验证工作流、测试加固，并生成有据可查的报告。
 
