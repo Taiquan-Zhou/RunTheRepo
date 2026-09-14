@@ -18,6 +18,10 @@
 
 https://github.com/user-attachments/assets/4380f694-e0c7-41ef-a5fe-14feead3bedb
 
+### 2.运行过程与结果
+
+https://github.com/user-attachments/assets/ec45bca0-173c-476b-9086-8473a86d999c
+
 ## 你将获得什么
 
 | 能力 | 结果 |
