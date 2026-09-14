@@ -15,6 +15,7 @@
 
 ![RunTheRepo 中文动态工作流程：固定版本、运行、验证、加固、报告与清理](docs/assets/workflow.zh-CN.gif)
 动画按 01 到 08 依次累积点亮，最后停留在完整工作流程。
+<!-- DEMO_VIDEO_PLAYER_URL -->
 
 ## 中文界面演示
 
