@@ -307,7 +307,7 @@ class CliRunner:
     ) -> tuple[str | None, bool]:
         if stream is None:
             return None, False
-        captured = bytearray()
+        captured_size = 0
         line_buffer = bytearray()
         limited = False
         found_run_id: str | None = None
@@ -315,9 +315,8 @@ class CliRunner:
             chunk = await stream.read(4096)
             if not chunk:
                 break
-            remaining = self.max_output_bytes - len(captured)
-            if remaining > 0:
-                captured.extend(chunk[:remaining])
+            remaining = self.max_output_bytes - captured_size
+            captured_size += min(len(chunk), max(remaining, 0))
             if len(chunk) > max(remaining, 0):
                 limited = True
             if found_run_id is None and (job is None or job.run_id is None):

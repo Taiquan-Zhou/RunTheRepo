@@ -167,6 +167,14 @@ class GitMetadataClient:
         if selected is not None and selected not in candidate_paths:
             candidate_paths = (*candidate_paths, selected)
         if selected is None:
+            if compose_path is not None:
+                return GitMetadata(
+                    sha,
+                    candidate_paths,
+                    None,
+                    None,
+                    errors=("git_compose_not_found",),
+                )
             if candidates:
                 return GitMetadata(
                     sha,

@@ -264,7 +264,7 @@ def _validate_api_key(api_key: object) -> None:
     if (
         not isinstance(api_key, str)
         or len(api_key) > _MAX_API_KEY_CHARS
-        or "\x00" in api_key
+        or any(ord(character) < 0x20 or ord(character) > 0x7E for character in api_key)
     ):
         raise SettingsValidationError("api_key is invalid")
 

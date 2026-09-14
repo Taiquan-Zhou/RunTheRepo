@@ -174,6 +174,19 @@ def test_cli_request_preserves_exact_arguments(tmp_path: Path) -> None:
     ]
 
 
+def test_drain_reports_run_id_and_output_limit_without_retaining_output(
+    tmp_path: Path,
+) -> None:
+    runner = CliRunner(tmp_path, max_output_bytes=8)
+
+    found_run_id, limited = asyncio.run(
+        runner._drain(FakeStream(f"run_id={RUN_ID}\n".encode() + b"x" * 100))
+    )
+
+    assert found_run_id == RUN_ID
+    assert limited is True
+
+
 def test_submit_projects_only_matching_terminal_evidence(
     monkeypatch, tmp_path: Path
 ) -> None:

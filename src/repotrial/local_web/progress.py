@@ -157,9 +157,7 @@ class _Attempt:
     __slots__ = (
         "boot_or_step",
         "boot_pass",
-        "create_attempt",
         "create_success",
-        "destroy_success",
         "events",
         "index",
         "journey_complete",
@@ -174,9 +172,7 @@ class _Attempt:
         self.index = index
         self.mtime = mtime
         self.events: list[_Event] = []
-        self.create_attempt = False
         self.create_success = False
-        self.destroy_success = False
         self.boot_or_step = False
         self.boot_pass = False
         self.journey_complete = False
@@ -318,9 +314,7 @@ def _read_lifecycle(
             }.get(event)
         attempt.events.append(_Event(event, operation, mtime, order))
         if not warmup:
-            attempt.create_attempt |= event == "create_attempt"
             attempt.create_success |= event == "create_success"
-        attempt.destroy_success |= event == "destroy_success"
 
 
 def _matching_terminal_mtime(run_path: Path, run_id: str) -> tuple[float, bool] | None:

@@ -171,6 +171,24 @@ def test_custom_compose_path_can_select_nonstandard_yaml() -> None:
     assert result.compose_bytes == b"services: {}\n"
 
 
+def test_missing_explicit_compose_path_is_not_found_even_with_other_candidates() -> (
+    None
+):
+    client, _ = _client(
+        _archive((f"demo-{SHA}/compose.yml", b"services: {}\n", "file"))
+    )
+
+    result = client.discover(
+        "acme",
+        "demo",
+        requested_sha=SHA,
+        compose_path="deploy/compose.yml",
+    )
+
+    assert result.selected_compose_path is None
+    assert result.errors == ("git_compose_not_found",)
+
+
 @pytest.mark.parametrize(
     "member_name",
     ("demo-" + SHA + "/../compose.yml", "/demo-" + SHA + "/compose.yml"),

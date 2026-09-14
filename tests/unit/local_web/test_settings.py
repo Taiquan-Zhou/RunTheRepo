@@ -349,7 +349,18 @@ def test_oversized_encoded_key_preserves_previous_bytes(tmp_path: Path) -> None:
     assert store.load_resolved().api_key == "old"
 
 
-@pytest.mark.parametrize("api_key", ["bad\x00key", "x" * 4097])
+@pytest.mark.parametrize(
+    "api_key",
+    [
+        "bad\x00key",
+        "bad\nkey",
+        "bad\rkey",
+        "bad\tkey",
+        "bad\x7fkey",
+        "badékey",
+        "x" * 4097,
+    ],
+)
 def test_invalid_disk_key_fails_closed(tmp_path: Path, api_key: str) -> None:
     path = tmp_path / "settings.json"
     path.write_text(
@@ -368,6 +379,16 @@ def test_invalid_disk_key_fails_closed(tmp_path: Path, api_key: str) -> None:
 
     assert store.load_public().api_key_configured is False
     assert store.load_resolved() is None
+
+
+@pytest.mark.parametrize("api_key", ["bad\nkey", "bad\rkey", "bad\x1fkey", "badékey"])
+def test_save_rejects_api_key_outside_model_discovery_boundary(
+    tmp_path: Path, api_key: str
+) -> None:
+    with pytest.raises(SettingsValidationError):
+        ModelSettingsStore(tmp_path / "settings.json").save(
+            ModelSettingsUpdate(provider="deepseek", api_key=api_key)
+        )
 
 
 @pytest.mark.parametrize(
@@ -539,13 +560,12 @@ def test_disk_schema_rejects_noncanonical_records(
     assert ModelSettingsStore(path).load_resolved() is None
 
 
-def test_multibyte_key_roundtrips_before_byte_limit(tmp_path: Path) -> None:
+def test_multibyte_key_is_rejected_by_model_discovery_boundary(tmp_path: Path) -> None:
     key = "密" * 1000
-    store = ModelSettingsStore(tmp_path / "settings.json")
-    store.save(ModelSettingsUpdate(provider="deepseek", api_key=key))
-    resolved = store.load_resolved()
-    assert resolved is not None
-    assert resolved.api_key == key
+    with pytest.raises(SettingsValidationError):
+        ModelSettingsStore(tmp_path / "settings.json").save(
+            ModelSettingsUpdate(provider="deepseek", api_key=key)
+        )
 
 
 def test_malformed_utf8_and_json_fail_closed(tmp_path: Path) -> None:

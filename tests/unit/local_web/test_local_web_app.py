@@ -44,7 +44,13 @@ def _client(
     tmp_path: Path, runner: FakeRunner | None = None
 ) -> tuple[TestClient, FakeRunner]:
     actual = runner or FakeRunner()
-    client = TestClient(create_app(tmp_path, runner=actual))
+    client = TestClient(
+        create_app(
+            tmp_path,
+            runner=actual,
+            settings_store=ModelSettingsStore(tmp_path / "settings.json"),
+        )
+    )
     return client, actual
 
 
@@ -160,6 +166,7 @@ def test_doctor_is_idle_only_and_input_is_strictly_validated(tmp_path: Path) -> 
             runner=runner,
             doctor=doctor,
             services=ReadyServices(),
+            settings_store=ModelSettingsStore(tmp_path / "settings.json"),
         )
     )
     token = _token(client)
@@ -248,7 +255,12 @@ def test_same_origin_requires_matching_scheme_host_and_port(tmp_path: Path) -> N
 
     fake_runner = FakeRunner()
     with TestClient(
-        create_app(tmp_path, runner=fake_runner, services=ReadyServices())
+        create_app(
+            tmp_path,
+            runner=fake_runner,
+            services=ReadyServices(),
+            settings_store=ModelSettingsStore(tmp_path / "settings.json"),
+        )
     ) as client:
         token = _token(client)
         headers = {
@@ -466,7 +478,12 @@ def test_lifespan_empty_service_report_blocks_submission(tmp_path: Path) -> None
 
     runner = FakeRunner()
     with TestClient(
-        create_app(tmp_path, runner=runner, services=EmptyServices())
+        create_app(
+            tmp_path,
+            runner=runner,
+            services=EmptyServices(),
+            settings_store=ModelSettingsStore(tmp_path / "settings.json"),
+        )
     ) as client:
         token = _token(client)
         response = client.post(
@@ -506,6 +523,7 @@ def test_incomplete_service_report_is_not_verified(
             runner=runner,
             services=IncompleteServices(),
             doctor=incomplete_doctor,
+            settings_store=ModelSettingsStore(tmp_path / "settings.json"),
         )
     ) as client:
         token = _token(client)
@@ -626,7 +644,13 @@ def test_model_discovery_accepts_async_injected_service(tmp_path: Path) -> None:
     async def discovery(_: str, __: str | None) -> tuple[str, ...]:
         return ("async-model",)
 
-    client = TestClient(create_app(tmp_path, model_discovery=discovery))
+    client = TestClient(
+        create_app(
+            tmp_path,
+            model_discovery=discovery,
+            settings_store=ModelSettingsStore(tmp_path / "settings.json"),
+        )
+    )
     token = _token(client)
     response = client.post(
         "/api/settings/model/discover",
@@ -646,6 +670,7 @@ def test_model_discovery_error_is_safe(tmp_path: Path) -> None:
         create_app(
             tmp_path,
             model_discovery=fail,
+            settings_store=ModelSettingsStore(tmp_path / "settings.json"),
         )
     )
     token = _token(client)
@@ -669,7 +694,13 @@ def test_model_discovery_rejects_unsafe_key_without_calling_upstream(
         calls.append((endpoint, api_key))
         return ("unused",)
 
-    client = TestClient(create_app(tmp_path, model_discovery=discovery))
+    client = TestClient(
+        create_app(
+            tmp_path,
+            model_discovery=discovery,
+            settings_store=ModelSettingsStore(tmp_path / "settings.json"),
+        )
+    )
     token = _token(client)
     response = client.post(
         "/api/settings/model/discover",
