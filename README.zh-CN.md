@@ -20,7 +20,7 @@
 
 ### 项目自动读取
 
-https://github.com/user-attachments/assets/b3706293-8c09-4ce4-9ee8-254269839e69
+https://github.com/user-attachments/assets/ec1fb7e6-3c57-4b43-9705-97b854d1eccd
 
 只有在记录的基线工作流再次通过后，改动才会被保留。
 即使沙箱清单为空，清理失败仍会使本次运行失败。
