@@ -17,7 +17,7 @@ test hardening, and get evidence-backed reports.
 
 ### 1. Automatic Project Detection and Environment Check
 
-https://github.com/user-attachments/assets/00b480d6-5954-4f11-be6c-9213c2ccecfe
+https://github.com/user-attachments/assets/90804069-60ac-4cc4-b164-53350d152066
 
 ## What you get
 

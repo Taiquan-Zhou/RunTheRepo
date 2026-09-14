@@ -16,7 +16,7 @@
 
 ### 1.项目自动读取与环境检查
 
-https://github.com/user-attachments/assets/ec1fb7e6-3c57-4b43-9705-97b854d1eccd
+https://github.com/user-attachments/assets/4380f694-e0c7-41ef-a5fe-14feead3bedb
 
 ## 你将获得什么
 
