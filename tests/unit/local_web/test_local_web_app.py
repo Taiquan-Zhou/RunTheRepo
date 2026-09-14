@@ -140,6 +140,13 @@ def test_doctor_is_idle_only_and_input_is_strictly_validated(tmp_path: Path) -> 
     client, runner = _client(tmp_path)
     token = _token(client)
     headers = {"host": "127.0.0.1", "x-csrf-token": token}
+
+    class ReadyServices:
+        def ensure_ready(self) -> DoctorReport:
+            return DoctorReport(
+                checks=(DoctorCheck("sbx_daemon", "PASS", True, "running", None),)
+            )
+
     doctor = lambda: DoctorReport(
         checks=(
             DoctorCheck("linux", "PASS", True, "ok", None),
@@ -147,7 +154,14 @@ def test_doctor_is_idle_only_and_input_is_strictly_validated(tmp_path: Path) -> 
             DoctorCheck("sbx_inventory", "PASS", True, "ok", None),
         )
     )
-    client = TestClient(create_app(tmp_path, runner=runner, doctor=doctor))
+    client = TestClient(
+        create_app(
+            tmp_path,
+            runner=runner,
+            doctor=doctor,
+            services=ReadyServices(),
+        )
+    )
     token = _token(client)
     headers["x-csrf-token"] = token
     result = client.post("/api/doctor", headers=headers)
