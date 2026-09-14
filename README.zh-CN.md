@@ -16,12 +16,11 @@
 ![RunTheRepo 中文动态工作流程：固定版本、运行、验证、加固、报告与清理](docs/assets/workflow.zh-CN.gif)
 动画按 01 到 08 依次累积点亮，最后停留在完整工作流程。
 
-## 中文界面演示
+## 功能演示
 
-https://github.com/user-attachments/assets/92fab766-db6b-422f-b99b-5200ff684db1
+### 项目自动读取
 
-演示从新建检查开始：自动识别提交 SHA、填写项目信息、检查运行环境，然后开始检查。
-如需下载，可[下载 MP4 文件](docs/assets/new-check.zh-CN.mp4)。
+https://github.com/user-attachments/assets/b3706293-8c09-4ce4-9ee8-254269839e69
 
 只有在记录的基线工作流再次通过后，改动才会被保留。
 即使沙箱清单为空，清理失败仍会使本次运行失败。
