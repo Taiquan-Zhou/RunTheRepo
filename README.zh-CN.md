@@ -2,7 +2,7 @@
 
 在一次性沙箱中运行 GitHub Docker Compose 应用，验证工作流、测试加固，并生成有据可查的报告。
 
-[快速开始](#快速开始) · [使用指南](docs/dev/usage.md) · [环境设置](docs/dev/wsl2-linux-sbx-setup.md) · [验证结果](docs/dev/release-closeout.md)
+[快速开始](#快速开始) · [使用指南](docs/dev/usage.md) · [环境设置](docs/dev/wsl2-linux-sbx-setup.md)
 
 [English README](README.md) · 中文
 
@@ -29,27 +29,6 @@ https://github.com/user-attachments/assets/ec45bca0-173c-476b-9086-8473a86d999c
 | 经过测试的加固 | 根据重放后的检查结果保留或回滚每项改动 |
 | 可用的输出 | JSON/HTML 报告、证据引用，以及在来源有效时生成的累计加固 overlay |
 | 本地控制台 | 提交一次试跑、跟踪状态并打开报告 |
-
-## 真实案例
-
-| 应用 | 已验证工作流 | 结果 |
-| --- | --- | --- |
-| Umami | 匿名访问拒绝 → 登录 → 创建 → 读取 → 删除 → 确认不存在 | 基线以及之后保留的 2 项改动均通过全部 6 个步骤 |
-| changedetection.io | HTTP `GET /` | 基线以及之后保留的 2 项改动均通过 |
-
-两次运行都生成了报告，并完成沙箱/模板清理，官方清单为空。Umami 的工作流由**操作员编写**，不是由 LLM 生成。这些示例不代表对所有仓库都兼容。
-
-<details>
-<summary>查看实际的 Umami 报告</summary>
-
-![显示固定源代码和认证 Journey 通过的实际 Umami 报告](docs/assets/umami-report.png)
-
-来自运行 `e751fd28-94f9-4d90-9a3c-7aaa8f791b47` 的未修改报告视图。
-报告仍使用内部名称 RepoTrial。
-
-</details>
-
-[精确提交、运行 ID、失败案例和质量检查 →](docs/dev/release-closeout.md)
 
 ## 快速开始
 
@@ -116,5 +95,3 @@ uv run repotrial inspect https://github.com/umami-software/umami \
 | --- | --- |
 | 安装 WSL/SBX 或排查连接问题 | [环境设置](docs/dev/wsl2-linux-sbx-setup.md) |
 | 编写 HTTP 检查、配置模型或排查问题 | [使用指南](docs/dev/usage.md) |
-| 查看验证证据和已知失败 | [Release closeout](docs/dev/release-closeout.md) |
-| 运行开发质量检查 | [开发门禁](docs/dev/usage.md#development-gates) |

@@ -52,7 +52,6 @@ source = ["repotrial"]
 fail_under = 85
 
 [tool.ruff]
-extend-exclude = ["docs/superpowers/plans/2026-08-25-repotrial-mvp.md"]
 target-version = "py312"
 
 [tool.mypy]

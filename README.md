@@ -3,7 +3,7 @@
 Run GitHub Docker Compose apps in disposable sandboxes. Verify workflows,
 test hardening, and get evidence-backed reports.
 
-[Quick start](#quick-start) · [Usage guide](docs/dev/usage.md) · [Setup](docs/dev/wsl2-linux-sbx-setup.md) · [Validation results](docs/dev/release-closeout.md)
+[Quick start](#quick-start) · [Usage guide](docs/dev/usage.md) · [Setup](docs/dev/wsl2-linux-sbx-setup.md)
 
 [中文 README](README.zh-CN.md) · English
 
@@ -30,29 +30,6 @@ https://github.com/user-attachments/assets/86a19206-d66b-4400-9620-831186d2e9df
 | Tested hardening | Keep or roll back each change based on replayed checks |
 | Usable outputs | JSON/HTML reports, evidence references and a cumulative hardened overlay when provenance is valid |
 | Local console | Submit one trial, follow its status and open its report |
-
-## Real-world examples
-
-| Application | Verified workflow | Outcome |
-| --- | --- | --- |
-| Umami | Anonymous access rejection → login → create → read → delete → confirm absence | All 6 steps passed at baseline and after each of 2 kept changes |
-| changedetection.io | HTTP `GET /` | Passed at baseline and after each of 2 kept changes |
-
-Both runs produced reports and completed sandbox/template cleanup with empty
-official inventory. Umami's workflow was **operator-authored**, not generated
-by an LLM. These examples do not imply universal repository compatibility.
-
-<details>
-<summary>View the actual Umami report</summary>
-
-![Actual Umami report showing the pinned source and authenticated Journey passing](docs/assets/umami-report.png)
-
-Unmodified report viewport from run `e751fd28-94f9-4d90-9a3c-7aaa8f791b47`.
-The report still uses the internal name RepoTrial.
-
-</details>
-
-[Exact commits, run IDs, failed cases and quality checks →](docs/dev/release-closeout.md)
 
 ## Quick start
 
@@ -137,5 +114,3 @@ For your own HTTP checks, use [`--journeys-file`](docs/dev/usage.md#operator-aut
 | --- | --- |
 | Install WSL/SBX or fix connectivity | [Environment setup](docs/dev/wsl2-linux-sbx-setup.md) |
 | Write HTTP checks, configure a model or troubleshoot | [Usage guide](docs/dev/usage.md) |
-| Inspect validation evidence and known failures | [Release closeout](docs/dev/release-closeout.md) |
-| Run development quality checks | [Development gates](docs/dev/usage.md#development-gates) |

@@ -2,8 +2,7 @@
 
 [Back to RunTheRepo](../../README.md)
 
-Detailed CLI, Journey, proxy and safety reference. For the supported preview
-scope and current evidence, see [release closeout](release-closeout.md).
+Detailed CLI, Journey, proxy and safety reference.
 
 ## Fastest supported setup
 
@@ -268,15 +267,3 @@ the host system, or the untrusted target workload.
   described above. Never print or record either key.
 - Reports are tested-journey/workload-conditioned results, not proof that a
   repository is globally safe or globally least-privileged.
-
-## Development gates
-
-```bash
-uv lock --check
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy src/repotrial
-uv run pytest -q --cov=repotrial --cov-branch --cov-report=term-missing
-uvx pre-commit run --all-files
-uv build
-```
