@@ -1,32 +1,26 @@
 # WSL2 Ubuntu + Linux Docker Sandboxes setup
 
-This guide reproduces RepoTrial's accepted Windows development topology. It is
-an environment procedure for the existing `DockerSbxProvider`; it does not add
-a Provider, change the frozen Pilot cohort, or authorize host Docker fallback.
+This guide prepares the supported Windows environment for RepoTrial's
+`DockerSbxProvider`. It does not authorize host Docker fallback.
 
 ## Support labels
 
 - **Microsoft-official WSL behavior:** Microsoft documents [`wsl --install`,
   `--location`, and WSL management
-  commands](https://learn.microsoft.com/en-us/windows/wsl/basic-commands). The
-  calibrated host's Microsoft WSL 2.6.3.0 `wsl --help` also verified `--name`,
-  `--version`, `--vhd-size`, and `--manage --set-default-user`; WSL owns the
-  resulting ext4 VHD.
+  commands](https://learn.microsoft.com/en-us/windows/wsl/basic-commands).
+  WSL owns the resulting ext4 VHD.
 - **Docker-official behavior:** the Docker-published Linux SBX package, the
   installed `sbx` CLI, and Docker's documented [upstream proxy
   settings](https://docs.docker.com/ai/sandboxes/configuration/upstream-proxy/).
 - **RepoTrial-supported runtime:** Windows 11 + WSL2 + a dedicated Ubuntu
   24.04 distro on D + official Linux SBX v0.42.0 is the current production
   runtime. This label does not turn the WSL topology into a Docker support
-  claim. The older v0.39.0 calibration remains historical and is not an
-  installation target.
+  claim. Older SBX releases are not supported.
 - **Known unsupported:** Docker SBX v0.42.0 has no verified PID hard bound.
   RepoTrial does not emulate one with `ulimit`, Compose `pids_limit`, polling,
   or memory limits and does not claim fork-bomb/PID hard protection.
 
-Historical calibration values and hashes are in the
-[calibration report](pilot-evidence/wsl2-linux-sbx-calibration.md); the active
-v0.42.0 package and CLI identity are pinned below.
+The active v0.42.0 package and CLI identity are pinned below.
 
 ## Verified topology and safety boundary
 
@@ -40,10 +34,10 @@ Windows 11 desktop/control entry
 ```
 
 CPU, memory, the three-part disk budget, host-side shared monotonic whole-trial
-duration, fail-closed network policy, forced cleanup, and no-host-fallback were
-calibrated. PID hard bound remains unsupported. The Windows host, dedicated WSL
-distro, Linux `sbx` process, sandboxd, and SBX policy proxy are trusted control
-infrastructure; target repositories remain untrusted and execute only inside a
+duration, fail-closed network policy, forced cleanup, and no-host-fallback are
+enforced by the supported runtime path. PID hard bound remains unsupported. The
+Windows host, dedicated WSL distro, Linux `sbx` process, sandboxd, and SBX policy
+proxy are trusted control infrastructure; target repositories remain untrusted and execute only inside a
 disposable SBX microVM.
 
 ## Prerequisites
@@ -233,15 +227,15 @@ RepoTrial.
 ## Proxy configuration: two Docker scopes plus the trusted client
 
 Docker officially defines the first two outbound scopes below and documents
-their precedence. RepoTrial separately observed the third client-side path on
-this machine; it is an operational requirement here, not another Docker scope.
+their precedence. The third client-side path is a RepoTrial operational
+requirement, not another Docker scope.
 
 1. **Docker-official daemon upstream:** sandboxd's own external downloads.
 2. **Docker-official sandbox upstream:** outbound traffic from disposable
    sandboxes through SBX's policy-enforcing proxy.
-3. **RepoTrial-tested trusted client process:** the `sbx` CLI and RepoTrial
+3. **RepoTrial trusted client process:** the `sbx` CLI and RepoTrial
    control process, including Docker session/JWKS verification and GitHub
-   access observed during calibration.
+   access required by GitHub and container registries.
 
 For an approved LAN proxy without embedded credentials, the proxied bootstrap
 above sets these two official SBX overrides. Their equivalent commands from an
@@ -292,17 +286,15 @@ restrict it with the Windows firewall to the intended WSL/host scope, do not
 expose it to an untrusted LAN, and never pass that upstream endpoint or its
 credentials directly to a target workload.
 
-## Ext4 checkout and locked development environment
+## Ext4 checkout and locked environment
 
 Keep the checkout under the distro's ext4 filesystem. `/mnt/c` and `/mnt/d`
-have Windows filesystem semantics and are not accepted for calibration or Pilot
-execution:
+have Windows filesystem semantics and are not supported for execution:
 
 ```bash
 mkdir -p /home/repotrial/src
 git clone <trusted-repository-source> /home/repotrial/src/RepoTrial
 cd /home/repotrial/src/RepoTrial
-git checkout --detach <approved-execution-head>
 test "$(findmnt -T . -n -o FSTYPE)" = ext4
 git status --porcelain=v1
 ```
@@ -328,17 +320,7 @@ wsl -d RepoTrial-Ubuntu -u root --cd /home/repotrial/src/RepoTrial -- env PATH=/
 wsl -d RepoTrial-Ubuntu --cd /home/repotrial/src/RepoTrial -- env PATH=/home/repotrial/.local/share/repotrial-uv/bin:/home/repotrial/.local/bin:/usr/local/bin:/usr/bin:/bin /home/repotrial/.local/share/repotrial-uv/bin/uv run playwright install chromium
 ```
 
-Install the user-scoped pre-commit runner without changing `pyproject.toml` or
-`uv.lock`; hook revisions remain controlled by `.pre-commit-config.yaml`:
-
-```bash
-uv tool install 'pre-commit==4.6.2'
-```
-
-Retain the uv directory on `PATH` when invoking tests because packaging tests
-spawn `uv` by command name.
-
-## Verification before Pilot execution
+## Verification before running
 
 From the ext4 checkout, with the required trusted-client proxy environment if
 applicable, verify:
@@ -348,36 +330,17 @@ sbx version
 sbx diagnose --output json
 sbx policy ls --type network --json
 sbx list
-uv lock --check
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy src/repotrial
-uv run pytest -q
-uv run pytest --cov=repotrial --cov-branch --cov-report=term-missing
-uv run pre-commit run --all-files
-git diff --check
+uv run repotrial doctor
 ```
 
-Real SBX smoke/calibration is opt-in and must follow the reviewed commands in
-the [execution plan](../superpowers/plans/2026-08-29-wsl2-linux-sbx-execution.md).
-Never reinterpret default skips as real-runtime PASS. Require an empty `sbx list`
-after every lifecycle.
+Continue only when doctor reports `READY`. Require an empty `sbx list` before
+and after every trial.
 
-## Upgrade invalidation conditions
+## After environment upgrades
 
-The accepted calibration applies only while these identities remain unchanged:
-
-- runtime inputs under `src/repotrial`, `pyproject.toml`, `uv.lock`, runtime
-  configuration, and the trusted calibration fixture;
-- `eval/real_repos.yaml` hash for cohort execution;
-- Ubuntu release, WSL kernel, KVM availability, SBX package/version/commit,
-  guest Compose version, and global network policy hash.
-
-Any change to one of those inputs requires fresh calibration and evidence review
-before Pilot execution. A docs-only descendant does not invalidate calibration
-when both runtime-input and environment fingerprints remain identical. Never
-upgrade SBX, WSL, Ubuntu, guest components, or policy in place and silently reuse
-the old report.
+After changing Ubuntu, WSL, KVM, SBX, guest Compose, or the global network
+policy, rerun the verification commands above before starting another trial.
+Do not reuse an earlier environment result after these inputs change.
 
 ## Troubleshooting
 
@@ -390,21 +353,20 @@ the old report.
 - **Daemon image pull/auth timeout:** verify the daemon upstream setting and the
   LAN proxy/firewall path. Do not pass the upstream proxy directly into target
   Compose services.
-- **Diagnose failure or non-empty inventory:** stop Pilot work, retain exact
+- **Diagnose failure or non-empty inventory:** stop new trials, retain exact
   output and logs, and identify owned sandbox IDs. Do not reset or restart in a
   loop and do not delete state manually.
 - **`/dev/kvm` or systemd unavailable:** treat the environment as unsupported;
   do not patch RepoTrial to bypass isolation.
 - **Checkout reports `drvfs`/`9p` instead of ext4:** reclone into
   `/home/repotrial/src`; do not calibrate from a Windows-mounted path.
-- **Native Windows sandboxd self-connect error:** it is retained historical
-  evidence, not a reason to switch to Docker Desktop or host Compose.
+- **Native Windows sandboxd self-connect error:** use the supported WSL setup;
+  do not switch to Docker Desktop or host Compose.
 
 ## Safe retirement
 
-Retirement is destructive and requires a separate Owner authorization. First
-export or copy the retained evidence, then independently verify the exact
-registered name `RepoTrial-Ubuntu` and exact location
+Retirement is destructive. First export or copy any needed artifacts, then
+independently verify the exact registered name `RepoTrial-Ubuntu` and exact location
 `D:\DockerData\WSL\RepoTrial-Ubuntu`. Unregister only that exact distro, then
 resolve and verify the dedicated cleanup target before removing only that
 directory. Never use a name pattern or recursively remove a parent directory.
